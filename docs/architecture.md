@@ -145,14 +145,6 @@ The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentic
 - A database-wide filesystem lock serializes audited mutations, and a pending-operation journal recovers single-record crash windows. There are no multi-record transactions.
 - YAML comments and hand-chosen front matter formatting are not preserved after a CLI mutation; the Markdown body is preserved exactly. A syntax-preserving YAML editor could replace serialization later without changing the command model.
 
-## Planned extension points
+## Roadmap
 
-1. `cr check` for whole-database integrity and dangling-link detection.
-2. `unlink`, backlinks, relation traversal, and delete policies.
-3. A richer query language with comparisons, boolean operators, sorting, pagination, aggregation, projections, and additional output formats.
-4. A disposable index for large collections.
-5. Schema-aware defaults, migrations, computed fields, and lifecycle hooks.
-6. Optimistic per-record concurrency and multi-record transactions.
-7. Automated signed or remotely anchored audit checkpoints.
-8. Audit redaction, encryption, and retention policies.
-9. Status ignore patterns, rename detection, and a reviewed interactive save UI.
+[`TODO.md`](../TODO.md) is the canonical roadmap and technical-debt register. It includes query expressions, projections, relationship traversal, indexes, schema migrations, HTTP hardening, audit improvements, and test work. Keeping the roadmap in one file avoids drift between implementation documentation and future plans.

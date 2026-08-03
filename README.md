@@ -801,4 +801,4 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for the storage protocol, integrity boundaries, and planned extension points.
+See [`docs/architecture.md`](docs/architecture.md) for the storage protocol and integrity boundaries. [`TODO.md`](TODO.md) is the canonical list of shortcuts, technical debt, and planned capabilities; update it in the same commit as future feature work.
