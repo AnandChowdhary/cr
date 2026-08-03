@@ -142,6 +142,7 @@ impl Database {
 
         fs::create_dir_all(root.join(".cr/schemas"))
             .context("could not create schema directory")?;
+        fs::create_dir_all(root.join(".cr/views")).context("could not create view directory")?;
         fs::create_dir_all(root.join("records")).context("could not create records directory")?;
 
         let config = Config::default();
@@ -467,6 +468,24 @@ impl Database {
             if let Some(body) = body {
                 document.body = body.to_owned();
             }
+            Ok(())
+        })
+    }
+
+    /// Replace a record's complete front matter and Markdown body atomically.
+    ///
+    /// This is used by server-rendered edit forms, where the user submits the
+    /// complete document rather than a partial API patch.
+    pub fn replace(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: Mapping,
+        body: &str,
+    ) -> Result<Record> {
+        self.update_document(collection, id, |document| {
+            document.attributes = attributes;
+            document.body = body.to_owned();
             Ok(())
         })
     }

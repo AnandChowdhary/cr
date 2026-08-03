@@ -598,7 +598,9 @@ async fn openapi_authentication_and_http_errors_are_structured() {
     assert_eq!(too_large.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(too_large.json()["error"]["code"], "payload_too_large");
 
-    let missing_route = request(&app, Method::GET, "/missing", None, &[]).await;
+    // Single-segment root paths are view names and are protected like the API.
+    // An unmatched multi-segment path still exercises the JSON route fallback.
+    let missing_route = request(&app, Method::GET, "/missing/route", None, &[]).await;
     assert_eq!(missing_route.status, StatusCode::NOT_FOUND);
     assert_eq!(missing_route.json()["error"]["code"], "route_not_found");
 

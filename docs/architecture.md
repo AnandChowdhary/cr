@@ -16,6 +16,8 @@ The mutation protocol follows write-ahead logging principles: durable intent pre
 
 Git's working-tree model separates detecting differences from explicitly selecting changes to record. `cr` applies the same boundary without adopting Git as a storage dependency: the audit journal is the recorded state, Markdown files are the working tree, `status` compares them, and `save` accepts reviewed paths. Git's author environment variables and repository `user.email` configuration also provide a familiar identity fallback.
 
+The HTML layer follows the web platform directly. Native forms submit mutations with `POST`, successful writes use `303 See Other` to return to an idempotent `GET`, and Maud escapes dynamic text while producing server-rendered markup. Tailwind's Play CDN supplies the requested no-build styling, with its documented development-only limitation recorded as technical debt.
+
 Research sources:
 
 - [Jekyll front matter](https://jekyllrb.com/docs/front-matter/)
@@ -34,6 +36,10 @@ Research sources:
 - [Axum server and router](https://docs.rs/axum/latest/axum/fn.serve.html)
 - [Axum repeated query parameters](https://docs.rs/axum/latest/axum/extract/struct.Query.html)
 - [OpenAPI Specification 3.1](https://spec.openapis.org/oas/v3.1.1.html)
+- [MDN HTML forms](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/form)
+- [MDN 303 See Other](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/303)
+- [Maud templates and escaping](https://docs.rs/maud/latest/maud/)
+- [Tailwind Play CDN](https://tailwindcss.com/docs/installation/play-cdn)
 
 ## Version 1 layout
 
@@ -46,8 +52,10 @@ database-root/
 │   │   └── segments/
 │   │       ├── 00000000000000000001.jsonl
 │   │       └── 00000000000000000257.jsonl
-│   └── schemas/
-│       └── candidates.json
+│   ├── schemas/
+│   │   └── candidates.json
+│   └── views/
+│       └── interviews.yaml
 └── records/
     ├── candidates/
     │   └── jane-doe.md
@@ -61,6 +69,7 @@ database-root/
 - The Markdown body is opaque user content and is preserved by metadata-only updates.
 - Relations live under `relations.<name>` as lists of `{ collection, id }` references. `cr link` verifies the target exists and is idempotent.
 - A collection schema is optional and validates only its front matter.
+- A saved view is an optional versioned query/display definition. Collections also receive automatic views without a file.
 
 ## Audit protocol
 
@@ -133,7 +142,19 @@ The REST API uses generic collection and record routes. List, search, status, an
 
 The OpenAPI 3.1 document is produced on demand at `/openapi.json`. OpenAPI 3.1 uses the Draft 2020-12 JSON Schema model, allowing collection schemas to be embedded without translating them into Rust types. The document includes generic transport schemas plus one live component per `.cr/schemas/<collection>.json`; `x-cr-collection-schemas` preserves the mapping when collection names are not safe or unique component identifiers.
 
-The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentication for the OpenAPI document and all `/api/v1` routes; `/health` remains public. `X-CR-Actor` is an audit attribution override with the same assertion-only trust boundary as CLI actor values. The server does not implement TLS, user accounts, authorization policies, or rate limiting; network deployments must supply those controls at a trusted reverse proxy or service boundary.
+The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentication for HTML views, the OpenAPI document, and all `/api/v1` routes; `/health` remains public. `X-CR-Actor` is an audit attribution override with the same assertion-only trust boundary as CLI actor values. The server does not implement TLS, user accounts, authorization policies, or rate limiting; network deployments must supply those controls at a trusted reverse proxy or service boundary.
+
+## Views and server-rendered HTML
+
+`.cr/views/<name>.yaml` stores a format version, title, target collection, typed equality filters, visible dotted columns, and default page size. These files contain no record data. A saved view overrides the automatic view with the same route name; otherwise each discovered collection is available at `/<collection>`. View names reserve their single-segment root routes, while `/health`, `/openapi.json`, and `/api` remain server-owned.
+
+The root page, tables, search/filter controls, pagination, and record forms are rendered with Maud on the server. Dynamic title, front matter, ID, and error text are HTML-escaped. Tailwind's browser CDN supplies styling without a frontend build or JavaScript framework. Because the CDN is explicitly intended for development, a production/offline deployment should replace it with compiled and pinned CSS.
+
+View reads call the same `list` and `search` methods as the CLI and REST API. Create, update, and delete forms call `Database` directly with `source: api`; they never shell out to the CLI. The edit form replaces the complete submitted front matter and Markdown atomically, then validates and records the normal update audit event. Like any whole-document editor without `If-Match`, an old open form can overwrite a newer edit, which is covered by the existing conditional-write roadmap item.
+
+Mutating forms include a cryptographically random token generated when the server starts. Same-origin protections keep another website from reading it, and every form POST verifies it before touching the database. Successful writes return `303 See Other` to a view `GET`, preventing refresh from replaying the mutation. Validation errors return escaped HTML and do not change the record or audit head.
+
+`CR_API_TOKEN` protects view routes with the same bearer middleware as REST and OpenAPI. It does not create cookies or a browser login, so direct browser navigation is most useful for the default loopback-only configuration; authenticated browser deployments currently need a trusted proxy capable of adding the header. The HTML routes are deliberately not part of the machine-facing OpenAPI contract.
 
 ## Integrity boundaries
 

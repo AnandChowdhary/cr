@@ -14,6 +14,7 @@ Current capabilities include:
 - literal, case-insensitive, field-scoped, and regular-expression search;
 - direct Markdown editing with reviewed audit reconciliation;
 - optional JSON Schema validation;
+- saved and automatic server-rendered HTML views with audited forms;
 - a REST API with pagination, authentication, and live OpenAPI 3.1 generation.
 
 The examples below cover both CLI and HTTP usage. Future work—including comparisons, Boolean expressions, projections, relationship traversal, and indexes—is tracked in [`TODO.md`](TODO.md).
@@ -527,7 +528,7 @@ Schemas validate front matter. The record ID, collection, path, and Markdown bod
 
 ## Serve the database over HTTP
 
-Start the REST API from inside a database:
+Start the web UI and REST API from inside a database:
 
 ```sh
 cr serve
@@ -537,6 +538,7 @@ The default address is `127.0.0.1:3000`, so the server is only reachable from th
 
 ```text
 Serving cr on http://127.0.0.1:3000
+Views: http://127.0.0.1:3000/
 OpenAPI: http://127.0.0.1:3000/openapi.json
 ```
 
@@ -548,9 +550,77 @@ cr serve --bind 127.0.0.1:8080
 
 The HTTP layer calls the same Rust database methods as the CLI. It does not spawn a `cr` subprocess. Schema validation, atomic writes, audit locking, direct-edit reconciliation, and tamper checks therefore behave the same way in both interfaces. HTTP mutations are recorded with `source: api`.
 
+### Browse automatic views
+
+Open [http://127.0.0.1:3000/](http://127.0.0.1:3000/) to see every collection. Each collection gets a useful table without configuration, so a `deals` collection is immediately available at:
+
+```text
+http://127.0.0.1:3000/deals
+```
+
+The table infers columns from the collection schema and current front matter. It includes case-insensitive document search, one typed exact-value filter, bounded pagination, create and edit forms, and audited deletion. Form front matter is YAML, so numbers, booleans, arrays, nested maps, strings, and `null` retain their types. Every mutation is schema-validated and recorded with `source: api`.
+
+### Create saved views
+
+A saved view gives a stable route a title, collection, default equality filters, explicit columns, and page size. This CRM example makes `/deals` show only open deals:
+
+```sh
+cr view create deals \
+  --collection deals \
+  --title "Open deals" \
+  --where status=open \
+  --column name \
+  --column status \
+  --column value \
+  --column owner.email \
+  --page-size 50
+```
+
+For an ATS, create a focused interview view without replacing the automatic `/candidates` page:
+
+```sh
+cr view create interviews \
+  --collection candidates \
+  --title "Candidates in interview" \
+  --where stage=interview \
+  --column name \
+  --column role \
+  --column stage \
+  --column recruiter.email
+```
+
+Inspect all routes or one definition:
+
+```sh
+cr view list
+cr view list --json
+cr view show interviews
+cr view show interviews --json
+```
+
+Definitions are ordinary, versioned files in `.cr/views/<name>.yaml`:
+
+```yaml
+version: 1
+title: Open deals
+collection: deals
+filters:
+  - status=open
+columns:
+  - name
+  - status
+  - value
+  - owner.email
+page_size: 50
+```
+
+You can edit these files directly. The server reloads them on each request. View filters use the same typed `KEY=YAML` equality semantics as `cr list`; comparison and Boolean expressions remain roadmap work.
+
+The UI is plain server-rendered HTML—there is no React, Next.js, client-side application state, or JavaScript data API. Templates escape database values, mutating forms carry a per-server CSRF token, and successful POSTs return `303 See Other` before the browser reloads the table. Styling currently uses Tailwind's Play CDN as requested; the official Tailwind documentation labels that browser CDN development-only, so compiling and bundling CSS is tracked in `TODO.md`.
+
 ### Authentication and identity
 
-Local access has no token by default. Set `CR_API_TOKEN` before starting the server to require a bearer token for `/openapi.json` and every `/api/v1` endpoint:
+Local access has no token by default. Set `CR_API_TOKEN` before starting the server to require a bearer token for the HTML views, `/openapi.json`, and every `/api/v1` endpoint:
 
 ```sh
 export CR_API_TOKEN='replace-with-a-long-random-token'
@@ -565,6 +635,8 @@ curl http://127.0.0.1:3000/api/v1/identity \
 ```
 
 `GET /health` remains public so process supervisors can check readiness. If you bind to a non-loopback address without a token, `cr` prints a warning. The built-in server does not terminate TLS; use a trusted reverse proxy for access across a network.
+
+The token mechanism is an HTTP bearer header. A normal browser address-bar request cannot attach that header, so the built-in HTML UI is currently intended for the default loopback-without-token setup or a trusted proxy that injects authentication. A browser login/session flow is tracked in `TODO.md`.
 
 Set the audit actor for one request with `X-CR-Actor`:
 

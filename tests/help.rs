@@ -33,9 +33,24 @@ fn serve_help_documents_safe_defaults_and_limits() {
         .expect("failed to run cr serve --help");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("help output was not UTF-8");
-    assert!(stdout.contains("Serve the database through a REST API"));
+    assert!(stdout.contains("Serve the database through a web UI and REST API"));
     assert!(stdout.contains("--bind <BIND>"));
     assert!(stdout.contains("127.0.0.1:3000"));
     assert!(stdout.contains("--max-page-size"));
     assert!(stdout.contains("--max-body-bytes"));
+}
+
+#[test]
+fn view_help_documents_saved_view_controls() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["view", "create", "--help"])
+        .output()
+        .expect("failed to run cr view create --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("help output was not UTF-8");
+    assert!(stdout.contains("Create a saved view definition"));
+    assert!(stdout.contains("--collection <COLLECTION>"));
+    assert!(stdout.contains("--where <KEY=YAML>"));
+    assert!(stdout.contains("--column <FIELD>"));
+    assert!(stdout.contains("--page-size <PAGE_SIZE>"));
 }

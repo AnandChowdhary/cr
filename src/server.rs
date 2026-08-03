@@ -1,23 +1,25 @@
-use std::{io::Write, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeSet, io::Write, net::SocketAddr, str::FromStr, sync::Arc};
 
 use anyhow::{bail, Context, Result};
 use axum::{
     body::Body,
-    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, RawQuery, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, RawForm, RawQuery, State},
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use maud::{html, Markup, DOCTYPE};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value as JsonValue};
 use sha2::{Digest, Sha256};
-use yaml_serde::Mapping;
+use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
     Assignment, AuditSource, CollectionModel, Database, Record, SearchQuery, SearchTarget,
+    ViewDefinition,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -69,6 +71,7 @@ struct AppState {
     database: Database,
     max_page_size: usize,
     api_token: Option<Arc<str>>,
+    csrf_token: Arc<str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +150,34 @@ struct ListQuery {
     filters: Vec<String>,
     limit: Option<usize>,
     offset: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ViewQuery {
+    q: Option<String>,
+    filter_field: Option<String>,
+    filter_value: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    notice: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HtmlDocumentForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    id: Option<String>,
+    front_matter: String,
+    markdown: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HtmlDeleteForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -356,9 +387,19 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         database: database.with_source(AuditSource::Api),
         max_page_size: config.max_page_size,
         api_token: config.api_token.map(Arc::from),
+        csrf_token: Arc::from(random_token()?),
     };
     let protected = Router::new()
         .route("/openapi.json", get(openapi))
+        .route("/", get(views_home))
+        .route("/{view}", get(view_records))
+        .route("/{view}/new", get(new_record_form))
+        .route("/{view}/records", post(create_record_form))
+        .route(
+            "/{view}/records/{id}",
+            get(edit_record_form).post(update_record_form),
+        )
+        .route("/{view}/records/{id}/delete", post(delete_record_form))
         .nest(
             "/api/v1",
             Router::new()
@@ -413,6 +454,7 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
         .local_addr()
         .context("could not read HTTP listener address")?;
     println!("Serving cr on http://{address}");
+    println!("Views: http://{address}/");
     println!("OpenAPI: http://{address}/openapi.json");
     std::io::stdout()
         .flush()
@@ -451,6 +493,202 @@ async fn authorize(State(state): State<AppState>, request: Request<Body>, next: 
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn views_home(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let result: ApiResult<Markup> = async {
+        let views = run_database(&state, &headers, Database::views).await?;
+        Ok(render_views_home(&views))
+    }
+    .await;
+    html_result(result)
+}
+
+async fn view_records(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(view_name): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let result: ApiResult<Markup> = async {
+        let query: ViewQuery = parse_query(raw)?;
+        let ad_hoc_filter = match (&query.filter_field, &query.filter_value) {
+            (None, None) => None,
+            (Some(field), Some(value)) if field.is_empty() && value.is_empty() => None,
+            (Some(field), Some(_)) if field.is_empty() => {
+                return Err(ApiError::bad_request(
+                    "invalid_filter",
+                    "filter_field cannot be empty when filter_value is provided",
+                ))
+            }
+            (Some(field), Some(value)) => Some(format!("{field}={value}")),
+            _ => {
+                return Err(ApiError::bad_request(
+                    "invalid_filter",
+                    "filter_field and filter_value must be provided together",
+                ))
+            }
+        };
+        let query_for_database = query.clone();
+        let requested_view = view_name.clone();
+        let (view, records, schema) = run_database(&state, &headers, move |database| {
+            let view = database.view(&requested_view)?;
+            let mut filters = view
+                .filters
+                .iter()
+                .map(|filter| Assignment::from_str(filter))
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(filter) = ad_hoc_filter {
+                filters.push(Assignment::from_str(&filter)?);
+            }
+            let records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
+                Some(pattern) => {
+                    let search = SearchQuery::new(pattern, SearchTarget::Document, false, true)?;
+                    database.search(Some(&view.collection), &filters, &search)?
+                }
+                None => database.list(&view.collection, &filters)?,
+            };
+            let schema = database
+                .collection_models()?
+                .into_iter()
+                .find(|model| model.name == view.collection)
+                .and_then(|model| model.schema);
+            Ok((view, records, schema))
+        })
+        .await?;
+
+        let columns = view_columns(&view, &records, schema.as_ref());
+        let bounds = page_bounds(
+            query
+                .limit
+                .or(Some(view.page_size.min(state.max_page_size))),
+            query.offset,
+            state.max_page_size,
+        )?;
+        let page = paginate(records, bounds);
+        Ok(render_view_records(&view, &columns, &page, &query))
+    }
+    .await;
+    html_result(result)
+}
+
+async fn new_record_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(view_name): Path<String>,
+) -> Response {
+    let result: ApiResult<Markup> = async {
+        let requested_view = view_name.clone();
+        let view = run_database(&state, &headers, move |database| {
+            database.view(&requested_view)
+        })
+        .await?;
+        Ok(render_record_form(&view, None, &state.csrf_token, None))
+    }
+    .await;
+    html_result(result)
+}
+
+async fn edit_record_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((view_name, id)): Path<(String, String)>,
+) -> Response {
+    let result: ApiResult<Markup> = async {
+        let requested_view = view_name.clone();
+        let requested_id = id.clone();
+        let (view, record) = run_database(&state, &headers, move |database| {
+            let view = database.view(&requested_view)?;
+            let record = database.get(&view.collection, &requested_id)?;
+            Ok((view, record))
+        })
+        .await?;
+        Ok(render_record_form(
+            &view,
+            Some(&record),
+            &state.csrf_token,
+            None,
+        ))
+    }
+    .await;
+    html_result(result)
+}
+
+async fn create_record_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(view_name): Path<String>,
+    RawForm(raw): RawForm,
+) -> Response {
+    let result: ApiResult<Response> = async {
+        let form: HtmlDocumentForm = parse_html_form(&raw)?;
+        verify_csrf(&state, &form.csrf)?;
+        let id = form
+            .id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| ApiError::bad_request("invalid_form", "record ID cannot be empty"))?;
+        let attributes = parse_front_matter(&form.front_matter)?;
+        let requested_view = view_name.clone();
+        let id = id.to_owned();
+        run_database(&state, &headers, move |database| {
+            let view = database.view(&requested_view)?;
+            database.create_record(&view.collection, &id, attributes, &form.markdown)
+        })
+        .await?;
+        see_other(&notice_url(&view_name, "Record created"))
+    }
+    .await;
+    result.unwrap_or_else(html_error)
+}
+
+async fn update_record_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((view_name, id)): Path<(String, String)>,
+    RawForm(raw): RawForm,
+) -> Response {
+    let result: ApiResult<Response> = async {
+        let form: HtmlDocumentForm = parse_html_form(&raw)?;
+        verify_csrf(&state, &form.csrf)?;
+        if form.id.is_some() {
+            return Err(ApiError::bad_request(
+                "invalid_form",
+                "record ID cannot be changed",
+            ));
+        }
+        let attributes = parse_front_matter(&form.front_matter)?;
+        let requested_view = view_name.clone();
+        run_database(&state, &headers, move |database| {
+            let view = database.view(&requested_view)?;
+            database.replace(&view.collection, &id, attributes, &form.markdown)
+        })
+        .await?;
+        see_other(&notice_url(&view_name, "Record updated"))
+    }
+    .await;
+    result.unwrap_or_else(html_error)
+}
+
+async fn delete_record_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((view_name, id)): Path<(String, String)>,
+    RawForm(raw): RawForm,
+) -> Response {
+    let result: ApiResult<Response> = async {
+        let form: HtmlDeleteForm = parse_html_form(&raw)?;
+        verify_csrf(&state, &form.csrf)?;
+        let requested_view = view_name.clone();
+        run_database(&state, &headers, move |database| {
+            let view = database.view(&requested_view)?;
+            database.delete(&view.collection, &id)
+        })
+        .await?;
+        see_other(&notice_url(&view_name, "Record deleted"))
+    }
+    .await;
+    result.unwrap_or_else(html_error)
 }
 
 async fn identity(
@@ -1110,6 +1348,417 @@ fn error_response() -> JsonValue {
 
 fn json_body(schema: &str) -> JsonValue {
     json!({ "required": true, "content": { "application/json": { "schema": { "$ref": schema } } } })
+}
+
+fn render_views_home(views: &[ViewDefinition]) -> Markup {
+    page_layout(
+        "Database views",
+        html! {
+            div class="mb-10 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between" {
+                div {
+                    p class="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600" { "cr database" }
+                    h1 class="mt-2 text-3xl font-bold tracking-tight text-slate-950" { "Database views" }
+                    p class="mt-2 max-w-2xl text-sm text-slate-600" {
+                        "Browse every collection or open a saved, filtered view. All changes use the same validated and audited database operations as the CLI and REST API."
+                    }
+                }
+                a href="/openapi.json" class="text-sm font-semibold text-indigo-700 hover:text-indigo-900" { "OpenAPI ↗" }
+            }
+            @if views.is_empty() {
+                div class="rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center shadow-sm" {
+                    h2 class="text-lg font-semibold text-slate-900" { "No collections yet" }
+                    p class="mt-2 text-sm text-slate-600" {
+                        "Create a record with the CLI, or add a saved view with "
+                        code class="rounded bg-slate-100 px-1.5 py-1 text-xs" { "cr view create" }
+                        "."
+                    }
+                }
+            } @else {
+                div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3" {
+                    @for view in views {
+                        a href=(format!("/{}", encode_segment(&view.name))) class="group rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition hover:-translate-y-0.5 hover:border-indigo-300 hover:shadow-md" {
+                            div class="flex items-start justify-between gap-4" {
+                                div {
+                                    h2 class="text-lg font-semibold capitalize text-slate-950 group-hover:text-indigo-700" { (&view.title) }
+                                    p class="mt-1 font-mono text-xs text-slate-500" { (&view.collection) }
+                                }
+                                span class="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600" {
+                                    @if view.saved { "saved" } @else { "automatic" }
+                                }
+                            }
+                            @if view.filters.is_empty() {
+                                p class="mt-5 text-sm text-slate-500" { "All records" }
+                            } @else {
+                                div class="mt-5 flex flex-wrap gap-2" {
+                                    @for filter in &view.filters {
+                                        span class="rounded-lg bg-indigo-50 px-2 py-1 font-mono text-xs text-indigo-700" { (filter) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn render_view_records(
+    view: &ViewDefinition,
+    columns: &[String],
+    page: &Page<Record>,
+    query: &ViewQuery,
+) -> Markup {
+    let new_url = format!("/{}/new", encode_segment(&view.name));
+    let reset_url = format!("/{}", encode_segment(&view.name));
+    let first = if page.pagination.returned == 0 {
+        0
+    } else {
+        page.pagination.offset + 1
+    };
+    let last = page.pagination.offset + page.pagination.returned;
+    page_layout(
+        &view.title,
+        html! {
+            nav class="mb-6 flex items-center gap-2 text-sm text-slate-500" {
+                a href="/" class="font-medium hover:text-indigo-700" { "Views" }
+                span { "/" }
+                span class="text-slate-900" { (&view.title) }
+            }
+            div class="mb-6 flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between" {
+                div {
+                    div class="flex flex-wrap items-center gap-3" {
+                        h1 class="text-3xl font-bold capitalize tracking-tight text-slate-950" { (&view.title) }
+                        span class="rounded-full bg-slate-200 px-2.5 py-1 text-xs font-medium text-slate-700" {
+                            @if view.saved { "saved view" } @else { "automatic view" }
+                        }
+                    }
+                    p class="mt-2 text-sm text-slate-600" {
+                        "Collection " code class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs" { (&view.collection) }
+                    }
+                    @if !view.filters.is_empty() {
+                        div class="mt-3 flex flex-wrap gap-2" {
+                            @for filter in &view.filters {
+                                span class="rounded-lg bg-indigo-50 px-2 py-1 font-mono text-xs text-indigo-700" { (filter) }
+                            }
+                        }
+                    }
+                }
+                a href=(new_url) class="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700" {
+                    "+ New record"
+                }
+            }
+            @if let Some(notice) = query.notice.as_deref() {
+                div role="status" class="mb-5 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800" { (notice) }
+            }
+            form method="get" action=(reset_url.clone()) class="mb-5 grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm lg:grid-cols-[2fr_1fr_1fr_auto]" {
+                label class="block" {
+                    span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Search" }
+                    input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) placeholder="Path, front matter, or Markdown" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+                }
+                label class="block" {
+                    span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Exact field" }
+                    input type="text" name="filter_field" value=(query.filter_field.as_deref().unwrap_or("")) placeholder="status" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+                }
+                label class="block" {
+                    span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "YAML value" }
+                    input type="text" name="filter_value" value=(query.filter_value.as_deref().unwrap_or("")) placeholder="open" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+                }
+                div class="flex items-end gap-2" {
+                    button type="submit" class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Apply" }
+                    a href=(reset_url) class="rounded-lg px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100" { "Reset" }
+                }
+            }
+            div class="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" {
+                div class="overflow-x-auto" {
+                    table class="min-w-full divide-y divide-slate-200 text-left text-sm" {
+                        thead class="bg-slate-50" {
+                            tr {
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "ID" }
+                                @for column in columns {
+                                    th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { (column) }
+                                }
+                                th scope="col" class="px-4 py-3 text-right font-semibold text-slate-700" { "" }
+                            }
+                        }
+                        tbody class="divide-y divide-slate-100" {
+                            @if page.data.is_empty() {
+                                tr { td colspan=(columns.len() + 2) class="px-4 py-12 text-center text-slate-500" { "No records match this view." } }
+                            } @else {
+                                @for record in &page.data {
+                                    tr class="hover:bg-slate-50/80" {
+                                        td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold text-slate-900" { (&record.id) }
+                                        @for column in columns {
+                                            td class="max-w-sm px-4 py-3 text-slate-700" {
+                                                span class="line-clamp-2" { (record_value(record, column)) }
+                                            }
+                                        }
+                                        td class="whitespace-nowrap px-4 py-3 text-right" {
+                                            a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="font-semibold text-indigo-700 hover:text-indigo-900" { "Edit" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                div class="flex flex-col gap-3 border-t border-slate-200 bg-slate-50 px-4 py-3 text-sm sm:flex-row sm:items-center sm:justify-between" {
+                    p class="text-slate-600" {
+                        "Showing " (first) "–" (last)
+                        @if let Some(total) = page.pagination.total { " of " (total) }
+                    }
+                    div class="flex items-center gap-2" {
+                        @if let Some(offset) = page.pagination.previous_offset {
+                            a href=(view_page_url(view, query, page.pagination.limit, offset)) class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100" { "Previous" }
+                        }
+                        @if let Some(offset) = page.pagination.next_offset {
+                            a href=(view_page_url(view, query, page.pagination.limit, offset)) class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100" { "Next" }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn render_record_form(
+    view: &ViewDefinition,
+    record: Option<&Record>,
+    csrf_token: &str,
+    error: Option<&str>,
+) -> Markup {
+    let editing = record.is_some();
+    let title = record
+        .map(|record| format!("Edit {}", record.id))
+        .unwrap_or_else(|| format!("New {} record", view.collection));
+    let action = record
+        .map(|record| {
+            format!(
+                "/{}/records/{}",
+                encode_segment(&view.name),
+                encode_segment(&record.id)
+            )
+        })
+        .unwrap_or_else(|| format!("/{}/records", encode_segment(&view.name)));
+    let front_matter = record
+        .map(|record| yaml_serde::to_string(&record.attributes).unwrap_or_default())
+        .unwrap_or_else(|| "{}\n".to_owned());
+    let markdown = record.map(|record| record.body.as_str()).unwrap_or("");
+    let back = format!("/{}", encode_segment(&view.name));
+    page_layout(
+        &title,
+        html! {
+            nav class="mb-6 flex items-center gap-2 text-sm text-slate-500" {
+                a href="/" class="font-medium hover:text-indigo-700" { "Views" }
+                span { "/" }
+                a href=(back.clone()) class="font-medium hover:text-indigo-700" { (&view.title) }
+                span { "/" }
+                span class="text-slate-900" { (&title) }
+            }
+            div class="mx-auto max-w-4xl" {
+                h1 class="text-3xl font-bold tracking-tight text-slate-950" { (&title) }
+                p class="mt-2 text-sm text-slate-600" { "YAML values retain their types. Saving validates the complete front matter against the collection schema." }
+                @if let Some(error) = error {
+                    div role="alert" class="mt-5 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" { (error) }
+                }
+                form method="post" action=(action) class="mt-6 space-y-5 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm" {
+                    input type="hidden" name="_csrf" value=(csrf_token);
+                    @if !editing {
+                        label class="block" {
+                            span class="mb-1.5 block text-sm font-semibold text-slate-800" { "Record ID" }
+                            input type="text" name="id" required pattern="[^/\\]+" placeholder="acme-renewal" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+                        }
+                    }
+                    label class="block" {
+                        span class="mb-1.5 block text-sm font-semibold text-slate-800" { "Front matter" }
+                        textarea name="front_matter" rows="14" spellcheck="false" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (front_matter) }
+                    }
+                    label class="block" {
+                        span class="mb-1.5 block text-sm font-semibold text-slate-800" { "Markdown" }
+                        textarea name="markdown" rows="12" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (markdown) }
+                    }
+                    div class="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-5" {
+                        a href=(back.clone()) class="rounded-lg px-3 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-100" { "Cancel" }
+                        button type="submit" class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700" {
+                            @if editing { "Save changes" } @else { "Create record" }
+                        }
+                    }
+                }
+                @if let Some(record) = record {
+                    form method="post" action=(format!("/{}/records/{}/delete", encode_segment(&view.name), encode_segment(&record.id))) class="mt-6 rounded-2xl border border-red-200 bg-red-50 p-5" {
+                        input type="hidden" name="_csrf" value=(csrf_token);
+                        div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
+                            div {
+                                h2 class="font-semibold text-red-900" { "Delete this record" }
+                                p class="mt-1 text-sm text-red-700" { "The previous document remains represented in the tamper-evident audit log." }
+                            }
+                            button type="submit" class="rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-semibold text-red-700 hover:bg-red-100" { "Delete record" }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn page_layout(title: &str, content: Markup) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" class="h-full bg-slate-100" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                meta name="color-scheme" content="light";
+                title { (title) " · cr" }
+                script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4" {}
+            }
+            body class="min-h-full text-slate-900 antialiased" {
+                main class="mx-auto w-full max-w-7xl px-4 py-8 sm:px-6 lg:px-8" { (content) }
+                footer class="mx-auto w-full max-w-7xl px-4 pb-8 text-xs text-slate-500 sm:px-6 lg:px-8" {
+                    "Server-rendered by cr · records remain Markdown with YAML front matter"
+                }
+            }
+        }
+    }
+}
+
+fn view_columns(
+    view: &ViewDefinition,
+    records: &[Record],
+    schema: Option<&JsonValue>,
+) -> Vec<String> {
+    if !view.columns.is_empty() {
+        return view.columns.clone();
+    }
+    let mut columns = BTreeSet::new();
+    if let Some(properties) = schema
+        .and_then(|schema| schema.get("properties"))
+        .and_then(JsonValue::as_object)
+    {
+        columns.extend(properties.keys().cloned());
+    }
+    for record in records {
+        columns.extend(record.attributes.keys().filter_map(|key| match key {
+            YamlValue::String(key) => Some(key.clone()),
+            _ => None,
+        }));
+    }
+    columns.into_iter().take(12).collect()
+}
+
+fn record_value(record: &Record, column: &str) -> String {
+    record
+        .field(column)
+        .ok()
+        .flatten()
+        .map(yaml_value)
+        .unwrap_or_else(|| "—".to_owned())
+}
+
+fn yaml_value(value: &YamlValue) -> String {
+    match value {
+        YamlValue::String(value) => value.clone(),
+        _ => yaml_serde::to_string(value)
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|_| "<unprintable>".to_owned()),
+    }
+}
+
+fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset: usize) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    if let Some(q) = query.q.as_deref().filter(|value| !value.is_empty()) {
+        serializer.append_pair("q", q);
+    }
+    if let (Some(field), Some(value)) = (&query.filter_field, &query.filter_value) {
+        serializer.append_pair("filter_field", field);
+        serializer.append_pair("filter_value", value);
+    }
+    serializer.append_pair("limit", &limit.to_string());
+    serializer.append_pair("offset", &offset.to_string());
+    format!("/{}?{}", encode_segment(&view.name), serializer.finish())
+}
+
+fn notice_url(view: &str, notice: &str) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("notice", notice);
+    format!("/{}?{}", encode_segment(view), serializer.finish())
+}
+
+fn parse_html_form<T: DeserializeOwned>(raw: &[u8]) -> ApiResult<T> {
+    serde_html_form::from_bytes(raw)
+        .map_err(|error| ApiError::bad_request("invalid_form", error.to_string()))
+}
+
+fn parse_front_matter(serialized: &str) -> ApiResult<Mapping> {
+    if serialized.trim().is_empty() {
+        return Ok(Mapping::new());
+    }
+    yaml_serde::from_str(serialized).map_err(|error| {
+        ApiError::bad_request(
+            "invalid_front_matter",
+            format!("front matter is not a YAML object: {error}"),
+        )
+    })
+}
+
+fn verify_csrf(state: &AppState, provided: &str) -> ApiResult<()> {
+    if provided == state.csrf_token.as_ref() {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "invalid_csrf_token",
+            "reload the form and try again",
+        ))
+    }
+}
+
+fn random_token() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("could not generate form security token: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn see_other(location: &str) -> ApiResult<Response> {
+    let location = HeaderValue::from_str(location)
+        .map_err(|error| ApiError::bad_request("invalid_location", error.to_string()))?;
+    Ok((StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response())
+}
+
+fn html_result(result: ApiResult<Markup>) -> Response {
+    match result {
+        Ok(markup) => html_response(StatusCode::OK, markup),
+        Err(error) => html_error(error),
+    }
+}
+
+fn html_error(error: ApiError) -> Response {
+    let status = error.status;
+    let markup = page_layout(
+        "Error",
+        html! {
+            div class="mx-auto max-w-2xl rounded-2xl border border-red-200 bg-white p-8 shadow-sm" {
+                p class="text-sm font-semibold uppercase tracking-wide text-red-600" { (status.as_u16()) " " (status.canonical_reason().unwrap_or("Error")) }
+                h1 class="mt-2 text-2xl font-bold text-slate-950" { "Request could not be completed" }
+                p class="mt-3 text-sm text-slate-700" { (error.message) }
+                a href="/" class="mt-6 inline-flex rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Back to views" }
+            }
+        },
+    );
+    html_response(status, markup)
+}
+
+fn html_response(status: StatusCode, markup: Markup) -> Response {
+    let mut response = (status, Html(markup.into_string())).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 async fn not_found() -> ApiError {

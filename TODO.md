@@ -63,6 +63,18 @@ Priorities:
 - [ ] **P3 — Add opt-in CORS configuration.**
   The API intentionally sends no permissive CORS headers. Add an explicit origin allowlist for browser clients without weakening the local-only default.
 
+- [ ] **P1 — Add browser sessions for token-protected views.**
+  `CR_API_TOKEN` protects HTML routes with a bearer header, which ordinary address-bar navigation and native forms cannot attach. Add an explicit login/session design with secure cookie rotation, logout, CSRF binding, expiry, and brute-force controls, or document a supported identity-aware proxy contract.
+
+- [ ] **P1 — Replace Tailwind Play CDN with compiled, pinned CSS.**
+  The server-rendered UI currently follows the requested CDN-only setup, but Tailwind documents the Play CDN as development-only. Bundle a reproducible stylesheet for production, offline use, tighter content security policy, and immunity to CDN changes.
+
+- [ ] **P2 — Add configuration history for schemas and views.**
+  View definitions and collection schemas are Git-friendly files but are not record audit events. Define a separate configuration audit or reviewed `status`/`save` flow without confusing configuration history with record history.
+
+- [ ] **P2 — Preserve submitted form values on validation errors.**
+  HTML mutations correctly remain atomic and audit-neutral on failure, but the generic error page requires navigating back and may lose unsaved browser input. Re-render the form with escaped submitted values and field-level schema diagnostics.
+
 ## Query and result capabilities
 
 - [ ] **P1 — Comparison expressions.**
@@ -86,8 +98,8 @@ Priorities:
 - [ ] **P2 — Additional streaming output formats.**
   Add JSON Lines and CSV where the projection is tabular. Large results should stream rather than building the complete response in memory.
 
-- [ ] **P2 — Saved and reusable queries.**
-  Allow named query definitions in `.cr/` with versioning and schema-aware validation.
+- [x] **P2 — Saved and reusable equality queries.**
+  Versioned `.cr/views/*.yaml` definitions provide named collection queries, typed equality filters, dotted columns, and page sizes to both CLI discovery and server-rendered routes. Richer expressions remain separate items above.
 
 - [ ] **P2 — Query planner and disposable indexes.**
   Use equality/range indexes when available, fall back to authoritative Markdown scans, and include explain/debug output for performance work.
@@ -213,4 +225,5 @@ Priorities:
 - [x] REST API covering current database, search, direct-edit, relation, and audit operations.
 - [x] Bounded HTTP pagination, bearer-token option, request actor attribution, and structured errors.
 - [x] Live OpenAPI 3.1 collection-schema components.
+- [x] Automatic collection tables and saved server-rendered HTML views with CSRF-protected audited forms.
 - [x] Unit, CLI, concurrency, direct-edit, in-process HTTP, and real TCP server tests.

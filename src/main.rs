@@ -131,7 +131,7 @@ enum Command {
         json: bool,
     },
 
-    /// Serve the database through a REST API.
+    /// Serve the database through a web UI and REST API.
     Serve {
         /// TCP address to listen on. Defaults to local access only.
         #[arg(long, default_value = "127.0.0.1:3000")]
@@ -144,6 +144,12 @@ enum Command {
         /// Largest accepted JSON request body in bytes.
         #[arg(long, default_value_t = 8 * 1024 * 1024)]
         max_body_bytes: usize,
+    },
+
+    /// Create and inspect saved web views.
+    View {
+        #[command(subcommand)]
+        command: ViewCommand,
     },
 
     /// Update a record's front matter and optionally its Markdown body.
@@ -215,6 +221,48 @@ enum Command {
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ViewCommand {
+    /// Create a saved view definition in .cr/views.
+    Create {
+        name: String,
+
+        /// Collection queried by the view.
+        #[arg(long)]
+        collection: String,
+
+        /// Human-readable page title. Defaults to the view name.
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Match a field using KEY=YAML. Multiple filters are combined with AND.
+        #[arg(short = 'w', long = "where", value_name = "KEY=YAML")]
+        filters: Vec<String>,
+
+        /// Show this dotted front matter field as a table column.
+        #[arg(short, long = "column", value_name = "FIELD")]
+        columns: Vec<String>,
+
+        /// Default records per page.
+        #[arg(long, default_value_t = 50)]
+        page_size: usize,
+    },
+
+    /// List automatic collection pages and saved views.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show a saved or automatic view definition.
+    Show {
+        name: String,
+
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -363,6 +411,48 @@ fn run() -> Result<()> {
                 .build()?
                 .block_on(cr::server::serve(database, config))?;
         }
+        Command::View { command } => match command {
+            ViewCommand::Create {
+                name,
+                collection,
+                title,
+                filters,
+                columns,
+                page_size,
+            } => {
+                let view = database.create_view(
+                    &name,
+                    title.as_deref(),
+                    &collection,
+                    filters,
+                    columns,
+                    page_size,
+                )?;
+                println!("/{}", view.name);
+            }
+            ViewCommand::List { json } => {
+                let views = database.views()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&views)?);
+                } else {
+                    for view in views {
+                        let kind = if view.saved { "saved" } else { "automatic" };
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            view.name, view.collection, kind, view.title
+                        );
+                    }
+                }
+            }
+            ViewCommand::Show { name, json } => {
+                let view = database.view(&name)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&view)?);
+                } else {
+                    print!("{}", yaml_serde::to_string(&view)?);
+                }
+            }
+        },
         Command::Update {
             collection,
             id,
