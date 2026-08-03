@@ -857,10 +857,12 @@ impl<'a> AuditLog<'a> {
                 .to_owned();
             for record in fs::read_dir(collection.path())? {
                 let record = record?;
-                if !record.file_type()?.is_file()
-                    || record.path().extension().and_then(|value| value.to_str()) != Some("md")
-                {
+                let path = record.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("md") {
                     continue;
+                }
+                if !record.file_type()?.is_file() {
+                    bail!("record path {} must be a regular file", path.display());
                 }
                 let id = record
                     .path()
@@ -1220,8 +1222,13 @@ fn digest(domain: &[u8], contents: &[u8]) -> String {
 }
 
 fn file_hash_optional(path: &Path) -> Result<Option<String>> {
-    match fs::read(path) {
-        Ok(contents) => Ok(Some(record_hash(&contents))),
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            bail!("record path {} must be a regular file", path.display())
+        }
+        Ok(_) => fs::read(path)
+            .map(|contents| Some(record_hash(&contents)))
+            .with_context(|| format!("could not hash {}", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => {
             Err(anyhow!(error)).with_context(|| format!("could not hash {}", path.display()))

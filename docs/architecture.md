@@ -119,6 +119,7 @@ Filters currently support typed equality and dotted field paths. A future expres
 ## Integrity boundaries
 
 - Collection names and IDs are single path components, preventing path traversal.
+- Markdown record paths must be regular files. Single-record CRUD, status, save, and audit verification reject symlinks and other special file types rather than trusting them by content hash; ordinary collection listings continue to ignore non-file entries.
 - Creation never overwrites an existing record.
 - Updates and links validate the complete next front matter before atomically replacing a file and committing its audit event.
 - Links validate that their target exists and matches its latest audited content hash. Manual deletion can still produce a dangling reference after the link is created; a future `cr check` command should scan links and delete policies.

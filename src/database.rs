@@ -260,8 +260,7 @@ impl Database {
 
     pub fn read_raw(&self, collection: &str, id: &str) -> Result<String> {
         let path = self.record_path(collection, id)?;
-        fs::read_to_string(&path)
-            .with_context(|| format!("could not read record {}", path.display()))
+        read_regular_string(&path)
     }
 
     pub fn list(&self, collection: &str, filters: &[Assignment]) -> Result<Vec<Record>> {
@@ -328,8 +327,7 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        let before_raw = fs::read_to_string(&path)
-            .with_context(|| format!("could not read record {}", path.display()))?;
+        let before_raw = read_regular_string(&path)?;
         let before = Document::parse(&before_raw)
             .with_context(|| format!("could not parse {}", path.display()))?;
         let mut document = before.clone();
@@ -367,7 +365,7 @@ impl Database {
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         let target_path = self.record_path(target_collection, target_id)?;
-        let target_raw = fs::read_to_string(&target_path).with_context(|| {
+        let target_raw = read_regular_string(&target_path).with_context(|| {
             format!("relation target {target_collection}/{target_id} does not exist")
         })?;
         Document::parse(&target_raw).with_context(|| {
@@ -376,8 +374,7 @@ impl Database {
         audit.assert_current(target_collection, target_id, target_raw.as_bytes())?;
 
         let path = self.record_path(collection, id)?;
-        let before_raw = fs::read_to_string(&path)
-            .with_context(|| format!("could not read record {}", path.display()))?;
+        let before_raw = read_regular_string(&path)?;
         let before = Document::parse(&before_raw)
             .with_context(|| format!("could not parse {}", path.display()))?;
         let mut document = before.clone();
@@ -411,8 +408,7 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        let before_raw = fs::read_to_string(&path)
-            .with_context(|| format!("could not read record {}", path.display()))?;
+        let before_raw = read_regular_string(&path)?;
         let document = Document::parse(&before_raw)
             .with_context(|| format!("could not parse {}", path.display()))?;
         let event = audit.prepare(AuditMutation {
@@ -500,10 +496,9 @@ impl Database {
             let path = self.root.join(&change.path);
             let after_raw = match change.status {
                 WorkingChangeKind::Deleted => None,
-                WorkingChangeKind::Added | WorkingChangeKind::Modified => Some(
-                    fs::read_to_string(&path)
-                        .with_context(|| format!("could not read record {}", path.display()))?,
-                ),
+                WorkingChangeKind::Added | WorkingChangeKind::Modified => {
+                    Some(read_regular_string(&path)?)
+                }
             };
             let after = after_raw
                 .as_deref()
@@ -584,8 +579,7 @@ impl Database {
             if audit.has_history(&collection, &id)? {
                 continue;
             }
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("could not read record {}", path.display()))?;
+            let raw = read_regular_string(&path)?;
             let document = Document::parse(&raw)
                 .with_context(|| format!("could not parse {}", path.display()))?;
             let event = audit.prepare(AuditMutation {
@@ -618,6 +612,7 @@ impl Database {
     ) -> Result<Vec<WorkingChange>> {
         let mut current = BTreeMap::new();
         for (collection, id, path) in self.record_files()? {
+            ensure_regular_record(&path)?;
             let contents = fs::read(&path)
                 .with_context(|| format!("could not hash record {}", path.display()))?;
             current.insert((collection, id), (path, record_hash(&contents)));
@@ -672,8 +667,7 @@ impl Database {
     }
 
     fn read_document(&self, path: &Path) -> Result<Document> {
-        let input = fs::read_to_string(path)
-            .with_context(|| format!("could not read record {}", path.display()))?;
+        let input = read_regular_string(path)?;
         Document::parse(&input).with_context(|| format!("could not parse {}", path.display()))
     }
 
@@ -754,12 +748,13 @@ impl Database {
             validate_component(&collection_name, "collection")?;
             for record in fs::read_dir(collection.path())? {
                 let record = record?;
-                if !record.file_type()?.is_file()
-                    || record.path().extension().and_then(|value| value.to_str()) != Some("md")
-                {
+                let path = record.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("md") {
                     continue;
                 }
-                let path = record.path();
+                if !record.file_type()?.is_file() {
+                    bail!("record path {} must be a regular file", path.display());
+                }
                 let id = path
                     .file_stem()
                     .and_then(|value| value.to_str())
@@ -886,6 +881,20 @@ fn relation_value(collection: &str, id: &str) -> Value {
     reference.insert("collection".into(), collection.into());
     reference.insert("id".into(), id.into());
     Value::Mapping(reference)
+}
+
+fn ensure_regular_record(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("could not read record {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("record path {} must be a regular file", path.display());
+    }
+    Ok(())
+}
+
+fn read_regular_string(path: &Path) -> Result<String> {
+    ensure_regular_record(path)?;
+    fs::read_to_string(path).with_context(|| format!("could not read record {}", path.display()))
 }
 
 pub(crate) fn validate_component(value: &str, label: &str) -> Result<()> {
