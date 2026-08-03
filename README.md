@@ -506,6 +506,224 @@ For example, `.cr/schemas/applications.json` can restrict ATS stages:
 
 Schemas validate front matter. The record ID, collection, path, and Markdown body remain separate. Creates, updates, links, and direct `save` operations validate before extending the audit journal.
 
+## Serve the database over HTTP
+
+Start the REST API from inside a database:
+
+```sh
+cr serve
+```
+
+The default address is `127.0.0.1:3000`, so the server is only reachable from the local machine:
+
+```text
+Serving cr on http://127.0.0.1:3000
+OpenAPI: http://127.0.0.1:3000/openapi.json
+```
+
+Use another address or port when needed:
+
+```sh
+cr serve --bind 127.0.0.1:8080
+```
+
+The HTTP layer calls the same Rust database methods as the CLI. It does not spawn a `cr` subprocess. Schema validation, atomic writes, audit locking, direct-edit reconciliation, and tamper checks therefore behave the same way in both interfaces. HTTP mutations are recorded with `source: api`.
+
+### Authentication and identity
+
+Local access has no token by default. Set `CR_API_TOKEN` before starting the server to require a bearer token for `/openapi.json` and every `/api/v1` endpoint:
+
+```sh
+export CR_API_TOKEN='replace-with-a-long-random-token'
+cr serve
+```
+
+Then include it in requests:
+
+```sh
+curl http://127.0.0.1:3000/api/v1/identity \
+  -H "Authorization: Bearer $CR_API_TOKEN"
+```
+
+`GET /health` remains public so process supervisors can check readiness. If you bind to a non-loopback address without a token, `cr` prints a warning. The built-in server does not terminate TLS; use a trusted reverse proxy for access across a network.
+
+Set the audit actor for one request with `X-CR-Actor`:
+
+```sh
+curl -X POST http://127.0.0.1:3000/api/v1/collections/deals/records \
+  -H 'Content-Type: application/json' \
+  -H 'X-CR-Actor: jane@example.com' \
+  -d '{
+    "id": "acme-renewal",
+    "front_matter": {
+      "name": "Acme renewal",
+      "status": "won",
+      "value": 25000
+    },
+    "markdown": "Renewal signed."
+  }'
+```
+
+Without the header, requests use the identity resolved when the server starts. As with `--actor`, this header provides attribution, not authenticated personal identity.
+
+### CRUD requests
+
+Fetch one record:
+
+```sh
+curl http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal
+```
+
+The response includes the identity, relative path, typed front matter, and Markdown body:
+
+```json
+{
+  "collection": "deals",
+  "id": "acme-renewal",
+  "path": "records/deals/acme-renewal.md",
+  "front_matter": {
+    "name": "Acme renewal",
+    "status": "won",
+    "value": 25000
+  },
+  "markdown": "Renewal signed."
+}
+```
+
+Fetch the exact Markdown file or one dotted field:
+
+```sh
+curl http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal/document
+curl http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal/fields/owner.email
+```
+
+PATCH performs an atomic deep merge into front matter. `remove` explicitly removes dotted fields, while `markdown` replaces the Markdown body. JSON `null` remains a real front matter value and does not mean deletion:
+
+```sh
+curl -X PATCH http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "front_matter": {
+      "status": "won",
+      "owner": { "email": "sales@example.com" }
+    },
+    "remove": ["temporary_note"],
+    "markdown": "Closed-won notes."
+  }'
+```
+
+Create a relation or delete a record:
+
+```sh
+curl -X POST http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal/links \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "relation": "company",
+    "target_collection": "companies",
+    "target_id": "acme"
+  }'
+
+curl -X DELETE http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal
+```
+
+### Filtering, search, and pagination
+
+Repeated `where` parameters are combined with AND and retain YAML types. URL-encode the `=` when writing URLs manually:
+
+```sh
+curl 'http://127.0.0.1:3000/api/v1/collections/deals/records?where=status%3Dwon&where=active%3Dtrue&limit=50&offset=0'
+```
+
+List and search responses contain compact `{ path, front_matter }` records inside a page:
+
+```json
+{
+  "data": [
+    {
+      "path": "records/deals/acme-renewal.md",
+      "front_matter": { "status": "won", "active": true }
+    }
+  ],
+  "pagination": {
+    "limit": 50,
+    "offset": 0,
+    "returned": 1,
+    "total": 1,
+    "has_more": false,
+    "next_offset": null,
+    "previous_offset": null
+  }
+}
+```
+
+Search supports the same targets and matching modes as `cr search`:
+
+```sh
+curl 'http://127.0.0.1:3000/api/v1/search?q=follow%20up&collection=deals&target=body&ignore_case=true&limit=50'
+curl 'http://127.0.0.1:3000/api/v1/search?q=%5Ewon%24&collection=deals&target=field&field=status&regex=true'
+```
+
+Allowed targets are `document`, `front_matter`, `field`, `body`, and `path`. The default target is `document`. The default maximum page size is 200 and can be changed with `cr serve --max-page-size N`. Offsets are deterministic because records are ordered by collection and ID.
+
+Audit-log pages deliberately return `total: null`: the journal reads only the requested newest window rather than loading the entire segmented history to count it. `has_more` and `next_offset` remain available.
+
+### Direct edits and audit endpoints
+
+The REST equivalents of the direct-edit and audit commands are:
+
+```text
+GET  /api/v1/status
+POST /api/v1/save
+GET  /api/v1/audit/log
+GET  /api/v1/audit/head
+GET  /api/v1/audit/verify
+POST /api/v1/audit/baseline
+```
+
+For example, accept selected direct edits:
+
+```sh
+curl -X POST http://127.0.0.1:3000/api/v1/save \
+  -H 'Content-Type: application/json' \
+  -H 'X-CR-Actor: editor@example.com' \
+  -d '{
+    "records": ["deals/acme-renewal"],
+    "message": "Reviewed direct Markdown edit"
+  }'
+```
+
+Use `{"all": true}` instead of `records` to accept every reported change.
+
+### Generated OpenAPI
+
+`GET /openapi.json` returns an OpenAPI 3.1 document covering every HTTP route. It is generated from the live database whenever it is requested. Each valid `.cr/schemas/<collection>.json` file is included under `components.schemas`, and `x-cr-collection-schemas` maps collection names to their exact component references. Schema-only collections appear even before their first record is created.
+
+This means changing a collection's JSON Schema updates the OpenAPI document without restarting the server. Schemaless collections use the generic open front matter object.
+
+The complete endpoint list is discoverable from that document. The main resource routes are:
+
+```text
+GET    /api/v1/collections
+GET    /api/v1/collections/{collection}/records
+POST   /api/v1/collections/{collection}/records
+GET    /api/v1/collections/{collection}/records/{id}
+PATCH  /api/v1/collections/{collection}/records/{id}
+DELETE /api/v1/collections/{collection}/records/{id}
+POST   /api/v1/collections/{collection}/records/{id}/links
+GET    /api/v1/search
+```
+
+Errors use a stable JSON envelope and appropriate HTTP status such as `400`, `401`, `404`, `409`, `413`, or `422`:
+
+```json
+{
+  "error": {
+    "code": "validation_failed",
+    "message": "record does not match schema for collection 'deals'"
+  }
+}
+```
+
 ## Useful command summary
 
 ```text
@@ -521,6 +739,7 @@ cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]... [--json]
 cr update COLLECTION ID [--set KEY=YAML]... [--body TEXT]
 cr link SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
 cr delete COLLECTION ID --yes
+cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N]
 
 cr status [--json]
 cr save COLLECTION/ID... [--message TEXT] [--json]

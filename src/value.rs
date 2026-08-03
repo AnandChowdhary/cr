@@ -64,6 +64,20 @@ pub(crate) fn get_path<'a>(attributes: &'a Mapping, path: &[String]) -> Option<&
     Some(current)
 }
 
+pub(crate) fn remove_path(attributes: &mut Mapping, path: &[String]) -> bool {
+    let Some((first, rest)) = path.split_first() else {
+        return false;
+    };
+    let key = Value::String(first.clone());
+    if rest.is_empty() {
+        return attributes.remove(&key).is_some();
+    }
+    let Some(Value::Mapping(child)) = attributes.get_mut(&key) else {
+        return false;
+    };
+    remove_path(child, rest)
+}
+
 fn set_path(attributes: &mut Mapping, path: &[String], value: Value) -> Result<()> {
     let (first, rest) = path
         .split_first()
@@ -89,7 +103,7 @@ fn set_path(attributes: &mut Mapping, path: &[String], value: Value) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::Assignment;
+    use super::{parse_path, remove_path, Assignment};
     use std::str::FromStr;
     use yaml_serde::{Mapping, Value};
 
@@ -177,5 +191,28 @@ mod tests {
         assert!(!Assignment::from_str("metrics.missing=42")
             .unwrap()
             .matches(&attributes));
+    }
+
+    #[test]
+    fn removes_existing_dotted_fields_without_affecting_siblings() {
+        let mut attributes = Mapping::new();
+        Assignment::from_str("contact.email=jane@example.com")
+            .unwrap()
+            .apply(&mut attributes)
+            .unwrap();
+        Assignment::from_str("contact.phone=123")
+            .unwrap()
+            .apply(&mut attributes)
+            .unwrap();
+
+        assert!(remove_path(
+            &mut attributes,
+            &parse_path("contact.email").unwrap()
+        ));
+        assert!(!remove_path(
+            &mut attributes,
+            &parse_path("contact.missing").unwrap()
+        ));
+        assert_eq!(attributes["contact"]["phone"], Value::Number(123.into()));
     }
 }

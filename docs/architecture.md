@@ -31,6 +31,9 @@ Research sources:
 - [Rust file locking](https://doc.rust-lang.org/std/fs/struct.File.html#method.lock)
 - [Git status and working-tree states](https://git-scm.com/docs/git-status)
 - [Git user identity](https://git-scm.com/docs/user-manual#telling-git-your-name)
+- [Axum server and router](https://docs.rs/axum/latest/axum/fn.serve.html)
+- [Axum repeated query parameters](https://docs.rs/axum/latest/axum/extract/struct.Query.html)
+- [OpenAPI Specification 3.1](https://spec.openapis.org/oas/v3.1.1.html)
 
 ## Version 1 layout
 
@@ -119,6 +122,18 @@ Filters support typed equality and dotted field paths. Search is literal and cas
 CLI list and search results are intentionally compact: plain output contains relative Markdown paths, while JSON contains `{ path, front_matter }` objects. Record bodies remain available through `get`, avoiding unexpectedly large multi-record responses.
 
 A future expression layer can add numeric and date comparisons, membership, boolean OR/NOT, ordering, projections, aggregation, backlinks, and pagination without changing the file format.
+
+## HTTP transport and OpenAPI
+
+`cr serve` is a transport over `Database`, not a subprocess adapter around the CLI binary. CLI and HTTP handlers therefore reach the same validation, locking, write-ahead audit, atomic file replacement, search, and reconciliation code. The database instance carries an audit source: command-line mutations use `cli`, REST mutations use `api`, and accepted direct edits retain `filesystem`.
+
+Axum runs synchronous filesystem operations through its blocking worker pool so scans and durable writes do not block asynchronous socket workers. The database-wide audit lock remains the concurrency boundary. A PATCH deep-merges front matter and removes explicit dotted paths while holding that lock, so concurrent patches cannot overwrite fields merely because both began from an older HTTP read.
+
+The REST API uses generic collection and record routes. List, search, status, and audit-log endpoints support bounded `limit`/`offset` windows. Record scans can report an exact total. Audit history intentionally reads only `offset + limit + 1` recent matching events, so its total is unknown while `has_more` remains exact; this preserves the segmented journal's bounded-read design.
+
+The OpenAPI 3.1 document is produced on demand at `/openapi.json`. OpenAPI 3.1 uses the Draft 2020-12 JSON Schema model, allowing collection schemas to be embedded without translating them into Rust types. The document includes generic transport schemas plus one live component per `.cr/schemas/<collection>.json`; `x-cr-collection-schemas` preserves the mapping when collection names are not safe or unique component identifiers.
+
+The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentication for the OpenAPI document and all `/api/v1` routes; `/health` remains public. `X-CR-Actor` is an audit attribution override with the same assertion-only trust boundary as CLI actor values. The server does not implement TLS, user accounts, authorization policies, or rate limiting; network deployments must supply those controls at a trusted reverse proxy or service boundary.
 
 ## Integrity boundaries
 

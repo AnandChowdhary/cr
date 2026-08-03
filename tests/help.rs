@@ -24,3 +24,18 @@ fn no_arguments_prints_help_and_returns_a_usage_error() {
     let stderr = String::from_utf8(output.stderr).expect("help output was not UTF-8");
     assert!(stderr.contains("Usage: cr [OPTIONS] <COMMAND>"));
 }
+
+#[test]
+fn serve_help_documents_safe_defaults_and_limits() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["serve", "--help"])
+        .output()
+        .expect("failed to run cr serve --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("help output was not UTF-8");
+    assert!(stdout.contains("Serve the database through a REST API"));
+    assert!(stdout.contains("--bind <BIND>"));
+    assert!(stdout.contains("127.0.0.1:3000"));
+    assert!(stdout.contains("--max-page-size"));
+    assert!(stdout.contains("--max-body-bytes"));
+}

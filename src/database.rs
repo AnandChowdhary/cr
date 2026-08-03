@@ -14,7 +14,7 @@ use yaml_serde::{Mapping, Value};
 use crate::{
     audit::{record_hash, AuditLog, AuditMutation, ReconciledMutation},
     frontmatter::Document,
-    value::{get_path, parse_path},
+    value::{get_path, parse_path, remove_path},
     Assignment, AuditAction, AuditEntry, AuditHead, AuditSource, AuditVerification, SearchQuery,
 };
 
@@ -62,6 +62,14 @@ pub struct Database {
     root: PathBuf,
     config: Config,
     actor: String,
+    source: AuditSource,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CollectionModel {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -144,6 +152,7 @@ impl Database {
             root,
             config,
             actor: String::new(),
+            source: AuditSource::Cli,
         };
         let database = database.with_default_actor();
         database.audit().ensure_layout()?;
@@ -191,6 +200,7 @@ impl Database {
             root,
             config,
             actor: String::new(),
+            source: AuditSource::Cli,
         };
         let database = database.with_default_actor();
         let audit = database.audit();
@@ -216,11 +226,28 @@ impl Database {
         Ok(self)
     }
 
+    pub fn with_source(mut self, source: AuditSource) -> Self {
+        self.source = source;
+        self
+    }
+
     pub fn create(
         &self,
         collection: &str,
         id: &str,
         assignments: &[Assignment],
+        body: &str,
+    ) -> Result<Record> {
+        let mut attributes = Mapping::new();
+        apply_all(&mut attributes, assignments)?;
+        self.create_record(collection, id, attributes, body)
+    }
+
+    pub fn create_record(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: Mapping,
         body: &str,
     ) -> Result<Record> {
         let path = self.record_path(collection, id)?;
@@ -230,11 +257,10 @@ impl Database {
         if path.exists() {
             bail!("record {collection}/{id} already exists");
         }
-        let mut document = Document {
-            attributes: Mapping::new(),
+        let document = Document {
+            attributes,
             body: body.to_owned(),
         };
-        apply_all(&mut document.attributes, assignments)?;
         self.validate(collection, &document.attributes)?;
         let rendered = document.render()?;
         let event = audit.prepare(AuditMutation {
@@ -245,7 +271,7 @@ impl Database {
             after_document: Some(&document),
             before_bytes: None,
             after_bytes: Some(rendered.as_bytes()),
-            source: AuditSource::Cli,
+            source: self.source.clone(),
             message: None,
         })?;
         audit.commit(event, &path, || write_new(&path, rendered.as_bytes()))?;
@@ -352,12 +378,104 @@ impl Database {
         Ok(matches)
     }
 
+    pub fn collection_models(&self) -> Result<Vec<CollectionModel>> {
+        let mut models: BTreeMap<String, Option<serde_json::Value>> = self
+            .collection_names()?
+            .into_iter()
+            .map(|name| (name, None))
+            .collect();
+        let schema_root = self.root.join(".cr/schemas");
+        let metadata = fs::symlink_metadata(&schema_root).with_context(|| {
+            format!(
+                "could not inspect schema directory {}",
+                schema_root.display()
+            )
+        })?;
+        if !metadata.file_type().is_dir() {
+            bail!("schema path {} must be a directory", schema_root.display());
+        }
+
+        for entry in fs::read_dir(&schema_root)
+            .with_context(|| format!("could not read schema directory {}", schema_root.display()))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let name = entry
+                .path()
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .context("schema filename is not valid UTF-8")?
+                .to_owned();
+            validate_component(&name, "collection")?;
+            let serialized = fs::read_to_string(entry.path())
+                .with_context(|| format!("could not read schema for collection '{name}'"))?;
+            let schema: serde_json::Value = serde_json::from_str(&serialized)
+                .with_context(|| format!("schema for collection '{name}' is not valid JSON"))?;
+            jsonschema::meta::validate(&schema)
+                .map_err(|error| anyhow!("invalid JSON Schema for collection '{name}': {error}"))?;
+            models.insert(name, Some(schema));
+        }
+
+        Ok(models
+            .into_iter()
+            .map(|(name, schema)| CollectionModel { name, schema })
+            .collect())
+    }
+
     pub fn update(
         &self,
         collection: &str,
         id: &str,
         assignments: &[Assignment],
         body: Option<&str>,
+    ) -> Result<Record> {
+        self.update_document(collection, id, |document| {
+            apply_all(&mut document.attributes, assignments)?;
+            if let Some(body) = body {
+                document.body = body.to_owned();
+            }
+            Ok(())
+        })
+    }
+
+    pub fn patch(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        remove: &[String],
+        body: Option<&str>,
+    ) -> Result<Record> {
+        if attributes.is_empty() && remove.is_empty() && body.is_none() {
+            bail!("patch must change front matter or Markdown");
+        }
+        let remove = remove
+            .iter()
+            .map(|path| Ok((path, parse_path(path)?)))
+            .collect::<Result<Vec<_>>>()?;
+        self.update_document(collection, id, |document| {
+            merge_mapping(&mut document.attributes, attributes);
+            for (raw, path) in &remove {
+                if !remove_path(&mut document.attributes, path) {
+                    bail!("field '{raw}' does not exist");
+                }
+            }
+            if let Some(body) = body {
+                document.body = body.to_owned();
+            }
+            Ok(())
+        })
+    }
+
+    fn update_document(
+        &self,
+        collection: &str,
+        id: &str,
+        mutate: impl FnOnce(&mut Document) -> Result<()>,
     ) -> Result<Record> {
         let path = self.record_path(collection, id)?;
         let audit = self.audit();
@@ -367,10 +485,7 @@ impl Database {
         let before = Document::parse(&before_raw)
             .with_context(|| format!("could not parse {}", path.display()))?;
         let mut document = before.clone();
-        apply_all(&mut document.attributes, assignments)?;
-        if let Some(body) = body {
-            document.body = body.to_owned();
-        }
+        mutate(&mut document)?;
         self.validate(collection, &document.attributes)?;
         let rendered = document.render()?;
         let event = audit.prepare(AuditMutation {
@@ -381,7 +496,7 @@ impl Database {
             after_document: Some(&document),
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: Some(rendered.as_bytes()),
-            source: AuditSource::Cli,
+            source: self.source.clone(),
             message: None,
         })?;
         audit.commit(event, &path, || write_replace(&path, rendered.as_bytes()))?;
@@ -432,7 +547,7 @@ impl Database {
             after_document: Some(&document),
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: Some(rendered.as_bytes()),
-            source: AuditSource::Cli,
+            source: self.source.clone(),
             message: None,
         })?;
         audit.commit(event, &path, || write_replace(&path, rendered.as_bytes()))?;
@@ -455,7 +570,7 @@ impl Database {
             after_document: None,
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: None,
-            source: AuditSource::Cli,
+            source: self.source.clone(),
             message: None,
         })?;
         let parent = path.parent().context("record has no parent directory")?;
@@ -626,7 +741,7 @@ impl Database {
                 after_document: Some(&document),
                 before_bytes: None,
                 after_bytes: Some(raw.as_bytes()),
-                source: AuditSource::Cli,
+                source: self.source.clone(),
                 message: None,
             })?;
             audit.commit(event, &path, || Ok(()))?;
@@ -917,6 +1032,17 @@ fn apply_all(attributes: &mut Mapping, assignments: &[Assignment]) -> Result<()>
         assignment.apply(attributes)?;
     }
     Ok(())
+}
+
+fn merge_mapping(target: &mut Mapping, patch: &Mapping) {
+    for (key, value) in patch {
+        match (target.get_mut(key), value) {
+            (Some(Value::Mapping(target)), Value::Mapping(patch)) => merge_mapping(target, patch),
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }
 
 fn mapping_field<'a>(attributes: &'a mut Mapping, field: &str) -> Result<&'a mut Mapping> {

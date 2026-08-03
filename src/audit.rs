@@ -140,6 +140,7 @@ impl<'de> Deserialize<'de> for AuditChange {
 pub enum AuditSource {
     #[default]
     Cli,
+    Api,
     Filesystem,
 }
 

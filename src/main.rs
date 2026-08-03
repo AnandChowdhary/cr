@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -129,6 +129,21 @@ enum Command {
         /// Return each matching file path and front matter as JSON.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Serve the database through a REST API.
+    Serve {
+        /// TCP address to listen on. Defaults to local access only.
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        bind: SocketAddr,
+
+        /// Largest accepted page size for list, search, status, and audit endpoints.
+        #[arg(long, default_value_t = 200)]
+        max_page_size: usize,
+
+        /// Largest accepted JSON request body in bytes.
+        #[arg(long, default_value_t = 8 * 1024 * 1024)]
+        max_body_bytes: usize,
     },
 
     /// Update a record's front matter and optionally its Markdown body.
@@ -323,6 +338,30 @@ fn run() -> Result<()> {
             let query = SearchQuery::new(&pattern, target, regex, ignore_case)?;
             let records = database.search(collection.as_deref(), &filters, &query)?;
             print_records(records, json)?;
+        }
+        Command::Serve {
+            bind,
+            max_page_size,
+            max_body_bytes,
+        } => {
+            let api_token = std::env::var("CR_API_TOKEN")
+                .ok()
+                .filter(|value| !value.is_empty());
+            if !bind.ip().is_loopback() && api_token.is_none() {
+                eprintln!(
+                    "warning: serving on a non-loopback address without CR_API_TOKEN authentication"
+                );
+            }
+            let config = cr::server::ServerConfig {
+                bind,
+                max_page_size,
+                max_body_bytes,
+                api_token,
+            };
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(cr::server::serve(database, config))?;
         }
         Command::Update {
             collection,
