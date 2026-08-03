@@ -6,6 +6,18 @@ You choose the collections and fields. The same CLI can therefore be used as a C
 
 Every change made through the CLI is recorded in a tamper-evident audit journal. You can also edit Markdown files directly, review those edits with `cr status`, and record them with `cr save`.
 
+Current capabilities include:
+
+- arbitrary collections and typed YAML front matter;
+- audited CRUD and relationships;
+- typed structured filtering and dotted field paths;
+- literal, case-insensitive, field-scoped, and regular-expression search;
+- direct Markdown editing with reviewed audit reconciliation;
+- optional JSON Schema validation;
+- a REST API with pagination, authentication, and live OpenAPI 3.1 generation.
+
+The examples below cover both CLI and HTTP usage. Future work—including comparisons, Boolean expressions, projections, relationship traversal, and indexes—is tracked in [`TODO.md`](TODO.md).
+
 ## Install the CLI
 
 You need a current Rust toolchain. From this repository, run:
@@ -143,6 +155,8 @@ cr get companies acme --field industry
 cr get contacts jane-doe --field contact.email
 ```
 
+### List and structured filtering
+
 List a collection:
 
 ```sh
@@ -168,15 +182,20 @@ Plain output contains one relative Markdown path per line. JSON output contains 
 
 Use `get COLLECTION ID` or `get COLLECTION ID --json` when you also need one record's Markdown body.
 
-Filter using typed equality. Multiple filters are combined with AND:
+Filter using typed equality. Values retain their YAML types, dotted paths select nested fields, and multiple filters are combined with AND:
 
 ```sh
 cr list companies --where 'active=true'
 cr list deals --where 'stage=proposal' --where 'value=25000' --json
 cr list deals --where 'stage=won' --json
+cr list contacts --where 'contact.country=NL' --where 'active=true' --json
 ```
 
 If your own deal model calls the field `status` instead of `stage`, use `--where 'status=won'`. Field names are entirely user-defined.
+
+The current filter language performs exact typed equality. Comparisons, membership, `OR`/`NOT`, sorting, and projections are planned rather than silently approximated; see [`TODO.md`](TODO.md).
+
+### Search
 
 Search literal text across every Markdown record:
 
