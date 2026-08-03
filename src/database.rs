@@ -15,7 +15,7 @@ use crate::{
     audit::{record_hash, AuditLog, AuditMutation, ReconciledMutation},
     frontmatter::Document,
     value::{get_path, parse_path},
-    Assignment, AuditAction, AuditEntry, AuditHead, AuditSource, AuditVerification,
+    Assignment, AuditAction, AuditEntry, AuditHead, AuditSource, AuditVerification, SearchQuery,
 };
 
 const CONFIG_PATH: &str = ".cr/config.yaml";
@@ -266,7 +266,16 @@ impl Database {
     pub fn list(&self, collection: &str, filters: &[Assignment]) -> Result<Vec<Record>> {
         validate_component(collection, "collection")?;
         let directory = self.root.join(&self.config.data_dir).join(collection);
-        if !directory.exists() {
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("could not inspect collection {}", directory.display())
+                })
+            }
+        };
+        if !metadata.file_type().is_dir() {
             return Ok(Vec::new());
         }
 
@@ -314,6 +323,33 @@ impl Database {
                     .unwrap_or(true)
             })
             .collect()
+    }
+
+    pub fn search(
+        &self,
+        collection: Option<&str>,
+        filters: &[Assignment],
+        query: &SearchQuery,
+    ) -> Result<Vec<Record>> {
+        let collections = match collection {
+            Some(collection) => {
+                validate_component(collection, "collection")?;
+                vec![collection.to_owned()]
+            }
+            None => self.collection_names()?,
+        };
+
+        let mut matches = Vec::new();
+        for collection in collections {
+            for record in self.list(&collection, filters)? {
+                let path = self.root.join(&record.path);
+                let raw_document = read_regular_string(&path)?;
+                if query.matches(&record, &raw_document)? {
+                    matches.push(record);
+                }
+            }
+        }
+        Ok(matches)
     }
 
     pub fn update(
@@ -766,6 +802,35 @@ impl Database {
         }
         records.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
         Ok(records)
+    }
+
+    fn collection_names(&self) -> Result<Vec<String>> {
+        let records_root = self.root.join(&self.config.data_dir);
+        if !records_root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut collections = Vec::new();
+        for entry in fs::read_dir(&records_root).with_context(|| {
+            format!(
+                "could not read records directory {}",
+                records_root.display()
+            )
+        })? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .to_str()
+                .context("collection filename is not valid UTF-8")?
+                .to_owned();
+            validate_component(&name, "collection")?;
+            collections.push(name);
+        }
+        collections.sort();
+        Ok(collections)
     }
 
     fn audit(&self) -> AuditLog<'_> {

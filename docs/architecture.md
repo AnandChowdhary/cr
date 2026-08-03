@@ -112,11 +112,13 @@ The journal contains historical values and deletion tombstones. Encryption, reda
 
 ## Query and indexing strategy
 
-Version 1 scans and parses one collection for every `list`. This keeps behavior easy to inspect and makes manual edits immediately visible. An index can be added later as disposable derived state keyed by file path, modification time, size, and content hash. The CLI must always be able to rebuild it from Markdown.
+Version 1 scans and parses one collection for every `list`; `search` scans either one selected collection or all collection directories in deterministic order. This keeps behavior easy to inspect and makes valid manual edits immediately visible. An index can be added later as disposable derived state keyed by file path, modification time, size, and content hash. The CLI must always be able to rebuild it from Markdown.
 
-Filters currently support typed equality and dotted field paths. A future expression layer can add comparison, membership, ordering, projections, backlinks, and pagination without changing the file format.
+Filters support typed equality and dotted field paths. Search is literal and case-sensitive by default, with explicit case-insensitive and Rust-regex modes. It can target the exact Markdown document, parsed front matter, one dotted field, the body, or the database-relative path. Rust's regex engine provides linear-time matching and avoids executing shell commands or user-supplied programs.
 
-CLI list results are intentionally compact: plain output contains relative Markdown paths, while JSON contains `{ path, front_matter }` objects. Record bodies remain available through `get`, avoiding unexpectedly large collection responses.
+CLI list and search results are intentionally compact: plain output contains relative Markdown paths, while JSON contains `{ path, front_matter }` objects. Record bodies remain available through `get`, avoiding unexpectedly large multi-record responses.
+
+A future expression layer can add numeric and date comparisons, membership, boolean OR/NOT, ordering, projections, aggregation, backlinks, and pagination without changing the file format.
 
 ## Integrity boundaries
 
@@ -132,7 +134,7 @@ CLI list results are intentionally compact: plain output contains relative Markd
 
 1. `cr check` for whole-database integrity and dangling-link detection.
 2. `unlink`, backlinks, relation traversal, and delete policies.
-3. A richer query language plus projections and output formats.
+3. A richer query language with comparisons, boolean operators, sorting, pagination, aggregation, projections, and additional output formats.
 4. A disposable index for large collections.
 5. Schema-aware defaults, migrations, computed fields, and lifecycle hooks.
 6. Optimistic per-record concurrency and multi-record transactions.

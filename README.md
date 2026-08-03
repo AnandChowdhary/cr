@@ -178,6 +178,38 @@ cr list deals --where 'stage=won' --json
 
 If your own deal model calls the field `status` instead of `stage`, use `--where 'status=won'`. Field names are entirely user-defined.
 
+Search literal text across every Markdown record:
+
+```sh
+cr search 'Acme Corporation'
+cr search 'distributed systems' --json
+```
+
+Search one collection, optionally after applying typed front matter filters:
+
+```sh
+cr search 'renewal' --collection deals
+cr search 'seat count' --collection deals --where 'stage=proposal' --json
+```
+
+Search is literal and case-sensitive by default, so characters such as `[` and `*` have no special meaning. Add `--ignore-case` or opt into a Rust regular expression with `--regex`:
+
+```sh
+cr search 'acme' --ignore-case
+cr search '^(won|closed_won)$' --collection deals --field status --regex
+```
+
+By default the exact Markdown file is searched, including its YAML front matter and body. Narrow the target when needed:
+
+```sh
+cr search 'won' --front-matter
+cr search 'won' --field status
+cr search 'follow up' --body --ignore-case
+cr search '2027-renewal.md' --path
+```
+
+Like `list`, plain search output is one relative Markdown path per line and `--json` returns only `path` and `front_matter`. A search with no matches succeeds with empty output, or `[]` in JSON mode. Search reads current files immediately, including valid direct edits that have not yet been accepted with `cr save`.
+
 Update fields or replace the Markdown body:
 
 ```sh
@@ -256,6 +288,7 @@ cr link deals acme-renewal-2027 primary_contact contacts jane-doe
 
 ```sh
 cr list deals --where 'stage=qualification'
+cr search 'seat count' --collection deals --body --ignore-case
 cr update deals acme-renewal-2027 --set 'stage=proposal'
 cr get deals acme-renewal-2027 --json
 cr audit log deals acme-renewal-2027 --limit 10
@@ -330,6 +363,7 @@ cr link applications alex-smith-senior-rust role roles senior-rust-engineer
 cr update applications alex-smith-senior-rust --set 'stage=recruiter_screen'
 cr update applications alex-smith-senior-rust --set 'stage=technical_interview'
 cr list applications --where 'stage=technical_interview' --json
+cr search 'distributed systems' --collection candidates --ignore-case --json
 cr get applications alex-smith-senior-rust --json
 ```
 
@@ -372,7 +406,7 @@ cr status
 - `A` means added directly on disk.
 - `D` means deleted directly on disk.
 
-Reads use the current Markdown files, so `get` and `list` can show an unsaved direct edit. Audit verification and further CLI mutations will reject the divergence until you review and save it.
+Reads use the current Markdown files, so `get`, `list`, and `search` can show an unsaved direct edit. Audit verification and further CLI mutations will reject the divergence until you review and save it.
 
 Record one or more reviewed changes:
 
@@ -481,6 +515,9 @@ cr identity
 cr create COLLECTION ID [--set KEY=YAML]... [--body TEXT]
 cr get COLLECTION ID [--json | --field KEY]
 cr list COLLECTION [--where KEY=YAML]... [--json]
+cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]... [--json]
+                  [--front-matter | --field KEY | --body | --path]
+                  [--ignore-case] [--regex]
 cr update COLLECTION ID [--set KEY=YAML]... [--body TEXT]
 cr link SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
 cr delete COLLECTION ID --yes

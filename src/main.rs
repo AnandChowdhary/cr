@@ -2,7 +2,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use cr::{Assignment, Database};
+use cr::{Assignment, Database, Record, SearchQuery, SearchTarget};
 use serde::Serialize;
 use yaml_serde::Mapping;
 
@@ -10,6 +10,15 @@ use yaml_serde::Mapping;
 struct ListedRecord {
     path: PathBuf,
     front_matter: Mapping,
+}
+
+impl From<Record> for ListedRecord {
+    fn from(record: Record) -> Self {
+        Self {
+            path: record.path,
+            front_matter: record.attributes,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -76,6 +85,48 @@ enum Command {
         filters: Vec<Assignment>,
 
         /// Return each file path and front matter as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Search record paths, front matter, and Markdown bodies.
+    Search {
+        /// Literal text to find, or a regular expression with --regex.
+        pattern: String,
+
+        /// Search only this collection. By default, search every collection.
+        #[arg(short, long, value_name = "COLLECTION")]
+        collection: Option<String>,
+
+        /// First match a field using KEY=YAML. Multiple filters use AND.
+        #[arg(short = 'w', long = "where", value_name = "KEY=YAML")]
+        filters: Vec<Assignment>,
+
+        /// Search only parsed front matter.
+        #[arg(long, conflicts_with_all = ["field", "body", "path"])]
+        front_matter: bool,
+
+        /// Search only one front matter field. Dotted paths select nested fields.
+        #[arg(long, value_name = "KEY", conflicts_with_all = ["front_matter", "body", "path"])]
+        field: Option<String>,
+
+        /// Search only the Markdown body.
+        #[arg(long, conflicts_with_all = ["front_matter", "field", "path"])]
+        body: bool,
+
+        /// Search only database-relative Markdown paths.
+        #[arg(long, conflicts_with_all = ["front_matter", "field", "body"])]
+        path: bool,
+
+        /// Match without regard to letter case.
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+
+        /// Interpret PATTERN as a Rust regular expression instead of literal text.
+        #[arg(long)]
+        regex: bool,
+
+        /// Return each matching file path and front matter as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -244,20 +295,34 @@ fn run() -> Result<()> {
             json,
         } => {
             let records = database.list(&collection, &filters)?;
-            if json {
-                let records: Vec<_> = records
-                    .into_iter()
-                    .map(|record| ListedRecord {
-                        path: record.path,
-                        front_matter: record.attributes,
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&records)?);
+            print_records(records, json)?;
+        }
+        Command::Search {
+            pattern,
+            collection,
+            filters,
+            front_matter,
+            field,
+            body,
+            path,
+            ignore_case,
+            regex,
+            json,
+        } => {
+            let target = if front_matter {
+                SearchTarget::FrontMatter
+            } else if let Some(field) = field {
+                SearchTarget::Field(field)
+            } else if body {
+                SearchTarget::Body
+            } else if path {
+                SearchTarget::Path
             } else {
-                for record in records {
-                    println!("{}", record.path.display());
-                }
-            }
+                SearchTarget::Document
+            };
+            let query = SearchQuery::new(&pattern, target, regex, ignore_case)?;
+            let records = database.search(collection.as_deref(), &filters, &query)?;
+            print_records(records, json)?;
         }
         Command::Update {
             collection,
@@ -390,5 +455,17 @@ fn run() -> Result<()> {
         },
     }
 
+    Ok(())
+}
+
+fn print_records(records: Vec<Record>, json: bool) -> Result<()> {
+    if json {
+        let records: Vec<ListedRecord> = records.into_iter().map(Into::into).collect();
+        println!("{}", serde_json::to_string_pretty(&records)?);
+    } else {
+        for record in records {
+            println!("{}", record.path.display());
+        }
+    }
     Ok(())
 }
