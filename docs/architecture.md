@@ -116,6 +116,8 @@ Version 1 scans and parses one collection for every `list`. This keeps behavior 
 
 Filters currently support typed equality and dotted field paths. A future expression layer can add comparison, membership, ordering, projections, backlinks, and pagination without changing the file format.
 
+CLI list results are intentionally compact: plain output contains relative Markdown paths, while JSON contains `{ path, front_matter }` objects. Record bodies remain available through `get`, avoiding unexpectedly large collection responses.
+
 ## Integrity boundaries
 
 - Collection names and IDs are single path components, preventing path traversal.

@@ -129,7 +129,7 @@ fn manual_markdown_crud_is_readable_while_dirty_and_fully_auditable_after_save()
     );
     assert_eq!(
         run_success(database.command().args(["list", "candidates"])),
-        "candidates/jane\n"
+        "records/candidates/jane.md\n"
     );
     assert_eq!(audit_head(&database)["sequence"], 0);
     run_success(database.command().args([

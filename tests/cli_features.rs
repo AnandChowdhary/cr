@@ -161,7 +161,7 @@ fn configured_records_directory_is_honored() {
         .exists());
     assert_eq!(
         run_success(database.command().args(["list", "companies"])).trim(),
-        "companies/acme"
+        "content/data/companies/acme.md"
     );
 }
 
@@ -205,7 +205,15 @@ fn list_combines_typed_nested_filters_and_orders_results() {
     ]));
     let filtered: Value = serde_json::from_str(&filtered).unwrap();
     assert_eq!(filtered.as_array().unwrap().len(), 1);
-    assert_eq!(filtered[0]["id"], "zoe");
+    assert_eq!(filtered[0]["path"], "records/candidates/zoe.md");
+    assert_eq!(filtered[0]["front_matter"]["stage"], "interview");
+    assert_eq!(filtered[0]["front_matter"]["active"], true);
+    assert_eq!(filtered[0]["front_matter"]["score"], 42);
+    assert_eq!(filtered[0]["front_matter"]["contact"]["country"], "NL");
+    assert!(filtered[0].get("body").is_none());
+    assert!(filtered[0].get("id").is_none());
+    assert!(filtered[0].get("collection").is_none());
+    assert!(filtered[0].get("attributes").is_none());
 
     let no_match = run_success(database.command().args([
         "list",
@@ -222,7 +230,11 @@ fn list_combines_typed_nested_filters_and_orders_results() {
     let ordered = run_success(database.command().args(["list", "candidates"]));
     assert_eq!(
         ordered.lines().collect::<Vec<_>>(),
-        ["candidates/amy", "candidates/mira", "candidates/zoe"]
+        [
+            "records/candidates/amy.md",
+            "records/candidates/mira.md",
+            "records/candidates/zoe.md"
+        ]
     );
 
     let missing = run_success(database.command().args(["list", "roles", "--json"]));
@@ -250,7 +262,10 @@ fn list_ignores_non_markdown_nested_and_symlink_entries() {
     std::os::unix::fs::symlink(collection.join("real.md"), collection.join("alias.md")).unwrap();
 
     let listed = run_success(database.command().args(["list", "items"]));
-    assert_eq!(listed.lines().collect::<Vec<_>>(), ["items/real"]);
+    assert_eq!(
+        listed.lines().collect::<Vec<_>>(),
+        ["records/items/real.md"]
+    );
 }
 
 #[test]

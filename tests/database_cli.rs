@@ -80,6 +80,13 @@ fn create_query_update_and_link_records() {
     ]));
     let listed: Value = serde_json::from_str(&listed).unwrap();
     assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["path"], "records/candidates/jane-doe.md");
+    assert_eq!(listed[0]["front_matter"]["stage"], "interview");
+    assert_eq!(
+        listed[0]["front_matter"]["contact"]["email"],
+        "jane@example.com"
+    );
+    assert!(listed[0].get("body").is_none());
 
     let markdown = fs::read_to_string(database.join("records/candidates/jane-doe.md")).unwrap();
     assert!(markdown.starts_with("---\n"));

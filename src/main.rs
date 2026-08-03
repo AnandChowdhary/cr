@@ -3,6 +3,14 @@ use std::{path::PathBuf, process::ExitCode};
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use cr::{Assignment, Database};
+use serde::Serialize;
+use yaml_serde::Mapping;
+
+#[derive(Debug, Serialize)]
+struct ListedRecord {
+    path: PathBuf,
+    front_matter: Mapping,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -67,7 +75,7 @@ enum Command {
         #[arg(short = 'w', long = "where", value_name = "KEY=YAML")]
         filters: Vec<Assignment>,
 
-        /// Return complete records as JSON.
+        /// Return each file path and front matter as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -237,10 +245,17 @@ fn run() -> Result<()> {
         } => {
             let records = database.list(&collection, &filters)?;
             if json {
+                let records: Vec<_> = records
+                    .into_iter()
+                    .map(|record| ListedRecord {
+                        path: record.path,
+                        front_matter: record.attributes,
+                    })
+                    .collect();
                 println!("{}", serde_json::to_string_pretty(&records)?);
             } else {
                 for record in records {
-                    println!("{}", record.reference());
+                    println!("{}", record.path.display());
                 }
             }
         }

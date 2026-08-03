@@ -150,12 +150,33 @@ cr list companies
 cr list companies --json
 ```
 
+Plain output contains one relative Markdown path per line. JSON output contains only the path and front matter for each matching object; it does not include the Markdown body:
+
+```json
+[
+  {
+    "path": "records/deals/acme-renewal-2027.md",
+    "front_matter": {
+      "name": "Acme 2027 renewal",
+      "stage": "won",
+      "value": 25000,
+      "currency": "USD"
+    }
+  }
+]
+```
+
+Use `get COLLECTION ID` or `get COLLECTION ID --json` when you also need one record's Markdown body.
+
 Filter using typed equality. Multiple filters are combined with AND:
 
 ```sh
 cr list companies --where 'active=true'
 cr list deals --where 'stage=proposal' --where 'value=25000' --json
+cr list deals --where 'stage=won' --json
 ```
+
+If your own deal model calls the field `status` instead of `stage`, use `--where 'status=won'`. Field names are entirely user-defined.
 
 Update fields or replace the Markdown body:
 
