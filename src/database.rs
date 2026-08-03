@@ -1,0 +1,767 @@
+use std::{
+    fs::{self, File},
+    io::Write,
+    path::{Component, Path, PathBuf},
+};
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
+use yaml_serde::{Mapping, Value};
+
+use crate::{
+    audit::{AuditLog, AuditMutation},
+    frontmatter::Document,
+    value::{get_path, parse_path},
+    Assignment, AuditAction, AuditEntry, AuditHead, AuditVerification,
+};
+
+const CONFIG_PATH: &str = ".cr/config.yaml";
+const CURRENT_FORMAT_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    version: u32,
+    data_dir: PathBuf,
+    #[serde(default)]
+    audit: AuditConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+#[serde(default)]
+struct AuditConfig {
+    segment_max_events: usize,
+    segment_max_bytes: u64,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            segment_max_events: 256,
+            segment_max_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: CURRENT_FORMAT_VERSION,
+            data_dir: PathBuf::from("records"),
+            audit: AuditConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Database {
+    root: PathBuf,
+    config: Config,
+    actor: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Record {
+    pub collection: String,
+    pub id: String,
+    pub path: PathBuf,
+    pub attributes: Mapping,
+    pub body: String,
+}
+
+impl Record {
+    pub fn reference(&self) -> String {
+        format!("{}/{}", self.collection, self.id)
+    }
+
+    pub fn field(&self, path: &str) -> Result<Option<&Value>> {
+        let path = parse_path(path)?;
+        Ok(get_path(&self.attributes, &path))
+    }
+}
+
+impl Database {
+    pub fn init(path: impl AsRef<Path>) -> Result<Self> {
+        let root = path.as_ref();
+        fs::create_dir_all(root)
+            .with_context(|| format!("could not create database root {}", root.display()))?;
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("could not resolve database root {}", root.display()))?;
+        let config_path = root.join(CONFIG_PATH);
+
+        if config_path.exists() {
+            bail!("a database already exists at {}", root.display());
+        }
+
+        fs::create_dir_all(root.join(".cr/schemas"))
+            .context("could not create schema directory")?;
+        fs::create_dir_all(root.join("records")).context("could not create records directory")?;
+
+        let config = Config::default();
+        let serialized = yaml_serde::to_string(&config).context("could not serialize config")?;
+        write_new(&config_path, serialized.as_bytes())?;
+
+        let database = Self {
+            root,
+            config,
+            actor: default_actor(),
+        };
+        database.audit().ensure_layout()?;
+        Ok(database)
+    }
+
+    pub fn discover(explicit_root: Option<&Path>) -> Result<Self> {
+        let root = match explicit_root {
+            Some(path) => path
+                .canonicalize()
+                .with_context(|| format!("could not resolve database root {}", path.display()))?,
+            None => {
+                let current =
+                    std::env::current_dir().context("could not read current directory")?;
+                current
+                    .ancestors()
+                    .find(|path| path.join(CONFIG_PATH).is_file())
+                    .map(Path::to_path_buf)
+                    .context("no database found; run 'cr init' or pass --database <PATH>")?
+            }
+        };
+
+        let config_path = root.join(CONFIG_PATH);
+        let serialized = fs::read_to_string(&config_path)
+            .with_context(|| format!("could not read {}", config_path.display()))?;
+        let config: Config = yaml_serde::from_str(&serialized)
+            .with_context(|| format!("{} is not valid YAML", config_path.display()))?;
+
+        if config.version != CURRENT_FORMAT_VERSION {
+            bail!(
+                "database format version {} is unsupported (expected {})",
+                config.version,
+                CURRENT_FORMAT_VERSION
+            );
+        }
+        validate_relative_path(&config.data_dir, "data_dir")?;
+        if config.audit.segment_max_events == 0 {
+            bail!("audit.segment_max_events must be greater than zero");
+        }
+        if config.audit.segment_max_bytes == 0 {
+            bail!("audit.segment_max_bytes must be greater than zero");
+        }
+
+        let database = Self {
+            root,
+            config,
+            actor: default_actor(),
+        };
+        let audit = database.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        Ok(database)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
+        self.actor = actor.into();
+        self
+    }
+
+    pub fn create(
+        &self,
+        collection: &str,
+        id: &str,
+        assignments: &[Assignment],
+        body: &str,
+    ) -> Result<Record> {
+        let path = self.record_path(collection, id)?;
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        if path.exists() {
+            bail!("record {collection}/{id} already exists");
+        }
+        let mut document = Document {
+            attributes: Mapping::new(),
+            body: body.to_owned(),
+        };
+        apply_all(&mut document.attributes, assignments)?;
+        self.validate(collection, &document.attributes)?;
+        let rendered = document.render()?;
+        let event = audit.prepare(AuditMutation {
+            action: AuditAction::Create,
+            collection,
+            id,
+            before_document: None,
+            after_document: Some(&document),
+            before_bytes: None,
+            after_bytes: Some(rendered.as_bytes()),
+        })?;
+        audit.commit(event, &path, || write_new(&path, rendered.as_bytes()))?;
+        self.record_from_document(collection, id, path, document)
+    }
+
+    pub fn get(&self, collection: &str, id: &str) -> Result<Record> {
+        let path = self.record_path(collection, id)?;
+        let document = self.read_document(&path)?;
+        self.record_from_document(collection, id, path, document)
+    }
+
+    pub fn read_raw(&self, collection: &str, id: &str) -> Result<String> {
+        let path = self.record_path(collection, id)?;
+        fs::read_to_string(&path)
+            .with_context(|| format!("could not read record {}", path.display()))
+    }
+
+    pub fn list(&self, collection: &str, filters: &[Assignment]) -> Result<Vec<Record>> {
+        validate_component(collection, "collection")?;
+        let directory = self.root.join(&self.config.data_dir).join(collection);
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(&directory)
+            .with_context(|| format!("could not read collection {}", directory.display()))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("md") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+
+        paths
+            .into_iter()
+            .map(|path| {
+                let id = path
+                    .file_stem()
+                    .context("record path has no filename")?
+                    .to_str()
+                    .with_context(|| {
+                        format!("record filename {} is not valid UTF-8", path.display())
+                    })?
+                    .to_owned();
+                Ok((id, path))
+            })
+            .map(|result: Result<(String, PathBuf)>| {
+                let (id, path) = result?;
+                let document = self.read_document(&path)?;
+                self.record_from_document(collection, &id, path, document)
+            })
+            .filter(|record| {
+                record
+                    .as_ref()
+                    .map(|record| {
+                        filters
+                            .iter()
+                            .all(|filter| filter.matches(&record.attributes))
+                    })
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    pub fn update(
+        &self,
+        collection: &str,
+        id: &str,
+        assignments: &[Assignment],
+        body: Option<&str>,
+    ) -> Result<Record> {
+        let path = self.record_path(collection, id)?;
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let before_raw = fs::read_to_string(&path)
+            .with_context(|| format!("could not read record {}", path.display()))?;
+        let before = Document::parse(&before_raw)
+            .with_context(|| format!("could not parse {}", path.display()))?;
+        let mut document = before.clone();
+        apply_all(&mut document.attributes, assignments)?;
+        if let Some(body) = body {
+            document.body = body.to_owned();
+        }
+        self.validate(collection, &document.attributes)?;
+        let rendered = document.render()?;
+        let event = audit.prepare(AuditMutation {
+            action: AuditAction::Update,
+            collection,
+            id,
+            before_document: Some(&before),
+            after_document: Some(&document),
+            before_bytes: Some(before_raw.as_bytes()),
+            after_bytes: Some(rendered.as_bytes()),
+        })?;
+        audit.commit(event, &path, || write_replace(&path, rendered.as_bytes()))?;
+        self.record_from_document(collection, id, path, document)
+    }
+
+    pub fn link(
+        &self,
+        collection: &str,
+        id: &str,
+        relation: &str,
+        target_collection: &str,
+        target_id: &str,
+    ) -> Result<Record> {
+        validate_component(relation, "relation")?;
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let target_path = self.record_path(target_collection, target_id)?;
+        let target_raw = fs::read_to_string(&target_path).with_context(|| {
+            format!("relation target {target_collection}/{target_id} does not exist")
+        })?;
+        Document::parse(&target_raw).with_context(|| {
+            format!("could not parse relation target {}", target_path.display())
+        })?;
+        audit.assert_current(target_collection, target_id, target_raw.as_bytes())?;
+
+        let path = self.record_path(collection, id)?;
+        let before_raw = fs::read_to_string(&path)
+            .with_context(|| format!("could not read record {}", path.display()))?;
+        let before = Document::parse(&before_raw)
+            .with_context(|| format!("could not parse {}", path.display()))?;
+        let mut document = before.clone();
+        let relations = mapping_field(&mut document.attributes, "relations")?;
+        let targets = sequence_field(relations, relation)?;
+        let reference = relation_value(target_collection, target_id);
+
+        if !targets.contains(&reference) {
+            targets.push(reference);
+        }
+
+        self.validate(collection, &document.attributes)?;
+        let rendered = document.render()?;
+        let event = audit.prepare(AuditMutation {
+            action: AuditAction::Link,
+            collection,
+            id,
+            before_document: Some(&before),
+            after_document: Some(&document),
+            before_bytes: Some(before_raw.as_bytes()),
+            after_bytes: Some(rendered.as_bytes()),
+        })?;
+        audit.commit(event, &path, || write_replace(&path, rendered.as_bytes()))?;
+        self.record_from_document(collection, id, path, document)
+    }
+
+    pub fn delete(&self, collection: &str, id: &str) -> Result<Record> {
+        let path = self.record_path(collection, id)?;
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let before_raw = fs::read_to_string(&path)
+            .with_context(|| format!("could not read record {}", path.display()))?;
+        let document = Document::parse(&before_raw)
+            .with_context(|| format!("could not parse {}", path.display()))?;
+        let event = audit.prepare(AuditMutation {
+            action: AuditAction::Delete,
+            collection,
+            id,
+            before_document: Some(&document),
+            after_document: None,
+            before_bytes: Some(before_raw.as_bytes()),
+            after_bytes: None,
+        })?;
+        let parent = path.parent().context("record has no parent directory")?;
+        audit.commit(event, &path, || {
+            fs::remove_file(&path)
+                .with_context(|| format!("could not delete record {}", path.display()))?;
+            sync_parent(parent)
+        })?;
+        self.record_from_document(collection, id, path, document)
+    }
+
+    pub fn audit_recent(
+        &self,
+        limit: usize,
+        collection: Option<&str>,
+        id: Option<&str>,
+    ) -> Result<Vec<AuditEntry>> {
+        if id.is_some() && collection.is_none() {
+            bail!("an audit record ID requires a collection");
+        }
+        if let Some(collection) = collection {
+            validate_component(collection, "collection")?;
+        }
+        if let Some(id) = id {
+            validate_component(id, "id")?;
+        }
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        audit.recent(limit, collection, id)
+    }
+
+    pub fn audit_head(&self) -> Result<AuditHead> {
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        audit.head()
+    }
+
+    pub fn audit_verify(&self, expected_head: Option<&str>) -> Result<AuditVerification> {
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        audit.verify(expected_head)
+    }
+
+    pub fn audit_baseline(&self) -> Result<usize> {
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let mut added = 0;
+
+        for (collection, id, path) in self.record_files()? {
+            if audit.has_history(&collection, &id)? {
+                continue;
+            }
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("could not read record {}", path.display()))?;
+            let document = Document::parse(&raw)
+                .with_context(|| format!("could not parse {}", path.display()))?;
+            let event = audit.prepare(AuditMutation {
+                action: AuditAction::Baseline,
+                collection: &collection,
+                id: &id,
+                before_document: None,
+                after_document: Some(&document),
+                before_bytes: None,
+                after_bytes: Some(raw.as_bytes()),
+            })?;
+            audit.commit(event, &path, || Ok(()))?;
+            added += 1;
+        }
+
+        audit.verify(None)?;
+        Ok(added)
+    }
+
+    fn record_path(&self, collection: &str, id: &str) -> Result<PathBuf> {
+        validate_component(collection, "collection")?;
+        validate_component(id, "id")?;
+        Ok(self
+            .root
+            .join(&self.config.data_dir)
+            .join(collection)
+            .join(format!("{id}.md")))
+    }
+
+    fn read_document(&self, path: &Path) -> Result<Document> {
+        let input = fs::read_to_string(path)
+            .with_context(|| format!("could not read record {}", path.display()))?;
+        Document::parse(&input).with_context(|| format!("could not parse {}", path.display()))
+    }
+
+    fn record_from_document(
+        &self,
+        collection: &str,
+        id: &str,
+        path: PathBuf,
+        document: Document,
+    ) -> Result<Record> {
+        let relative_path = path
+            .strip_prefix(&self.root)
+            .context("record path is outside the database")?
+            .to_path_buf();
+        Ok(Record {
+            collection: collection.to_owned(),
+            id: id.to_owned(),
+            path: relative_path,
+            attributes: document.attributes,
+            body: document.body,
+        })
+    }
+
+    fn validate(&self, collection: &str, attributes: &Mapping) -> Result<()> {
+        let schema_path = self
+            .root
+            .join(".cr/schemas")
+            .join(format!("{collection}.json"));
+        if !schema_path.exists() {
+            return Ok(());
+        }
+
+        let serialized = fs::read_to_string(&schema_path)
+            .with_context(|| format!("could not read schema {}", schema_path.display()))?;
+        let schema: serde_json::Value = serde_json::from_str(&serialized)
+            .with_context(|| format!("{} is not valid JSON", schema_path.display()))?;
+        jsonschema::meta::validate(&schema)
+            .map_err(|error| anyhow!("invalid JSON Schema {}: {error}", schema_path.display()))?;
+        let validator = jsonschema::validator_for(&schema).map_err(|error| {
+            anyhow!(
+                "could not compile schema {}: {error}",
+                schema_path.display()
+            )
+        })?;
+        let instance = serde_json::to_value(attributes)
+            .context("front matter cannot be represented as JSON for schema validation")?;
+        let errors: Vec<_> = validator
+            .iter_errors(&instance)
+            .map(|error| format!("- {error}"))
+            .collect();
+
+        if !errors.is_empty() {
+            bail!(
+                "record does not match schema for collection '{collection}':\n{}",
+                errors.join("\n")
+            );
+        }
+
+        Ok(())
+    }
+
+    fn record_files(&self) -> Result<Vec<(String, String, PathBuf)>> {
+        let records_root = self.root.join(&self.config.data_dir);
+        if !records_root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        for collection in fs::read_dir(&records_root)? {
+            let collection = collection?;
+            if !collection.file_type()?.is_dir() {
+                continue;
+            }
+            let collection_name = collection
+                .file_name()
+                .to_str()
+                .context("collection filename is not valid UTF-8")?
+                .to_owned();
+            validate_component(&collection_name, "collection")?;
+            for record in fs::read_dir(collection.path())? {
+                let record = record?;
+                if !record.file_type()?.is_file()
+                    || record.path().extension().and_then(|value| value.to_str()) != Some("md")
+                {
+                    continue;
+                }
+                let path = record.path();
+                let id = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .context("record filename is not valid UTF-8")?
+                    .to_owned();
+                validate_component(&id, "id")?;
+                records.push((collection_name.clone(), id, path));
+            }
+        }
+        records.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+        Ok(records)
+    }
+
+    fn audit(&self) -> AuditLog<'_> {
+        AuditLog::new(
+            &self.root,
+            &self.config.data_dir,
+            self.config.audit.segment_max_events,
+            self.config.audit.segment_max_bytes,
+            &self.actor,
+        )
+    }
+}
+
+fn default_actor() -> String {
+    std::env::var("CR_ACTOR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("USERNAME").ok())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn apply_all(attributes: &mut Mapping, assignments: &[Assignment]) -> Result<()> {
+    for assignment in assignments {
+        assignment.apply(attributes)?;
+    }
+    Ok(())
+}
+
+fn mapping_field<'a>(attributes: &'a mut Mapping, field: &str) -> Result<&'a mut Mapping> {
+    let key = Value::String(field.to_owned());
+    if !attributes.contains_key(&key) {
+        attributes.insert(key.clone(), Value::Mapping(Mapping::new()));
+    }
+    match attributes.get_mut(&key) {
+        Some(Value::Mapping(mapping)) => Ok(mapping),
+        _ => bail!("field '{field}' must be an object to store relations"),
+    }
+}
+
+fn sequence_field<'a>(mapping: &'a mut Mapping, field: &str) -> Result<&'a mut Vec<Value>> {
+    let key = Value::String(field.to_owned());
+    if !mapping.contains_key(&key) {
+        mapping.insert(key.clone(), Value::Sequence(Vec::new()));
+    }
+    match mapping.get_mut(&key) {
+        Some(Value::Sequence(sequence)) => Ok(sequence),
+        _ => bail!("relation '{field}' must be a list"),
+    }
+}
+
+fn relation_value(collection: &str, id: &str) -> Value {
+    let mut reference = Mapping::new();
+    reference.insert("collection".into(), collection.into());
+    reference.insert("id".into(), id.into());
+    Value::Mapping(reference)
+}
+
+pub(crate) fn validate_component(value: &str, label: &str) -> Result<()> {
+    if value.is_empty() || value == "." || value == ".." {
+        bail!("{label} must be a non-empty path component");
+    }
+    if value.contains('/') || value.contains('\\') || value.contains('\0') {
+        bail!("{label} '{value}' cannot contain path separators");
+    }
+    Ok(())
+}
+
+fn validate_relative_path(path: &Path, label: &str) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("{label} must be a relative path without '.' or '..'");
+    }
+    Ok(())
+}
+
+pub(crate) fn write_new(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("could not create directory {}", parent.display()))?;
+
+    let mut temporary = NamedTempFile::new_in(parent)
+        .with_context(|| format!("could not create temporary file in {}", parent.display()))?;
+    temporary
+        .write_all(contents)
+        .with_context(|| format!("could not write temporary file for {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("could not sync temporary file for {}", path.display()))?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| anyhow!("could not create {}: {}", path.display(), error.error))?;
+    sync_parent(parent)?;
+    Ok(())
+}
+
+pub(crate) fn write_replace(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    let permissions = fs::metadata(path)
+        .with_context(|| format!("could not inspect {}", path.display()))?
+        .permissions();
+    let mut temporary = NamedTempFile::new_in(parent)
+        .with_context(|| format!("could not create temporary file in {}", parent.display()))?;
+    temporary
+        .as_file()
+        .set_permissions(permissions)
+        .with_context(|| format!("could not preserve permissions for {}", path.display()))?;
+    temporary
+        .write_all(contents)
+        .with_context(|| format!("could not write temporary file for {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("could not sync temporary file for {}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| anyhow!("could not replace {}: {}", path.display(), error.error))?;
+    sync_parent(parent)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_parent(parent: &Path) -> Result<()> {
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("could not sync directory {}", parent.display()))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sync_parent(_parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_component, validate_relative_path, write_new, write_replace};
+    use std::{fs, path::Path};
+
+    #[test]
+    fn path_validation_blocks_traversal_but_allows_unicode() {
+        assert!(validate_component("candidates", "collection").is_ok());
+        assert!(validate_component("候補者", "collection").is_ok());
+        assert!(validate_component("", "id").is_err());
+        assert!(validate_component("..", "id").is_err());
+        assert!(validate_component("../outside", "id").is_err());
+        assert!(validate_component("nested/item", "id").is_err());
+
+        assert!(validate_relative_path(Path::new("records"), "data_dir").is_ok());
+        assert!(validate_relative_path(Path::new("data/records"), "data_dir").is_ok());
+        assert!(validate_relative_path(Path::new("../records"), "data_dir").is_err());
+        assert!(validate_relative_path(Path::new("/records"), "data_dir").is_err());
+    }
+
+    #[test]
+    fn new_file_write_never_clobbers_existing_content() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("record.md");
+        write_new(&path, b"original").unwrap();
+
+        assert!(write_new(&path, b"replacement").is_err());
+        assert_eq!(fs::read(path).unwrap(), b"original");
+    }
+
+    #[test]
+    fn replacement_write_publishes_the_complete_next_value() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("record.md");
+        write_new(&path, b"original").unwrap();
+
+        write_replace(&path, b"replacement").unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn replacement_failure_does_not_destroy_the_destination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+
+        assert!(write_replace(&destination, b"replacement").is_err());
+        assert!(destination.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_preserves_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("record.md");
+        write_new(&path, b"original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_replace(&path, b"replacement").unwrap();
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+}
