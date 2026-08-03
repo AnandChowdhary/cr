@@ -15,8 +15,8 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     database: Option<PathBuf>,
 
-    /// Actor recorded in audit events. Defaults to CR_ACTOR or the OS user.
-    #[arg(long, global = true, value_name = "NAME")]
+    /// Identity recorded in audit events. Overrides CR/Git identity discovery.
+    #[arg(long, global = true, value_name = "IDENTITY")]
     actor: Option<String>,
 
     #[command(subcommand)]
@@ -95,6 +95,38 @@ enum Command {
         target_id: String,
     },
 
+    /// Show direct Markdown changes not yet recorded in the audit journal.
+    Status {
+        /// Return changes as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Record selected direct Markdown changes in the audit journal.
+    Save {
+        /// Records to accept, written as COLLECTION/ID.
+        #[arg(value_name = "COLLECTION/ID")]
+        records: Vec<String>,
+
+        /// Accept every change shown by `cr status`.
+        #[arg(short = 'a', long, conflicts_with = "records")]
+        all: bool,
+
+        /// Explain why the direct changes are being accepted.
+        #[arg(short = 'm', long, value_name = "MESSAGE")]
+        message: Option<String>,
+
+        /// Return the committed audit events as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print the identity that will be used for audit events.
+    Identity {
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Delete a record while retaining its previous state in the audit log.
     Delete {
         collection: String,
@@ -165,7 +197,7 @@ fn run() -> Result<()> {
 
     let database = Database::discover(cli.database.as_deref())?;
     let database = match cli.actor {
-        Some(actor) => database.with_actor(actor),
+        Some(actor) => database.with_actor(actor)?,
         None => database,
     };
 
@@ -234,6 +266,52 @@ fn run() -> Result<()> {
             let record =
                 database.link(&collection, &id, &relation, &target_collection, &target_id)?;
             println!("{}", record.reference());
+        }
+        Command::Status { json } => {
+            let changes = database.status()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&changes)?);
+            } else if changes.is_empty() {
+                println!("Clean");
+            } else {
+                for change in changes {
+                    println!("{} {}", change.status.short_code(), change.reference());
+                }
+            }
+        }
+        Command::Save {
+            records,
+            all,
+            message,
+            json,
+        } => {
+            let entries = database.save(&records, all, message.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("No changes to save");
+            } else {
+                for entry in entries {
+                    println!(
+                        "Saved {} {} as audit event {}",
+                        entry.payload.action,
+                        entry.payload.record.reference(),
+                        entry.payload.sequence
+                    );
+                }
+            }
+        }
+        Command::Identity { json } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "actor": database.actor()
+                    }))?
+                );
+            } else {
+                println!("{}", database.actor());
+            }
         }
         Command::Delete {
             collection,

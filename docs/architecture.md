@@ -14,6 +14,8 @@ For audit integrity, OWASP recommends a chronological, independently verifiable 
 
 The mutation protocol follows write-ahead logging principles: durable intent precedes the record change, and recovery determines whether to commit or discard that intent by hashing the resulting record. Rust's standard file locks serialize writers across processes. The audit payload's exact stored JSON bytes are the hash input, so verification does not depend on parsing and reserializing arbitrary YAML-derived values.
 
+Git's working-tree model separates detecting differences from explicitly selecting changes to record. `cr` applies the same boundary without adopting Git as a storage dependency: the audit journal is the recorded state, Markdown files are the working tree, `status` compares them, and `save` accepts reviewed paths. Git's author environment variables and repository `user.email` configuration also provide a familiar identity fallback.
+
 Research sources:
 
 - [Jekyll front matter](https://jekyllrb.com/docs/front-matter/)
@@ -27,6 +29,8 @@ Research sources:
 - [RFC 6962: Certificate Transparency](https://www.rfc-editor.org/info/rfc6962/)
 - [SQLite write-ahead logging](https://www.sqlite.org/wal.html)
 - [Rust file locking](https://doc.rust-lang.org/std/fs/struct.File.html#method.lock)
+- [Git status and working-tree states](https://git-scm.com/docs/git-status)
+- [Git user identity](https://git-scm.com/docs/user-manual#telling-git-your-name)
 
 ## Version 1 layout
 
@@ -59,13 +63,15 @@ database-root/
 
 Each stored line is a small JSON wrapper containing a SHA-256 hash and an exact JSON payload. The payload contains:
 
-- format version, global sequence, UTC timestamp, actor, and action;
+- format version, global sequence, UTC timestamp, actor, source, optional message, and action;
 - collection and record ID;
 - JSON Pointer-like field changes with distinguishable absent and `null` values;
 - SHA-256 hashes of the complete record bytes before and after the mutation;
 - the previous event hash, chaining events across segment files.
 
-Create and baseline events store the complete after-state. Delete events store the complete before-state. Updates and links recursively diff objects while treating arrays and scalar values as replaceable units.
+Create and baseline events store the complete after-state. Delete events store the complete before-state. Updates and links recursively diff objects while treating arrays and scalar values as replaceable units. Version 2 changes use explicit `add`, `remove`, and `replace` operations, so an absent value remains distinguishable from a present `null`. The reader accepts and safely converts version 1 change objects while retaining their original hashed bytes.
+
+Verification replays these operations independently for each record. Every event's `before_hash` must equal that record's prior audited hash, every change's before-value must equal the replayed semantic state, and record presence must agree with `after_hash`. This replay makes the prior document available even after somebody directly edits or deletes its Markdown file.
 
 Segments rotate on configurable event-count and byte-size bounds. Appending atomically rewrites only the active bounded segment; verification and history reads stream segments and never require the complete journal in memory. `audit log` reads newest segments backward until its requested limit is satisfied.
 
@@ -76,11 +82,31 @@ Writers acquire `.cr/audit/lock`. Before changing a record, the CLI verifies the
 
 Any third state stops recovery for manual investigation. This protocol covers one-record mutations; it is not a multi-record transaction system.
 
+### Direct-edit reconciliation
+
+`status` verifies and replays the audit chain without requiring current files to match it, scans the records tree, and compares exact file hashes across the union of audited and current record identities. It reports added, modified, and deleted records in deterministic order. Malformed Markdown is still visible as a changed path because status does not need to parse working files.
+
+`save` requires selected `collection/id` references or an explicit `--all`. Under the audit lock it:
+
+1. verifies and replays the current chain;
+2. calculates the working-tree changes;
+3. reconstructs the prior documents from replayed events;
+4. reads, parses, and schema-validates every selected current document before appending anything;
+5. rechecks each current file hash and appends a `source: filesystem` event.
+
+The record already contains the proposed state, so this path does not use the pending mutation file: an atomic event append either accepts that hash or leaves the record dirty. An editor that races with save can cause a selected hash check to fail; if it changes a file immediately after acceptance, the next `status` reports another modification. Multiple selected records are preflighted together but committed as sequential single-record events, not as one atomic transaction.
+
+Automatic filesystem watchers are intentionally not trusted to append events. Automatically accepting every observed change would erase the distinction between a reviewed edit and tampering. A future UI may watch only to refresh status and request approval.
+
+Reconciliation observes net record-content state, not every low-level filesystem operation. Byte-for-byte reverted edits and metadata-only changes are outside this journal; deployments that need every write attempt require operating-system audit facilities in addition to `cr`.
+
 `audit verify` validates the chain and reconciles every latest record hash, including deleted-record absence and manually added untracked files. `audit baseline` explicitly introduces legacy records into the chain. It cannot silently baseline a record that already has history.
 
 ### Threat boundary
 
-The hash chain detects modified payloads, missing or reordered middle events, segment gaps, and current-record divergence. It cannot by itself prove that the final events were not removed or that an attacker with full write access did not rewrite the entire chain. `audit head` exists so the sequence and head hash can be signed, timestamped, committed, or uploaded outside the database; `audit verify --expected-head` checks such a checkpoint. Stronger deployments can later automate Ed25519-signed checkpoints or remote transparency-log anchoring without changing event files.
+The hash chain detects modified payloads, missing or reordered middle events, segment gaps, internally inconsistent record changes, and current-record divergence. It cannot by itself prove that the final events were not removed or that an attacker with full write access did not rewrite the entire chain. `audit head` exists so the sequence and head hash can be signed, timestamped, committed, or uploaded outside the database; `audit verify --expected-head` checks such a checkpoint. Stronger deployments can later automate Ed25519-signed checkpoints or remote transparency-log anchoring without changing event files.
+
+Actor values are assertions supplied by the process, not authenticated principals. Resolution prefers the explicit CLI override and `CR_*` environment, then Git author environment/configuration, then common email and OS-user fallbacks. Signed events or trusted operating-system identity integration would be required to authenticate them.
 
 The journal contains historical values and deletion tombstones. Encryption, redaction rules, retention, and access control are deployment concerns and must be designed before storing regulated or highly sensitive data.
 
@@ -109,3 +135,4 @@ Filters currently support typed equality and dotted field paths. A future expres
 6. Optimistic per-record concurrency and multi-record transactions.
 7. Automated signed or remotely anchored audit checkpoints.
 8. Audit redaction, encryption, and retention policies.
+9. Status ignore patterns, rename detection, and a reviewed interactive save UI.

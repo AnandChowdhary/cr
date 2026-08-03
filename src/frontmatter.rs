@@ -51,6 +51,22 @@ impl Document {
 
         Ok(format!("---\n{}---\n{}", yaml, self.body))
     }
+
+    pub fn from_audit_value(value: &serde_json::Value) -> Result<Self> {
+        let object = value
+            .as_object()
+            .context("audited document state is not an object")?;
+        if object.len() != 2 || !object.contains_key("attributes") || !object.contains_key("body") {
+            bail!("audited document state must contain only attributes and body");
+        }
+        let attributes = serde_json::from_value(object["attributes"].clone())
+            .context("audited front matter cannot be decoded")?;
+        let body = object["body"]
+            .as_str()
+            .context("audited Markdown body is not a string")?
+            .to_owned();
+        Ok(Self { attributes, body })
+    }
 }
 
 fn trim_line_ending(line: &str) -> &str {

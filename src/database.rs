@@ -1,7 +1,9 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Write,
     path::{Component, Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -10,10 +12,10 @@ use tempfile::NamedTempFile;
 use yaml_serde::{Mapping, Value};
 
 use crate::{
-    audit::{AuditLog, AuditMutation},
+    audit::{record_hash, AuditLog, AuditMutation, ReconciledMutation},
     frontmatter::Document,
     value::{get_path, parse_path},
-    Assignment, AuditAction, AuditEntry, AuditHead, AuditVerification,
+    Assignment, AuditAction, AuditEntry, AuditHead, AuditSource, AuditVerification,
 };
 
 const CONFIG_PATH: &str = ".cr/config.yaml";
@@ -71,6 +73,40 @@ pub struct Record {
     pub body: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingChangeKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+impl WorkingChangeKind {
+    pub fn short_code(&self) -> char {
+        match self {
+            Self::Added => 'A',
+            Self::Modified => 'M',
+            Self::Deleted => 'D',
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WorkingChange {
+    pub status: WorkingChangeKind,
+    pub collection: String,
+    pub id: String,
+    pub path: PathBuf,
+    pub audited_hash: Option<String>,
+    pub current_hash: Option<String>,
+}
+
+impl WorkingChange {
+    pub fn reference(&self) -> String {
+        format!("{}/{}", self.collection, self.id)
+    }
+}
+
 impl Record {
     pub fn reference(&self) -> String {
         format!("{}/{}", self.collection, self.id)
@@ -107,8 +143,9 @@ impl Database {
         let database = Self {
             root,
             config,
-            actor: default_actor(),
+            actor: String::new(),
         };
+        let database = database.with_default_actor();
         database.audit().ensure_layout()?;
         Ok(database)
     }
@@ -153,8 +190,9 @@ impl Database {
         let database = Self {
             root,
             config,
-            actor: default_actor(),
+            actor: String::new(),
         };
+        let database = database.with_default_actor();
         let audit = database.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
@@ -165,9 +203,17 @@ impl Database {
         &self.root
     }
 
-    pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
-        self.actor = actor.into();
-        self
+    pub fn actor(&self) -> &str {
+        &self.actor
+    }
+
+    pub fn with_actor(mut self, actor: impl Into<String>) -> Result<Self> {
+        let actor = actor.into();
+        if actor.trim().is_empty() {
+            bail!("audit actor cannot be empty");
+        }
+        self.actor = actor;
+        Ok(self)
     }
 
     pub fn create(
@@ -199,6 +245,8 @@ impl Database {
             after_document: Some(&document),
             before_bytes: None,
             after_bytes: Some(rendered.as_bytes()),
+            source: AuditSource::Cli,
+            message: None,
         })?;
         audit.commit(event, &path, || write_new(&path, rendered.as_bytes()))?;
         self.record_from_document(collection, id, path, document)
@@ -299,6 +347,8 @@ impl Database {
             after_document: Some(&document),
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: Some(rendered.as_bytes()),
+            source: AuditSource::Cli,
+            message: None,
         })?;
         audit.commit(event, &path, || write_replace(&path, rendered.as_bytes()))?;
         self.record_from_document(collection, id, path, document)
@@ -349,6 +399,8 @@ impl Database {
             after_document: Some(&document),
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: Some(rendered.as_bytes()),
+            source: AuditSource::Cli,
+            message: None,
         })?;
         audit.commit(event, &path, || write_replace(&path, rendered.as_bytes()))?;
         self.record_from_document(collection, id, path, document)
@@ -371,6 +423,8 @@ impl Database {
             after_document: None,
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: None,
+            source: AuditSource::Cli,
+            message: None,
         })?;
         let parent = path.parent().context("record has no parent directory")?;
         audit.commit(event, &path, || {
@@ -379,6 +433,110 @@ impl Database {
             sync_parent(parent)
         })?;
         self.record_from_document(collection, id, path, document)
+    }
+
+    pub fn status(&self) -> Result<Vec<WorkingChange>> {
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        self.working_changes(&audit)
+    }
+
+    pub fn save(
+        &self,
+        references: &[String],
+        all: bool,
+        message: Option<&str>,
+    ) -> Result<Vec<AuditEntry>> {
+        if all && !references.is_empty() {
+            bail!("--all cannot be combined with record references");
+        }
+        if !all && references.is_empty() {
+            bail!("provide at least one COLLECTION/ID or use --all");
+        }
+        if message.is_some_and(|value| value.trim().is_empty()) {
+            bail!("save message cannot be empty");
+        }
+
+        let selected = references
+            .iter()
+            .map(|reference| parse_reference(reference))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let states = audit.record_states()?;
+        let changes = self.working_changes_from_states(&states)?;
+        let available: BTreeMap<_, _> = changes
+            .into_iter()
+            .map(|change| ((change.collection.clone(), change.id.clone()), change))
+            .collect();
+
+        if !all {
+            for reference in &selected {
+                if !available.contains_key(reference) {
+                    bail!(
+                        "record {}/{} has no unsaved changes",
+                        reference.0,
+                        reference.1
+                    );
+                }
+            }
+        }
+        let selected_changes: Vec<_> = available
+            .into_iter()
+            .filter(|(reference, _)| all || selected.contains(reference))
+            .map(|(_, change)| change)
+            .collect();
+
+        let mut prepared = Vec::with_capacity(selected_changes.len());
+        for change in &selected_changes {
+            let key = (change.collection.clone(), change.id.clone());
+            let prior = states.get(&key);
+            let before = prior
+                .and_then(|state| state.document.as_ref())
+                .map(Document::from_audit_value)
+                .transpose()?;
+            let path = self.root.join(&change.path);
+            let after_raw = match change.status {
+                WorkingChangeKind::Deleted => None,
+                WorkingChangeKind::Added | WorkingChangeKind::Modified => Some(
+                    fs::read_to_string(&path)
+                        .with_context(|| format!("could not read record {}", path.display()))?,
+                ),
+            };
+            let after = after_raw
+                .as_deref()
+                .map(Document::parse)
+                .transpose()
+                .with_context(|| format!("could not parse {}", path.display()))?;
+            if let Some(document) = &after {
+                self.validate(&change.collection, &document.attributes)?;
+            }
+            let action = match change.status {
+                WorkingChangeKind::Added => AuditAction::Create,
+                WorkingChangeKind::Modified => AuditAction::Update,
+                WorkingChangeKind::Deleted => AuditAction::Delete,
+            };
+            prepared.push((change, before, after, after_raw, action));
+        }
+
+        let mut entries = Vec::with_capacity(prepared.len());
+        for (change, before, after, after_raw, action) in prepared {
+            let event = audit.prepare_reconciled(ReconciledMutation {
+                action,
+                collection: &change.collection,
+                id: &change.id,
+                before_document: before.as_ref(),
+                after_document: after.as_ref(),
+                before_hash: change.audited_hash.as_deref(),
+                after_bytes: after_raw.as_deref().map(str::as_bytes),
+                had_history: states.contains_key(&(change.collection.clone(), change.id.clone())),
+                message,
+            })?;
+            entries.push(audit.accept(event, &self.root.join(&change.path))?);
+        }
+        Ok(entries)
     }
 
     pub fn audit_recent(
@@ -438,6 +596,8 @@ impl Database {
                 after_document: Some(&document),
                 before_bytes: None,
                 after_bytes: Some(raw.as_bytes()),
+                source: AuditSource::Cli,
+                message: None,
             })?;
             audit.commit(event, &path, || Ok(()))?;
             added += 1;
@@ -445,6 +605,60 @@ impl Database {
 
         audit.verify(None)?;
         Ok(added)
+    }
+
+    fn working_changes(&self, audit: &AuditLog<'_>) -> Result<Vec<WorkingChange>> {
+        let states = audit.record_states()?;
+        self.working_changes_from_states(&states)
+    }
+
+    fn working_changes_from_states(
+        &self,
+        states: &crate::audit::AuditedRecordStates,
+    ) -> Result<Vec<WorkingChange>> {
+        let mut current = BTreeMap::new();
+        for (collection, id, path) in self.record_files()? {
+            let contents = fs::read(&path)
+                .with_context(|| format!("could not hash record {}", path.display()))?;
+            current.insert((collection, id), (path, record_hash(&contents)));
+        }
+        let references: BTreeSet<_> = states
+            .keys()
+            .cloned()
+            .chain(current.keys().cloned())
+            .collect();
+        let mut changes = Vec::new();
+        for (collection, id) in references {
+            let audited_hash = states
+                .get(&(collection.clone(), id.clone()))
+                .and_then(|state| state.hash.clone());
+            let current_entry = current.get(&(collection.clone(), id.clone()));
+            let current_hash = current_entry.map(|(_, hash)| hash.clone());
+            if audited_hash == current_hash {
+                continue;
+            }
+            let status = match (audited_hash.is_some(), current_hash.is_some()) {
+                (false, true) => WorkingChangeKind::Added,
+                (true, false) => WorkingChangeKind::Deleted,
+                (true, true) => WorkingChangeKind::Modified,
+                (false, false) => continue,
+            };
+            let path = current_entry
+                .map(|(path, _)| path.clone())
+                .unwrap_or(self.record_path(&collection, &id)?)
+                .strip_prefix(&self.root)
+                .context("record path is outside the database")?
+                .to_path_buf();
+            changes.push(WorkingChange {
+                status,
+                collection,
+                id,
+                path,
+                audited_hash,
+                current_hash,
+            });
+        }
+        Ok(changes)
     }
 
     fn record_path(&self, collection: &str, id: &str) -> Result<PathBuf> {
@@ -568,15 +782,74 @@ impl Database {
             &self.actor,
         )
     }
+
+    fn with_default_actor(mut self) -> Self {
+        self.actor = default_actor(&self.root);
+        self
+    }
 }
 
-fn default_actor() -> String {
-    std::env::var("CR_ACTOR")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("USER").ok())
+fn default_actor(root: &Path) -> String {
+    nonempty_environment("CR_ACTOR")
+        .or_else(|| {
+            identity(
+                nonempty_environment("CR_NAME"),
+                nonempty_environment("CR_EMAIL"),
+            )
+        })
+        .or_else(|| {
+            identity(
+                nonempty_environment("GIT_AUTHOR_NAME"),
+                nonempty_environment("GIT_AUTHOR_EMAIL"),
+            )
+        })
+        .or_else(|| git_identity(root))
+        .or_else(|| nonempty_environment("EMAIL"))
+        .or_else(|| nonempty_environment("USER"))
         .or_else(|| std::env::var("USERNAME").ok())
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn nonempty_environment(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn identity(name: Option<String>, email: Option<String>) -> Option<String> {
+    match (name, email) {
+        (Some(name), Some(email)) => Some(format!("{name} <{email}>")),
+        (None, Some(email)) => Some(email),
+        _ => None,
+    }
+}
+
+fn git_identity(root: &Path) -> Option<String> {
+    let read = |key: &str| {
+        Command::new("git")
+            .args(["-C"])
+            .arg(root)
+            .args(["config", "--get", key])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    identity(read("user.name"), read("user.email"))
+}
+
+fn parse_reference(reference: &str) -> Result<(String, String)> {
+    let (collection, id) = reference
+        .split_once('/')
+        .with_context(|| format!("record reference '{reference}' must be COLLECTION/ID"))?;
+    if id.contains('/') {
+        bail!("record reference '{reference}' must contain exactly one '/'");
+    }
+    validate_component(collection, "collection")?;
+    validate_component(id, "id")?;
+    Ok((collection.to_owned(), id.to_owned()))
 }
 
 fn apply_all(attributes: &mut Mapping, assignments: &[Assignment]) -> Result<()> {

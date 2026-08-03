@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::{value::RawValue, Value};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -16,7 +16,8 @@ use crate::{
     frontmatter::Document,
 };
 
-const AUDIT_VERSION: u32 = 1;
+const AUDIT_VERSION: u32 = 2;
+const MIN_AUDIT_VERSION: u32 = 1;
 const EVENT_HASH_DOMAIN: &[u8] = b"cr:audit:event:v1\0";
 const RECORD_HASH_DOMAIN: &[u8] = b"cr:record:v1\0";
 
@@ -55,13 +56,91 @@ impl AuditRecord {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct AuditChange {
-    pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub before: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub after: Option<Value>,
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum AuditChange {
+    Add {
+        path: String,
+        after: Value,
+    },
+    Remove {
+        path: String,
+        before: Value,
+    },
+    Replace {
+        path: String,
+        before: Value,
+        after: Value,
+    },
+}
+
+impl AuditChange {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Add { path, .. } | Self::Remove { path, .. } | Self::Replace { path, .. } => path,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AuditChange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut fields = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        let path = take_string::<D::Error>(&mut fields, "path")?;
+        let operation = fields.remove("operation");
+        let change = match operation {
+            Some(Value::String(operation)) if operation == "add" => Self::Add {
+                path,
+                after: take_value::<D::Error>(&mut fields, "after")?,
+            },
+            Some(Value::String(operation)) if operation == "remove" => Self::Remove {
+                path,
+                before: take_value::<D::Error>(&mut fields, "before")?,
+            },
+            Some(Value::String(operation)) if operation == "replace" => Self::Replace {
+                path,
+                before: take_value::<D::Error>(&mut fields, "before")?,
+                after: take_value::<D::Error>(&mut fields, "after")?,
+            },
+            Some(Value::String(operation)) => {
+                return Err(D::Error::custom(format!(
+                    "unsupported audit change operation '{operation}'"
+                )))
+            }
+            Some(_) => return Err(D::Error::custom("audit change operation must be a string")),
+            None => match (fields.remove("before"), fields.remove("after")) {
+                (None, Some(after)) => Self::Add { path, after },
+                (Some(before), None) => Self::Remove { path, before },
+                (Some(before), Some(after)) => Self::Replace {
+                    path,
+                    before,
+                    after,
+                },
+                (None, None) => {
+                    return Err(D::Error::custom(
+                        "legacy audit change must contain before or after",
+                    ))
+                }
+            },
+        };
+        if !fields.is_empty() {
+            return Err(D::Error::custom(format!(
+                "unknown audit change fields: {}",
+                fields.keys().cloned().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        Ok(change)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditSource {
+    #[default]
+    Cli,
+    Filesystem,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -70,6 +149,10 @@ pub struct AuditPayload {
     pub sequence: u64,
     pub timestamp: String,
     pub actor: String,
+    #[serde(default)]
+    pub source: AuditSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     pub action: AuditAction,
     pub record: AuditRecord,
     pub changes: Vec<AuditChange>,
@@ -145,7 +228,42 @@ pub(crate) struct AuditMutation<'a> {
     pub after_document: Option<&'a Document>,
     pub before_bytes: Option<&'a [u8]>,
     pub after_bytes: Option<&'a [u8]>,
+    pub source: AuditSource,
+    pub message: Option<&'a str>,
 }
+
+pub(crate) struct ReconciledMutation<'a> {
+    pub action: AuditAction,
+    pub collection: &'a str,
+    pub id: &'a str,
+    pub before_document: Option<&'a Document>,
+    pub after_document: Option<&'a Document>,
+    pub before_hash: Option<&'a str>,
+    pub after_bytes: Option<&'a [u8]>,
+    pub had_history: bool,
+    pub message: Option<&'a str>,
+}
+
+struct PayloadMutation<'a> {
+    action: AuditAction,
+    collection: &'a str,
+    id: &'a str,
+    before_document: Option<&'a Document>,
+    after_document: Option<&'a Document>,
+    before_hash: Option<String>,
+    after_hash: Option<String>,
+    chain: ChainState,
+    source: AuditSource,
+    message: Option<&'a str>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AuditedRecordState {
+    pub hash: Option<String>,
+    pub document: Option<Value>,
+}
+
+pub(crate) type AuditedRecordStates = HashMap<(String, String), AuditedRecordState>;
 
 impl<'a> AuditLog<'a> {
     pub fn new(
@@ -214,8 +332,48 @@ impl<'a> AuditLog<'a> {
             }
         }
 
-        let sequence = chain.entries + 1;
-        let previous_hash = chain.head_hash;
+        self.prepare_payload(PayloadMutation {
+            action: mutation.action,
+            collection: mutation.collection,
+            id: mutation.id,
+            before_document: mutation.before_document,
+            after_document: mutation.after_document,
+            before_hash,
+            after_hash: mutation.after_bytes.map(record_hash),
+            chain,
+            source: mutation.source,
+            message: mutation.message,
+        })
+    }
+
+    pub fn prepare_reconciled(&self, mutation: ReconciledMutation<'_>) -> Result<PreparedEntry> {
+        let (audited_state, chain) = self.record_state(mutation.collection, mutation.id)?;
+        let before_hash = mutation.before_hash.map(str::to_owned);
+        let expected_state = mutation.had_history.then_some(before_hash.clone());
+        if audited_state != expected_state {
+            bail!(
+                "record {}/{} changed since status was calculated",
+                mutation.collection,
+                mutation.id
+            );
+        }
+        self.prepare_payload(PayloadMutation {
+            action: mutation.action,
+            collection: mutation.collection,
+            id: mutation.id,
+            before_document: mutation.before_document,
+            after_document: mutation.after_document,
+            before_hash,
+            after_hash: mutation.after_bytes.map(record_hash),
+            chain,
+            source: AuditSource::Filesystem,
+            message: mutation.message,
+        })
+    }
+
+    fn prepare_payload(&self, mutation: PayloadMutation<'_>) -> Result<PreparedEntry> {
+        let sequence = mutation.chain.entries + 1;
+        let previous_hash = mutation.chain.head_hash;
         let before = mutation.before_document.map(document_value).transpose()?;
         let after = mutation.after_document.map(document_value).transpose()?;
         let payload = AuditPayload {
@@ -225,14 +383,16 @@ impl<'a> AuditLog<'a> {
                 .format(&Rfc3339)
                 .context("could not format audit timestamp")?,
             actor: self.actor.to_owned(),
+            source: mutation.source,
+            message: mutation.message.map(str::to_owned),
             action: mutation.action,
             record: AuditRecord {
                 collection: mutation.collection.to_owned(),
                 id: mutation.id.to_owned(),
             },
             changes: diff_documents(before.as_ref(), after.as_ref()),
-            before_hash,
-            after_hash: mutation.after_bytes.map(record_hash),
+            before_hash: mutation.before_hash,
+            after_hash: mutation.after_hash,
             previous_hash,
         };
         let serialized =
@@ -307,6 +467,35 @@ impl<'a> AuditLog<'a> {
         bail!(
             "record mutation completed without producing the audited state; pending recovery was retained"
         )
+    }
+
+    pub fn accept(&self, entry: PreparedEntry, target: &Path) -> Result<AuditEntry> {
+        let target = target
+            .strip_prefix(self.root)
+            .context("audit target is outside the database")?
+            .to_path_buf();
+        validate_relative_target(&target)?;
+        let expected_target = self
+            .records_dir
+            .join(&entry.parsed.record.collection)
+            .join(format!("{}.md", entry.parsed.record.id));
+        if target != expected_target {
+            bail!("audit target does not match its record identity");
+        }
+        let current_hash = file_hash_optional(&self.root.join(target))?;
+        if current_hash != entry.parsed.after_hash {
+            bail!(
+                "record {}/{} changed while it was being saved",
+                entry.parsed.record.collection,
+                entry.parsed.record.id
+            );
+        }
+        let result = AuditEntry {
+            hash: entry.hash.clone(),
+            payload: entry.parsed.clone(),
+        };
+        self.append(&entry)?;
+        Ok(result)
     }
 
     pub fn recover_pending(&self) -> Result<()> {
@@ -413,17 +602,7 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn verify(&self, expected_head: Option<&str>) -> Result<AuditVerification> {
-        let mut latest: HashMap<(String, String), Option<String>> = HashMap::new();
-        let state = self.verify_chain(|entry| {
-            latest.insert(
-                (
-                    entry.payload.record.collection.clone(),
-                    entry.payload.record.id.clone(),
-                ),
-                entry.payload.after_hash.clone(),
-            );
-            Ok(())
-        })?;
+        let (latest, state) = self.states()?;
 
         if let Some(expected) = expected_head {
             if state.head_hash.as_deref() != Some(expected) {
@@ -434,7 +613,11 @@ impl<'a> AuditLog<'a> {
             }
         }
 
-        self.verify_records(&latest)?;
+        let latest_hashes = latest
+            .iter()
+            .map(|(record, state)| (record.clone(), state.hash.clone()))
+            .collect();
+        self.verify_records(&latest_hashes)?;
         Ok(AuditVerification {
             entries: state.entries,
             records_checked: latest.len(),
@@ -443,6 +626,57 @@ impl<'a> AuditLog<'a> {
                 hash: state.head_hash,
             },
         })
+    }
+
+    pub fn record_states(&self) -> Result<AuditedRecordStates> {
+        self.states().map(|(states, _)| states)
+    }
+
+    fn states(&self) -> Result<(AuditedRecordStates, ChainState)> {
+        let mut latest = AuditedRecordStates::new();
+        let chain = self.verify_chain(|entry| {
+            let key = (
+                entry.payload.record.collection.clone(),
+                entry.payload.record.id.clone(),
+            );
+            let had_history = latest.contains_key(&key);
+            let state = latest.entry(key).or_insert_with(|| AuditedRecordState {
+                hash: None,
+                document: None,
+            });
+            if state.hash != entry.payload.before_hash {
+                bail!(
+                    "audit record-state chain is broken at sequence {}",
+                    entry.payload.sequence
+                );
+            }
+            if !had_history
+                && !matches!(
+                    entry.payload.action,
+                    AuditAction::Create | AuditAction::Baseline
+                )
+            {
+                bail!(
+                    "audit record history begins with an invalid action at sequence {}",
+                    entry.payload.sequence
+                );
+            }
+            apply_changes(&mut state.document, &entry.payload.changes).with_context(|| {
+                format!(
+                    "audit changes are inconsistent at sequence {}",
+                    entry.payload.sequence
+                )
+            })?;
+            if state.document.is_some() != entry.payload.after_hash.is_some() {
+                bail!(
+                    "audit record state is inconsistent at sequence {}",
+                    entry.payload.sequence
+                );
+            }
+            state.hash = entry.payload.after_hash.clone();
+            Ok(())
+        })?;
+        Ok((latest, chain))
     }
 
     fn append(&self, entry: &PreparedEntry) -> Result<()> {
@@ -723,7 +957,7 @@ fn parse_line(line: &[u8]) -> Result<StoredEntry> {
         bail!("audit event hash mismatch");
     }
     let parsed: AuditPayload = serde_json::from_str(&payload)?;
-    if parsed.version != AUDIT_VERSION {
+    if !(MIN_AUDIT_VERSION..=AUDIT_VERSION).contains(&parsed.version) {
         bail!("unsupported audit event version {}", parsed.version);
     }
     Ok(StoredEntry {
@@ -733,6 +967,32 @@ fn parse_line(line: &[u8]) -> Result<StoredEntry> {
         },
         payload,
     })
+}
+
+fn take_string<E: serde::de::Error>(
+    fields: &mut serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<String, E> {
+    match fields.remove(field) {
+        Some(Value::String(value)) => Ok(value),
+        Some(_) => Err(E::custom(format!(
+            "audit change '{field}' must be a string"
+        ))),
+        None => Err(E::missing_field(if field == "path" {
+            "path"
+        } else {
+            "operation"
+        })),
+    }
+}
+
+fn take_value<E: serde::de::Error>(
+    fields: &mut serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Value, E> {
+    fields
+        .remove(field)
+        .ok_or_else(|| E::custom(format!("audit change is missing '{field}'")))
 }
 
 fn verify_entries(
@@ -788,15 +1048,13 @@ fn document_value(document: &Document) -> Result<Value> {
 
 fn diff_documents(before: Option<&Value>, after: Option<&Value>) -> Vec<AuditChange> {
     match (before, after) {
-        (None, Some(after)) => vec![AuditChange {
+        (None, Some(after)) => vec![AuditChange::Add {
             path: String::new(),
-            before: None,
-            after: Some(after.clone()),
+            after: after.clone(),
         }],
-        (Some(before), None) => vec![AuditChange {
+        (Some(before), None) => vec![AuditChange::Remove {
             path: String::new(),
-            before: Some(before.clone()),
-            after: None,
+            before: before.clone(),
         }],
         (Some(before), Some(after)) => {
             let mut changes = Vec::new();
@@ -817,15 +1075,13 @@ fn diff_value(path: &str, before: &Value, after: &Value, changes: &mut Vec<Audit
             let child_path = format!("{path}/{}", escape_pointer(&key));
             match (before.get(&key), after.get(&key)) {
                 (Some(before), Some(after)) => diff_value(&child_path, before, after, changes),
-                (Some(before), None) => changes.push(AuditChange {
+                (Some(before), None) => changes.push(AuditChange::Remove {
                     path: child_path,
-                    before: Some(before.clone()),
-                    after: None,
+                    before: before.clone(),
                 }),
-                (None, Some(after)) => changes.push(AuditChange {
+                (None, Some(after)) => changes.push(AuditChange::Add {
                     path: child_path,
-                    before: None,
-                    after: Some(after.clone()),
+                    after: after.clone(),
                 }),
                 (None, None) => unreachable!(),
             }
@@ -833,10 +1089,10 @@ fn diff_value(path: &str, before: &Value, after: &Value, changes: &mut Vec<Audit
         return;
     }
 
-    changes.push(AuditChange {
+    changes.push(AuditChange::Replace {
         path: path.to_owned(),
-        before: Some(before.clone()),
-        after: Some(after.clone()),
+        before: before.clone(),
+        after: after.clone(),
     });
 }
 
@@ -844,11 +1100,108 @@ fn escape_pointer(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
 
+fn apply_changes(state: &mut Option<Value>, changes: &[AuditChange]) -> Result<()> {
+    for change in changes {
+        apply_change(state, change)?;
+    }
+    Ok(())
+}
+
+fn apply_change(state: &mut Option<Value>, change: &AuditChange) -> Result<()> {
+    if change.path().is_empty() {
+        match change {
+            AuditChange::Add { after, .. } => {
+                if state.is_some() {
+                    bail!("cannot add a root record that already exists");
+                }
+                *state = Some(after.clone());
+            }
+            AuditChange::Remove { before, .. } => {
+                if state.as_ref() != Some(before) {
+                    bail!("root record does not match the removed value");
+                }
+                *state = None;
+            }
+            AuditChange::Replace { before, after, .. } => {
+                if state.as_ref() != Some(before) {
+                    bail!("root record does not match the replaced value");
+                }
+                *state = Some(after.clone());
+            }
+        }
+        return Ok(());
+    }
+
+    let segments = parse_pointer(change.path())?;
+    let (key, parents) = segments
+        .split_last()
+        .context("audit change path has no field")?;
+    let mut parent = state
+        .as_mut()
+        .context("cannot apply a field change to a deleted record")?;
+    for segment in parents {
+        parent = parent
+            .as_object_mut()
+            .with_context(|| format!("audit change parent is not an object at '{segment}'"))?
+            .get_mut(segment)
+            .with_context(|| format!("audit change parent field '{segment}' does not exist"))?;
+    }
+    let object = parent
+        .as_object_mut()
+        .context("audit change target parent is not an object")?;
+    match change {
+        AuditChange::Add { after, .. } => {
+            if object.contains_key(key) {
+                bail!("audit change cannot add existing field '{key}'");
+            }
+            object.insert(key.clone(), after.clone());
+        }
+        AuditChange::Remove { before, .. } => {
+            if object.get(key) != Some(before) {
+                bail!("audit change removed field '{key}' from an unexpected value");
+            }
+            object.remove(key);
+        }
+        AuditChange::Replace { before, after, .. } => {
+            if object.get(key) != Some(before) {
+                bail!("audit change replaced field '{key}' from an unexpected value");
+            }
+            object.insert(key.clone(), after.clone());
+        }
+    }
+    Ok(())
+}
+
+fn parse_pointer(path: &str) -> Result<Vec<String>> {
+    let path = path
+        .strip_prefix('/')
+        .context("audit change path must be empty or begin with '/'")?;
+    path.split('/').map(unescape_pointer).collect()
+}
+
+fn unescape_pointer(value: &str) -> Result<String> {
+    let mut result = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '~' {
+            result.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('0') => result.push('~'),
+            Some('1') => result.push('/'),
+            Some(other) => bail!("invalid JSON Pointer escape '~{other}'"),
+            None => bail!("incomplete JSON Pointer escape"),
+        }
+    }
+    Ok(result)
+}
+
 fn event_hash(payload: &[u8]) -> String {
     digest(EVENT_HASH_DOMAIN, payload)
 }
 
-fn record_hash(contents: &[u8]) -> String {
+pub(crate) fn record_hash(contents: &[u8]) -> String {
     digest(RECORD_HASH_DOMAIN, contents)
 }
 
@@ -879,11 +1232,12 @@ fn file_hash_optional(path: &Path) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        diff_documents, event_hash, AuditAction, AuditLog, AuditMutation, PendingMutation,
-        PreparedEntry,
+        apply_changes, diff_documents, event_hash, parse_line, record_hash, stored_line,
+        AuditAction, AuditChange, AuditLog, AuditMutation, AuditSource, PendingMutation,
+        PreparedEntry, ReconciledMutation,
     };
     use crate::{database::write_new, frontmatter::Document};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
     use yaml_serde::Mapping;
 
@@ -906,9 +1260,9 @@ mod tests {
         });
         let changes = diff_documents(Some(&before), Some(&after));
         assert_eq!(changes.len(), 3);
-        assert_eq!(changes[0].path, "/attributes/owner");
-        assert_eq!(changes[1].path, "/attributes/score");
-        assert_eq!(changes[2].path, "/attributes/stage");
+        assert_eq!(changes[0].path(), "/attributes/owner");
+        assert_eq!(changes[1].path(), "/attributes/score");
+        assert_eq!(changes[2].path(), "/attributes/stage");
     }
 
     #[test]
@@ -916,13 +1270,134 @@ mod tests {
         let document = json!({"attributes": {"name": "Jane"}, "body": "Notes"});
         let created = diff_documents(None, Some(&document));
         assert_eq!(created.len(), 1);
-        assert!(created[0].before.is_none());
-        assert_eq!(created[0].after.as_ref(), Some(&document));
+        assert_eq!(
+            created[0],
+            AuditChange::Add {
+                path: String::new(),
+                after: document.clone()
+            }
+        );
 
         let deleted = diff_documents(Some(&document), None);
         assert_eq!(deleted.len(), 1);
-        assert_eq!(deleted[0].before.as_ref(), Some(&document));
-        assert!(deleted[0].after.is_none());
+        assert_eq!(
+            deleted[0],
+            AuditChange::Remove {
+                path: String::new(),
+                before: document
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_changes_preserve_present_null_values_and_replay() {
+        let legacy: AuditChange =
+            serde_json::from_str(r#"{"path":"/attributes/value","before":"ready","after":null}"#)
+                .unwrap();
+        assert_eq!(
+            legacy,
+            AuditChange::Replace {
+                path: "/attributes/value".to_owned(),
+                before: json!("ready"),
+                after: Value::Null,
+            }
+        );
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(encoded["operation"], "replace");
+        assert!(encoded.get("after").unwrap().is_null());
+
+        let mut state = Some(json!({"attributes": {"value": "ready"}, "body": ""}));
+        apply_changes(&mut state, &[legacy]).unwrap();
+        assert!(state.unwrap()["attributes"]["value"].is_null());
+    }
+
+    #[test]
+    fn replay_rejects_changes_that_do_not_match_the_prior_state() {
+        let mut state = Some(json!({"attributes": {"stage": "screening"}, "body": ""}));
+        let error = apply_changes(
+            &mut state,
+            &[AuditChange::Replace {
+                path: "/attributes/stage".to_owned(),
+                before: json!("offer"),
+                after: json!("hired"),
+            }],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unexpected value"));
+    }
+
+    #[test]
+    fn version_one_payloads_remain_readable_with_cli_source() {
+        let payload = r#"{"version":1,"sequence":1,"timestamp":"2026-01-01T00:00:00Z","actor":"legacy@example.com","action":"create","record":{"collection":"items","id":"one"},"changes":[{"path":"","after":{"attributes":{"value":null},"body":""}}],"before_hash":null,"after_hash":"sha256:legacy","previous_hash":null}"#;
+        let line = stored_line(&event_hash(payload.as_bytes()), payload).unwrap();
+        let stored = parse_line(line.trim_end().as_bytes()).unwrap();
+        assert_eq!(stored.entry.payload.version, 1);
+        assert_eq!(stored.entry.payload.source, AuditSource::Cli);
+        assert!(stored.entry.payload.message.is_none());
+        assert_eq!(
+            stored.entry.payload.changes[0],
+            AuditChange::Add {
+                path: String::new(),
+                after: json!({"attributes": {"value": null}, "body": ""})
+            }
+        );
+    }
+
+    #[test]
+    fn accepting_a_direct_edit_rechecks_the_current_file_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(root.path(), Path::new("records"), 10, 1024 * 1024, "tester");
+        let _lock = audit.lock().unwrap();
+        let original = Document {
+            attributes: Mapping::new(),
+            body: "Original\n".to_owned(),
+        };
+        let original_raw = original.render().unwrap();
+        let target = root.path().join("records/items/one.md");
+        let created = audit
+            .prepare(AuditMutation {
+                action: AuditAction::Create,
+                collection: "items",
+                id: "one",
+                before_document: None,
+                after_document: Some(&original),
+                before_bytes: None,
+                after_bytes: Some(original_raw.as_bytes()),
+                source: AuditSource::Cli,
+                message: None,
+            })
+            .unwrap();
+        audit
+            .commit(created, &target, || {
+                write_new(&target, original_raw.as_bytes())
+            })
+            .unwrap();
+
+        let accepted = Document {
+            attributes: Mapping::new(),
+            body: "Accepted\n".to_owned(),
+        };
+        let accepted_raw = accepted.render().unwrap();
+        std::fs::write(&target, &accepted_raw).unwrap();
+        let event = audit
+            .prepare_reconciled(ReconciledMutation {
+                action: AuditAction::Update,
+                collection: "items",
+                id: "one",
+                before_document: Some(&original),
+                after_document: Some(&accepted),
+                before_hash: Some(&record_hash(original_raw.as_bytes())),
+                after_bytes: Some(accepted_raw.as_bytes()),
+                had_history: true,
+                message: None,
+            })
+            .unwrap();
+        std::fs::write(&target, "---\n---\nChanged again\n").unwrap();
+        let error = audit.accept(event, &target).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed while it was being saved"));
+        assert_eq!(audit.head().unwrap().sequence, 1);
     }
 
     #[test]
@@ -952,6 +1427,8 @@ mod tests {
                 after_document: Some(&document),
                 before_bytes: None,
                 after_bytes: Some(rendered.as_bytes()),
+                source: AuditSource::Cli,
+                message: None,
             })
             .unwrap();
         store_pending(&committed, &entry, PathBuf::from("records/items/one.md"));
@@ -981,6 +1458,8 @@ mod tests {
                 after_document: Some(&document),
                 before_bytes: None,
                 after_bytes: Some(rendered.as_bytes()),
+                source: AuditSource::Cli,
+                message: None,
             })
             .unwrap();
         store_pending(&aborted, &entry, PathBuf::from("records/items/one.md"));
