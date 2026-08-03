@@ -514,6 +514,12 @@ async fn openapi_authentication_and_http_errors_are_structured() {
     let openapi = openapi.json();
     assert_eq!(openapi["openapi"], "3.1.1");
     assert_local_schema_references_resolve(&openapi, &openapi);
+    assert!(
+        openapi["components"]["schemas"]["AuditEntry"]["properties"]["source"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("sync"))
+    );
     assert_eq!(openapi["security"][0]["bearerAuth"], json!([]));
     assert!(openapi["paths"]
         .get("/api/v1/collections/{collection}/records")

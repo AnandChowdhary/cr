@@ -63,6 +63,7 @@ pub struct Database {
     config: Config,
     actor: String,
     source: AuditSource,
+    audit_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -143,6 +144,11 @@ impl Database {
         fs::create_dir_all(root.join(".cr/schemas"))
             .context("could not create schema directory")?;
         fs::create_dir_all(root.join(".cr/views")).context("could not create view directory")?;
+        fs::create_dir_all(root.join(".cr/syncs")).context("could not create sync directory")?;
+        fs::create_dir_all(root.join(".cr/sync/state"))
+            .context("could not create sync state directory")?;
+        fs::create_dir_all(root.join(".cr/sync/locks"))
+            .context("could not create sync lock directory")?;
         fs::create_dir_all(root.join("records")).context("could not create records directory")?;
 
         let config = Config::default();
@@ -154,6 +160,7 @@ impl Database {
             config,
             actor: String::new(),
             source: AuditSource::Cli,
+            audit_message: None,
         };
         let database = database.with_default_actor();
         database.audit().ensure_layout()?;
@@ -202,6 +209,7 @@ impl Database {
             config,
             actor: String::new(),
             source: AuditSource::Cli,
+            audit_message: None,
         };
         let database = database.with_default_actor();
         let audit = database.audit();
@@ -230,6 +238,15 @@ impl Database {
     pub fn with_source(mut self, source: AuditSource) -> Self {
         self.source = source;
         self
+    }
+
+    pub fn with_audit_message(mut self, message: impl Into<String>) -> Result<Self> {
+        let message = message.into();
+        if message.trim().is_empty() {
+            bail!("audit message cannot be empty");
+        }
+        self.audit_message = Some(message);
+        Ok(self)
     }
 
     pub fn create(
@@ -273,7 +290,7 @@ impl Database {
             before_bytes: None,
             after_bytes: Some(rendered.as_bytes()),
             source: self.source.clone(),
-            message: None,
+            message: self.audit_message.as_deref(),
         })?;
         audit.commit(event, &path, || write_new(&path, rendered.as_bytes()))?;
         self.record_from_document(collection, id, path, document)
@@ -283,6 +300,17 @@ impl Database {
         let path = self.record_path(collection, id)?;
         let document = self.read_document(&path)?;
         self.record_from_document(collection, id, path, document)
+    }
+
+    pub fn get_optional(&self, collection: &str, id: &str) -> Result<Option<Record>> {
+        let path = self.record_path(collection, id)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => self.get(collection, id).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("could not inspect record {collection}/{id}"))
+            }
+        }
     }
 
     pub fn read_raw(&self, collection: &str, id: &str) -> Result<String> {
@@ -427,6 +455,11 @@ impl Database {
             .collect())
     }
 
+    pub fn validate_record_attributes(&self, collection: &str, attributes: &Mapping) -> Result<()> {
+        validate_component(collection, "collection")?;
+        self.validate(collection, attributes)
+    }
+
     pub fn update(
         &self,
         collection: &str,
@@ -516,7 +549,7 @@ impl Database {
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: Some(rendered.as_bytes()),
             source: self.source.clone(),
-            message: None,
+            message: self.audit_message.as_deref(),
         })?;
         audit.commit(event, &path, || write_replace(&path, rendered.as_bytes()))?;
         self.record_from_document(collection, id, path, document)
@@ -567,7 +600,7 @@ impl Database {
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: Some(rendered.as_bytes()),
             source: self.source.clone(),
-            message: None,
+            message: self.audit_message.as_deref(),
         })?;
         audit.commit(event, &path, || write_replace(&path, rendered.as_bytes()))?;
         self.record_from_document(collection, id, path, document)
@@ -590,7 +623,7 @@ impl Database {
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: None,
             source: self.source.clone(),
-            message: None,
+            message: self.audit_message.as_deref(),
         })?;
         let parent = path.parent().context("record has no parent directory")?;
         audit.commit(event, &path, || {
@@ -761,7 +794,7 @@ impl Database {
                 before_bytes: None,
                 after_bytes: Some(raw.as_bytes()),
                 source: self.source.clone(),
-                message: None,
+                message: self.audit_message.as_deref(),
             })?;
             audit.commit(event, &path, || Ok(()))?;
             added += 1;

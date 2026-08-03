@@ -13,6 +13,7 @@ Current capabilities include:
 - typed structured filtering and dotted field paths;
 - literal, case-insensitive, field-scoped, and regular-expression search;
 - direct Markdown editing with reviewed audit reconciliation;
+- scheduled, checkpointed external sync adapters with audited upserts and deletes;
 - optional JSON Schema validation;
 - saved and automatic server-rendered HTML views with audited forms;
 - a REST API with pagination, authentication, and live OpenAPI 3.1 generation.
@@ -51,13 +52,18 @@ my-database/
 ├── .cr/
 │   ├── config.yaml
 │   ├── audit/
-│   └── schemas/
+│   ├── schemas/
+│   ├── sync/
+│   ├── syncs/
+│   └── views/
 └── records/
 ```
 
 - `records/` contains your Markdown records.
 - `.cr/audit/` contains the audit journal.
 - `.cr/schemas/` can contain optional validation rules.
+- `.cr/syncs/` contains versioned external sync definitions; `.cr/sync/` holds their checkpoints and locks.
+- `.cr/views/` contains optional saved web views.
 - `.cr/config.yaml` contains database settings.
 
 Commands search the current directory and its parents for a database. If you are elsewhere, pass its path explicitly:
@@ -451,11 +457,11 @@ cr save candidates/alex-smith --message 'Reviewed' --json
 
 `save` parses and schema-validates every selected file before recording any event. Formatting-only changes are recorded because the exact file bytes changed, even when the fields and body have the same meaning.
 
-Do not run `cr save --all` automatically from a watcher or scheduled task. An explicit save is the point where you acknowledge that the filesystem changes are legitimate rather than tampering.
+Do not run `cr save --all` automatically from a watcher or scheduled task. An explicit save is the point where you acknowledge that filesystem changes are legitimate rather than tampering. For unattended imports, use the validated `cr sync` protocol below instead of writing records and auto-accepting them.
 
 ## Audit history
 
-Every successful `create`, `update`, `link`, `delete`, and direct `save` writes an attributed event.
+Every successful `create`, `update`, `link`, `delete`, direct `save`, and changed sync upsert/delete writes an attributed event.
 
 Show recent events for the entire database:
 
@@ -524,7 +530,132 @@ For example, `.cr/schemas/applications.json` can restrict ATS stages:
 }
 ```
 
-Schemas validate front matter. The record ID, collection, path, and Markdown body remain separate. Creates, updates, links, and direct `save` operations validate before extending the audit journal.
+Schemas validate front matter. The record ID, collection, path, and Markdown body remain separate. Creates, updates, links, direct `save` operations, and sync upserts validate before extending the audit journal.
+
+## Import data with sync adapters
+
+A sync adapter is an ordinary executable: a shell script, Python program, compiled Rust binary, or any other local command. It fetches or computes data and writes one JSON object per line to stdout. `cr` owns the database writes, schema validation, audit events, checkpoints, limits, and overlap protection.
+
+This subprocess boundary is intentionally simpler than an in-process Rust plugin ABI. Adapters can use any language or SDK, fail without crashing `cr`, and evolve independently. They are still trusted local programs: they inherit your environment and can access the filesystem, network, and external services with your operating-system permissions.
+
+### A Notion meeting-notes adapter
+
+For example, save this as `scripts/notion_page.py` inside the database. It uses Notion's Markdown endpoint, which can return a meeting page and optionally its transcript directly as Markdown:
+
+```python
+#!/usr/bin/env python3
+import json
+import os
+import urllib.parse
+import urllib.request
+
+page_id = os.environ["NOTION_PAGE_ID"]
+url = "https://api.notion.com/v1/pages/" + urllib.parse.quote(page_id) + "/markdown?include_transcript=true"
+request = urllib.request.Request(url, headers={
+    "Authorization": "Bearer " + os.environ["NOTION_API_KEY"],
+    "Notion-Version": "2026-03-11",
+})
+
+with urllib.request.urlopen(request) as response:
+    page = json.load(response)
+
+if page["truncated"] or page["unknown_block_ids"]:
+    raise RuntimeError("Notion returned incomplete page content")
+
+print(json.dumps({
+    "type": "upsert",
+    "collection": "meeting_notes",
+    "id": page["id"],
+    "front_matter": {
+        "source": "notion",
+        "notion_page_id": page["id"],
+    },
+    "markdown": page["markdown"],
+}))
+print(json.dumps({
+    "type": "checkpoint",
+    "state": {"last_page_id": page["id"]},
+}))
+```
+
+Keep credentials out of the sync definition. Export them in your shell, inject them through your scheduler or secret manager, and then register the command:
+
+```sh
+export NOTION_API_KEY='secret_...'
+export NOTION_PAGE_ID='00000000-0000-0000-0000-000000000000'
+
+cr sync create notion-meeting \
+  --actor 'notion-sync@example.com' \
+  --timeout-seconds 120 \
+  -- python3 scripts/notion_page.py
+
+cr sync show notion-meeting
+cr sync run notion-meeting --json
+cr sync state notion-meeting
+```
+
+No `cr save` follows a successful run. The upsert is already schema-validated and recorded with `source: sync`, the configured actor, and a message containing the sync name and unique run ID. An identical second run reports the record as unchanged and creates no duplicate audit event.
+
+For Gmail, use the same shape: list message IDs, fetch each message with `users.messages.get`, decode the MIME content, and emit one `upsert` per stable Gmail message ID. A final checkpoint can store the last Gmail `historyId` for the next incremental run. An importer should only emit `delete` when it has an explicit source-side deletion signal; absence from one paginated response is not proof of deletion.
+
+### JSON Lines protocol
+
+Stdout is reserved for protocol messages. Send diagnostics and progress to stderr. Blank stdout lines are ignored. The version 1 messages are:
+
+```json
+{"type":"upsert","collection":"emails","id":"message-123","front_matter":{"from":"ada@example.com","labels":["inbox"]},"markdown":"Message body\n"}
+{"type":"delete","collection":"emails","id":"message-456"}
+{"type":"checkpoint","state":{"history_id":"98765"}}
+```
+
+- `upsert` creates the record or completely replaces its front matter and Markdown. It is unchanged when the parsed front matter and exact Markdown body already match.
+- `delete` is idempotent: deleting a missing record counts as unchanged.
+- `checkpoint` is optional, must be the final message, and is stored only after all preceding record operations succeed.
+- A run cannot target the same `collection/id` twice. Every message and every upsert schema is preflighted before the first mutation.
+- Output defaults to 16 MiB and 10,000 messages; the command defaults to a 300-second timeout. `sync create` can lower or raise these within the built-in safety bounds.
+
+The adapter runs from the database root with stdin closed and receives:
+
+```text
+CR_DATABASE_ROOT
+CR_SYNC_NAME
+CR_SYNC_RUN_ID
+CR_SYNC_PROTOCOL=cr-jsonl-v1
+CR_SYNC_STATE_PATH
+CR_SYNC_HAS_STATE=true|false
+```
+
+`CR_SYNC_STATE_PATH` is a read-only-by-convention temporary snapshot containing the previous JSON checkpoint or `null`. Read it to choose an incremental cursor, then emit the next checkpoint; do not modify `.cr/sync/state` yourself.
+
+The command is stored as a program plus an exact argument array, not as a shell command string. Shell expansion, pipes, and redirects only happen when you explicitly register a shell such as `sh scripts/import.sh`. Relative executables containing a path separator are resolved from the database root, and other relative arguments are interpreted from that root.
+
+### Failure, direct writes, and external effects
+
+The database must pass `audit verify` before an adapter starts and again after it exits. A timeout, nonzero exit, invalid JSON, output-limit violation, duplicate target, schema error, or dirty database prevents all emitted operations and checkpoint changes. Only one run of a named sync can execute at once.
+
+Do not have an unattended adapter write `records/` directly. If it does, the second verification rejects its protocol output and leaves the direct file edit visible in `cr status`; a person can review it with the normal selective `cr save` flow. This is what keeps sync automation from silently accepting unrelated manual edits or tampering.
+
+Record operations are preflighted together but currently committed as sequential audited single-record mutations, not one all-or-nothing multi-record transaction. A rare durable-write failure midway through application can therefore leave earlier operations committed and the checkpoint unchanged. Retry-safe upserts and deletes make recovery straightforward, but adapters should not assume transactionality.
+
+An adapter may also perform external effects, such as creating a calendar event or sending a message. `cr` cannot roll those effects back if a later record operation fails. Use the remote service's idempotency keys, design the adapter to retry safely, and emit the checkpoint only for work that can be resumed.
+
+### Run on a schedule
+
+`cr` deliberately does not keep a background daemon running. Use the platform scheduler you already operate—cron, a systemd timer, macOS `launchd`, a container scheduler, or CI—to run:
+
+```sh
+cd /absolute/path/to/my-database
+/absolute/path/to/cr sync run notion-meeting
+```
+
+Schedulers often start with a small environment and a different working directory. Use absolute paths and inject credentials through the scheduler's protected environment or a secret manager, never into `.cr/syncs/*.yaml`. Capture stdout/stderr in your normal job logs and alert on the nonzero exit status.
+
+List configured adapters at any time:
+
+```sh
+cr sync list
+cr sync list --json
+```
 
 ## Serve the database over HTTP
 
@@ -832,6 +963,12 @@ cr link SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
 cr delete COLLECTION ID --yes
 cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N]
 
+cr sync create NAME [--actor IDENTITY] [--timeout-seconds N] -- COMMAND...
+cr sync list [--json]
+cr sync show NAME [--json]
+cr sync run NAME [--json]
+cr sync state NAME
+
 cr status [--json]
 cr save COLLECTION/ID... [--message TEXT] [--json]
 cr save --all [--message TEXT] [--json]
@@ -878,9 +1015,20 @@ For a newly added Markdown record, prefer `cr status` followed by a selective `c
 
 The file or proposed CLI update does not satisfy `.cr/schemas/<collection>.json`. Fix the fields and retry. Failed validation does not append an audit event.
 
+### A sync fails after changing files directly
+
+The adapter bypassed the JSONL protocol or another process edited a record during its run. Inspect the changes before doing anything else:
+
+```sh
+cr status
+cr save collection/id --message 'Reviewed direct adapter change'
+```
+
+Prefer changing the adapter to emit `upsert` or `delete` messages so future runs are validated and audited automatically.
+
 ## Backups and sensitive data
 
-Back up the whole database directory, not only `records/`. The `.cr/audit/` directory is necessary to verify history and reconcile direct edits.
+Back up the whole database directory, not only `records/`. The `.cr/audit/` directory is necessary to verify history and reconcile direct edits, while `.cr/syncs/` and `.cr/sync/state/` are needed to resume configured incremental imports.
 
 CRM and ATS records often contain personal or confidential information. Apply appropriate filesystem permissions, disk encryption, backup retention, and access controls.
 

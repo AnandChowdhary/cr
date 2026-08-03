@@ -1146,7 +1146,7 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "sequence": { "type": "integer", "minimum": 1 },
                 "timestamp": { "type": "string", "format": "date-time" },
                 "actor": { "type": "string" },
-                "source": { "enum": ["cli", "api", "filesystem"] },
+                "source": { "enum": ["cli", "api", "filesystem", "sync"] },
                 "action": { "enum": ["baseline", "create", "update", "link", "delete"] },
                 "record": { "type": "object" },
                 "changes": { "type": "array", "items": { "type": "object" } }

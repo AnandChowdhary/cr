@@ -54,3 +54,19 @@ fn view_help_documents_saved_view_controls() {
     assert!(stdout.contains("--column <FIELD>"));
     assert!(stdout.contains("--page-size <PAGE_SIZE>"));
 }
+
+#[test]
+fn sync_help_documents_protocol_safety_controls() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["sync", "create", "--help"])
+        .output()
+        .expect("failed to run cr sync create --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("help output was not UTF-8");
+    assert!(stdout.contains("Create a versioned sync definition"));
+    assert!(stdout.contains("--timeout-seconds"));
+    assert!(stdout.contains("--max-output-bytes"));
+    assert!(stdout.contains("--max-operations"));
+    assert!(stdout.contains("--actor <ACTOR>"));
+    assert!(stdout.contains("<COMMAND>..."));
+}

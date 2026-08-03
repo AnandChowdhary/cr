@@ -152,6 +152,12 @@ enum Command {
         command: ViewCommand,
     },
 
+    /// Create, inspect, and run external data syncs.
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
+
     /// Update a record's front matter and optionally its Markdown body.
     Update {
         collection: String,
@@ -264,6 +270,64 @@ enum ViewCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncCommand {
+    /// Create a versioned sync definition in .cr/syncs.
+    Create {
+        name: String,
+
+        /// Stop the command after this many seconds.
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+
+        /// Reject stdout larger than this many bytes.
+        #[arg(long, default_value_t = 16 * 1024 * 1024)]
+        max_output_bytes: u64,
+
+        /// Reject more than this many JSONL protocol messages.
+        #[arg(long, default_value_t = 10_000)]
+        max_operations: usize,
+
+        /// Identity recorded for this sync's audit events.
+        #[arg(long)]
+        actor: Option<String>,
+
+        /// Program and arguments. Use -- before the program.
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
+    },
+
+    /// List configured syncs.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show one sync definition.
+    Show {
+        name: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run one sync and apply its operations with audit provenance.
+    Run {
+        name: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print the last committed checkpoint state as JSON.
+    State { name: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -451,6 +515,76 @@ fn run() -> Result<()> {
                 } else {
                     print!("{}", yaml_serde::to_string(&view)?);
                 }
+            }
+        },
+        Command::Sync { command } => match command {
+            SyncCommand::Create {
+                name,
+                timeout_seconds,
+                max_output_bytes,
+                max_operations,
+                actor,
+                command,
+            } => {
+                let sync = database.create_sync(
+                    &name,
+                    command,
+                    timeout_seconds,
+                    max_output_bytes,
+                    max_operations,
+                    actor,
+                )?;
+                println!("{}", sync.name);
+            }
+            SyncCommand::List { json } => {
+                let syncs = database.syncs()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&syncs)?);
+                } else {
+                    for sync in syncs {
+                        println!("{}\t{}", sync.name, sync.command.join(" "));
+                    }
+                }
+            }
+            SyncCommand::Show { name, json } => {
+                let sync = database.sync(&name)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&sync)?);
+                } else {
+                    print!("{}", yaml_serde::to_string(&sync)?);
+                }
+            }
+            SyncCommand::Run { name, json } => {
+                let summary = database.run_sync(&name)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    println!(
+                        "Sync {} {}: {} created, {} updated, {} deleted, {} unchanged; checkpoint {}",
+                        summary.name,
+                        summary.run_id,
+                        summary.created,
+                        summary.updated,
+                        summary.deleted,
+                        summary.unchanged,
+                        if summary.checkpoint_updated {
+                            "updated"
+                        } else {
+                            "unchanged"
+                        }
+                    );
+                }
+            }
+            SyncCommand::State { name } => {
+                database.sync(&name)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &database
+                            .sync_state(&name)?
+                            .unwrap_or(serde_json::Value::Null)
+                    )?
+                );
             }
         },
         Command::Update {

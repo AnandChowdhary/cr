@@ -69,8 +69,17 @@ Priorities:
 - [ ] **P1 — Replace Tailwind Play CDN with compiled, pinned CSS.**
   The server-rendered UI currently follows the requested CDN-only setup, but Tailwind documents the Play CDN as development-only. Bundle a reproducible stylesheet for production, offline use, tighter content security policy, and immunity to CDN changes.
 
-- [ ] **P2 — Add configuration history for schemas and views.**
-  View definitions and collection schemas are Git-friendly files but are not record audit events. Define a separate configuration audit or reviewed `status`/`save` flow without confusing configuration history with record history.
+- [ ] **P2 — Add configuration history for schemas, views, and syncs.**
+  View definitions, collection schemas, sync definitions, and mutable sync checkpoints are Git-friendly files but are not record audit events. Define configuration and operational-state history without confusing either with record history or exposing adapter secrets.
+
+- [ ] **P1 — Add sync sandboxing and complete resource controls.**
+  Sync adapters are trusted local executables that inherit the caller's environment, filesystem, and network access. Add opt-in environment allowlists, stderr bounds, CPU/memory/process limits, and a defensible sandbox profile. POSIX timeouts terminate the adapter process group; define and test equivalent descendant termination on Windows.
+
+- [ ] **P2 — Add scheduler helpers and durable run history.**
+  Version 1 delegates recurrence and job logs to cron, systemd, `launchd`, containers, or CI. Add optional platform-specific schedule install/remove/status helpers and a bounded run ledger with start/end time, exit result, counts, checkpoint hash, and safe diagnostics—without turning `cr serve` into an implicit scheduler.
+
+- [ ] **P2 — Stream large sync output through bounded preflight storage.**
+  Sync stdout is bounded on disk but then read and parsed into memory before application. Preserve all-before-first-mutation validation while supporting larger imports through a validated spool/index or another bounded two-pass design.
 
 - [ ] **P2 — Preserve submitted form values on validation errors.**
   HTML mutations correctly remain atomic and audit-neutral on failure, but the generic error page requires navigating back and may lose unsaved browser input. Re-render the form with escaped submitted values and field-level schema diagnostics.
@@ -156,7 +165,10 @@ Priorities:
 ## HTTP and integrations
 
 - [ ] **P1 — Bulk mutation endpoints and multi-record transactions.**
-  Define atomicity, validation, audit grouping, crash recovery, maximum batch sizes, and partial-failure behavior before exposing bulk create/update/delete.
+  Define atomicity, validation, audit grouping, crash recovery, maximum batch sizes, and partial-failure behavior before exposing bulk create/update/delete. Sync runs currently preflight their complete bounded stream but commit sequential single-record mutations, so a durable application failure can leave a committed prefix and unchanged checkpoint.
+
+- [ ] **P1 — Define sync ownership, pruning, and remote-effect idempotency.**
+  Version 1 only deletes records when an adapter emits an explicit target. Add optional source ownership metadata and safe prune previews without treating absence from a partial page as deletion. Define retry/idempotency guidance or primitives for adapters that also perform irreversible remote effects.
 
 - [ ] **P1 — Idempotency keys for retried mutations.**
   Safely replay POST/PATCH requests after client timeouts without duplicating audit events.
@@ -226,4 +238,5 @@ Priorities:
 - [x] Bounded HTTP pagination, bearer-token option, request actor attribution, and structured errors.
 - [x] Live OpenAPI 3.1 collection-schema components.
 - [x] Automatic collection tables and saved server-rendered HTML views with CSRF-protected audited forms.
+- [x] Versioned subprocess sync adapters with JSONL upsert/delete/checkpoint messages, clean-state verification, limits, overlap locks, checkpointing, and `source: sync` audit provenance.
 - [x] Unit, CLI, concurrency, direct-edit, in-process HTTP, and real TCP server tests.

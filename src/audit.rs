@@ -142,6 +142,7 @@ pub enum AuditSource {
     Cli,
     Api,
     Filesystem,
+    Sync,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
