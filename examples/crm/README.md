@@ -21,7 +21,7 @@ Then open:
 
 The HTML forms are live: creating, editing, deleting, or moving a Kanban card changes the Markdown files in this directory and appends to its audit journal. Record pages derive typed inputs, select controls, descriptions, and validation hints from the CRM schemas. Drag a card between stage lanes, or use its accessible move selector and button.
 
-List and Kanban pages also derive their filter controls from the schema. Add multiple conditions such as `stage is negotiation`, `value is at least 50000`, or `tags contains renewal`, then choose whether all or any conditions must match. Each field only offers compatible operators, and select values only offer their declared choices.
+List and Kanban pages keep search in the header. Open **Filter** for the schema-derived query controls, then add conditions such as `stage is negotiation`, `value is at least 50000`, or `tags contains renewal` and choose whether all or any conditions must match. Each field only offers compatible operators, and select values only offer their declared choices.
 
 Use the Sorting controls to order deals by value, close date, owner, or any other schema field. Table column headings toggle direction directly; Kanban sorts cards within each stage lane. The saved pipeline opens with its persisted `value` descending default, which the current URL can override or clear.
 

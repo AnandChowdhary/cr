@@ -2481,6 +2481,10 @@ fn render_view_records(
     if filter_rows.is_empty() {
         filter_rows.push(("", ViewFilterOperator::default(), ""));
     }
+    let active_filter_count = filter_rows
+        .iter()
+        .filter(|(field, _, value)| !field.is_empty() || !value.is_empty())
+        .count();
     page_layout(
         &view.title,
         html! {
@@ -2528,6 +2532,98 @@ fn render_view_records(
                         available_columns,
                         csrf_token,
                     ))
+                    form method="get" action=(reset_url.clone()) data-filter-builder="true" data-max-filters=(MAX_VIEW_FILTERS) class="contents" {
+                        label class="relative block min-w-48 flex-1 sm:flex-none" {
+                            span class="sr-only" { "Search records" }
+                            span aria-hidden="true" class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-slate-400" { "⌕" }
+                            input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Search records" placeholder="Search records…" data-view-search="true" class="w-full rounded-xl border border-slate-300 bg-white py-2.5 pl-9 pr-3 text-sm outline-none ring-indigo-500 placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 sm:w-56";
+                        }
+                        details class="relative" data-filter-disclosure="true" data-active-filters=(active_filter_count) {
+                            summary class="inline-flex cursor-pointer list-none items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm hover:border-indigo-300 hover:text-indigo-700" {
+                                "Filter"
+                                @if active_filter_count > 0 {
+                                    span class="rounded-full bg-indigo-100 px-2 py-0.5 text-xs font-bold text-indigo-700" { (active_filter_count) }
+                                }
+                            }
+                            div data-filter-panel="true" class="absolute right-0 z-30 mt-2 max-h-[calc(100vh-7rem)] w-[min(42rem,calc(100vw-2rem))] space-y-4 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl sm:p-5" {
+                                div {
+                                    div class="mb-3 flex flex-wrap items-center justify-between gap-3" {
+                                        div {
+                                            div class="flex items-center gap-2" {
+                                                h2 class="text-sm font-bold text-slate-900" { "Filters" }
+                                                label {
+                                                    span class="sr-only" { "Condition match mode" }
+                                                    select name="filter_match" aria-label="Condition match mode" class="rounded-full border-0 bg-slate-100 py-1 pl-2.5 pr-8 text-xs font-semibold text-slate-600 outline-none ring-indigo-500 focus:ring-2" {
+                                                        option value="all" selected[query.filter_match == ViewFilterMatch::All] { "All conditions match" }
+                                                        option value="any" selected[query.filter_match == ViewFilterMatch::Any] { "Any condition matches" }
+                                                    }
+                                                }
+                                            }
+                                            p class="mt-1 text-xs text-slate-500" { "Field controls and allowed values come from the collection schema." }
+                                        }
+                                        button type="button" data-add-filter="true" class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:border-indigo-300 hover:text-indigo-700 disabled:cursor-not-allowed disabled:opacity-40" { "+ Add condition" }
+                                    }
+                                    div data-filter-list="true" class="space-y-2" {
+                                        @for (index, (field, operator, value)) in filter_rows.iter().enumerate() {
+                                            (render_filter_row(&filter_fields, index, field, *operator, value))
+                                        }
+                                    }
+                                    template data-filter-template="true" {
+                                        (render_filter_row(&filter_fields, 0, "", ViewFilterOperator::default(), ""))
+                                    }
+                                }
+                                div class="border-t border-slate-100 pt-4" {
+                                    details open[query_columns_custom(query)] {
+                                        summary class="cursor-pointer list-none text-sm font-bold text-slate-900" {
+                                            span class="inline-flex items-center gap-2" {
+                                                "Columns"
+                                                span class="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-600" { (columns.len()) " shown" }
+                                            }
+                                        }
+                                        input type="hidden" name="columns" value="custom";
+                                        p class="mt-1 text-xs text-slate-500" { "Choose the fields shown in the table or on Kanban cards. Select at least one." }
+                                        div role="group" aria-label="Visible columns" class="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" {
+                                            @for column in available_columns {
+                                                label class="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 hover:border-indigo-300 hover:bg-indigo-50/40" {
+                                                    input type="checkbox" name="column" value=(column) checked[columns.contains(column)] class="size-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500";
+                                                    span class="truncate" title=(column) { (humanize_field_name(column)) }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                div class="border-t border-slate-100 pt-4" {
+                                    div class="mb-3" {
+                                        h2 class="text-sm font-bold text-slate-900" { "Sorting" }
+                                        p class="mt-1 text-xs text-slate-500" { "Missing values stay last; record ID breaks ties." }
+                                    }
+                                    div class="grid gap-3 sm:grid-cols-2" {
+                                        label {
+                                            span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Sort by" }
+                                            select name="sort_field" aria-label="Sort by" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                                                option value="" selected[view_sort_field(query).is_none()] { "Default (record ID)" }
+                                                option value="$id" selected[view_sort_field(query) == Some("$id")] { "Record ID" }
+                                                @for field in &filter_fields {
+                                                    option value=(&field.key) selected[view_sort_field(query) == Some(field.key.as_str())] { (&field.label) }
+                                                }
+                                            }
+                                        }
+                                        label {
+                                            span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Direction" }
+                                            select name="sort_direction" aria-label="Sort direction" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                                                option value="asc" selected[query.sort_direction == ViewSortDirection::Asc] { "Ascending" }
+                                                option value="desc" selected[query.sort_direction == ViewSortDirection::Desc] { "Descending" }
+                                            }
+                                        }
+                                    }
+                                }
+                                div class="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-4" {
+                                    a href=(reset_url.clone()) class="rounded-lg px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100" { "Clear all" }
+                                    button type="submit" class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Apply view" }
+                                }
+                            }
+                        }
+                    }
                     a href=(new_url) class="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700" {
                         "+ New record"
                     }
@@ -2535,87 +2631,6 @@ fn render_view_records(
             }
             @if let Some(notice) = query.notice.as_deref() {
                 div role="status" class="mb-5 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800" { (notice) }
-            }
-            form method="get" action=(reset_url.clone()) data-filter-builder="true" data-max-filters=(MAX_VIEW_FILTERS) class="mb-5 space-y-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5" {
-                label class="block" {
-                    span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Search records" }
-                    input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) placeholder="Search paths, front matter, and Markdown…" class="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
-                }
-                div class="border-t border-slate-100 pt-4" {
-                    div class="mb-3 flex flex-wrap items-center justify-between gap-3" {
-                        div {
-                            div class="flex items-center gap-2" {
-                                h2 class="text-sm font-bold text-slate-900" { "Filters" }
-                                label {
-                                    span class="sr-only" { "Condition match mode" }
-                                    select name="filter_match" aria-label="Condition match mode" class="rounded-full border-0 bg-slate-100 py-1 pl-2.5 pr-8 text-xs font-semibold text-slate-600 outline-none ring-indigo-500 focus:ring-2" {
-                                        option value="all" selected[query.filter_match == ViewFilterMatch::All] { "All conditions match" }
-                                        option value="any" selected[query.filter_match == ViewFilterMatch::Any] { "Any condition matches" }
-                                    }
-                                }
-                            }
-                            p class="mt-1 text-xs text-slate-500" { "Field controls and allowed values come from the collection schema." }
-                        }
-                        button type="button" data-add-filter="true" class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:border-indigo-300 hover:text-indigo-700 disabled:cursor-not-allowed disabled:opacity-40" { "+ Add condition" }
-                    }
-                    div data-filter-list="true" class="space-y-2" {
-                        @for (index, (field, operator, value)) in filter_rows.iter().enumerate() {
-                            (render_filter_row(&filter_fields, index, field, *operator, value))
-                        }
-                    }
-                    template data-filter-template="true" {
-                        (render_filter_row(&filter_fields, 0, "", ViewFilterOperator::default(), ""))
-                    }
-                }
-                div class="border-t border-slate-100 pt-4" {
-                    details open[query_columns_custom(query)] {
-                        summary class="cursor-pointer list-none text-sm font-bold text-slate-900" {
-                            span class="inline-flex items-center gap-2" {
-                                "Columns"
-                                span class="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-600" { (columns.len()) " shown" }
-                            }
-                        }
-                        input type="hidden" name="columns" value="custom";
-                        p class="mt-1 text-xs text-slate-500" { "Choose the fields shown in the table or on Kanban cards. Select at least one." }
-                        div role="group" aria-label="Visible columns" class="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" {
-                            @for column in available_columns {
-                                label class="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 hover:border-indigo-300 hover:bg-indigo-50/40" {
-                                    input type="checkbox" name="column" value=(column) checked[columns.contains(column)] class="size-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500";
-                                    span class="truncate" title=(column) { (humanize_field_name(column)) }
-                                }
-                            }
-                        }
-                    }
-                }
-                div class="border-t border-slate-100 pt-4" {
-                    div class="mb-3" {
-                        h2 class="text-sm font-bold text-slate-900" { "Sorting" }
-                        p class="mt-1 text-xs text-slate-500" { "Missing values stay last; record ID breaks ties." }
-                    }
-                    div class="grid gap-3 sm:grid-cols-2" {
-                        label {
-                            span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Sort by" }
-                            select name="sort_field" aria-label="Sort by" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
-                                option value="" selected[view_sort_field(query).is_none()] { "Default (record ID)" }
-                                option value="$id" selected[view_sort_field(query) == Some("$id")] { "Record ID" }
-                                @for field in &filter_fields {
-                                    option value=(&field.key) selected[view_sort_field(query) == Some(field.key.as_str())] { (&field.label) }
-                                }
-                            }
-                        }
-                        label {
-                            span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Direction" }
-                            select name="sort_direction" aria-label="Sort direction" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
-                                option value="asc" selected[query.sort_direction == ViewSortDirection::Asc] { "Ascending" }
-                                option value="desc" selected[query.sort_direction == ViewSortDirection::Desc] { "Descending" }
-                            }
-                        }
-                    }
-                }
-                div class="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-4" {
-                    a href=(reset_url) class="rounded-lg px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100" { "Clear all" }
-                    button type="submit" class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Apply view" }
-                }
             }
             script { (PreEscaped(FILTER_BUILDER_SCRIPT)) }
             @if view.layout == ViewLayout::Kanban {

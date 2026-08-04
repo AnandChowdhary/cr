@@ -251,5 +251,6 @@ Priorities:
 - [x] In-page Save as view with CSRF protection, atomic no-clobber creation, preserved all/any filter groups, inherited immutable scopes, effective sorting, redirects, and conflict/error coverage.
 - [x] URL-persisted visible-column selection for tables and Kanban cards, including pagination/sort preservation, validation, and Save as view persistence.
 - [x] Browser-created Kanban views with layout selection, schema/data-derived grouping fields, inherited pipeline settings, and server-side validation.
+- [x] Compact view header with always-available search and an on-demand filter, column, and sorting panel with active-condition count.
 - [x] Versioned subprocess sync adapters with JSONL upsert/delete/checkpoint messages, clean-state verification, limits, overlap locks, checkpointing, and `source: sync` audit provenance.
 - [x] Unit, CLI, concurrency, direct-edit, in-process HTTP, and real TCP server tests.

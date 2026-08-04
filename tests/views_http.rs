@@ -138,6 +138,18 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(automatic.text().contains("beta"));
     assert!(automatic.text().contains("href=\"/deals/records/alpha\""));
     assert!(automatic.text().contains("data-filter-builder=\"true\""));
+    assert!(automatic.text().contains("data-view-search=\"true\""));
+    assert!(automatic
+        .text()
+        .contains("data-filter-disclosure=\"true\" data-active-filters=\"0\""));
+    assert!(automatic.text().contains("data-filter-panel=\"true\""));
+    let search_position = automatic.text().find("data-view-search=\"true\"").unwrap();
+    let filter_position = automatic
+        .text()
+        .find("data-filter-disclosure=\"true\"")
+        .unwrap();
+    let new_record_position = automatic.text().find("href=\"/deals/new\"").unwrap();
+    assert!(search_position < filter_position && filter_position < new_record_position);
     assert!(automatic.text().contains("+ Add condition"));
     assert!(automatic.text().contains("All conditions match"));
     assert!(automatic.text().contains("name=\"filter_match\""));
@@ -477,6 +489,9 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     )
     .await;
     assert_eq!(greater_than.status, StatusCode::OK);
+    assert!(greater_than
+        .text()
+        .contains("data-filter-disclosure=\"true\" data-active-filters=\"1\""));
     assert!(greater_than.text().contains("value=\"gt\" selected"));
     assert!(greater_than.text().contains("alpha"));
     assert!(!greater_than.text().contains("beta"));
