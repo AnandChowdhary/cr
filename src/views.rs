@@ -12,7 +12,7 @@ use crate::{
 const VIEW_FORMAT_VERSION: u32 = 1;
 const DEFAULT_VIEW_PAGE_SIZE: usize = 50;
 const MAX_VIEW_PAGE_SIZE: usize = 1_000;
-const RESERVED_VIEW_NAMES: &[&str] = &["api", "health", "openapi.json"];
+const RESERVED_VIEW_NAMES: &[&str] = &["api", "audit", "health", "openapi.json"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ViewDefinition {
@@ -267,6 +267,11 @@ mod tests {
 
         assert!(database
             .create_view("api", None, "deals", vec![], vec![], 50)
+            .unwrap_err()
+            .to_string()
+            .contains("reserved"));
+        assert!(database
+            .create_view("audit", None, "deals", vec![], vec![], 50)
             .unwrap_err()
             .to_string()
             .contains("reserved"));

@@ -14,6 +14,7 @@ Then open:
 - `http://127.0.0.1:3000/deals` for the saved open-deals pipeline;
 - `http://127.0.0.1:3000/companies` for all companies;
 - `http://127.0.0.1:3000/contacts` for all contacts;
+- `http://127.0.0.1:3000/audit` for the complete audit timeline;
 - `http://127.0.0.1:3000/openapi.json` for the generated API contract.
 
 The HTML forms are live: creating, editing, or deleting a record changes the Markdown files in this directory and appends to its audit journal.

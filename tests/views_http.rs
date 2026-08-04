@@ -125,6 +125,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     let home = request(&app, Method::GET, "/", None, &[]).await;
     assert_eq!(home.status, StatusCode::OK);
     assert!(home.text().contains("Database views"));
+    assert!(home.text().contains("href=\"/audit\""));
     assert!(home.text().contains("href=\"/deals\""));
     assert!(home.text().contains("href=\"/open-deals\""));
 
@@ -135,6 +136,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
         .contains("https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"));
     assert!(automatic.text().contains("alpha"));
     assert!(automatic.text().contains("beta"));
+    assert!(automatic.text().contains("href=\"/deals/records/alpha\""));
     assert!(automatic
         .text()
         .contains("&lt;script&gt;alert('x')&lt;/script&gt;"));
@@ -253,6 +255,12 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
     assert_eq!(edit_page.status, StatusCode::OK);
     assert!(edit_page.text().contains("status: open"));
     assert!(edit_page.text().contains("value: 12500"));
+    assert!(edit_page.text().contains("Audit history"));
+    assert!(edit_page.text().contains("sales@example.com"));
+    assert!(edit_page.text().contains("create"));
+    assert!(edit_page
+        .text()
+        .contains("/audit?collection=deals&amp;id=acme"));
     let edit_token = csrf(edit_page.text()).to_owned();
 
     let invalid = request(
@@ -307,6 +315,11 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
         .unwrap();
     assert_eq!(audit[0].payload.action, AuditAction::Update);
     assert_eq!(audit[0].payload.source, AuditSource::Api);
+    let updated_page = request(&app, Method::GET, "/deals/records/acme", None, &[]).await;
+    assert_eq!(updated_page.status, StatusCode::OK);
+    assert!(updated_page.text().contains("replace"));
+    assert!(updated_page.text().contains("/attributes/status"));
+    assert!(updated_page.text().contains("Closed won"));
     let filtered = request(&app, Method::GET, "/open-deals", None, &[]).await;
     assert!(!filtered.text().contains("acme"));
 
@@ -331,6 +344,87 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
 }
 
 #[tokio::test]
+async fn global_audit_view_renders_filters_and_paginates_field_changes() {
+    let (_temporary, database) = test_database("global-audit-view");
+    let attributed = database.clone().with_actor("sales@example.com").unwrap();
+    attributed
+        .create(
+            "deals",
+            "alpha",
+            &[
+                Assignment::from_str("name=Alpha renewal").unwrap(),
+                Assignment::from_str("stage=proposal").unwrap(),
+            ],
+            "<script>alert('historical')</script>",
+        )
+        .unwrap();
+    attributed
+        .update(
+            "deals",
+            "alpha",
+            &[Assignment::from_str("stage=won").unwrap()],
+            Some("Closed won"),
+        )
+        .unwrap();
+    attributed
+        .create(
+            "contacts",
+            "beta",
+            &[Assignment::from_str("name=Beta Buyer").unwrap()],
+            "",
+        )
+        .unwrap();
+    let app = router(database, ServerConfig::default()).unwrap();
+
+    let global = request(&app, Method::GET, "/audit", None, &[]).await;
+    assert_eq!(global.status, StatusCode::OK);
+    assert!(global.text().contains("Global audit log"));
+    assert!(global.text().contains("contacts/beta"));
+    assert!(global.text().contains("deals/alpha"));
+    assert!(global.text().contains("sales@example.com"));
+    assert!(global.text().contains("/attributes/stage"));
+    assert!(global.text().contains("proposal"));
+    assert!(global.text().contains("won"));
+    assert!(global
+        .text()
+        .contains("&lt;script&gt;alert('historical')&lt;/script&gt;"));
+    assert!(!global
+        .text()
+        .contains("<script>alert('historical')</script>"));
+    assert!(
+        global.text().find("contacts/beta").unwrap() < global.text().find("deals/alpha").unwrap()
+    );
+
+    let filtered = request(
+        &app,
+        Method::GET,
+        "/audit?collection=deals&id=alpha",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(filtered.status, StatusCode::OK);
+    assert!(filtered.text().contains("deals/alpha"));
+    assert!(!filtered.text().contains("contacts/beta"));
+    assert!(filtered.text().contains("value=\"deals\""));
+    assert!(filtered.text().contains("value=\"alpha\""));
+
+    let first_page = request(&app, Method::GET, "/audit?limit=1", None, &[]).await;
+    assert_eq!(first_page.status, StatusCode::OK);
+    assert!(first_page.text().contains("contacts/beta"));
+    assert!(!first_page.text().contains("deals/alpha"));
+    assert!(first_page.text().contains("limit=1&amp;offset=1"));
+    let second_page = request(&app, Method::GET, "/audit?limit=1&offset=1", None, &[]).await;
+    assert_eq!(second_page.status, StatusCode::OK);
+    assert!(!second_page.text().contains("contacts/beta"));
+    assert!(second_page.text().contains("deals/alpha"));
+
+    let invalid = request(&app, Method::GET, "/audit?id=alpha", None, &[]).await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    assert!(invalid.text().contains("collection is required"));
+}
+
+#[tokio::test]
 async fn view_routes_respect_api_authentication_and_return_html_errors() {
     let (_temporary, database) = test_database("views-auth");
     database.create("deals", "one", &[], "").unwrap();
@@ -348,6 +442,8 @@ async fn view_routes_respect_api_authentication_and_return_html_errors() {
     let unauthorized = request(&app, Method::GET, "/deals", None, &[]).await;
     assert_eq!(unauthorized.status, StatusCode::UNAUTHORIZED);
     assert!(unauthorized.text().contains("unauthorized"));
+    let unauthorized_audit = request(&app, Method::GET, "/audit", None, &[]).await;
+    assert_eq!(unauthorized_audit.status, StatusCode::UNAUTHORIZED);
 
     let authorized = request(
         &app,

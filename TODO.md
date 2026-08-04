@@ -238,5 +238,6 @@ Priorities:
 - [x] Bounded HTTP pagination, bearer-token option, request actor attribution, and structured errors.
 - [x] Live OpenAPI 3.1 collection-schema components.
 - [x] Automatic collection tables and saved server-rendered HTML views with CSRF-protected audited forms.
+- [x] Per-record and global server-rendered audit history with filtering, pagination, attribution, and expandable field diffs.
 - [x] Versioned subprocess sync adapters with JSONL upsert/delete/checkpoint messages, clean-state verification, limits, overlap locks, checkpointing, and `source: sync` audit provenance.
 - [x] Unit, CLI, concurrency, direct-edit, in-process HTTP, and real TCP server tests.

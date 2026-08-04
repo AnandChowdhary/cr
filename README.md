@@ -681,6 +681,7 @@ The default address is `127.0.0.1:3000`, so the server is only reachable from th
 ```text
 Serving cr on http://127.0.0.1:3000
 Views: http://127.0.0.1:3000/
+Audit: http://127.0.0.1:3000/audit
 OpenAPI: http://127.0.0.1:3000/openapi.json
 ```
 
@@ -700,7 +701,13 @@ Open [http://127.0.0.1:3000/](http://127.0.0.1:3000/) to see every collection. E
 http://127.0.0.1:3000/deals
 ```
 
-The table infers columns from the collection schema and current front matter. It includes case-insensitive document search, one typed exact-value filter, bounded pagination, create and edit forms, and audited deletion. Form front matter is YAML, so numbers, booleans, arrays, nested maps, strings, and `null` retain their types. Every mutation is schema-validated and recorded with `source: api`.
+The table infers columns from the collection schema and current front matter. It includes case-insensitive document search, one typed exact-value filter, bounded pagination, create and edit forms, and audited deletion. Click a record ID, field value, or its **View** action to open the record editor and its newest audit events. Form front matter is YAML, so numbers, booleans, arrays, nested maps, strings, and `null` retain their types. Every mutation is schema-validated and recorded with `source: api`.
+
+### Browse audit history
+
+Open [http://127.0.0.1:3000/audit](http://127.0.0.1:3000/audit) for the global audit journal, newest first. Filter it by collection and record ID, page through older events, and expand an event to inspect its add/remove/replace operations with before and after values.
+
+Every existing record page embeds its newest audit history with actor, source, timestamp, optional sync/save message, and field-level changes. The **View complete history** link opens `/audit` with that collection and ID already selected. Historical values are escaped before rendering and long values are preview-limited in the page; the complete event remains available from the JSON API and CLI.
 
 ### Create saved views
 
@@ -758,7 +765,7 @@ page_size: 50
 
 You can edit these files directly. The server reloads them on each request. View filters use the same typed `KEY=YAML` equality semantics as `cr list`; comparison and Boolean expressions remain roadmap work.
 
-The UI is plain server-rendered HTML—there is no React, Next.js, client-side application state, or JavaScript data API. Templates escape database values, mutating forms carry a per-server CSRF token, and successful POSTs return `303 See Other` before the browser reloads the table. Styling currently uses Tailwind's Play CDN as requested; the official Tailwind documentation labels that browser CDN development-only, so compiling and bundling CSS is tracked in `TODO.md`.
+The UI is plain server-rendered HTML—there is no React, Next.js, client-side application state, or JavaScript data API. Templates escape database and audit values, mutating forms carry a per-server CSRF token, and successful POSTs return `303 See Other` before the browser reloads the table. Styling currently uses Tailwind's Play CDN as requested; the official Tailwind documentation labels that browser CDN development-only, so compiling and bundling CSS is tracked in `TODO.md`.
 
 ### Authentication and identity
 

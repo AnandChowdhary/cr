@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
-    Assignment, AuditSource, CollectionModel, Database, Record, SearchQuery, SearchTarget,
-    ViewDefinition,
+    audit::AuditChange, Assignment, AuditEntry, AuditSource, CollectionModel, Database, Record,
+    SearchQuery, SearchTarget, ViewDefinition,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -161,6 +161,15 @@ struct ViewQuery {
     limit: Option<usize>,
     offset: Option<usize>,
     notice: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditViewQuery {
+    collection: Option<String>,
+    id: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -392,6 +401,7 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
     let protected = Router::new()
         .route("/openapi.json", get(openapi))
         .route("/", get(views_home))
+        .route("/audit", get(audit_view))
         .route("/{view}", get(view_records))
         .route("/{view}/new", get(new_record_form))
         .route("/{view}/records", post(create_record_form))
@@ -455,6 +465,7 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
         .context("could not read HTTP listener address")?;
     println!("Serving cr on http://{address}");
     println!("Views: http://{address}/");
+    println!("Audit: http://{address}/audit");
     println!("OpenAPI: http://{address}/openapi.json");
     std::io::stdout()
         .flush()
@@ -499,6 +510,47 @@ async fn views_home(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let result: ApiResult<Markup> = async {
         let views = run_database(&state, &headers, Database::views).await?;
         Ok(render_views_home(&views))
+    }
+    .await;
+    html_result(result)
+}
+
+async fn audit_view(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let result: ApiResult<Markup> = async {
+        let query: AuditViewQuery = parse_query(raw)?;
+        let bounds = page_bounds(
+            query
+                .limit
+                .or(Some(DEFAULT_PAGE_SIZE.min(state.max_page_size))),
+            query.offset,
+            state.max_page_size,
+        )?;
+        let collection = query
+            .collection
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        let id = query.id.clone().filter(|value| !value.trim().is_empty());
+        if id.is_some() && collection.is_none() {
+            return Err(ApiError::bad_request(
+                "invalid_audit_filter",
+                "collection is required when filtering by record ID",
+            ));
+        }
+        let requested = bounds
+            .offset
+            .checked_add(bounds.limit)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| ApiError::unprocessable("pagination window is too large"))?;
+        let entries = run_database(&state, &headers, move |database| {
+            database.audit_recent(requested, collection.as_deref(), id.as_deref())
+        })
+        .await?;
+        let page = paginate_unknown_total(entries, bounds);
+        Ok(render_audit_view(&page, &query))
     }
     .await;
     html_result(result)
@@ -583,7 +635,13 @@ async fn new_record_form(
             database.view(&requested_view)
         })
         .await?;
-        Ok(render_record_form(&view, None, &state.csrf_token, None))
+        Ok(render_record_form(
+            &view,
+            None,
+            &[],
+            &state.csrf_token,
+            None,
+        ))
     }
     .await;
     html_result(result)
@@ -597,15 +655,21 @@ async fn edit_record_form(
     let result: ApiResult<Markup> = async {
         let requested_view = view_name.clone();
         let requested_id = id.clone();
-        let (view, record) = run_database(&state, &headers, move |database| {
+        let (view, record, audit_entries) = run_database(&state, &headers, move |database| {
             let view = database.view(&requested_view)?;
             let record = database.get(&view.collection, &requested_id)?;
-            Ok((view, record))
+            let audit_entries = database.audit_recent(
+                DEFAULT_PAGE_SIZE,
+                Some(&view.collection),
+                Some(&requested_id),
+            )?;
+            Ok((view, record, audit_entries))
         })
         .await?;
         Ok(render_record_form(
             &view,
             Some(&record),
+            &audit_entries,
             &state.csrf_token,
             None,
         ))
@@ -1362,7 +1426,10 @@ fn render_views_home(views: &[ViewDefinition]) -> Markup {
                         "Browse every collection or open a saved, filtered view. All changes use the same validated and audited database operations as the CLI and REST API."
                     }
                 }
-                a href="/openapi.json" class="text-sm font-semibold text-indigo-700 hover:text-indigo-900" { "OpenAPI ↗" }
+                div class="flex items-center gap-4" {
+                    a href="/audit" class="text-sm font-semibold text-indigo-700 hover:text-indigo-900" { "Audit log" }
+                    a href="/openapi.json" class="text-sm font-semibold text-indigo-700 hover:text-indigo-900" { "OpenAPI ↗" }
+                }
             }
             @if views.is_empty() {
                 div class="rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center shadow-sm" {
@@ -1401,6 +1468,128 @@ fn render_views_home(views: &[ViewDefinition]) -> Markup {
             }
         },
     )
+}
+
+fn render_audit_view(page: &Page<AuditEntry>, query: &AuditViewQuery) -> Markup {
+    let reset_url = "/audit";
+    let first = if page.pagination.returned == 0 {
+        0
+    } else {
+        page.pagination.offset + 1
+    };
+    let last = page.pagination.offset + page.pagination.returned;
+    page_layout(
+        "Audit log",
+        html! {
+            nav class="mb-6 flex items-center gap-2 text-sm text-slate-500" {
+                a href="/" class="font-medium hover:text-indigo-700" { "Views" }
+                span { "/" }
+                span class="text-slate-900" { "Audit log" }
+            }
+            div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between" {
+                div {
+                    p class="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600" { "Tamper-evident journal" }
+                    h1 class="mt-2 text-3xl font-bold tracking-tight text-slate-950" { "Global audit log" }
+                    p class="mt-2 max-w-2xl text-sm text-slate-600" {
+                        "Every accepted record mutation, newest first. Expand an event to inspect its field-level changes."
+                    }
+                }
+                a href="/api/v1/audit/log" class="text-sm font-semibold text-indigo-700 hover:text-indigo-900" { "JSON API ↗" }
+            }
+            form method="get" action=(reset_url) class="mb-6 grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:grid-cols-[1fr_1fr_auto]" {
+                label class="block" {
+                    span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Collection" }
+                    input type="text" name="collection" value=(query.collection.as_deref().unwrap_or("")) placeholder="deals" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+                }
+                label class="block" {
+                    span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Record ID" }
+                    input type="text" name="id" value=(query.id.as_deref().unwrap_or("")) placeholder="acme-renewal" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+                }
+                div class="flex items-end gap-2" {
+                    button type="submit" class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Filter" }
+                    a href=(reset_url) class="rounded-lg px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100" { "Reset" }
+                }
+            }
+            (render_audit_entries(&page.data))
+            div class="mt-4 flex flex-col gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm sm:flex-row sm:items-center sm:justify-between" {
+                p class="text-slate-600" { "Showing events " (first) "–" (last) " newest first" }
+                div class="flex items-center gap-2" {
+                    @if let Some(offset) = page.pagination.previous_offset {
+                        a href=(audit_page_url(query, page.pagination.limit, offset)) class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100" { "Previous" }
+                    }
+                    @if let Some(offset) = page.pagination.next_offset {
+                        a href=(audit_page_url(query, page.pagination.limit, offset)) class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100" { "Next" }
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
+    html! {
+        div class="space-y-3" {
+            @if entries.is_empty() {
+                div class="rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center text-sm text-slate-500 shadow-sm" {
+                    "No audit events match this filter."
+                }
+            } @else {
+                @for entry in entries {
+                    article id=(format!("event-{}", entry.payload.sequence)) class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" {
+                        div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between" {
+                            div class="min-w-0" {
+                                div class="flex flex-wrap items-center gap-2" {
+                                    span class="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-bold uppercase tracking-wide text-indigo-700" { (entry.payload.action.to_string()) }
+                                    span class="font-mono text-xs text-slate-500" { "#" (entry.payload.sequence) }
+                                    span class="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600" { (audit_source_label(&entry.payload.source)) }
+                                }
+                                a href=(audit_filter_url(&entry.payload.record.collection, &entry.payload.record.id)) class="mt-3 block truncate font-mono text-sm font-semibold text-slate-950 hover:text-indigo-700" {
+                                    (entry.payload.record.reference())
+                                }
+                                p class="mt-1 text-xs text-slate-500" {
+                                    "by " span class="font-medium text-slate-700" { (&entry.payload.actor) }
+                                    " · " time datetime=(&entry.payload.timestamp) { (&entry.payload.timestamp) }
+                                }
+                                @if let Some(message) = &entry.payload.message {
+                                    p class="mt-2 text-sm text-slate-600" { (message) }
+                                }
+                            }
+                            span class="shrink-0 font-mono text-xs text-slate-400" { (short_hash(&entry.hash)) }
+                        }
+                        details class="mt-4 border-t border-slate-100 pt-4" {
+                            summary class="cursor-pointer text-sm font-semibold text-indigo-700 hover:text-indigo-900" {
+                                (entry.payload.changes.len()) " field-level " @if entry.payload.changes.len() == 1 { "change" } @else { "changes" }
+                            }
+                            div class="mt-3 space-y-3" {
+                                @for change in &entry.payload.changes {
+                                    div class="rounded-xl bg-slate-50 p-3" {
+                                        div class="flex flex-wrap items-center gap-2" {
+                                            span class="rounded bg-slate-200 px-2 py-0.5 text-xs font-bold uppercase text-slate-700" { (audit_change_operation(change)) }
+                                            code class="text-xs text-slate-700" { (audit_change_path(change)) }
+                                        }
+                                        div class="mt-3 grid gap-3 lg:grid-cols-2" {
+                                            @if let Some(before) = audit_change_before(change) {
+                                                div {
+                                                    p class="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500" { "Before" }
+                                                    pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-red-100 bg-red-50 p-3 text-xs leading-5 text-red-950" { (json_preview(before)) }
+                                                }
+                                            }
+                                            @if let Some(after) = audit_change_after(change) {
+                                                div {
+                                                    p class="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500" { "After" }
+                                                    pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-xs leading-5 text-emerald-950" { (json_preview(after)) }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn render_view_records(
@@ -1487,14 +1676,16 @@ fn render_view_records(
                             } @else {
                                 @for record in &page.data {
                                     tr class="hover:bg-slate-50/80" {
-                                        td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold text-slate-900" { (&record.id) }
+                                        td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold" {
+                                            a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="text-slate-900 hover:text-indigo-700 hover:underline" { (&record.id) }
+                                        }
                                         @for column in columns {
                                             td class="max-w-sm px-4 py-3 text-slate-700" {
-                                                span class="line-clamp-2" { (record_value(record, column)) }
+                                                a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="line-clamp-2 hover:text-indigo-700 hover:underline" { (record_value(record, column)) }
                                             }
                                         }
                                         td class="whitespace-nowrap px-4 py-3 text-right" {
-                                            a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="font-semibold text-indigo-700 hover:text-indigo-900" { "Edit" }
+                                            a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="font-semibold text-indigo-700 hover:text-indigo-900" { "View" }
                                         }
                                     }
                                 }
@@ -1524,6 +1715,7 @@ fn render_view_records(
 fn render_record_form(
     view: &ViewDefinition,
     record: Option<&Record>,
+    audit_entries: &[AuditEntry],
     csrf_token: &str,
     error: Option<&str>,
 ) -> Markup {
@@ -1556,7 +1748,14 @@ fn render_record_form(
                 span class="text-slate-900" { (&title) }
             }
             div class="mx-auto max-w-4xl" {
-                h1 class="text-3xl font-bold tracking-tight text-slate-950" { (&title) }
+                div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
+                    h1 class="text-3xl font-bold tracking-tight text-slate-950" { (&title) }
+                    @if editing {
+                        a href="#audit-history" class="inline-flex items-center rounded-lg bg-indigo-50 px-3 py-2 text-sm font-semibold text-indigo-700 hover:bg-indigo-100" {
+                            (audit_entries.len()) " audit " @if audit_entries.len() == 1 { "event" } @else { "events" } " ↓"
+                        }
+                    }
+                }
                 p class="mt-2 text-sm text-slate-600" { "YAML values retain their types. Saving validates the complete front matter against the collection schema." }
                 @if let Some(error) = error {
                     div role="alert" class="mt-5 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" { (error) }
@@ -1585,6 +1784,16 @@ fn render_record_form(
                     }
                 }
                 @if let Some(record) = record {
+                    section id="audit-history" class="mt-6 scroll-mt-6 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm" {
+                        div class="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between" {
+                            div {
+                                h2 class="text-xl font-bold text-slate-950" { "Audit history" }
+                                p class="mt-1 text-sm text-slate-600" { "Newest accepted changes to this record, with actor and source attribution." }
+                            }
+                            a href=(audit_filter_url(&view.collection, &record.id)) class="text-sm font-semibold text-indigo-700 hover:text-indigo-900" { "View complete history →" }
+                        }
+                        (render_audit_entries(audit_entries))
+                    }
                     form method="post" action=(format!("/{}/records/{}/delete", encode_segment(&view.name), encode_segment(&record.id))) class="mt-6 rounded-2xl border border-red-200 bg-red-50 p-5" {
                         input type="hidden" name="_csrf" value=(csrf_token);
                         div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
@@ -1613,6 +1822,16 @@ fn page_layout(title: &str, content: Markup) -> Markup {
                 script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4" {}
             }
             body class="min-h-full text-slate-900 antialiased" {
+                header class="border-b border-slate-200 bg-white" {
+                    div class="mx-auto flex w-full max-w-7xl items-center justify-between px-4 py-3 sm:px-6 lg:px-8" {
+                        a href="/" class="font-bold tracking-tight text-slate-950 hover:text-indigo-700" { "cr" }
+                        nav aria-label="Primary" class="flex items-center gap-4 text-sm font-semibold" {
+                            a href="/" class="text-slate-600 hover:text-indigo-700" { "Views" }
+                            a href="/audit" class="text-slate-600 hover:text-indigo-700" { "Audit log" }
+                            a href="/openapi.json" class="text-slate-600 hover:text-indigo-700" { "OpenAPI" }
+                        }
+                    }
+                }
                 main class="mx-auto w-full max-w-7xl px-4 py-8 sm:px-6 lg:px-8" { (content) }
                 footer class="mx-auto w-full max-w-7xl px-4 pb-8 text-xs text-slate-500 sm:px-6 lg:px-8" {
                     "Server-rendered by cr · records remain Markdown with YAML front matter"
@@ -1662,6 +1881,86 @@ fn yaml_value(value: &YamlValue) -> String {
             .map(|value| value.trim().to_owned())
             .unwrap_or_else(|_| "<unprintable>".to_owned()),
     }
+}
+
+fn audit_source_label(source: &AuditSource) -> &'static str {
+    match source {
+        AuditSource::Cli => "CLI",
+        AuditSource::Api => "web/API",
+        AuditSource::Filesystem => "filesystem",
+        AuditSource::Sync => "sync",
+    }
+}
+
+fn audit_change_operation(change: &AuditChange) -> &'static str {
+    match change {
+        AuditChange::Add { .. } => "add",
+        AuditChange::Remove { .. } => "remove",
+        AuditChange::Replace { .. } => "replace",
+    }
+}
+
+fn audit_change_path(change: &AuditChange) -> &str {
+    let path = change.path();
+    if path.is_empty() {
+        "complete record"
+    } else {
+        path
+    }
+}
+
+fn audit_change_before(change: &AuditChange) -> Option<&JsonValue> {
+    match change {
+        AuditChange::Remove { before, .. } | AuditChange::Replace { before, .. } => Some(before),
+        AuditChange::Add { .. } => None,
+    }
+}
+
+fn audit_change_after(change: &AuditChange) -> Option<&JsonValue> {
+    match change {
+        AuditChange::Add { after, .. } | AuditChange::Replace { after, .. } => Some(after),
+        AuditChange::Remove { .. } => None,
+    }
+}
+
+fn json_preview(value: &JsonValue) -> String {
+    const MAX_CHARS: usize = 2_000;
+    let rendered = serde_json::to_string_pretty(value).unwrap_or_else(|_| "<unprintable>".into());
+    let mut characters = rendered.chars();
+    let preview: String = characters.by_ref().take(MAX_CHARS).collect();
+    if characters.next().is_some() {
+        format!("{preview}\n…")
+    } else {
+        preview
+    }
+}
+
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(20).collect()
+}
+
+fn audit_filter_url(collection: &str, id: &str) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("collection", collection);
+    serializer.append_pair("id", id);
+    format!("/audit?{}", serializer.finish())
+}
+
+fn audit_page_url(query: &AuditViewQuery, limit: usize, offset: usize) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    if let Some(collection) = query
+        .collection
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        serializer.append_pair("collection", collection);
+    }
+    if let Some(id) = query.id.as_deref().filter(|value| !value.trim().is_empty()) {
+        serializer.append_pair("id", id);
+    }
+    serializer.append_pair("limit", &limit.to_string());
+    serializer.append_pair("offset", &offset.to_string());
+    format!("/audit?{}", serializer.finish())
 }
 
 fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset: usize) -> String {
