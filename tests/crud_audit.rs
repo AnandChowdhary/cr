@@ -229,12 +229,7 @@ fn manual_markdown_crud_is_readable_while_dirty_and_fully_auditable_after_save()
 fn manual_crud_honors_a_custom_records_directory() {
     let database = TestDatabase::new("manual-custom-directory");
     let config_path = database.root.join(".cr/config.yaml");
-    let config = fs::read_to_string(&config_path).unwrap();
-    fs::write(
-        &config_path,
-        config.replace("data_dir: records", "data_dir: content/data"),
-    )
-    .unwrap();
+    fs::write(&config_path, "data_dir: content/data\n").unwrap();
     let collection = database.root.join("content/data/companies");
     fs::create_dir_all(&collection).unwrap();
     let record = collection.join("acme.md");

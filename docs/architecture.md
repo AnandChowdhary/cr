@@ -56,7 +56,7 @@ Research sources:
 ```text
 database-root/
 ├── .cr/
-│   ├── config.yaml
+│   ├── config.yaml        # optional overrides
 │   ├── audit/
 │   │   ├── lock
 │   │   └── segments/
@@ -80,7 +80,7 @@ database-root/
         └── acme.md
 ```
 
-- `.cr/config.yaml` versions the storage format and chooses the records directory.
+- `.cr/` is the database marker. An absent `.cr/config.yaml` uses format version 1, `records/`, 256 events per audit segment, and an 8 MiB segment limit. A present config can override any subset while unknown, malformed, unsafe, or unsupported settings remain errors.
 - A collection is a directory; a record ID is its Markdown filename without `.md`.
 - Front matter contains arbitrary model attributes.
 - The Markdown body is opaque user content and is preserved by metadata-only updates.

@@ -2,6 +2,8 @@
 
 This is a ready-to-use `cr` database with sample companies, contacts, deals, relationships, schemas, audit history, an open-deals table, and a Kanban pipeline.
 
+It intentionally has no `.cr/config.yaml`: the standard `records/` directory and audit segment limits come from built-in defaults. Add a config only when this database needs an override.
+
 From the repository root, start it with:
 
 ```sh

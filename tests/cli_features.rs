@@ -150,7 +150,7 @@ fn configured_records_directory_is_honored() {
     let database = TestDatabase::new("custom-data-directory");
     fs::write(
         database.root.join(".cr/config.yaml"),
-        "version: 1\ndata_dir: content/data\n",
+        "data_dir: content/data\n",
     )
     .unwrap();
 

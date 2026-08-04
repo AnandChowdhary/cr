@@ -34,10 +34,12 @@ fn duplicate_create_never_overwrites_the_existing_record() {
 }
 
 #[test]
-fn repeated_init_does_not_replace_database_configuration() {
+fn repeated_init_does_not_modify_an_existing_configless_database() {
     let database = TestDatabase::new("duplicate-init");
     let config = database.root.join(".cr/config.yaml");
-    let before = fs::read_to_string(&config).unwrap();
+    let marker = database.root.join(".cr/keep");
+    fs::write(&marker, "unchanged").unwrap();
+    assert!(!config.exists());
 
     let stderr = run_failure(
         std::process::Command::new(common::binary())
@@ -46,7 +48,22 @@ fn repeated_init_does_not_replace_database_configuration() {
     );
 
     assert!(stderr.contains("a database already exists"));
-    assert_eq!(fs::read_to_string(config).unwrap(), before);
+    assert!(!config.exists());
+    assert_eq!(fs::read_to_string(marker).unwrap(), "unchanged");
+}
+
+#[test]
+fn an_explicit_directory_without_a_cr_marker_is_not_a_database() {
+    let temporary = tempfile::tempdir().unwrap();
+    let stderr = run_failure(
+        std::process::Command::new(common::binary())
+            .arg("--database")
+            .arg(temporary.path())
+            .args(["list", "items"]),
+    );
+
+    assert!(stderr.contains("no database found at"));
+    assert!(!temporary.path().join(".cr").exists());
 }
 
 #[test]

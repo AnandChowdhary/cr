@@ -123,12 +123,7 @@ fn failed_mutations_do_not_create_audit_events() {
 fn bounded_segments_rotate_and_recent_log_crosses_boundaries() {
     let database = TestDatabase::new("audit-rotation");
     let config_path = database.root.join(".cr/config.yaml");
-    let config = fs::read_to_string(&config_path).unwrap();
-    fs::write(
-        &config_path,
-        config.replace("segment_max_events: 256", "segment_max_events: 2"),
-    )
-    .unwrap();
+    fs::write(&config_path, "audit:\n  segment_max_events: 2\n").unwrap();
 
     for index in 1..=5 {
         let id = format!("item-{index}");
@@ -186,12 +181,7 @@ fn bounded_segments_rotate_and_recent_log_crosses_boundaries() {
 fn segment_byte_limit_bounds_the_active_segment() {
     let database = TestDatabase::new("audit-byte-rotation");
     let config_path = database.root.join(".cr/config.yaml");
-    let config = fs::read_to_string(&config_path).unwrap();
-    fs::write(
-        &config_path,
-        config.replace("segment_max_bytes: 8388608", "segment_max_bytes: 1"),
-    )
-    .unwrap();
+    fs::write(&config_path, "audit:\n  segment_max_bytes: 1\n").unwrap();
 
     run_success(database.command().args(["create", "items", "one"]));
     run_success(database.command().args(["create", "items", "two"]));

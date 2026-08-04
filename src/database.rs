@@ -19,10 +19,11 @@ use crate::{
 };
 
 const CONFIG_PATH: &str = ".cr/config.yaml";
+const DATABASE_DIRECTORY: &str = ".cr";
 const CURRENT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 struct Config {
     version: u32,
     data_dir: PathBuf,
@@ -191,9 +192,9 @@ impl Database {
         let root = root
             .canonicalize()
             .with_context(|| format!("could not resolve database root {}", root.display()))?;
-        let config_path = root.join(CONFIG_PATH);
+        let database_directory = root.join(DATABASE_DIRECTORY);
 
-        if config_path.exists() {
+        if database_directory.exists() {
             bail!("a database already exists at {}", root.display());
         }
 
@@ -207,13 +208,9 @@ impl Database {
             .context("could not create sync lock directory")?;
         fs::create_dir_all(root.join("records")).context("could not create records directory")?;
 
-        let config = Config::default();
-        let serialized = yaml_serde::to_string(&config).context("could not serialize config")?;
-        write_new(&config_path, serialized.as_bytes())?;
-
         let database = Self {
             root,
-            config,
+            config: Config::default(),
             actor: String::new(),
             source: AuditSource::Cli,
             audit_message: None,
@@ -233,17 +230,29 @@ impl Database {
                     std::env::current_dir().context("could not read current directory")?;
                 current
                     .ancestors()
-                    .find(|path| path.join(CONFIG_PATH).is_file())
+                    .find(|path| path.join(DATABASE_DIRECTORY).is_dir())
                     .map(Path::to_path_buf)
                     .context("no database found; run 'cr init' or pass --database <PATH>")?
             }
         };
 
+        if !root.join(DATABASE_DIRECTORY).is_dir() {
+            bail!(
+                "no database found at {}; run 'cr init' first",
+                root.display()
+            );
+        }
+
         let config_path = root.join(CONFIG_PATH);
-        let serialized = fs::read_to_string(&config_path)
-            .with_context(|| format!("could not read {}", config_path.display()))?;
-        let config: Config = yaml_serde::from_str(&serialized)
-            .with_context(|| format!("{} is not valid YAML", config_path.display()))?;
+        let config = match fs::read_to_string(&config_path) {
+            Ok(serialized) => yaml_serde::from_str(&serialized)
+                .with_context(|| format!("{} is not valid YAML", config_path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not read {}", config_path.display()))
+            }
+        };
 
         if config.version != CURRENT_FORMAT_VERSION {
             bail!(

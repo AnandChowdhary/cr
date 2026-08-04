@@ -61,7 +61,6 @@ The new directory contains:
 ```text
 my-database/
 ├── .cr/
-│   ├── config.yaml
 │   ├── audit/
 │   ├── schemas/
 │   ├── sync/
@@ -75,7 +74,16 @@ my-database/
 - `.cr/schemas/` can contain optional validation rules.
 - `.cr/syncs/` contains versioned external sync definitions; `.cr/sync/` holds their checkpoints and locks.
 - `.cr/views/` contains optional saved web views.
-- `.cr/config.yaml` contains database settings.
+- `.cr/` identifies the database root.
+- `.cr/config.yaml` is optional and contains only overrides from the defaults.
+
+Without a config file, `cr` uses format version 1, stores records under `records/`, and rotates audit segments after 256 events or 8 MiB. Add only the settings you want to change; omitted fields retain their defaults:
+
+```yaml
+data_dir: content/data
+audit:
+  segment_max_events: 500
+```
 
 Commands search the current directory and its parents for a database. If you are elsewhere, pass its path explicitly:
 
