@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{cmp::Ordering, fmt, str::FromStr};
 
 use anyhow::{bail, Context, Result};
 use yaml_serde::{Mapping, Value};
@@ -19,6 +19,211 @@ impl Assignment {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterOperator {
+    Equal,
+    NotEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    Contains,
+    NotContains,
+    StartsWith,
+    EndsWith,
+    IsEmpty,
+    IsNotEmpty,
+}
+
+impl FilterOperator {
+    pub fn requires_value(self) -> bool {
+        !matches!(self, Self::IsEmpty | Self::IsNotEmpty)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Equal => "eq",
+            Self::NotEqual => "ne",
+            Self::GreaterThan => "gt",
+            Self::GreaterThanOrEqual => "gte",
+            Self::LessThan => "lt",
+            Self::LessThanOrEqual => "lte",
+            Self::Contains => "contains",
+            Self::NotContains => "not-contains",
+            Self::StartsWith => "starts-with",
+            Self::EndsWith => "ends-with",
+            Self::IsEmpty => "is-empty",
+            Self::IsNotEmpty => "is-not-empty",
+        }
+    }
+}
+
+impl fmt::Display for FilterOperator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilterExpression {
+    path: Vec<String>,
+    operator: FilterOperator,
+    value: Option<Value>,
+}
+
+impl FilterExpression {
+    pub fn new(path: &str, operator: FilterOperator, raw_value: &str) -> Result<Self> {
+        let path = parse_path(path)?;
+        let value = if operator.requires_value() {
+            Some(parse_filter_value(raw_value)?)
+        } else {
+            if !raw_value.trim().is_empty() {
+                bail!("operator '{operator}' does not accept a value");
+            }
+            None
+        };
+        Ok(Self {
+            path,
+            operator,
+            value,
+        })
+    }
+
+    pub fn operator(&self) -> FilterOperator {
+        self.operator
+    }
+
+    pub fn matches(&self, attributes: &Mapping) -> bool {
+        let current = get_path(attributes, &self.path);
+        match self.operator {
+            FilterOperator::IsEmpty => value_is_empty(current),
+            FilterOperator::IsNotEmpty => !value_is_empty(current),
+            FilterOperator::Equal => current == self.value.as_ref(),
+            FilterOperator::NotEqual => current
+                .zip(self.value.as_ref())
+                .is_some_and(|(current, expected)| current != expected),
+            FilterOperator::GreaterThan => self
+                .ordering(current)
+                .is_some_and(|ordering| ordering == Ordering::Greater),
+            FilterOperator::GreaterThanOrEqual => self
+                .ordering(current)
+                .is_some_and(|ordering| ordering != Ordering::Less),
+            FilterOperator::LessThan => self
+                .ordering(current)
+                .is_some_and(|ordering| ordering == Ordering::Less),
+            FilterOperator::LessThanOrEqual => self
+                .ordering(current)
+                .is_some_and(|ordering| ordering != Ordering::Greater),
+            FilterOperator::Contains => self.contains(current),
+            FilterOperator::NotContains => current.is_some() && !self.contains(current),
+            FilterOperator::StartsWith => {
+                self.string_match(current, |current, expected| current.starts_with(expected))
+            }
+            FilterOperator::EndsWith => {
+                self.string_match(current, |current, expected| current.ends_with(expected))
+            }
+        }
+    }
+
+    fn ordering(&self, current: Option<&Value>) -> Option<Ordering> {
+        match (current?, self.value.as_ref()?) {
+            (Value::Number(left), Value::Number(right)) => {
+                number_as_f64(left).partial_cmp(&number_as_f64(right))
+            }
+            (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
+            _ => None,
+        }
+    }
+
+    fn contains(&self, current: Option<&Value>) -> bool {
+        match (current, self.value.as_ref()) {
+            (Some(Value::String(current)), Some(Value::String(expected))) => {
+                current.contains(expected)
+            }
+            (Some(Value::Sequence(current)), Some(expected)) => current.contains(expected),
+            _ => false,
+        }
+    }
+
+    fn string_match(&self, current: Option<&Value>, predicate: fn(&str, &str) -> bool) -> bool {
+        match (current, self.value.as_ref()) {
+            (Some(Value::String(current)), Some(Value::String(expected))) => {
+                predicate(current, expected)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl From<Assignment> for FilterExpression {
+    fn from(assignment: Assignment) -> Self {
+        Self {
+            path: assignment.path,
+            operator: FilterOperator::Equal,
+            value: Some(assignment.value),
+        }
+    }
+}
+
+impl FromStr for FilterExpression {
+    type Err = anyhow::Error;
+
+    fn from_str(input: &str) -> Result<Self> {
+        let operators = [
+            (" is-not-empty", FilterOperator::IsNotEmpty),
+            (" not-contains ", FilterOperator::NotContains),
+            (" starts-with ", FilterOperator::StartsWith),
+            (" ends-with ", FilterOperator::EndsWith),
+            (" is-empty", FilterOperator::IsEmpty),
+            (" contains ", FilterOperator::Contains),
+            ("!=", FilterOperator::NotEqual),
+            (">=", FilterOperator::GreaterThanOrEqual),
+            ("<=", FilterOperator::LessThanOrEqual),
+            ("=", FilterOperator::Equal),
+            (">", FilterOperator::GreaterThan),
+            ("<", FilterOperator::LessThan),
+        ];
+        let (position, token, operator) = operators
+            .iter()
+            .filter_map(|(token, operator)| input.find(token).map(|position| (position, *token, *operator)))
+            .min_by_key(|(position, token, _)| (*position, std::cmp::Reverse(token.len())))
+            .context(
+                "expected a filter expression such as value>=10000, name contains Acme, or owner is-empty",
+            )?;
+        let path = input[..position].trim();
+        let raw_value = input[position + token.len()..].trim();
+        Self::new(path, operator, raw_value)
+    }
+}
+
+fn parse_filter_value(raw_value: &str) -> Result<Value> {
+    if raw_value.is_empty() {
+        Ok(Value::String(String::new()))
+    } else {
+        yaml_serde::from_str(raw_value)
+            .with_context(|| format!("'{raw_value}' is not a valid YAML value"))
+    }
+}
+
+fn value_is_empty(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => true,
+        Some(Value::String(value)) => value.is_empty(),
+        Some(Value::Sequence(value)) => value.is_empty(),
+        Some(Value::Mapping(value)) => value.is_empty(),
+        _ => false,
+    }
+}
+
+fn number_as_f64(number: &yaml_serde::Number) -> f64 {
+    number
+        .as_i64()
+        .map(|value| value as f64)
+        .or_else(|| number.as_u64().map(|value| value as f64))
+        .or_else(|| number.as_f64())
+        .expect("YAML numbers are representable as integers or floats")
+}
+
 impl FromStr for Assignment {
     type Err = anyhow::Error;
 
@@ -27,12 +232,7 @@ impl FromStr for Assignment {
             .split_once('=')
             .context("expected KEY=YAML (for example, stage=interview)")?;
         let path = parse_path(key)?;
-        let value = if raw_value.is_empty() {
-            Value::String(String::new())
-        } else {
-            yaml_serde::from_str(raw_value)
-                .with_context(|| format!("'{raw_value}' is not a valid YAML value"))?
-        };
+        let value = parse_filter_value(raw_value)?;
 
         Ok(Self { path, value })
     }
@@ -103,7 +303,7 @@ fn set_path(attributes: &mut Mapping, path: &[String], value: Value) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_path, remove_path, Assignment};
+    use super::{parse_path, remove_path, Assignment, FilterExpression, FilterOperator};
     use std::str::FromStr;
     use yaml_serde::{Mapping, Value};
 
@@ -191,6 +391,87 @@ mod tests {
         assert!(!Assignment::from_str("metrics.missing=42")
             .unwrap()
             .matches(&attributes));
+    }
+
+    #[test]
+    fn filter_expressions_compare_typed_numbers_and_iso_dates() {
+        let mut attributes = Mapping::new();
+        Assignment::from_str("value=12000")
+            .unwrap()
+            .apply(&mut attributes)
+            .unwrap();
+        Assignment::from_str("expected_close=2027-03-15")
+            .unwrap()
+            .apply(&mut attributes)
+            .unwrap();
+
+        assert!(FilterExpression::from_str("value>10000")
+            .unwrap()
+            .matches(&attributes));
+        assert!(FilterExpression::from_str("value<=12000")
+            .unwrap()
+            .matches(&attributes));
+        assert!(!FilterExpression::from_str("value>12000")
+            .unwrap()
+            .matches(&attributes));
+        assert!(FilterExpression::from_str("expected_close<2028-01-01")
+            .unwrap()
+            .matches(&attributes));
+        assert!(!FilterExpression::from_str("value>\"10000\"")
+            .unwrap()
+            .matches(&attributes));
+    }
+
+    #[test]
+    fn filter_expressions_support_string_array_and_empty_operators() {
+        let mut attributes = Mapping::new();
+        Assignment::from_str("name=Acme annual renewal")
+            .unwrap()
+            .apply(&mut attributes)
+            .unwrap();
+        Assignment::from_str("tags=[enterprise, renewal]")
+            .unwrap()
+            .apply(&mut attributes)
+            .unwrap();
+        Assignment::from_str("notes=\"\"")
+            .unwrap()
+            .apply(&mut attributes)
+            .unwrap();
+
+        for expression in [
+            "name contains annual",
+            "name starts-with Acme",
+            "name ends-with renewal",
+            "tags contains enterprise",
+            "notes is-empty",
+            "owner is-empty",
+            "name is-not-empty",
+            "name!=Globex",
+        ] {
+            assert!(
+                FilterExpression::from_str(expression)
+                    .unwrap()
+                    .matches(&attributes),
+                "filter did not match: {expression}"
+            );
+        }
+        assert!(!FilterExpression::from_str("owner!=Maya")
+            .unwrap()
+            .matches(&attributes));
+        assert!(!FilterExpression::from_str("tags not-contains enterprise")
+            .unwrap()
+            .matches(&attributes));
+    }
+
+    #[test]
+    fn filter_expression_parsing_reports_invalid_shapes() {
+        assert!(FilterExpression::from_str("value").is_err());
+        assert!(FilterExpression::from_str("=100").is_err());
+        assert!(FilterExpression::from_str("owner is-empty Maya").is_err());
+        assert_eq!(
+            FilterExpression::from_str("value>=100").unwrap().operator(),
+            FilterOperator::GreaterThanOrEqual
+        );
     }
 
     #[test]

@@ -189,10 +189,48 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
         3
     );
 
+    let greater_than = request(
+        &app,
+        Method::GET,
+        "/deals?filter_field=value&filter_operator=gt&filter_value=10000",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(greater_than.status, StatusCode::OK);
+    assert!(greater_than.text().contains("value=\"gt\" selected"));
+    assert!(greater_than.text().contains("alpha"));
+    assert!(!greater_than.text().contains("beta"));
+
+    let contains = request(
+        &app,
+        Method::GET,
+        "/deals?filter_field=name&filter_operator=contains&filter_value=Beta",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(contains.status, StatusCode::OK);
+    assert!(contains.text().contains("beta"));
+    assert!(!contains.text().contains("href=\"/deals/records/alpha\""));
+
+    let empty = request(
+        &app,
+        Method::GET,
+        "/deals?filter_field=owner&filter_operator=is-empty&filter_value=",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert!(empty.text().contains("No value needed"));
+    assert!(empty.text().contains("alpha"));
+    assert!(empty.text().contains("beta"));
+
     let any = request(
         &app,
         Method::GET,
-        "/deals?filter_match=any&filter_field=status&filter_value=open&filter_field=value&filter_value=8000",
+        "/deals?filter_match=any&filter_field=status&filter_operator=eq&filter_value=open&filter_field=value&filter_operator=gte&filter_value=8000",
         None,
         &[],
     )
@@ -262,12 +300,13 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
         r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "x-cr-ui": { "order": ["name", "stage", "owner"] },
+  "x-cr-ui": { "order": ["name", "stage", "owner", "score"] },
   "required": ["name"],
   "properties": {
     "name": { "type": "string" },
     "stage": { "enum": ["qualification", "interview", "offer", "won", "lost"] },
-    "owner": { "type": "string" }
+    "owner": { "type": "string" },
+    "score": { "type": "integer" }
   },
   "additionalProperties": true
 }"#,
@@ -281,6 +320,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
                 Assignment::from_str("name=\"<script>alert('x')</script>\"").unwrap(),
                 Assignment::from_str("stage=qualification").unwrap(),
                 Assignment::from_str("owner=Ana").unwrap(),
+                Assignment::from_str("score=42").unwrap(),
             ],
             "",
         )
@@ -292,6 +332,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
             &[
                 Assignment::from_str("name=Beta").unwrap(),
                 Assignment::from_str("stage=offer").unwrap(),
+                Assignment::from_str("score=80").unwrap(),
             ],
             "",
         )
@@ -355,6 +396,20 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
         .contains("value=\"offer\" selected>Offer</option>"));
     assert!(typed_filter.text().contains("beta"));
     assert!(!typed_filter.text().contains("alpha"));
+
+    let numeric_filter = request(
+        &app,
+        Method::GET,
+        "/pipeline?filter_field=score&filter_operator=gte&filter_value=80",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(numeric_filter.status, StatusCode::OK);
+    assert!(numeric_filter.text().contains("value=\"gte\" selected"));
+    assert!(numeric_filter.text().contains("type=\"number\" step=\"1\""));
+    assert!(numeric_filter.text().contains("beta"));
+    assert!(!numeric_filter.text().contains("alpha"));
 
     let token = csrf(board.text()).to_owned();
     let target = r#"{"kind":"value","value":"interview"}"#;
@@ -913,4 +968,17 @@ async fn view_routes_respect_api_authentication_and_return_html_errors() {
     .await;
     assert_eq!(invalid_query.status, StatusCode::BAD_REQUEST);
     assert!(invalid_query.text().contains("one matching filter_value"));
+
+    let invalid_operators = request(
+        &app,
+        Method::GET,
+        "/deals?filter_field=status&filter_operator=eq&filter_operator=ne&filter_value=open",
+        None,
+        &[("authorization", "Bearer secret")],
+    )
+    .await;
+    assert_eq!(invalid_operators.status, StatusCode::BAD_REQUEST);
+    assert!(invalid_operators
+        .text()
+        .contains("one matching filter_operator"));
 }

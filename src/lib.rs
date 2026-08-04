@@ -11,5 +11,5 @@ pub use audit::{AuditAction, AuditEntry, AuditHead, AuditSource, AuditVerificati
 pub use database::{CollectionModel, Database, Record, WorkingChange, WorkingChangeKind};
 pub use search::{SearchQuery, SearchTarget};
 pub use sync::{SyncDefinition, SyncRunSummary};
-pub use value::Assignment;
+pub use value::{Assignment, FilterExpression, FilterOperator};
 pub use views::{ViewDefinition, ViewLayout};

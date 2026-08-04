@@ -24,8 +24,9 @@ use sha2::{Digest, Sha256};
 use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
-    audit::AuditChange, Assignment, AuditEntry, AuditSource, CollectionModel, Database, Record,
-    SearchQuery, SearchTarget, ViewDefinition, ViewLayout,
+    audit::AuditChange, Assignment, AuditEntry, AuditSource, CollectionModel, Database,
+    FilterExpression, FilterOperator, Record, SearchQuery, SearchTarget, ViewDefinition,
+    ViewLayout,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -168,6 +169,8 @@ struct ViewQuery {
     #[serde(default)]
     filter_field: Vec<String>,
     #[serde(default)]
+    filter_operator: Vec<ViewFilterOperator>,
+    #[serde(default)]
     filter_value: Vec<String>,
     limit: Option<usize>,
     offset: Option<usize>,
@@ -182,8 +185,85 @@ enum ViewFilterMatch {
     Any,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum ViewFilterOperator {
+    #[default]
+    Eq,
+    Ne,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Contains,
+    NotContains,
+    StartsWith,
+    EndsWith,
+    IsEmpty,
+    IsNotEmpty,
+}
+
+impl ViewFilterOperator {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Ne => "ne",
+            Self::Gt => "gt",
+            Self::Gte => "gte",
+            Self::Lt => "lt",
+            Self::Lte => "lte",
+            Self::Contains => "contains",
+            Self::NotContains => "not-contains",
+            Self::StartsWith => "starts-with",
+            Self::EndsWith => "ends-with",
+            Self::IsEmpty => "is-empty",
+            Self::IsNotEmpty => "is-not-empty",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Eq => "is",
+            Self::Ne => "is not",
+            Self::Gt => "is greater than",
+            Self::Gte => "is at least",
+            Self::Lt => "is less than",
+            Self::Lte => "is at most",
+            Self::Contains => "contains",
+            Self::NotContains => "does not contain",
+            Self::StartsWith => "starts with",
+            Self::EndsWith => "ends with",
+            Self::IsEmpty => "is empty",
+            Self::IsNotEmpty => "is not empty",
+        }
+    }
+
+    fn requires_value(self) -> bool {
+        !matches!(self, Self::IsEmpty | Self::IsNotEmpty)
+    }
+}
+
+impl From<ViewFilterOperator> for FilterOperator {
+    fn from(operator: ViewFilterOperator) -> Self {
+        match operator {
+            ViewFilterOperator::Eq => Self::Equal,
+            ViewFilterOperator::Ne => Self::NotEqual,
+            ViewFilterOperator::Gt => Self::GreaterThan,
+            ViewFilterOperator::Gte => Self::GreaterThanOrEqual,
+            ViewFilterOperator::Lt => Self::LessThan,
+            ViewFilterOperator::Lte => Self::LessThanOrEqual,
+            ViewFilterOperator::Contains => Self::Contains,
+            ViewFilterOperator::NotContains => Self::NotContains,
+            ViewFilterOperator::StartsWith => Self::StartsWith,
+            ViewFilterOperator::EndsWith => Self::EndsWith,
+            ViewFilterOperator::IsEmpty => Self::IsEmpty,
+            ViewFilterOperator::IsNotEmpty => Self::IsNotEmpty,
+        }
+    }
+}
+
 impl ViewFilterMatch {
-    fn matches(self, filters: &[Assignment], attributes: &Mapping) -> bool {
+    fn matches(self, filters: &[FilterExpression], attributes: &Mapping) -> bool {
         filters.is_empty()
             || match self {
                 Self::All => filters.iter().all(|filter| filter.matches(attributes)),
@@ -654,7 +734,7 @@ async fn view_records(
 ) -> Response {
     let result: ApiResult<Markup> = async {
         let query: ViewQuery = parse_query(raw)?;
-        let ad_hoc_filters = view_filter_assignments(&query)?;
+        let ad_hoc_filters = view_filter_expressions(&query)?;
         let query_for_database = query.clone();
         let requested_view = view_name.clone();
         let (view, records, schema) = run_database(&state, &headers, move |database| {
@@ -663,10 +743,6 @@ async fn view_records(
                 .filters
                 .iter()
                 .map(|filter| Assignment::from_str(filter))
-                .collect::<Result<Vec<_>>>()?;
-            let ad_hoc_filters = ad_hoc_filters
-                .into_iter()
-                .map(|filter| Assignment::from_str(&filter))
                 .collect::<Result<Vec<_>>>()?;
             let mut records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
                 Some(pattern) => {
@@ -1789,17 +1865,18 @@ fn view_filter_fields(schema: Option<&JsonValue>, columns: &[String]) -> Vec<Vie
 fn filter_kind_data(kind: &SchemaFieldKind) -> (&'static str, &'static str) {
     match kind {
         SchemaFieldKind::Select(_) => ("select", "text"),
+        SchemaFieldKind::MultiSelect(_) => ("select", "text"),
         SchemaFieldKind::Boolean => ("select", "text"),
         SchemaFieldKind::Integer { .. } => ("input", "number"),
         SchemaFieldKind::Number { .. } => ("input", "number"),
         SchemaFieldKind::String { input_type, .. } => ("input", input_type),
-        SchemaFieldKind::MultiSelect(_) | SchemaFieldKind::Yaml => ("input", "text"),
+        SchemaFieldKind::Yaml => ("input", "text"),
     }
 }
 
 fn filter_options_json(kind: &SchemaFieldKind) -> String {
     let values = match kind {
-        SchemaFieldKind::Select(values) => values
+        SchemaFieldKind::Select(values) | SchemaFieldKind::MultiSelect(values) => values
             .iter()
             .map(|value| {
                 json!({
@@ -1817,16 +1894,99 @@ fn filter_options_json(kind: &SchemaFieldKind) -> String {
     serde_json::to_string(&values).expect("filter options are JSON serializable")
 }
 
+fn filter_operator_options(kind: &SchemaFieldKind) -> Vec<ViewFilterOperator> {
+    use ViewFilterOperator::{
+        Contains, EndsWith, Eq, Gt, Gte, IsEmpty, IsNotEmpty, Lt, Lte, Ne, NotContains, StartsWith,
+    };
+    match kind {
+        SchemaFieldKind::Select(_) | SchemaFieldKind::Boolean => {
+            vec![Eq, Ne, IsEmpty, IsNotEmpty]
+        }
+        SchemaFieldKind::Integer { .. } | SchemaFieldKind::Number { .. } => {
+            vec![Eq, Ne, Gt, Gte, Lt, Lte, IsEmpty, IsNotEmpty]
+        }
+        SchemaFieldKind::String { .. } => vec![
+            Eq,
+            Ne,
+            Contains,
+            NotContains,
+            StartsWith,
+            EndsWith,
+            Gt,
+            Gte,
+            Lt,
+            Lte,
+            IsEmpty,
+            IsNotEmpty,
+        ],
+        SchemaFieldKind::MultiSelect(_) => {
+            vec![Contains, NotContains, IsEmpty, IsNotEmpty]
+        }
+        SchemaFieldKind::Yaml => vec![
+            Eq,
+            Ne,
+            Contains,
+            NotContains,
+            StartsWith,
+            EndsWith,
+            Gt,
+            Gte,
+            Lt,
+            Lte,
+            IsEmpty,
+            IsNotEmpty,
+        ],
+    }
+}
+
+fn filter_operators_json(kind: &SchemaFieldKind) -> String {
+    let operators = filter_operator_options(kind)
+        .into_iter()
+        .map(|operator| json!({ "value": operator.as_str(), "label": operator.label() }))
+        .collect::<Vec<_>>();
+    serde_json::to_string(&operators).expect("filter operators are JSON serializable")
+}
+
+fn render_filter_operator_control(
+    fields: &[ViewFilterField],
+    index: usize,
+    selected_field: &str,
+    selected_operator: ViewFilterOperator,
+) -> Markup {
+    let mut operators = fields
+        .iter()
+        .find(|field| field.key == selected_field)
+        .map(|field| filter_operator_options(&field.kind))
+        .unwrap_or_else(|| filter_operator_options(&SchemaFieldKind::Yaml));
+    if !operators.contains(&selected_operator) {
+        operators.push(selected_operator);
+    }
+    html! {
+        select name="filter_operator" data-filter-operator="true" aria-label=(format!("Filter operator {}", index + 1)) class="min-w-0 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 xl:col-span-3" {
+            @for operator in operators {
+                option value=(operator.as_str()) selected[operator == selected_operator] { (operator.label()) }
+            }
+        }
+    }
+}
+
 fn render_filter_value_control(
     fields: &[ViewFilterField],
     index: usize,
     selected_field: &str,
+    selected_operator: ViewFilterOperator,
     value: &str,
 ) -> Markup {
+    if !selected_operator.requires_value() {
+        return html! {
+            input type="hidden" name="filter_value" data-filter-value="true" value="";
+            span class="block px-3 py-2 text-sm text-slate-400" { "No value needed" }
+        };
+    }
     let definition = fields.iter().find(|field| field.key == selected_field);
     let aria_label = format!("Filter value {}", index + 1);
     match definition.map(|field| &field.kind) {
-        Some(SchemaFieldKind::Select(options)) => {
+        Some(SchemaFieldKind::Select(options) | SchemaFieldKind::MultiSelect(options)) => {
             let known = options
                 .iter()
                 .any(|option| serialize_yaml_value(option) == value);
@@ -1869,24 +2029,25 @@ fn render_filter_row(
     fields: &[ViewFilterField],
     index: usize,
     selected_field: &str,
+    selected_operator: ViewFilterOperator,
     value: &str,
 ) -> Markup {
     let selected_known = fields.iter().any(|field| field.key == selected_field);
     html! {
         div data-filter-row="true" class="grid gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 md:grid-cols-2 xl:grid-cols-12 xl:items-center" {
-            select name="filter_field" data-filter-field="true" aria-label=(format!("Filter field {}", index + 1)) class="min-w-0 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 xl:col-span-5" {
-                option value="" selected[selected_field.is_empty()] data-filter-kind="input" data-filter-input-type="text" data-filter-options="[]" { "Choose a field…" }
+            select name="filter_field" data-filter-field="true" aria-label=(format!("Filter field {}", index + 1)) class="min-w-0 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 xl:col-span-4" {
+                option value="" selected[selected_field.is_empty()] data-filter-kind="input" data-filter-input-type="text" data-filter-options="[]" data-filter-operators=(filter_operators_json(&SchemaFieldKind::Yaml)) { "Choose a field…" }
                 @for field in fields {
                     @let (kind, input_type) = filter_kind_data(&field.kind);
-                    option value=(&field.key) selected[field.key == selected_field] data-filter-kind=(kind) data-filter-input-type=(input_type) data-filter-options=(filter_options_json(&field.kind)) { (&field.label) }
+                    option value=(&field.key) selected[field.key == selected_field] data-filter-kind=(kind) data-filter-input-type=(input_type) data-filter-options=(filter_options_json(&field.kind)) data-filter-operators=(filter_operators_json(&field.kind)) { (&field.label) }
                 }
                 @if !selected_field.is_empty() && !selected_known {
-                    option value=(selected_field) selected data-filter-kind="input" data-filter-input-type="text" data-filter-options="[]" { (selected_field) " (custom)" }
+                    option value=(selected_field) selected data-filter-kind="input" data-filter-input-type="text" data-filter-options="[]" data-filter-operators=(filter_operators_json(&SchemaFieldKind::Yaml)) { (selected_field) " (custom)" }
                 }
             }
-            span class="hidden text-center text-xs font-bold uppercase tracking-wide text-slate-400 xl:col-span-1 xl:block" { "is" }
-            div data-filter-value-slot="true" class="min-w-0 xl:col-span-5" {
-                (render_filter_value_control(fields, index, selected_field, value))
+            (render_filter_operator_control(fields, index, selected_field, selected_operator))
+            div data-filter-value-slot="true" class="min-w-0 md:col-span-2 xl:col-span-4" {
+                (render_filter_value_control(fields, index, selected_field, selected_operator, value))
             }
             button type="button" data-remove-filter="true" aria-label=(format!("Remove filter {}", index + 1)) class="justify-self-start rounded-lg px-3 py-2 text-sm font-semibold text-slate-500 hover:bg-red-50 hover:text-red-700 md:col-span-2 xl:col-span-1 xl:justify-self-end" { "Remove" }
         }
@@ -1905,6 +2066,7 @@ const FILTER_BUILDER_SCRIPT: &str = r#"(() => {
     const rows = [...list.querySelectorAll('[data-filter-row]')];
     rows.forEach((row, index) => {
       row.querySelector('[data-filter-field]').setAttribute('aria-label', `Filter field ${index + 1}`);
+      row.querySelector('[data-filter-operator]').setAttribute('aria-label', `Filter operator ${index + 1}`);
       row.querySelector('[data-filter-value]').setAttribute('aria-label', `Filter value ${index + 1}`);
       row.querySelector('[data-remove-filter]').setAttribute('aria-label', `Remove filter ${index + 1}`);
     });
@@ -1914,11 +2076,23 @@ const FILTER_BUILDER_SCRIPT: &str = r#"(() => {
   const replaceValueControl = (row) => {
     const field = row.querySelector('[data-filter-field]');
     const option = field.selectedOptions[0];
+    const operator = row.querySelector('[data-filter-operator]').value;
     const slot = row.querySelector('[data-filter-value-slot]');
-    const oldControl = row.querySelector('[data-filter-value]');
     const kind = option.dataset.filterKind || 'input';
     let control;
-    if (kind === 'select') {
+    if (operator === 'is-empty' || operator === 'is-not-empty') {
+      control = document.createElement('input');
+      control.type = 'hidden';
+      control.value = '';
+      const hint = document.createElement('span');
+      hint.className = 'block px-3 py-2 text-sm text-slate-400';
+      hint.textContent = 'No value needed';
+      control.name = 'filter_value';
+      control.dataset.filterValue = 'true';
+      slot.replaceChildren(control, hint);
+      reindex();
+      return;
+    } else if (kind === 'select') {
       control = document.createElement('select');
       const blank = document.createElement('option');
       blank.value = '';
@@ -1938,18 +2112,36 @@ const FILTER_BUILDER_SCRIPT: &str = r#"(() => {
     }
     control.name = 'filter_value';
     control.dataset.filterValue = 'true';
-    control.className = oldControl.className;
+    control.className = 'w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2';
     slot.replaceChildren(control);
     reindex();
   };
 
+  const replaceOperatorControl = (row) => {
+    const field = row.querySelector('[data-filter-field]');
+    const selected = field.selectedOptions[0];
+    const operator = row.querySelector('[data-filter-operator]');
+    const previous = operator.value;
+    const options = JSON.parse(selected.dataset.filterOperators || '[]');
+    operator.replaceChildren(...options.map((item) => {
+      const choice = document.createElement('option');
+      choice.value = item.value;
+      choice.textContent = item.label;
+      return choice;
+    }));
+    if (options.some((item) => item.value === previous)) operator.value = previous;
+    replaceValueControl(row);
+  };
+
   const bindRow = (row) => {
-    row.querySelector('[data-filter-field]').addEventListener('change', () => replaceValueControl(row));
+    row.querySelector('[data-filter-field]').addEventListener('change', () => replaceOperatorControl(row));
+    row.querySelector('[data-filter-operator]').addEventListener('change', () => replaceValueControl(row));
     row.querySelector('[data-remove-filter]').addEventListener('click', () => {
       const rows = list.querySelectorAll('[data-filter-row]');
       if (rows.length === 1) {
         row.querySelector('[data-filter-field]').value = '';
-        replaceValueControl(row);
+        row.querySelector('[data-filter-operator]').value = 'eq';
+        replaceOperatorControl(row);
       } else {
         row.remove();
         reindex();
@@ -1990,10 +2182,21 @@ fn render_view_records(
         .filter_field
         .iter()
         .zip(&query.filter_value)
-        .map(|(field, value)| (field.as_str(), value.as_str()))
+        .enumerate()
+        .map(|(index, (field, value))| {
+            (
+                field.as_str(),
+                query
+                    .filter_operator
+                    .get(index)
+                    .copied()
+                    .unwrap_or_default(),
+                value.as_str(),
+            )
+        })
         .collect::<Vec<_>>();
     if filter_rows.is_empty() {
-        filter_rows.push(("", ""));
+        filter_rows.push(("", ViewFilterOperator::default(), ""));
     }
     page_layout(
         &view.title,
@@ -2055,12 +2258,12 @@ fn render_view_records(
                         button type="button" data-add-filter="true" class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:border-indigo-300 hover:text-indigo-700 disabled:cursor-not-allowed disabled:opacity-40" { "+ Add condition" }
                     }
                     div data-filter-list="true" class="space-y-2" {
-                        @for (index, (field, value)) in filter_rows.iter().enumerate() {
-                            (render_filter_row(&filter_fields, index, field, value))
+                        @for (index, (field, operator, value)) in filter_rows.iter().enumerate() {
+                            (render_filter_row(&filter_fields, index, field, *operator, value))
                         }
                     }
                     template data-filter-template="true" {
-                        (render_filter_row(&filter_fields, 0, "", ""))
+                        (render_filter_row(&filter_fields, 0, "", ViewFilterOperator::default(), ""))
                     }
                 }
                 div class="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-4" {
@@ -2964,11 +3167,18 @@ fn audit_page_url(query: &AuditViewQuery, limit: usize, offset: usize) -> String
     format!("/audit?{}", serializer.finish())
 }
 
-fn view_filter_assignments(query: &ViewQuery) -> ApiResult<Vec<String>> {
+fn view_filter_expressions(query: &ViewQuery) -> ApiResult<Vec<FilterExpression>> {
     if query.filter_field.len() != query.filter_value.len() {
         return Err(ApiError::bad_request(
             "invalid_filter",
             "each filter_field must have one matching filter_value",
+        ));
+    }
+    if !query.filter_operator.is_empty() && query.filter_field.len() != query.filter_operator.len()
+    {
+        return Err(ApiError::bad_request(
+            "invalid_filter",
+            "each filter_field must have one matching filter_operator",
         ));
     }
     if query.filter_field.len() > MAX_VIEW_FILTERS {
@@ -2981,7 +3191,8 @@ fn view_filter_assignments(query: &ViewQuery) -> ApiResult<Vec<String>> {
         .filter_field
         .iter()
         .zip(&query.filter_value)
-        .filter_map(|(field, value)| {
+        .enumerate()
+        .filter_map(|(index, (field, value))| {
             if field.is_empty() && value.is_empty() {
                 None
             } else if field.is_empty() {
@@ -2990,7 +3201,15 @@ fn view_filter_assignments(query: &ViewQuery) -> ApiResult<Vec<String>> {
                     "filter_field cannot be empty when filter_value is provided",
                 )))
             } else {
-                Some(Ok(format!("{field}={value}")))
+                let operator = query
+                    .filter_operator
+                    .get(index)
+                    .copied()
+                    .unwrap_or_default();
+                Some(
+                    FilterExpression::new(field, operator.into(), value)
+                        .map_err(ApiError::from_database),
+                )
             }
         })
         .collect()
@@ -3008,8 +3227,22 @@ fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset:
             ViewFilterMatch::Any => "any",
         },
     );
-    for (field, value) in query.filter_field.iter().zip(&query.filter_value) {
+    for (index, (field, value)) in query
+        .filter_field
+        .iter()
+        .zip(&query.filter_value)
+        .enumerate()
+    {
         serializer.append_pair("filter_field", field);
+        serializer.append_pair(
+            "filter_operator",
+            query
+                .filter_operator
+                .get(index)
+                .copied()
+                .unwrap_or_default()
+                .as_str(),
+        );
         serializer.append_pair("filter_value", value);
     }
     serializer.append_pair("limit", &limit.to_string());

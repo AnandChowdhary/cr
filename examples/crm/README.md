@@ -20,7 +20,7 @@ Then open:
 
 The HTML forms are live: creating, editing, deleting, or moving a Kanban card changes the Markdown files in this directory and appends to its audit journal. Record pages derive typed inputs, select controls, descriptions, and validation hints from the CRM schemas. Drag a card between stage lanes, or use its accessible move selector and button.
 
-List and Kanban pages also derive their filter controls from the schema. Add multiple conditions such as `stage is negotiation` and `currency is USD`, then choose whether all or any conditions must match. Select fields only offer their declared values.
+List and Kanban pages also derive their filter controls from the schema. Add multiple conditions such as `stage is negotiation`, `value is at least 50000`, or `tags contains renewal`, then choose whether all or any conditions must match. Each field only offers compatible operators, and select values only offer their declared choices.
 
 Useful CLI queries:
 
