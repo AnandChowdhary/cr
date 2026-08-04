@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     io::Write,
     net::SocketAddr,
@@ -24,8 +25,8 @@ use sha2::{Digest, Sha256};
 use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
-    audit::AuditChange, Assignment, AuditEntry, AuditSource, CollectionModel, Database,
-    FilterExpression, FilterOperator, Record, SearchQuery, SearchTarget, ViewDefinition,
+    audit::AuditChange, compare_yaml_values, Assignment, AuditEntry, AuditSource, CollectionModel,
+    Database, FilterExpression, FilterOperator, Record, SearchQuery, SearchTarget, ViewDefinition,
     ViewLayout,
 };
 
@@ -174,6 +175,9 @@ struct ViewQuery {
     filter_operator: Vec<ViewFilterOperator>,
     #[serde(default)]
     filter_value: Vec<String>,
+    sort_field: Option<String>,
+    #[serde(default)]
+    sort_direction: ViewSortDirection,
     limit: Option<usize>,
     offset: Option<usize>,
     notice: Option<String>,
@@ -185,6 +189,23 @@ enum ViewFilterMatch {
     #[default]
     All,
     Any,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ViewSortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl ViewSortDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -741,7 +762,7 @@ async fn view_records(
         let ad_hoc_filters = view_filter_expressions(&query)?;
         let query_for_database = query.clone();
         let requested_view = view_name.clone();
-        let (view, records, schema) = run_database(&state, &headers, move |database| {
+        let (view, mut records, schema) = run_database(&state, &headers, move |database| {
             let view = database.view(&requested_view)?;
             let view_filters = view
                 .filters
@@ -770,6 +791,7 @@ async fn view_records(
         .await?;
 
         let columns = view_columns(&view, &records, schema.as_ref());
+        sort_view_records(&mut records, &query)?;
         let bounds = page_bounds(
             query
                 .limit
@@ -2286,9 +2308,34 @@ fn render_view_records(
                         (render_filter_row(&filter_fields, 0, "", ViewFilterOperator::default(), ""))
                     }
                 }
+                div class="border-t border-slate-100 pt-4" {
+                    div class="mb-3" {
+                        h2 class="text-sm font-bold text-slate-900" { "Sorting" }
+                        p class="mt-1 text-xs text-slate-500" { "Missing values stay last; record ID breaks ties." }
+                    }
+                    div class="grid gap-3 sm:grid-cols-2" {
+                        label {
+                            span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Sort by" }
+                            select name="sort_field" aria-label="Sort by" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                                option value="" selected[view_sort_field(query).is_none()] { "Default (record ID)" }
+                                option value="$id" selected[view_sort_field(query) == Some("$id")] { "Record ID" }
+                                @for field in &filter_fields {
+                                    option value=(&field.key) selected[view_sort_field(query) == Some(field.key.as_str())] { (&field.label) }
+                                }
+                            }
+                        }
+                        label {
+                            span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Direction" }
+                            select name="sort_direction" aria-label="Sort direction" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                                option value="asc" selected[query.sort_direction == ViewSortDirection::Asc] { "Ascending" }
+                                option value="desc" selected[query.sort_direction == ViewSortDirection::Desc] { "Descending" }
+                            }
+                        }
+                    }
+                }
                 div class="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-4" {
                     a href=(reset_url) class="rounded-lg px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100" { "Clear all" }
-                    button type="submit" class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Apply filters" }
+                    button type="submit" class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Apply view" }
                 }
             }
             script { (PreEscaped(FILTER_BUILDER_SCRIPT)) }
@@ -2300,9 +2347,17 @@ fn render_view_records(
                     table class="min-w-full divide-y divide-slate-200 text-left text-sm" {
                         thead class="bg-slate-50" {
                             tr {
-                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "ID" }
+                                th scope="col" aria-sort=(sort_aria_state(query, "$id")) class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" {
+                                    a href=(view_sort_url(view, query, "$id", page.pagination.limit)) aria-label=(sort_link_label(query, "record ID", "$id")) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
+                                        "ID" span aria-hidden="true" class="text-slate-400" { (sort_indicator(query, "$id")) }
+                                    }
+                                }
                                 @for column in columns {
-                                    th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { (column) }
+                                    th scope="col" aria-sort=(sort_aria_state(query, column)) class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" {
+                                        a href=(view_sort_url(view, query, column, page.pagination.limit)) aria-label=(sort_link_label(query, &humanize_field_name(column), column)) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
+                                            (column) span aria-hidden="true" class="text-slate-400" { (sort_indicator(query, column)) }
+                                        }
+                                    }
                                 }
                                 th scope="col" class="px-4 py-3 text-right font-semibold text-slate-700" { "" }
                             }
@@ -3235,6 +3290,51 @@ fn view_filter_expressions(query: &ViewQuery) -> ApiResult<Vec<FilterExpression>
         .collect()
 }
 
+fn view_sort_field(query: &ViewQuery) -> Option<&str> {
+    query
+        .sort_field
+        .as_deref()
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+}
+
+fn sort_view_records(records: &mut [Record], query: &ViewQuery) -> ApiResult<()> {
+    let Some(field) = view_sort_field(query) else {
+        return Ok(());
+    };
+    if field != "$id" {
+        crate::value::parse_path(field)
+            .map_err(|error| ApiError::unprocessable(error.to_string()))?;
+    }
+    records.sort_by(|left, right| {
+        let ordering = if field == "$id" {
+            direction_ordering(left.id.cmp(&right.id), query.sort_direction)
+        } else {
+            let left_value = left.field(field).expect("sort field path was validated");
+            let right_value = right.field(field).expect("sort field path was validated");
+            match (left_value, right_value) {
+                (Some(left), Some(right)) => {
+                    direction_ordering(compare_yaml_values(left, right), query.sort_direction)
+                }
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        };
+        ordering
+            .then_with(|| left.collection.cmp(&right.collection))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(())
+}
+
+fn direction_ordering(ordering: Ordering, direction: ViewSortDirection) -> Ordering {
+    match direction {
+        ViewSortDirection::Asc => ordering,
+        ViewSortDirection::Desc => ordering.reverse(),
+    }
+}
+
 fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset: usize) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     if let Some(q) = query.q.as_deref().filter(|value| !value.is_empty()) {
@@ -3265,9 +3365,57 @@ fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset:
         );
         serializer.append_pair("filter_value", value);
     }
+    if let Some(field) = view_sort_field(query) {
+        serializer.append_pair("sort_field", field);
+        serializer.append_pair("sort_direction", query.sort_direction.as_str());
+    }
     serializer.append_pair("limit", &limit.to_string());
     serializer.append_pair("offset", &offset.to_string());
     format!("/{}?{}", encode_segment(&view.name), serializer.finish())
+}
+
+fn view_sort_url(view: &ViewDefinition, query: &ViewQuery, field: &str, limit: usize) -> String {
+    let mut next = query.clone();
+    next.sort_direction = if view_sort_field(query) == Some(field)
+        && query.sort_direction == ViewSortDirection::Asc
+    {
+        ViewSortDirection::Desc
+    } else {
+        ViewSortDirection::Asc
+    };
+    next.sort_field = Some(field.to_owned());
+    view_page_url(view, &next, limit, 0)
+}
+
+fn sort_indicator(query: &ViewQuery, field: &str) -> &'static str {
+    if view_sort_field(query) != Some(field) {
+        "↕"
+    } else if query.sort_direction == ViewSortDirection::Asc {
+        "↑"
+    } else {
+        "↓"
+    }
+}
+
+fn sort_aria_state(query: &ViewQuery, field: &str) -> &'static str {
+    if view_sort_field(query) != Some(field) {
+        "none"
+    } else if query.sort_direction == ViewSortDirection::Asc {
+        "ascending"
+    } else {
+        "descending"
+    }
+}
+
+fn sort_link_label(query: &ViewQuery, label: &str, field: &str) -> String {
+    let direction = if view_sort_field(query) == Some(field)
+        && query.sort_direction == ViewSortDirection::Asc
+    {
+        "descending"
+    } else {
+        "ascending"
+    };
+    format!("Sort by {label} {direction}")
 }
 
 fn parse_document_form(raw: &[u8]) -> ApiResult<HtmlDocumentForm> {

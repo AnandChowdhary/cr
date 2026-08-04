@@ -714,6 +714,8 @@ The table infers columns from the collection schema and current front matter. It
 
 The filter builder combines up to 20 conditions with either **all** (AND) or **any** (OR) matching. Each row has schema-aware operators: equality and inequality for every type; numeric and ISO string/date comparisons; string and array containment; starts/ends-with; and explicit empty/not-empty checks. Enum, boolean, and multi-select values use constrained dropdowns, numeric fields use numeric inputs, formatted strings use their matching input type, and other values accept typed YAML. Add or remove rows in the browser; the match mode and filters stay in the URL as `filter_match` plus repeated `filter_field`, `filter_operator`, and `filter_value` triples, including through pagination. Saved-view predicates always remain required, so choosing **any** cannot escape the view's underlying scope. Missing values match `is empty`, but do not silently match negative operators such as `is not` or `does not contain`.
 
+Every generated page also has schema-aware sorting. Choose a field and direction in the query panel, or click a table column heading to toggle ascending and descending order. Numbers sort numerically, strings and normalized ISO dates sort lexicographically, missing values stay last in both directions, and record ID is the deterministic tie-breaker. Sorting happens before pagination and remains in pagination URLs; Kanban uses the same order for cards inside each lane.
+
 ### Use schema-driven record forms
 
 When a collection has a JSON Schema, create and edit pages generate one control per declared top-level attribute:

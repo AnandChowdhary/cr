@@ -224,6 +224,42 @@ fn number_as_f64(number: &yaml_serde::Number) -> f64 {
         .expect("YAML numbers are representable as integers or floats")
 }
 
+pub fn compare_yaml_values(left: &Value, right: &Value) -> Ordering {
+    match (left, right) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
+        (Value::Number(left), Value::Number(right)) => number_as_f64(left)
+            .partial_cmp(&number_as_f64(right))
+            .unwrap_or(Ordering::Equal),
+        (Value::String(left), Value::String(right)) => left.cmp(right),
+        (Value::Sequence(left), Value::Sequence(right)) => left
+            .iter()
+            .zip(right)
+            .map(|(left, right)| compare_yaml_values(left, right))
+            .find(|ordering| *ordering != Ordering::Equal)
+            .unwrap_or_else(|| left.len().cmp(&right.len())),
+        _ => value_type_rank(left)
+            .cmp(&value_type_rank(right))
+            .then_with(|| serialized_sort_value(left).cmp(&serialized_sort_value(right))),
+    }
+}
+
+fn value_type_rank(value: &Value) -> u8 {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(_) => 2,
+        Value::String(_) => 3,
+        Value::Sequence(_) => 4,
+        Value::Mapping(_) => 5,
+        _ => 6,
+    }
+}
+
+fn serialized_sort_value(value: &Value) -> String {
+    yaml_serde::to_string(value).unwrap_or_default()
+}
+
 impl FromStr for Assignment {
     type Err = anyhow::Error;
 
@@ -303,8 +339,10 @@ fn set_path(attributes: &mut Mapping, path: &[String], value: Value) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_path, remove_path, Assignment, FilterExpression, FilterOperator};
-    use std::str::FromStr;
+    use super::{
+        compare_yaml_values, parse_path, remove_path, Assignment, FilterExpression, FilterOperator,
+    };
+    use std::{cmp::Ordering, str::FromStr};
     use yaml_serde::{Mapping, Value};
 
     #[test]
@@ -471,6 +509,29 @@ mod tests {
         assert_eq!(
             FilterExpression::from_str("value>=100").unwrap().operator(),
             FilterOperator::GreaterThanOrEqual
+        );
+    }
+
+    #[test]
+    fn yaml_sorting_is_typed_and_deterministic() {
+        assert_eq!(
+            compare_yaml_values(&Value::Number(2.into()), &Value::Number(10.into())),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_yaml_values(&Value::String("10".into()), &Value::String("2".into())),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_yaml_values(
+                &Value::Sequence(vec![1.into(), 2.into()]),
+                &Value::Sequence(vec![1.into(), 3.into()])
+            ),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_yaml_values(&Value::Bool(false), &Value::Number(0.into())),
+            Ordering::Less
         );
     }
 

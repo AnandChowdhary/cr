@@ -142,6 +142,10 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(automatic.text().contains("All conditions match"));
     assert!(automatic.text().contains("name=\"filter_match\""));
     assert!(automatic.text().contains("Any condition matches"));
+    assert!(automatic.text().contains("aria-label=\"Sort by\""));
+    assert!(automatic.text().contains("aria-label=\"Sort direction\""));
+    assert!(automatic.text().contains("Missing values stay last"));
+    assert!(automatic.text().contains("Sort by Value ascending"));
     assert!(automatic.text().contains("md:grid-cols-2 xl:grid-cols-12"));
     assert!(automatic
         .text()
@@ -153,6 +157,49 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(!automatic.text().to_lowercase().contains("react"));
     assert_eq!(automatic.headers[header::CACHE_CONTROL], "no-store");
     assert_eq!(automatic.headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+
+    let sorted = request(
+        &app,
+        Method::GET,
+        "/deals?sort_field=value&sort_direction=asc",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(sorted.status, StatusCode::OK);
+    assert!(sorted.text().contains("value=\"value\" selected"));
+    assert!(sorted.text().contains("value=\"asc\" selected"));
+    assert!(sorted.text().contains("aria-sort=\"ascending\""));
+    assert!(sorted.text().contains("Sort by Value descending"));
+    assert!(
+        sorted.text().find("/deals/records/beta").unwrap()
+            < sorted.text().find("/deals/records/alpha").unwrap()
+    );
+
+    let sorted_page = request(
+        &app,
+        Method::GET,
+        "/deals?sort_field=value&sort_direction=asc&limit=1",
+        None,
+        &[],
+    )
+    .await;
+    assert!(sorted_page.text().contains("/deals/records/beta"));
+    assert!(!sorted_page.text().contains("/deals/records/alpha"));
+    assert!(sorted_page
+        .text()
+        .contains("sort_field=value&amp;sort_direction=asc&amp;limit=1&amp;offset=1"));
+
+    let invalid_sort = request(
+        &app,
+        Method::GET,
+        "/deals?sort_field=contact..country",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(invalid_sort.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(invalid_sort.text().contains("contains an empty segment"));
 
     let saved = request(&app, Method::GET, "/open-deals", None, &[]).await;
     assert_eq!(saved.status, StatusCode::OK);

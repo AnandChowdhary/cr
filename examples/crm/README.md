@@ -22,6 +22,8 @@ The HTML forms are live: creating, editing, deleting, or moving a Kanban card ch
 
 List and Kanban pages also derive their filter controls from the schema. Add multiple conditions such as `stage is negotiation`, `value is at least 50000`, or `tags contains renewal`, then choose whether all or any conditions must match. Each field only offers compatible operators, and select values only offer their declared choices.
 
+Use the Sorting controls to order deals by value, close date, owner, or any other schema field. Table column headings toggle direction directly; Kanban sorts cards within each stage lane.
+
 Useful CLI queries:
 
 ```sh
