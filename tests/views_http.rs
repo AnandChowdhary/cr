@@ -393,6 +393,18 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
         )
         .unwrap();
     database
+        .create(
+            "deals",
+            "gamma",
+            &[
+                Assignment::from_str("name=Gamma").unwrap(),
+                Assignment::from_str("stage=offer").unwrap(),
+                Assignment::from_str("score=60").unwrap(),
+            ],
+            "",
+        )
+        .unwrap();
+    database
         .create_view_with_layout(
             "pipeline",
             Some("Sales pipeline"),
@@ -457,6 +469,20 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     assert!(numeric_filter.text().contains("type=\"number\" step=\"1\""));
     assert!(numeric_filter.text().contains("beta"));
     assert!(!numeric_filter.text().contains("alpha"));
+
+    let sorted_lane = request(
+        &app,
+        Method::GET,
+        "/pipeline?sort_field=score&sort_direction=asc",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(sorted_lane.status, StatusCode::OK);
+    assert!(
+        sorted_lane.text().find("/pipeline/records/gamma").unwrap()
+            < sorted_lane.text().find("/pipeline/records/beta").unwrap()
+    );
 
     let token = csrf(board.text()).to_owned();
     let target = r#"{"kind":"value","value":"interview"}"#;
