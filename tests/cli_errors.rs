@@ -195,6 +195,14 @@ fn path_traversal_and_invalid_assignments_are_rejected() {
         run_failure(database.command().args(arguments));
     }
 
+    let expression_error =
+        run_failure(
+            database
+                .command()
+                .args(["list", "candidates", "--where-expr", "score"]),
+        );
+    assert!(expression_error.contains("expected a filter expression"));
+
     assert!(!database.root.join("outside.md").exists());
     assert!(!database.root.join("records/candidates/jane.md").exists());
 }

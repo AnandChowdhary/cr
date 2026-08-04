@@ -10,7 +10,7 @@ Current capabilities include:
 
 - arbitrary collections and typed YAML front matter;
 - audited CRUD and relationships;
-- typed structured filtering and dotted field paths;
+- typed equality, comparison, containment, empty-value filtering, and dotted field paths;
 - literal, case-insensitive, field-scoped, and regular-expression search;
 - direct Markdown editing with reviewed audit reconciliation;
 - scheduled, checkpointed external sync adapters with audited upserts and deletes;
@@ -18,7 +18,7 @@ Current capabilities include:
 - saved and automatic server-rendered HTML views with audited forms;
 - a REST API with pagination, authentication, and live OpenAPI 3.1 generation.
 
-The examples below cover both CLI and HTTP usage. Future work—including comparisons, Boolean expressions, projections, relationship traversal, and indexes—is tracked in [`TODO.md`](TODO.md).
+The examples below cover both CLI and HTTP usage. Future work—including a full Boolean expression grammar, projections, relationship traversal, and indexes—is tracked in [`TODO.md`](TODO.md).
 
 ## Install the CLI
 
@@ -211,7 +211,16 @@ cr list contacts --where 'contact.country=NL' --where 'active=true' --json
 
 If your own deal model calls the field `status` instead of `stage`, use `--where 'status=won'`. Field names are entirely user-defined.
 
-The current filter language performs exact typed equality. Comparisons, membership, `OR`/`NOT`, sorting, and projections are planned rather than silently approximated; see [`TODO.md`](TODO.md).
+Use `--where-expr` for shared typed operators. Repeat it to combine expressions with AND, and combine it with exact `--where` filters when useful:
+
+```sh
+cr list deals --where-expr 'value>=10000' --where-expr 'stage!=lost' --json
+cr list deals --where-expr 'name contains renewal'
+cr list deals --where-expr 'tags contains enterprise'
+cr list contacts --where-expr 'contact.email is-not-empty'
+```
+
+Supported operators are `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `not-contains`, `starts-with`, `ends-with`, `is-empty`, and `is-not-empty`. Ordering compares numbers numerically and strings lexicographically, which gives the expected ordering for normalized ISO dates and times. Missing fields count as empty but do not match negative operators. A full parenthesized `AND`/`OR`/`NOT` grammar, membership sets, sorting, and projections remain explicit roadmap work.
 
 ### Search
 
@@ -843,7 +852,7 @@ group_by: stage
 page_size: 200
 ```
 
-You can edit these files directly. The server reloads them on each request. View filters use the same typed `KEY=YAML` equality semantics as `cr list`; comparison and Boolean expressions remain roadmap work.
+You can edit these files directly. The server reloads them on each request. Persisted `filters` in view definitions use typed `KEY=YAML` equality; the page's ad hoc filter builder adds comparisons and all/any composition without changing the saved scope.
 
 The UI is plain server-rendered HTML—there is no React, Next.js, client-side application state, or JavaScript data API. Kanban adds a small vanilla-JavaScript drag-and-drop enhancement over native HTML move forms, so the board remains usable without dragging. Templates escape database, schema, and audit values; mutating forms carry a per-server CSRF token; and successful POSTs return `303 See Other` before the browser reloads the view. Styling currently uses Tailwind's Play CDN as requested; the official Tailwind documentation labels that browser CDN development-only, so compiling and bundling CSS is tracked in `TODO.md`.
 
@@ -952,6 +961,7 @@ Repeated `where` parameters are combined with AND and retain YAML types. URL-enc
 
 ```sh
 curl 'http://127.0.0.1:3000/api/v1/collections/deals/records?where=status%3Dwon&where=active%3Dtrue&limit=50&offset=0'
+curl 'http://127.0.0.1:3000/api/v1/collections/deals/records?where_expr=value%3E%3D10000&where_expr=name%20contains%20renewal'
 ```
 
 List and search responses contain compact `{ path, front_matter }` records inside a page:
@@ -980,6 +990,7 @@ Search supports the same targets and matching modes as `cr search`:
 
 ```sh
 curl 'http://127.0.0.1:3000/api/v1/search?q=follow%20up&collection=deals&target=body&ignore_case=true&limit=50'
+curl 'http://127.0.0.1:3000/api/v1/search?q=renewal&collection=deals&where_expr=value%3E%3D10000'
 curl 'http://127.0.0.1:3000/api/v1/search?q=%5Ewon%24&collection=deals&target=field&field=status&regex=true'
 ```
 
@@ -1052,8 +1063,9 @@ cr identity
 
 cr create COLLECTION ID [--set KEY=YAML]... [--body TEXT]
 cr get COLLECTION ID [--json | --field KEY]
-cr list COLLECTION [--where KEY=YAML]... [--json]
-cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]... [--json]
+cr list COLLECTION [--where KEY=YAML]... [--where-expr EXPRESSION]... [--json]
+cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]...
+                  [--where-expr EXPRESSION]... [--json]
                   [--front-matter | --field KEY | --body | --path]
                   [--ignore-case] [--regex]
 cr update COLLECTION ID [--set KEY=YAML]... [--body TEXT]

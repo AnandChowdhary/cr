@@ -89,7 +89,7 @@ Priorities:
 
 ## Query and result capabilities
 
-- [ ] **P1 — Comparison expressions.**
+- [x] **P1 — Comparison expressions.**
   Support typed numeric, string, and date comparisons such as `value > 10000`, `score >= 80`, and `expected_close < 2027-12-31`.
 
 - [ ] **P1 — Boolean expressions.**

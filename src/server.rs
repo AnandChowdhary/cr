@@ -156,6 +156,8 @@ struct PageQuery {
 struct ListQuery {
     #[serde(default, rename = "where")]
     filters: Vec<String>,
+    #[serde(default)]
+    where_expr: Vec<String>,
     limit: Option<usize>,
     offset: Option<usize>,
 }
@@ -375,6 +377,8 @@ struct SearchParameters {
     collection: Option<String>,
     #[serde(default, rename = "where")]
     filters: Vec<String>,
+    #[serde(default)]
+    where_expr: Vec<String>,
     target: Option<SearchTargetParameter>,
     field: Option<String>,
     #[serde(default)]
@@ -1025,8 +1029,15 @@ async fn list_records(
     let query: ListQuery = parse_query(raw)?;
     let bounds = page_bounds(query.limit, query.offset, state.max_page_size)?;
     let filters = parse_filters(query.filters)?;
+    let expressions = parse_filter_expressions(query.where_expr)?;
     let records = run_database(&state, &headers, move |database| {
-        database.list(&collection, &filters)
+        let mut records = database.list(&collection, &filters)?;
+        records.retain(|record| {
+            expressions
+                .iter()
+                .all(|expression| expression.matches(&record.attributes))
+        });
+        Ok(records)
     })
     .await?;
     let page = paginate(records, bounds).try_map(ApiRecordSummary::try_from)?;
@@ -1172,6 +1183,7 @@ async fn search_records(
     let parameters: SearchParameters = parse_query(raw)?;
     let bounds = page_bounds(parameters.limit, parameters.offset, state.max_page_size)?;
     let filters = parse_filters(parameters.filters)?;
+    let expressions = parse_filter_expressions(parameters.where_expr)?;
     let target = search_target(parameters.target, parameters.field)?;
     let query = SearchQuery::new(
         &parameters.q,
@@ -1182,7 +1194,13 @@ async fn search_records(
     .map_err(ApiError::from_database)?;
     let collection = parameters.collection;
     let records = run_database(&state, &headers, move |database| {
-        database.search(collection.as_deref(), &filters, &query)
+        let mut records = database.search(collection.as_deref(), &filters, &query)?;
+        records.retain(|record| {
+            expressions
+                .iter()
+                .all(|expression| expression.matches(&record.attributes))
+        });
+        Ok(records)
     })
     .await?;
     let page = paginate(records, bounds).try_map(ApiRecordSummary::try_from)?;
@@ -1568,6 +1586,7 @@ fn openapi_paths() -> JsonValue {
                 "operationId": "listRecords",
                 "parameters": [collection.clone(),
                     json!({ "name": "where", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }),
+                    json!({ "name": "where_expr", "in": "query", "description": "Typed expressions such as value>=10000, name contains Acme, or owner is-empty. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }),
                     json!({ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } }),
                     json!({ "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } })],
                 "responses": ok("#/components/schemas/RecordPage")
@@ -1601,6 +1620,7 @@ fn openapi_paths() -> JsonValue {
                 { "name": "q", "in": "query", "required": true, "schema": { "type": "string" } },
                 { "name": "collection", "in": "query", "schema": { "type": "string" } },
                 { "name": "where", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
+                { "name": "where_expr", "in": "query", "description": "Typed expressions such as value>=10000, name contains Acme, or owner is-empty. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "target", "in": "query", "schema": { "enum": ["document", "front_matter", "field", "body", "path"] } },
                 { "name": "field", "in": "query", "schema": { "type": "string" } },
                 { "name": "ignore_case", "in": "query", "schema": { "type": "boolean", "default": false } },
@@ -3656,6 +3676,13 @@ fn parse_filters(filters: Vec<String>) -> ApiResult<Vec<Assignment>> {
     filters
         .into_iter()
         .map(|filter| filter.parse().map_err(ApiError::from_database))
+        .collect()
+}
+
+fn parse_filter_expressions(expressions: Vec<String>) -> ApiResult<Vec<FilterExpression>> {
+    expressions
+        .into_iter()
+        .map(|expression| expression.parse().map_err(ApiError::from_database))
         .collect()
 }
 

@@ -2,7 +2,7 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use cr::{Assignment, Database, Record, SearchQuery, SearchTarget, ViewLayout};
+use cr::{Assignment, Database, FilterExpression, Record, SearchQuery, SearchTarget, ViewLayout};
 use serde::Serialize;
 use yaml_serde::Mapping;
 
@@ -84,6 +84,10 @@ enum Command {
         #[arg(short = 'w', long = "where", value_name = "KEY=YAML")]
         filters: Vec<Assignment>,
 
+        /// Match a typed expression such as value>=10000, name contains Acme, or owner is-empty.
+        #[arg(long = "where-expr", value_name = "EXPRESSION")]
+        expressions: Vec<FilterExpression>,
+
         /// Return each file path and front matter as JSON.
         #[arg(long)]
         json: bool,
@@ -101,6 +105,10 @@ enum Command {
         /// First match a field using KEY=YAML. Multiple filters use AND.
         #[arg(short = 'w', long = "where", value_name = "KEY=YAML")]
         filters: Vec<Assignment>,
+
+        /// First match a typed expression such as value>=10000. Multiple expressions use AND.
+        #[arg(long = "where-expr", value_name = "EXPRESSION")]
+        expressions: Vec<FilterExpression>,
 
         /// Search only parsed front matter.
         #[arg(long, conflicts_with_all = ["field", "body", "path"])]
@@ -442,15 +450,22 @@ fn run() -> Result<()> {
         Command::List {
             collection,
             filters,
+            expressions,
             json,
         } => {
-            let records = database.list(&collection, &filters)?;
+            let mut records = database.list(&collection, &filters)?;
+            records.retain(|record| {
+                expressions
+                    .iter()
+                    .all(|expression| expression.matches(&record.attributes))
+            });
             print_records(records, json)?;
         }
         Command::Search {
             pattern,
             collection,
             filters,
+            expressions,
             front_matter,
             field,
             body,
@@ -471,7 +486,12 @@ fn run() -> Result<()> {
                 SearchTarget::Document
             };
             let query = SearchQuery::new(&pattern, target, regex, ignore_case)?;
-            let records = database.search(collection.as_deref(), &filters, &query)?;
+            let mut records = database.search(collection.as_deref(), &filters, &query)?;
+            records.retain(|record| {
+                expressions
+                    .iter()
+                    .all(|expression| expression.matches(&record.attributes))
+            });
             print_records(records, json)?;
         }
         Command::Serve {

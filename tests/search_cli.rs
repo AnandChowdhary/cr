@@ -71,6 +71,20 @@ fn search_spans_collections_combines_filters_and_returns_compact_results() {
         ["front_matter", "path"]
     );
 
+    let compared = run_success(database.command().args([
+        "search",
+        "notes",
+        "--collection",
+        "deals",
+        "--ignore-case",
+        "--where-expr",
+        "value>=20000",
+        "--json",
+    ]));
+    let compared: Value = serde_json::from_str(&compared).unwrap();
+    assert_eq!(compared.as_array().unwrap().len(), 1);
+    assert_eq!(compared[0]["path"], "records/deals/acme-renewal.md");
+
     assert!(run_success(database.command().args(["search", "missing"])).is_empty());
     let none = run_success(database.command().args(["search", "missing", "--json"]));
     assert_eq!(

@@ -119,6 +119,7 @@ async fn rest_crud_search_relations_audit_and_pagination_share_database_semantic
             "front_matter": {
                 "stage": "won",
                 "active": true,
+                "value": 25000,
                 "obsolete": "remove me"
             },
             "markdown": "Priority account. Follow up next week."
@@ -147,9 +148,9 @@ async fn rest_crud_search_relations_audit_and_pagination_share_database_semantic
     assert_eq!(duplicate.status, StatusCode::CONFLICT);
     assert_eq!(duplicate.json()["error"]["code"], "already_exists");
 
-    for (id, stage, active) in [
-        ("beta-expansion", "won", true),
-        ("gamma-trial", "open", true),
+    for (id, stage, active, value) in [
+        ("beta-expansion", "won", true, 15000),
+        ("gamma-trial", "open", true, 5000),
     ] {
         let response = json_request(
             &app,
@@ -157,7 +158,7 @@ async fn rest_crud_search_relations_audit_and_pagination_share_database_semantic
             "/api/v1/collections/deals/records",
             json!({
                 "id": id,
-                "front_matter": { "stage": stage, "active": active },
+                "front_matter": { "stage": stage, "active": active, "value": value },
                 "markdown": format!("Notes for {id}")
             }),
             &[],
@@ -184,6 +185,40 @@ async fn rest_crud_search_relations_audit_and_pagination_share_database_semantic
     assert_eq!(listed["pagination"]["returned"], 1);
     assert_eq!(listed["pagination"]["previous_offset"], 0);
     assert_eq!(listed["pagination"]["next_offset"], Value::Null);
+
+    let compared = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/records?where_expr=value%3E%3D15000",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(compared.status, StatusCode::OK);
+    let compared = compared.json();
+    assert_eq!(compared["pagination"]["total"], 2);
+    assert_eq!(
+        compared["data"][0]["path"],
+        "records/deals/alpha-renewal.md"
+    );
+    assert_eq!(
+        compared["data"][1]["path"],
+        "records/deals/beta-expansion.md"
+    );
+
+    let invalid_expression = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/records?where_expr=value",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(invalid_expression.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        invalid_expression.json()["error"]["code"],
+        "validation_failed"
+    );
 
     let patched = json_request(
         &app,
@@ -258,7 +293,7 @@ async fn rest_crud_search_relations_audit_and_pagination_share_database_semantic
     let searched = request(
         &app,
         Method::GET,
-        "/api/v1/search?q=FOLLOW%20UP&collection=deals&target=body&ignore_case=true&limit=1",
+        "/api/v1/search?q=FOLLOW%20UP&collection=deals&target=body&ignore_case=true&where_expr=value%3E%3D20000&limit=1",
         None,
         &[],
     )
@@ -524,6 +559,13 @@ async fn openapi_authentication_and_http_errors_are_structured() {
     assert!(openapi["paths"]
         .get("/api/v1/collections/{collection}/records")
         .is_some());
+    for path in ["/api/v1/collections/{collection}/records", "/api/v1/search"] {
+        assert!(openapi["paths"][path]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|parameter| parameter["name"] == "where_expr"));
+    }
     let reference = openapi["x-cr-collection-schemas"]["candidates"]
         .as_str()
         .unwrap();

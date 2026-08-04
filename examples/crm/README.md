@@ -27,6 +27,7 @@ Useful CLI queries:
 ```sh
 cr --database examples/crm list deals --where 'status=open' --json
 cr --database examples/crm list deals --where 'stage=negotiation' --json
+cr --database examples/crm list deals --where-expr 'value>=50000' --where-expr 'stage!=won' --json
 cr --database examples/crm search 'Acme' --ignore-case --json
 cr --database examples/crm audit verify
 ```

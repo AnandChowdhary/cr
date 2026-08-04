@@ -215,6 +215,37 @@ fn list_combines_typed_nested_filters_and_orders_results() {
     assert!(filtered[0].get("collection").is_none());
     assert!(filtered[0].get("attributes").is_none());
 
+    let compared = run_success(database.command().args([
+        "list",
+        "candidates",
+        "--where-expr",
+        "score>=42",
+        "--json",
+    ]));
+    let compared: Value = serde_json::from_str(&compared).unwrap();
+    assert_eq!(
+        compared
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["records/candidates/mira.md", "records/candidates/zoe.md"]
+    );
+
+    let mixed = run_success(database.command().args([
+        "list",
+        "candidates",
+        "--where",
+        "active=true",
+        "--where-expr",
+        "score>=42",
+        "--json",
+    ]));
+    let mixed: Value = serde_json::from_str(&mixed).unwrap();
+    assert_eq!(mixed.as_array().unwrap().len(), 1);
+    assert_eq!(mixed[0]["path"], "records/candidates/zoe.md");
+
     let no_match = run_success(database.command().args([
         "list",
         "candidates",

@@ -166,11 +166,11 @@ The journal contains historical values and deletion tombstones. Encryption, reda
 
 Version 1 scans and parses one collection for every `list`; `search` scans either one selected collection or all collection directories in deterministic order. This keeps behavior easy to inspect and makes valid manual edits immediately visible. An index can be added later as disposable derived state keyed by file path, modification time, size, and content hash. The CLI must always be able to rebuild it from Markdown.
 
-Filters support typed equality and dotted field paths. Search is literal and case-sensitive by default, with explicit case-insensitive and Rust-regex modes. It can target the exact Markdown document, parsed front matter, one dotted field, the body, or the database-relative path. Rust's regex engine provides linear-time matching and avoids executing shell commands or user-supplied programs.
+Exact filters support typed equality and dotted field paths. A shared `FilterExpression` layer adds numeric and ISO string/date ordering, string and array containment, prefixes/suffixes, and explicit empty checks to CLI `--where-expr`, REST `where_expr`, and HTML views. CLI and REST repeat expressions with AND; the view builder additionally supports a bounded all/any group inside the mandatory saved-view scope. Search is literal and case-sensitive by default, with explicit case-insensitive and Rust-regex modes. It can target the exact Markdown document, parsed front matter, one dotted field, the body, or the database-relative path. Rust's regex engine provides linear-time matching and avoids executing shell commands or user-supplied programs.
 
 CLI list and search results are intentionally compact: plain output contains relative Markdown paths, while JSON contains `{ path, front_matter }` objects. Record bodies remain available through `get`, avoiding unexpectedly large multi-record responses.
 
-A future expression layer can add numeric and date comparisons, membership, boolean OR/NOT, ordering, projections, aggregation, backlinks, and pagination without changing the file format.
+A future expression grammar can add nested Boolean groups, `NOT`, membership sets, ordering, projections, aggregation, backlinks, and cursor pagination without changing the file format.
 
 ## HTTP transport and OpenAPI
 
