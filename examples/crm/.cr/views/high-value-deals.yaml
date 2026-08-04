@@ -1,0 +1,18 @@
+version: 1
+title: High-value open deals
+collection: deals
+filters:
+- status=open
+where_expr:
+- value>=50000
+columns:
+- name
+- stage
+- value
+- currency
+- probability
+- expected_close
+- owner
+sort_by: value
+sort_direction: desc
+page_size: 25

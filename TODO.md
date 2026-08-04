@@ -110,8 +110,8 @@ Priorities:
 - [ ] **P2 — Additional streaming output formats.**
   Add JSON Lines and CSV where the projection is tabular. Large results should stream rather than building the complete response in memory.
 
-- [x] **P2 — Saved and reusable equality queries.**
-  Versioned `.cr/views/*.yaml` definitions provide named collection queries, typed equality filters, dotted columns, and page sizes to both CLI discovery and server-rendered routes. Richer expressions remain separate items above.
+- [x] **P2 — Saved and reusable filtered queries.**
+  Versioned `.cr/views/*.yaml` definitions provide named collection queries, typed equality filters, shared comparison/containment/empty expressions, dotted columns, default ordering, and page sizes to CLI discovery and server-rendered routes.
 
 - [ ] **P2 — Query planner and disposable indexes.**
   Use equality/range indexes when available, fall back to authoritative Markdown scans, and include explain/debug output for performance work.
@@ -247,5 +247,6 @@ Priorities:
 - [x] Schema-aware multi-condition filter builder with typed comparison, containment, and empty-value operators; constrained controls; AND/OR composition; saved-view scoping; URL persistence; bounded decoding; and progressive row management.
 - [x] Shared single-field sorting across CLI, REST, OpenAPI, tables, and Kanban with accessible table-header toggles, typed YAML ordering, missing-last rules, deterministic ties, and pre-pagination application.
 - [x] Persisted saved-view default ordering with CLI/YAML configuration, legacy defaults, URL overrides, explicit clearing, and Kanban lane application.
+- [x] Persisted typed saved-view expressions with CLI/YAML configuration, immutable AND scoping, legacy defaults, and visible query chips.
 - [x] Versioned subprocess sync adapters with JSONL upsert/delete/checkpoint messages, clean-state verification, limits, overlap locks, checkpointing, and `source: sync` audit provenance.
 - [x] Unit, CLI, concurrency, direct-edit, in-process HTTP, and real TCP server tests.

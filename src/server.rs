@@ -801,6 +801,11 @@ async fn view_records(
                 .iter()
                 .map(|filter| Assignment::from_str(filter))
                 .collect::<Result<Vec<_>>>()?;
+            let view_expressions = view
+                .where_expr
+                .iter()
+                .map(|expression| FilterExpression::from_str(expression))
+                .collect::<Result<Vec<_>>>()?;
             let mut records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
                 Some(pattern) => {
                     let search = SearchQuery::new(pattern, SearchTarget::Document, false, true)?;
@@ -809,9 +814,12 @@ async fn view_records(
                 None => database.list(&view.collection, &view_filters)?,
             };
             records.retain(|record| {
-                query_for_database
-                    .filter_match
-                    .matches(&ad_hoc_filters, &record.attributes)
+                view_expressions
+                    .iter()
+                    .all(|expression| expression.matches(&record.attributes))
+                    && query_for_database
+                        .filter_match
+                        .matches(&ad_hoc_filters, &record.attributes)
             });
             let schema = database
                 .collection_models()?
@@ -1792,12 +1800,15 @@ fn render_views_home(views: &[ViewDefinition]) -> Markup {
                                     span class="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700" { "kanban" }
                                 }
                             }
-                            @if view.filters.is_empty() {
+                            @if view.filters.is_empty() && view.where_expr.is_empty() {
                                 p class="mt-5 text-sm text-slate-500" { "All records" }
                             } @else {
                                 div class="mt-5 flex flex-wrap gap-2" {
                                     @for filter in &view.filters {
                                         span class="rounded-lg bg-indigo-50 px-2 py-1 font-mono text-xs text-indigo-700" { (filter) }
+                                    }
+                                    @for expression in &view.where_expr {
+                                        span class="rounded-lg bg-violet-50 px-2 py-1 font-mono text-xs text-violet-700" { (expression) }
                                     }
                                 }
                             }
@@ -2316,10 +2327,13 @@ fn render_view_records(
                     p class="mt-2 text-sm text-slate-600" {
                         "Collection " code class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs" { (&view.collection) }
                     }
-                    @if !view.filters.is_empty() {
+                    @if !view.filters.is_empty() || !view.where_expr.is_empty() {
                         div class="mt-3 flex flex-wrap gap-2" {
                             @for filter in &view.filters {
                                 span class="rounded-lg bg-indigo-50 px-2 py-1 font-mono text-xs text-indigo-700" { (filter) }
+                            }
+                            @for expression in &view.where_expr {
+                                span class="rounded-lg bg-violet-50 px-2 py-1 font-mono text-xs text-violet-700" { (expression) }
                             }
                         }
                     }

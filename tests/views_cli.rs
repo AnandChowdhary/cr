@@ -22,6 +22,7 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
     assert_eq!(automatic["saved"], false);
     assert_eq!(automatic["layout"], "table");
     assert!(automatic["group_by"].is_null());
+    assert_eq!(automatic["where_expr"], serde_json::json!([]));
     assert!(automatic["sort_by"].is_null());
     assert_eq!(automatic["sort_direction"], "asc");
     assert_eq!(automatic["page_size"], 50);
@@ -37,6 +38,8 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
             "Open deals",
             "--where",
             "status=open",
+            "--where-expr",
+            "value>=10000",
             "--column",
             "name",
             "--column",
@@ -60,6 +63,7 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
     assert!(stored.contains("title: Open deals"));
     assert!(stored.contains("collection: deals"));
     assert!(stored.contains("- status=open"));
+    assert!(stored.contains("- value>=10000"));
     assert!(stored.contains("- owner.email"));
     assert!(stored.contains("layout: kanban"));
     assert!(stored.contains("group_by: stage"));
@@ -76,6 +80,7 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
     assert_eq!(shown["name"], "open-deals");
     assert_eq!(shown["title"], "Open deals");
     assert_eq!(shown["filters"], serde_json::json!(["status=open"]));
+    assert_eq!(shown["where_expr"], serde_json::json!(["value>=10000"]));
     assert_eq!(shown["columns"], serde_json::json!(["name", "owner.email"]));
     assert_eq!(shown["layout"], "kanban");
     assert_eq!(shown["group_by"], "stage");
@@ -126,6 +131,17 @@ fn view_cli_rejects_invalid_duplicate_reserved_and_malformed_definitions() {
         "owner..email",
     ]));
     assert!(invalid_column.contains("invalid column"));
+
+    let invalid_expression = run_failure(database.command().args([
+        "view",
+        "create",
+        "bad-expression",
+        "--collection",
+        "deals",
+        "--where-expr",
+        "value",
+    ]));
+    assert!(invalid_expression.contains("invalid where_expr"));
 
     let invalid_page_size = run_failure(database.command().args([
         "view",

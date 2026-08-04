@@ -275,6 +275,10 @@ enum ViewCommand {
         #[arg(short = 'w', long = "where", value_name = "KEY=YAML")]
         filters: Vec<String>,
 
+        /// Match a typed expression such as value>=10000. Multiple expressions use AND.
+        #[arg(long = "where-expr", value_name = "EXPRESSION")]
+        expressions: Vec<String>,
+
         /// Show this dotted front matter field as a table column or Kanban card detail.
         #[arg(short, long = "column", value_name = "FIELD")]
         columns: Vec<String>,
@@ -592,6 +596,7 @@ fn run() -> Result<()> {
                 collection,
                 title,
                 filters,
+                expressions,
                 columns,
                 layout,
                 group_by,
@@ -604,6 +609,7 @@ fn run() -> Result<()> {
                     title.as_deref(),
                     &collection,
                     filters,
+                    expressions,
                     columns,
                     page_size,
                     layout.into(),

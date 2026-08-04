@@ -13,6 +13,7 @@ Then open:
 - `http://127.0.0.1:3000/` for the database home page;
 - `http://127.0.0.1:3000/deals` for the saved open-deals pipeline;
 - `http://127.0.0.1:3000/pipeline` for every deal grouped by stage on a Kanban board;
+- `http://127.0.0.1:3000/high-value-deals` for open deals worth at least 50,000, ordered by value;
 - `http://127.0.0.1:3000/companies` for all companies;
 - `http://127.0.0.1:3000/contacts` for all contacts;
 - `http://127.0.0.1:3000/audit` for the complete audit timeline;
@@ -23,6 +24,8 @@ The HTML forms are live: creating, editing, deleting, or moving a Kanban card ch
 List and Kanban pages also derive their filter controls from the schema. Add multiple conditions such as `stage is negotiation`, `value is at least 50000`, or `tags contains renewal`, then choose whether all or any conditions must match. Each field only offers compatible operators, and select values only offer their declared choices.
 
 Use the Sorting controls to order deals by value, close date, owner, or any other schema field. Table column headings toggle direction directly; Kanban sorts cards within each stage lane. The saved pipeline opens with its persisted `value` descending default, which the current URL can override or clear.
+
+The `high-value-deals` route demonstrates a reusable typed saved query. Its YAML combines `status=open` with `value>=50000`; browser filters remain additive and cannot escape that scope.
 
 Useful CLI queries:
 

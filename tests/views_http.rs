@@ -388,7 +388,22 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
         .create(
             "deals",
             "unassigned",
-            &[Assignment::from_str("name=Unassigned").unwrap()],
+            &[
+                Assignment::from_str("name=Unassigned").unwrap(),
+                Assignment::from_str("score=50").unwrap(),
+            ],
+            "",
+        )
+        .unwrap();
+    database
+        .create(
+            "deals",
+            "excluded",
+            &[
+                Assignment::from_str("name=Excluded").unwrap(),
+                Assignment::from_str("stage=offer").unwrap(),
+                Assignment::from_str("score=20").unwrap(),
+            ],
             "",
         )
         .unwrap();
@@ -410,6 +425,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
             Some("Sales pipeline"),
             "deals",
             vec![],
+            vec!["score>=40".into()],
             vec!["name".into(), "owner".into(), "stage".into()],
             50,
             ViewLayout::Kanban,
@@ -427,6 +443,8 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     assert!(board.text().contains("draggable=\"true\""));
     assert!(board.text().contains("form.submit()"));
     assert!(board.text().contains("Move alpha to"));
+    assert!(board.text().contains("score&gt;=40"));
+    assert!(!board.text().contains("/pipeline/records/excluded"));
     assert!(board.text().contains("value=\"score\" selected"));
     assert!(board.text().contains("value=\"asc\" selected"));
     assert!(board.text().contains("Unassigned"));

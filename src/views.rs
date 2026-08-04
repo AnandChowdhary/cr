@@ -21,6 +21,7 @@ pub struct ViewDefinition {
     pub title: String,
     pub collection: String,
     pub filters: Vec<String>,
+    pub where_expr: Vec<String>,
     pub columns: Vec<String>,
     pub layout: ViewLayout,
     pub group_by: Option<String>,
@@ -46,6 +47,8 @@ struct StoredViewDefinition {
     collection: String,
     #[serde(default)]
     filters: Vec<String>,
+    #[serde(default)]
+    where_expr: Vec<String>,
     #[serde(default)]
     columns: Vec<String>,
     #[serde(default)]
@@ -99,6 +102,7 @@ impl Database {
             title,
             collection,
             filters,
+            Vec::new(),
             columns,
             page_size,
             layout,
@@ -115,6 +119,7 @@ impl Database {
         title: Option<&str>,
         collection: &str,
         filters: Vec<String>,
+        where_expr: Vec<String>,
         columns: Vec<String>,
         page_size: usize,
         layout: ViewLayout,
@@ -134,6 +139,7 @@ impl Database {
             title: title.to_owned(),
             collection: collection.to_owned(),
             filters,
+            where_expr,
             columns,
             layout,
             group_by,
@@ -268,6 +274,10 @@ fn validate_stored(name: &str, view: &StoredViewDefinition) -> Result<()> {
         Assignment::from_str(filter)
             .with_context(|| format!("view '{name}' has invalid filter '{filter}'"))?;
     }
+    for expression in &view.where_expr {
+        crate::FilterExpression::from_str(expression)
+            .with_context(|| format!("view '{name}' has invalid where_expr '{expression}'"))?;
+    }
     for column in &view.columns {
         parse_path(column)
             .with_context(|| format!("view '{name}' has invalid column '{column}'"))?;
@@ -308,6 +318,7 @@ fn automatic_view(collection: &str) -> ViewDefinition {
         title: collection.replace(['-', '_'], " "),
         collection: collection.to_owned(),
         filters: Vec::new(),
+        where_expr: Vec::new(),
         columns: Vec::new(),
         layout: ViewLayout::Table,
         group_by: None,
@@ -325,6 +336,7 @@ fn to_public(name: &str, stored: StoredViewDefinition, saved: bool) -> ViewDefin
         title: stored.title,
         collection: stored.collection,
         filters: stored.filters,
+        where_expr: stored.where_expr,
         columns: stored.columns,
         layout: stored.layout,
         group_by: stored.group_by,
@@ -388,6 +400,7 @@ mod tests {
                 Some("Sales pipeline"),
                 "deals",
                 vec![],
+                vec!["value>=10000".into()],
                 vec!["name".into(), "value".into()],
                 200,
                 ViewLayout::Kanban,
@@ -400,9 +413,11 @@ mod tests {
         assert_eq!(kanban.group_by.as_deref(), Some("stage"));
         assert_eq!(kanban.sort_by.as_deref(), Some("value"));
         assert_eq!(kanban.sort_direction, SortDirection::Desc);
+        assert_eq!(kanban.where_expr, ["value>=10000"]);
         let stored = fs::read_to_string(database.root().join(".cr/views/pipeline.yaml")).unwrap();
         assert!(stored.contains("layout: kanban"));
         assert!(stored.contains("group_by: stage"));
+        assert!(stored.contains("- value>=10000"));
         assert!(stored.contains("sort_by: value"));
         assert!(stored.contains("sort_direction: desc"));
 
@@ -414,6 +429,7 @@ mod tests {
         let legacy = database.view("legacy").unwrap();
         assert_eq!(legacy.layout, ViewLayout::Table);
         assert_eq!(legacy.group_by, None);
+        assert!(legacy.where_expr.is_empty());
         assert_eq!(legacy.sort_by, None);
         assert_eq!(legacy.sort_direction, SortDirection::Asc);
     }
@@ -457,6 +473,7 @@ mod tests {
                 "deals",
                 vec![],
                 vec![],
+                vec![],
                 50,
                 ViewLayout::Table,
                 None,
@@ -471,6 +488,7 @@ mod tests {
                 "missing-sort",
                 None,
                 "deals",
+                vec![],
                 vec![],
                 vec![],
                 50,

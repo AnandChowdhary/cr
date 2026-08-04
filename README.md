@@ -753,13 +753,14 @@ Every existing record page embeds its newest audit history with actor, source, t
 
 ### Create saved views
 
-A saved view gives a stable route a title, collection, default equality filters, explicit columns or card details, layout, default ordering, and page size. This CRM example makes `/deals` show only open deals as a table, with the largest opportunities first:
+A saved view gives a stable route a title, collection, reusable typed filters, explicit columns or card details, layout, default ordering, and page size. This CRM example makes `/deals` show only open deals worth at least 10,000, with the largest opportunities first:
 
 ```sh
 cr view create deals \
   --collection deals \
   --title "Open deals" \
   --where status=open \
+  --where-expr 'value>=10000' \
   --column name \
   --column status \
   --column value \
@@ -830,7 +831,7 @@ cr view show interviews
 cr view show interviews --json
 ```
 
-Definitions are ordinary, versioned files in `.cr/views/<name>.yaml`:
+Definitions are ordinary, versioned files in `.cr/views/<name>.yaml`. `filters` stores typed equality predicates; `where_expr` stores richer shared expressions, all combined with AND:
 
 ```yaml
 version: 1
@@ -838,6 +839,8 @@ title: Open deals
 collection: deals
 filters:
   - status=open
+where_expr:
+  - value>=10000
 columns:
   - name
   - status
