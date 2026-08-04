@@ -137,6 +137,9 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(automatic.text().contains("alpha"));
     assert!(automatic.text().contains("beta"));
     assert!(automatic.text().contains("href=\"/deals/records/alpha\""));
+    assert!(automatic.text().contains("data-filter-builder=\"true\""));
+    assert!(automatic.text().contains("+ Add condition"));
+    assert!(automatic.text().contains("All conditions match"));
     assert!(automatic
         .text()
         .contains("&lt;script&gt;alert('x')&lt;/script&gt;"));
@@ -163,6 +166,22 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert_eq!(exact.status, StatusCode::OK);
     assert!(exact.text().contains("beta"));
     assert!(!exact.text().contains("alpha"));
+
+    let combined = request(
+        &app,
+        Method::GET,
+        "/deals?filter_field=status&filter_value=open&filter_field=value&filter_value=12000",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(combined.status, StatusCode::OK);
+    assert!(combined.text().contains("alpha"));
+    assert!(!combined.text().contains("beta"));
+    assert_eq!(
+        combined.text().matches("data-filter-row=\"true\"").count(),
+        3
+    );
 
     let searched = request(&app, Method::GET, "/deals?q=ENTERPRISE", None, &[]).await;
     assert_eq!(searched.status, StatusCode::OK);
@@ -196,7 +215,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
         r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "x-cr-ui": { "order": ["name", "email", "stage", "budget", "active", "tags"] },
+  "x-cr-ui": { "order": ["name", "stage", "owner"] },
   "required": ["name"],
   "properties": {
     "name": { "type": "string" },
@@ -270,6 +289,25 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     let won = board.text().find(">won<").unwrap();
     let lost = board.text().find(">lost<").unwrap();
     assert!(qualification < interview && interview < offer && offer < won && won < lost);
+
+    let typed_filter = request(
+        &app,
+        Method::GET,
+        "/pipeline?filter_field=stage&filter_value=offer",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(typed_filter.status, StatusCode::OK);
+    assert!(typed_filter.text().contains("value=\"stage\" selected"));
+    assert!(typed_filter
+        .text()
+        .contains("name=\"filter_value\" data-filter-value=\"true\""));
+    assert!(typed_filter
+        .text()
+        .contains("value=\"offer\" selected>Offer</option>"));
+    assert!(typed_filter.text().contains("beta"));
+    assert!(!typed_filter.text().contains("alpha"));
 
     let token = csrf(board.text()).to_owned();
     let target = r#"{"kind":"value","value":"interview"}"#;
@@ -535,6 +573,7 @@ async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
         r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
+  "x-cr-ui": { "order": ["name", "email", "stage", "budget", "active", "tags"] },
   "required": ["name", "email", "stage", "budget"],
   "properties": {
     "name": {
@@ -826,5 +865,5 @@ async fn view_routes_respect_api_authentication_and_return_html_errors() {
     )
     .await;
     assert_eq!(invalid_query.status, StatusCode::BAD_REQUEST);
-    assert!(invalid_query.text().contains("must be provided together"));
+    assert!(invalid_query.text().contains("one matching filter_value"));
 }

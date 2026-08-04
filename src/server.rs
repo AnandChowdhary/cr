@@ -32,6 +32,7 @@ const DEFAULT_PAGE_SIZE: usize = 50;
 const DEFAULT_MAX_PAGE_SIZE: usize = 200;
 const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PAGE_OFFSET: usize = 1_000_000;
+const MAX_VIEW_FILTERS: usize = 20;
 const ACTOR_HEADER: &str = "x-cr-actor";
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -162,8 +163,10 @@ struct ListQuery {
 #[serde(deny_unknown_fields)]
 struct ViewQuery {
     q: Option<String>,
-    filter_field: Option<String>,
-    filter_value: Option<String>,
+    #[serde(default)]
+    filter_field: Vec<String>,
+    #[serde(default)]
+    filter_value: Vec<String>,
     limit: Option<usize>,
     offset: Option<usize>,
     notice: Option<String>,
@@ -196,6 +199,13 @@ struct SchemaFormField {
     description: Option<String>,
     required: bool,
     value: Option<YamlValue>,
+    kind: SchemaFieldKind,
+}
+
+#[derive(Clone, Debug)]
+struct ViewFilterField {
+    key: String,
+    label: String,
     kind: SchemaFieldKind,
 }
 
@@ -624,23 +634,7 @@ async fn view_records(
 ) -> Response {
     let result: ApiResult<Markup> = async {
         let query: ViewQuery = parse_query(raw)?;
-        let ad_hoc_filter = match (&query.filter_field, &query.filter_value) {
-            (None, None) => None,
-            (Some(field), Some(value)) if field.is_empty() && value.is_empty() => None,
-            (Some(field), Some(_)) if field.is_empty() => {
-                return Err(ApiError::bad_request(
-                    "invalid_filter",
-                    "filter_field cannot be empty when filter_value is provided",
-                ))
-            }
-            (Some(field), Some(value)) => Some(format!("{field}={value}")),
-            _ => {
-                return Err(ApiError::bad_request(
-                    "invalid_filter",
-                    "filter_field and filter_value must be provided together",
-                ))
-            }
-        };
+        let ad_hoc_filters = view_filter_assignments(&query)?;
         let query_for_database = query.clone();
         let requested_view = view_name.clone();
         let (view, records, schema) = run_database(&state, &headers, move |database| {
@@ -650,7 +644,7 @@ async fn view_records(
                 .iter()
                 .map(|filter| Assignment::from_str(filter))
                 .collect::<Result<Vec<_>>>()?;
-            if let Some(filter) = ad_hoc_filter {
+            for filter in ad_hoc_filters {
                 filters.push(Assignment::from_str(&filter)?);
             }
             let records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
@@ -1739,6 +1733,216 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
     }
 }
 
+fn view_filter_fields(schema: Option<&JsonValue>, columns: &[String]) -> Vec<ViewFilterField> {
+    let mut fields = schema
+        .and_then(|schema| schema_form_fields(schema, &Mapping::new()))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|field| ViewFilterField {
+            key: field.key,
+            label: field.label,
+            kind: field.kind,
+        })
+        .collect::<Vec<_>>();
+    let mut known = fields
+        .iter()
+        .map(|field| field.key.clone())
+        .collect::<BTreeSet<_>>();
+    for column in columns {
+        if known.insert(column.clone()) {
+            fields.push(ViewFilterField {
+                key: column.clone(),
+                label: humanize_field_name(column),
+                kind: SchemaFieldKind::Yaml,
+            });
+        }
+    }
+    fields
+}
+
+fn filter_kind_data(kind: &SchemaFieldKind) -> (&'static str, &'static str) {
+    match kind {
+        SchemaFieldKind::Select(_) => ("select", "text"),
+        SchemaFieldKind::Boolean => ("select", "text"),
+        SchemaFieldKind::Integer { .. } => ("input", "number"),
+        SchemaFieldKind::Number { .. } => ("input", "number"),
+        SchemaFieldKind::String { input_type, .. } => ("input", input_type),
+        SchemaFieldKind::MultiSelect(_) | SchemaFieldKind::Yaml => ("input", "text"),
+    }
+}
+
+fn filter_options_json(kind: &SchemaFieldKind) -> String {
+    let values = match kind {
+        SchemaFieldKind::Select(values) => values
+            .iter()
+            .map(|value| {
+                json!({
+                    "value": serialize_yaml_value(value),
+                    "label": schema_value_label(value),
+                })
+            })
+            .collect::<Vec<_>>(),
+        SchemaFieldKind::Boolean => vec![
+            json!({ "value": "true", "label": "True" }),
+            json!({ "value": "false", "label": "False" }),
+        ],
+        _ => Vec::new(),
+    };
+    serde_json::to_string(&values).expect("filter options are JSON serializable")
+}
+
+fn render_filter_value_control(
+    fields: &[ViewFilterField],
+    index: usize,
+    selected_field: &str,
+    value: &str,
+) -> Markup {
+    let definition = fields.iter().find(|field| field.key == selected_field);
+    let aria_label = format!("Filter value {}", index + 1);
+    match definition.map(|field| &field.kind) {
+        Some(SchemaFieldKind::Select(options)) => {
+            let known = options
+                .iter()
+                .any(|option| serialize_yaml_value(option) == value);
+            html! {
+                select name="filter_value" data-filter-value="true" aria-label=(aria_label) class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                    option value="" selected[value.is_empty()] { "Select a value…" }
+                    @for option in options {
+                        @let serialized = serialize_yaml_value(option);
+                        option value=(serialized.clone()) selected[serialized == value] { (schema_value_label(option)) }
+                    }
+                    @if !value.is_empty() && !known {
+                        option value=(value) selected { (value) " (custom)" }
+                    }
+                }
+            }
+        }
+        Some(SchemaFieldKind::Boolean) => html! {
+            select name="filter_value" data-filter-value="true" aria-label=(aria_label) class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                option value="" selected[value.is_empty()] { "Select a value…" }
+                option value="true" selected[value == "true"] { "True" }
+                option value="false" selected[value == "false"] { "False" }
+            }
+        },
+        Some(SchemaFieldKind::Integer { .. }) => html! {
+            input type="number" step="1" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Exact number" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+        },
+        Some(SchemaFieldKind::Number { .. }) => html! {
+            input type="number" step="any" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Exact number" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+        },
+        Some(SchemaFieldKind::String { input_type, .. }) => html! {
+            input type=(input_type) name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Exact value" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+        },
+        _ => html! {
+            input type="text" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Typed YAML value" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+        },
+    }
+}
+
+fn render_filter_row(
+    fields: &[ViewFilterField],
+    index: usize,
+    selected_field: &str,
+    value: &str,
+) -> Markup {
+    let selected_known = fields.iter().any(|field| field.key == selected_field);
+    html! {
+        div data-filter-row="true" class="grid gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto] sm:items-center" {
+            select name="filter_field" data-filter-field="true" aria-label=(format!("Filter field {}", index + 1)) class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                option value="" selected[selected_field.is_empty()] data-filter-kind="input" data-filter-input-type="text" data-filter-options="[]" { "Choose a field…" }
+                @for field in fields {
+                    @let (kind, input_type) = filter_kind_data(&field.kind);
+                    option value=(&field.key) selected[field.key == selected_field] data-filter-kind=(kind) data-filter-input-type=(input_type) data-filter-options=(filter_options_json(&field.kind)) { (&field.label) }
+                }
+                @if !selected_field.is_empty() && !selected_known {
+                    option value=(selected_field) selected data-filter-kind="input" data-filter-input-type="text" data-filter-options="[]" { (selected_field) " (custom)" }
+                }
+            }
+            span class="text-center text-xs font-bold uppercase tracking-wide text-slate-400" { "is" }
+            div data-filter-value-slot="true" {
+                (render_filter_value_control(fields, index, selected_field, value))
+            }
+            button type="button" data-remove-filter="true" aria-label=(format!("Remove filter {}", index + 1)) class="rounded-lg px-3 py-2 text-sm font-semibold text-slate-500 hover:bg-red-50 hover:text-red-700" { "Remove" }
+        }
+    }
+}
+
+const FILTER_BUILDER_SCRIPT: &str = r#"(() => {
+  const builder = document.querySelector('[data-filter-builder]');
+  if (!builder) return;
+  const list = builder.querySelector('[data-filter-list]');
+  const template = builder.querySelector('template[data-filter-template]');
+  const addButton = builder.querySelector('[data-add-filter]');
+  const maximum = Number(builder.dataset.maxFilters || '20');
+
+  const reindex = () => {
+    const rows = [...list.querySelectorAll('[data-filter-row]')];
+    rows.forEach((row, index) => {
+      row.querySelector('[data-filter-field]').setAttribute('aria-label', `Filter field ${index + 1}`);
+      row.querySelector('[data-filter-value]').setAttribute('aria-label', `Filter value ${index + 1}`);
+      row.querySelector('[data-remove-filter]').setAttribute('aria-label', `Remove filter ${index + 1}`);
+    });
+    addButton.disabled = rows.length >= maximum;
+  };
+
+  const replaceValueControl = (row) => {
+    const field = row.querySelector('[data-filter-field]');
+    const option = field.selectedOptions[0];
+    const slot = row.querySelector('[data-filter-value-slot]');
+    const oldControl = row.querySelector('[data-filter-value]');
+    const kind = option.dataset.filterKind || 'input';
+    let control;
+    if (kind === 'select') {
+      control = document.createElement('select');
+      const blank = document.createElement('option');
+      blank.value = '';
+      blank.textContent = 'Select a value…';
+      control.appendChild(blank);
+      JSON.parse(option.dataset.filterOptions || '[]').forEach((item) => {
+        const choice = document.createElement('option');
+        choice.value = item.value;
+        choice.textContent = item.label;
+        control.appendChild(choice);
+      });
+    } else {
+      control = document.createElement('input');
+      control.type = option.dataset.filterInputType || 'text';
+      if (control.type === 'number') control.step = 'any';
+      control.placeholder = control.type === 'number' ? 'Exact number' : 'Exact value';
+    }
+    control.name = 'filter_value';
+    control.dataset.filterValue = 'true';
+    control.className = oldControl.className;
+    slot.replaceChildren(control);
+    reindex();
+  };
+
+  const bindRow = (row) => {
+    row.querySelector('[data-filter-field]').addEventListener('change', () => replaceValueControl(row));
+    row.querySelector('[data-remove-filter]').addEventListener('click', () => {
+      const rows = list.querySelectorAll('[data-filter-row]');
+      if (rows.length === 1) {
+        row.querySelector('[data-filter-field]').value = '';
+        replaceValueControl(row);
+      } else {
+        row.remove();
+        reindex();
+      }
+    });
+  };
+
+  list.querySelectorAll('[data-filter-row]').forEach(bindRow);
+  addButton.addEventListener('click', () => {
+    if (list.querySelectorAll('[data-filter-row]').length >= maximum) return;
+    const row = template.content.firstElementChild.cloneNode(true);
+    list.appendChild(row);
+    bindRow(row);
+    reindex();
+    row.querySelector('[data-filter-field]').focus();
+  });
+  reindex();
+})();"#;
+
 fn render_view_records(
     view: &ViewDefinition,
     columns: &[String],
@@ -1755,6 +1959,16 @@ fn render_view_records(
         page.pagination.offset + 1
     };
     let last = page.pagination.offset + page.pagination.returned;
+    let filter_fields = view_filter_fields(schema, columns);
+    let mut filter_rows = query
+        .filter_field
+        .iter()
+        .zip(&query.filter_value)
+        .map(|(field, value)| (field.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    if filter_rows.is_empty() {
+        filter_rows.push(("", ""));
+    }
     page_layout(
         &view.title,
         html! {
@@ -1792,24 +2006,37 @@ fn render_view_records(
             @if let Some(notice) = query.notice.as_deref() {
                 div role="status" class="mb-5 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800" { (notice) }
             }
-            form method="get" action=(reset_url.clone()) class="mb-5 grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm lg:grid-cols-[2fr_1fr_1fr_auto]" {
+            form method="get" action=(reset_url.clone()) data-filter-builder="true" data-max-filters=(MAX_VIEW_FILTERS) class="mb-5 space-y-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5" {
                 label class="block" {
-                    span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Search" }
-                    input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) placeholder="Path, front matter, or Markdown" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+                    span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Search records" }
+                    input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) placeholder="Search paths, front matter, and Markdown…" class="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
                 }
-                label class="block" {
-                    span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Exact field" }
-                    input type="text" name="filter_field" value=(query.filter_field.as_deref().unwrap_or("")) placeholder="status" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+                div class="border-t border-slate-100 pt-4" {
+                    div class="mb-3 flex flex-wrap items-center justify-between gap-3" {
+                        div {
+                            div class="flex items-center gap-2" {
+                                h2 class="text-sm font-bold text-slate-900" { "Filters" }
+                                span class="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500" { "All conditions match" }
+                            }
+                            p class="mt-1 text-xs text-slate-500" { "Field controls and allowed values come from the collection schema." }
+                        }
+                        button type="button" data-add-filter="true" class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:border-indigo-300 hover:text-indigo-700 disabled:cursor-not-allowed disabled:opacity-40" { "+ Add condition" }
+                    }
+                    div data-filter-list="true" class="space-y-2" {
+                        @for (index, (field, value)) in filter_rows.iter().enumerate() {
+                            (render_filter_row(&filter_fields, index, field, value))
+                        }
+                    }
+                    template data-filter-template="true" {
+                        (render_filter_row(&filter_fields, 0, "", ""))
+                    }
                 }
-                label class="block" {
-                    span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "YAML value" }
-                    input type="text" name="filter_value" value=(query.filter_value.as_deref().unwrap_or("")) placeholder="open" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
-                }
-                div class="flex items-end gap-2" {
-                    button type="submit" class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Apply" }
-                    a href=(reset_url) class="rounded-lg px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100" { "Reset" }
+                div class="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-4" {
+                    a href=(reset_url) class="rounded-lg px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100" { "Clear all" }
+                    button type="submit" class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Apply filters" }
                 }
             }
+            script { (PreEscaped(FILTER_BUILDER_SCRIPT)) }
             @if view.layout == ViewLayout::Kanban {
                 (render_kanban_board(view, columns, page, query, schema, csrf_token))
             } @else {
@@ -2705,12 +2932,44 @@ fn audit_page_url(query: &AuditViewQuery, limit: usize, offset: usize) -> String
     format!("/audit?{}", serializer.finish())
 }
 
+fn view_filter_assignments(query: &ViewQuery) -> ApiResult<Vec<String>> {
+    if query.filter_field.len() != query.filter_value.len() {
+        return Err(ApiError::bad_request(
+            "invalid_filter",
+            "each filter_field must have one matching filter_value",
+        ));
+    }
+    if query.filter_field.len() > MAX_VIEW_FILTERS {
+        return Err(ApiError::bad_request(
+            "invalid_filter",
+            format!("a view can apply at most {MAX_VIEW_FILTERS} filters"),
+        ));
+    }
+    query
+        .filter_field
+        .iter()
+        .zip(&query.filter_value)
+        .filter_map(|(field, value)| {
+            if field.is_empty() && value.is_empty() {
+                None
+            } else if field.is_empty() {
+                Some(Err(ApiError::bad_request(
+                    "invalid_filter",
+                    "filter_field cannot be empty when filter_value is provided",
+                )))
+            } else {
+                Some(Ok(format!("{field}={value}")))
+            }
+        })
+        .collect()
+}
+
 fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset: usize) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     if let Some(q) = query.q.as_deref().filter(|value| !value.is_empty()) {
         serializer.append_pair("q", q);
     }
-    if let (Some(field), Some(value)) = (&query.filter_field, &query.filter_value) {
+    for (field, value) in query.filter_field.iter().zip(&query.filter_value) {
         serializer.append_pair("filter_field", field);
         serializer.append_pair("filter_value", value);
     }

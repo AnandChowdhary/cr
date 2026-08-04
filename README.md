@@ -701,7 +701,9 @@ Open [http://127.0.0.1:3000/](http://127.0.0.1:3000/) to see every collection. E
 http://127.0.0.1:3000/deals
 ```
 
-The table infers columns from the collection schema and current front matter. It includes case-insensitive document search, one typed exact-value filter, bounded pagination, create and edit forms, and audited deletion. Click a record ID, field value, or its **View** action to open the record editor and its newest audit events. Saved views can switch the same query to a Kanban layout. Every mutation is schema-validated and recorded with `source: api`.
+The table infers columns from the collection schema and current front matter. It includes case-insensitive document search, a schema-aware multi-condition filter builder, bounded pagination, create and edit forms, and audited deletion. Click a record ID, field value, or its **View** action to open the record editor and its newest audit events. Saved views can switch the same query to a Kanban layout. Every mutation is schema-validated and recorded with `source: api`.
+
+The filter builder combines up to 20 exact-value conditions with AND. Enum and boolean fields use constrained dropdowns, numeric fields use numeric inputs, formatted strings use their matching input type, and other values accept typed YAML. Add or remove rows in the browser; filters stay in the URL as repeated `filter_field` and `filter_value` pairs, including through pagination. The server independently pairs, bounds, parses, and applies every condition—the JavaScript only improves the form interaction.
 
 ### Use schema-driven record forms
 
