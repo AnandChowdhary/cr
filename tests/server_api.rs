@@ -186,6 +186,32 @@ async fn rest_crud_search_relations_audit_and_pagination_share_database_semantic
     assert_eq!(listed["pagination"]["previous_offset"], 0);
     assert_eq!(listed["pagination"]["next_offset"], Value::Null);
 
+    let sorted = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/records?sort=value&direction=asc&limit=2",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(sorted.status, StatusCode::OK);
+    let sorted = sorted.json();
+    assert_eq!(sorted["pagination"]["total"], 3);
+    assert_eq!(sorted["pagination"]["returned"], 2);
+    assert_eq!(sorted["data"][0]["path"], "records/deals/gamma-trial.md");
+    assert_eq!(sorted["data"][1]["path"], "records/deals/beta-expansion.md");
+
+    let invalid_sort = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/records?sort=owner..email",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(invalid_sort.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(invalid_sort.json()["error"]["code"], "validation_failed");
+
     let compared = request(
         &app,
         Method::GET,
@@ -302,6 +328,25 @@ async fn rest_crud_search_relations_audit_and_pagination_share_database_semantic
     assert_eq!(
         searched.json()["data"][0]["path"],
         "records/deals/alpha-renewal.md"
+    );
+
+    let sorted_search = request(
+        &app,
+        Method::GET,
+        "/api/v1/search?q=Notes&collection=deals&sort=value&direction=asc",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(sorted_search.status, StatusCode::OK);
+    let sorted_search = sorted_search.json();
+    assert_eq!(
+        sorted_search["data"][0]["path"],
+        "records/deals/gamma-trial.md"
+    );
+    assert_eq!(
+        sorted_search["data"][1]["path"],
+        "records/deals/beta-expansion.md"
     );
 
     let company = json_request(
@@ -560,11 +605,12 @@ async fn openapi_authentication_and_http_errors_are_structured() {
         .get("/api/v1/collections/{collection}/records")
         .is_some());
     for path in ["/api/v1/collections/{collection}/records", "/api/v1/search"] {
-        assert!(openapi["paths"][path]["get"]["parameters"]
+        let parameters = openapi["paths"][path]["get"]["parameters"]
             .as_array()
-            .unwrap()
-            .iter()
-            .any(|parameter| parameter["name"] == "where_expr"));
+            .unwrap();
+        for name in ["where_expr", "sort", "direction"] {
+            assert!(parameters.iter().any(|parameter| parameter["name"] == name));
+        }
     }
     let reference = openapi["x-cr-collection-schemas"]["candidates"]
         .as_str()

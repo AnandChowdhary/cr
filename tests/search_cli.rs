@@ -51,6 +51,37 @@ fn search_spans_collections_combines_filters_and_returns_compact_results() {
         ]
     );
 
+    run_success(database.command().args([
+        "create",
+        "deals",
+        "new-renewal",
+        "--set",
+        "status=open",
+        "--set",
+        "active=true",
+        "--set",
+        "value=10000",
+        "--body",
+        "Shared account notes for a smaller deal.",
+    ]));
+    let sorted = run_success(database.command().args([
+        "search",
+        "notes",
+        "--collection",
+        "deals",
+        "--sort",
+        "value",
+        "--desc",
+    ]));
+    assert_eq!(
+        sorted.lines().collect::<Vec<_>>(),
+        [
+            "records/deals/acme-renewal.md",
+            "records/deals/new-renewal.md",
+            "records/deals/old-renewal.md",
+        ]
+    );
+
     let filtered = run_success(database.command().args([
         "search",
         "won",
@@ -231,4 +262,6 @@ fn search_help_is_available_without_a_database() {
     assert!(output.contains("--front-matter"));
     assert!(output.contains("--field <KEY>"));
     assert!(output.contains("--regex"));
+    assert!(output.contains("--sort <FIELD>"));
+    assert!(output.contains("--desc"));
 }

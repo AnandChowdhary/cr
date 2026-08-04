@@ -1,5 +1,4 @@
 use std::{
-    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     io::Write,
     net::SocketAddr,
@@ -25,9 +24,9 @@ use sha2::{Digest, Sha256};
 use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
-    audit::AuditChange, compare_yaml_values, Assignment, AuditEntry, AuditSource, CollectionModel,
-    Database, FilterExpression, FilterOperator, Record, SearchQuery, SearchTarget, ViewDefinition,
-    ViewLayout,
+    audit::AuditChange, sort_records_by_field, Assignment, AuditEntry, AuditSource,
+    CollectionModel, Database, FilterExpression, FilterOperator, Record, SearchQuery, SearchTarget,
+    SortDirection, ViewDefinition, ViewLayout,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -159,6 +158,9 @@ struct ListQuery {
     filters: Vec<String>,
     #[serde(default)]
     where_expr: Vec<String>,
+    sort: Option<String>,
+    #[serde(default)]
+    direction: SortDirectionParameter,
     limit: Option<usize>,
     offset: Option<usize>,
 }
@@ -197,6 +199,32 @@ enum ViewSortDirection {
     #[default]
     Asc,
     Desc,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum SortDirectionParameter {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl From<SortDirectionParameter> for SortDirection {
+    fn from(direction: SortDirectionParameter) -> Self {
+        match direction {
+            SortDirectionParameter::Asc => Self::Asc,
+            SortDirectionParameter::Desc => Self::Desc,
+        }
+    }
+}
+
+impl From<ViewSortDirection> for SortDirection {
+    fn from(direction: ViewSortDirection) -> Self {
+        match direction {
+            ViewSortDirection::Asc => Self::Asc,
+            ViewSortDirection::Desc => Self::Desc,
+        }
+    }
 }
 
 impl ViewSortDirection {
@@ -400,6 +428,9 @@ struct SearchParameters {
     filters: Vec<String>,
     #[serde(default)]
     where_expr: Vec<String>,
+    sort: Option<String>,
+    #[serde(default)]
+    direction: SortDirectionParameter,
     target: Option<SearchTargetParameter>,
     field: Option<String>,
     #[serde(default)]
@@ -542,6 +573,7 @@ impl ApiError {
             || lower.contains("cannot ")
             || lower.contains("provide ")
             || lower.contains("field '")
+            || lower.contains("field path")
             || lower.contains("path component")
             || lower.contains("regular expression")
         {
@@ -1052,6 +1084,8 @@ async fn list_records(
     let bounds = page_bounds(query.limit, query.offset, state.max_page_size)?;
     let filters = parse_filters(query.filters)?;
     let expressions = parse_filter_expressions(query.where_expr)?;
+    let sort = query.sort;
+    let direction = query.direction.into();
     let records = run_database(&state, &headers, move |database| {
         let mut records = database.list(&collection, &filters)?;
         records.retain(|record| {
@@ -1059,6 +1093,9 @@ async fn list_records(
                 .iter()
                 .all(|expression| expression.matches(&record.attributes))
         });
+        if let Some(field) = sort {
+            sort_records_by_field(&mut records, &field, direction)?;
+        }
         Ok(records)
     })
     .await?;
@@ -1206,6 +1243,8 @@ async fn search_records(
     let bounds = page_bounds(parameters.limit, parameters.offset, state.max_page_size)?;
     let filters = parse_filters(parameters.filters)?;
     let expressions = parse_filter_expressions(parameters.where_expr)?;
+    let sort = parameters.sort;
+    let direction = parameters.direction.into();
     let target = search_target(parameters.target, parameters.field)?;
     let query = SearchQuery::new(
         &parameters.q,
@@ -1222,6 +1261,9 @@ async fn search_records(
                 .iter()
                 .all(|expression| expression.matches(&record.attributes))
         });
+        if let Some(field) = sort {
+            sort_records_by_field(&mut records, &field, direction)?;
+        }
         Ok(records)
     })
     .await?;
@@ -1609,6 +1651,8 @@ fn openapi_paths() -> JsonValue {
                 "parameters": [collection.clone(),
                     json!({ "name": "where", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }),
                     json!({ "name": "where_expr", "in": "query", "description": "Typed expressions such as value>=10000, name contains Acme, or owner is-empty. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }),
+                    json!({ "name": "sort", "in": "query", "description": "Dotted front matter field or $id, $collection, or $path. Missing fields remain last.", "schema": { "type": "string" } }),
+                    json!({ "name": "direction", "in": "query", "description": "Sort direction. Record ID remains the ascending deterministic tie-breaker.", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } }),
                     json!({ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } }),
                     json!({ "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } })],
                 "responses": ok("#/components/schemas/RecordPage")
@@ -1643,6 +1687,8 @@ fn openapi_paths() -> JsonValue {
                 { "name": "collection", "in": "query", "schema": { "type": "string" } },
                 { "name": "where", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "where_expr", "in": "query", "description": "Typed expressions such as value>=10000, name contains Acme, or owner is-empty. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
+                { "name": "sort", "in": "query", "description": "Dotted front matter field or $id, $collection, or $path. Missing fields remain last.", "schema": { "type": "string" } },
+                { "name": "direction", "in": "query", "description": "Sort direction. Record ID remains the ascending deterministic tie-breaker.", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } },
                 { "name": "target", "in": "query", "schema": { "enum": ["document", "front_matter", "field", "body", "path"] } },
                 { "name": "field", "in": "query", "schema": { "type": "string" } },
                 { "name": "ignore_case", "in": "query", "schema": { "type": "boolean", "default": false } },
@@ -3302,37 +3348,8 @@ fn sort_view_records(records: &mut [Record], query: &ViewQuery) -> ApiResult<()>
     let Some(field) = view_sort_field(query) else {
         return Ok(());
     };
-    if field != "$id" {
-        crate::value::parse_path(field)
-            .map_err(|error| ApiError::unprocessable(error.to_string()))?;
-    }
-    records.sort_by(|left, right| {
-        let ordering = if field == "$id" {
-            direction_ordering(left.id.cmp(&right.id), query.sort_direction)
-        } else {
-            let left_value = left.field(field).expect("sort field path was validated");
-            let right_value = right.field(field).expect("sort field path was validated");
-            match (left_value, right_value) {
-                (Some(left), Some(right)) => {
-                    direction_ordering(compare_yaml_values(left, right), query.sort_direction)
-                }
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            }
-        };
-        ordering
-            .then_with(|| left.collection.cmp(&right.collection))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    Ok(())
-}
-
-fn direction_ordering(ordering: Ordering, direction: ViewSortDirection) -> Ordering {
-    match direction {
-        ViewSortDirection::Asc => ordering,
-        ViewSortDirection::Desc => ordering.reverse(),
-    }
+    sort_records_by_field(records, field, query.sort_direction.into())
+        .map_err(ApiError::from_database)
 }
 
 fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset: usize) -> String {

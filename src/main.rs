@@ -2,7 +2,10 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use cr::{Assignment, Database, FilterExpression, Record, SearchQuery, SearchTarget, ViewLayout};
+use cr::{
+    sort_records_by_field, Assignment, Database, FilterExpression, Record, SearchQuery,
+    SearchTarget, SortDirection, ViewLayout,
+};
 use serde::Serialize;
 use yaml_serde::Mapping;
 
@@ -88,6 +91,14 @@ enum Command {
         #[arg(long = "where-expr", value_name = "EXPRESSION")]
         expressions: Vec<FilterExpression>,
 
+        /// Sort by a dotted field, $id, $collection, or $path. Missing fields stay last.
+        #[arg(long, value_name = "FIELD")]
+        sort: Option<String>,
+
+        /// Sort descending. Record ID remains the ascending deterministic tie-breaker.
+        #[arg(long, requires = "sort")]
+        desc: bool,
+
         /// Return each file path and front matter as JSON.
         #[arg(long)]
         json: bool,
@@ -109,6 +120,14 @@ enum Command {
         /// First match a typed expression such as value>=10000. Multiple expressions use AND.
         #[arg(long = "where-expr", value_name = "EXPRESSION")]
         expressions: Vec<FilterExpression>,
+
+        /// Sort by a dotted field, $id, $collection, or $path. Missing fields stay last.
+        #[arg(long, value_name = "FIELD")]
+        sort: Option<String>,
+
+        /// Sort descending. Record ID remains the ascending deterministic tie-breaker.
+        #[arg(long, requires = "sort")]
+        desc: bool,
 
         /// Search only parsed front matter.
         #[arg(long, conflicts_with_all = ["field", "body", "path"])]
@@ -451,6 +470,8 @@ fn run() -> Result<()> {
             collection,
             filters,
             expressions,
+            sort,
+            desc,
             json,
         } => {
             let mut records = database.list(&collection, &filters)?;
@@ -459,6 +480,17 @@ fn run() -> Result<()> {
                     .iter()
                     .all(|expression| expression.matches(&record.attributes))
             });
+            if let Some(field) = sort {
+                sort_records_by_field(
+                    &mut records,
+                    &field,
+                    if desc {
+                        SortDirection::Desc
+                    } else {
+                        SortDirection::Asc
+                    },
+                )?;
+            }
             print_records(records, json)?;
         }
         Command::Search {
@@ -466,6 +498,8 @@ fn run() -> Result<()> {
             collection,
             filters,
             expressions,
+            sort,
+            desc,
             front_matter,
             field,
             body,
@@ -492,6 +526,17 @@ fn run() -> Result<()> {
                     .iter()
                     .all(|expression| expression.matches(&record.attributes))
             });
+            if let Some(field) = sort {
+                sort_records_by_field(
+                    &mut records,
+                    &field,
+                    if desc {
+                        SortDirection::Desc
+                    } else {
+                        SortDirection::Asc
+                    },
+                )?;
+            }
             print_records(records, json)?;
         }
         Command::Serve {

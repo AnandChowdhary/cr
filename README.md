@@ -218,9 +218,10 @@ cr list deals --where-expr 'value>=10000' --where-expr 'stage!=lost' --json
 cr list deals --where-expr 'name contains renewal'
 cr list deals --where-expr 'tags contains enterprise'
 cr list contacts --where-expr 'contact.email is-not-empty'
+cr list deals --where 'stage=open' --sort value --desc --json
 ```
 
-Supported operators are `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `not-contains`, `starts-with`, `ends-with`, `is-empty`, and `is-not-empty`. Ordering compares numbers numerically and strings lexicographically, which gives the expected ordering for normalized ISO dates and times. Missing fields count as empty but do not match negative operators. A full parenthesized `AND`/`OR`/`NOT` grammar, membership sets, sorting, and projections remain explicit roadmap work.
+Supported operators are `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `not-contains`, `starts-with`, `ends-with`, `is-empty`, and `is-not-empty`. Ordering compares numbers numerically and strings lexicographically, which gives the expected ordering for normalized ISO dates and times. Missing fields count as empty but do not match negative operators. Use `--sort FIELD` on `list` or `search`, and add `--desc` for descending order. Dotted front matter paths and the special keys `$id`, `$collection`, and `$path` are supported; missing values remain last and record ID breaks equal-value ties. A full parenthesized `AND`/`OR`/`NOT` grammar, membership sets, multi-field sorting, and projections remain explicit roadmap work.
 
 ### Search
 
@@ -964,6 +965,7 @@ Repeated `where` parameters are combined with AND and retain YAML types. URL-enc
 ```sh
 curl 'http://127.0.0.1:3000/api/v1/collections/deals/records?where=status%3Dwon&where=active%3Dtrue&limit=50&offset=0'
 curl 'http://127.0.0.1:3000/api/v1/collections/deals/records?where_expr=value%3E%3D10000&where_expr=name%20contains%20renewal'
+curl 'http://127.0.0.1:3000/api/v1/collections/deals/records?sort=value&direction=desc&limit=50'
 ```
 
 List and search responses contain compact `{ path, front_matter }` records inside a page:
@@ -993,6 +995,7 @@ Search supports the same targets and matching modes as `cr search`:
 ```sh
 curl 'http://127.0.0.1:3000/api/v1/search?q=follow%20up&collection=deals&target=body&ignore_case=true&limit=50'
 curl 'http://127.0.0.1:3000/api/v1/search?q=renewal&collection=deals&where_expr=value%3E%3D10000'
+curl 'http://127.0.0.1:3000/api/v1/search?q=renewal&collection=deals&sort=value&direction=desc'
 curl 'http://127.0.0.1:3000/api/v1/search?q=%5Ewon%24&collection=deals&target=field&field=status&regex=true'
 ```
 
@@ -1065,9 +1068,10 @@ cr identity
 
 cr create COLLECTION ID [--set KEY=YAML]... [--body TEXT]
 cr get COLLECTION ID [--json | --field KEY]
-cr list COLLECTION [--where KEY=YAML]... [--where-expr EXPRESSION]... [--json]
+cr list COLLECTION [--where KEY=YAML]... [--where-expr EXPRESSION]...
+                   [--sort FIELD [--desc]] [--json]
 cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]...
-                  [--where-expr EXPRESSION]... [--json]
+                  [--where-expr EXPRESSION]... [--sort FIELD [--desc]] [--json]
                   [--front-matter | --field KEY | --body | --path]
                   [--ignore-case] [--regex]
 cr update COLLECTION ID [--set KEY=YAML]... [--body TEXT]

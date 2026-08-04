@@ -99,7 +99,7 @@ Priorities:
   Support `in`, `not in`, array/string `contains`, field existence, and explicit distinctions among missing, `null`, empty string, and empty collection.
 
 - [ ] **P1 — Sorting.**
-  Sort by one or more dotted fields, path, collection, or ID with stable missing-value and mixed-type rules. Pagination must be deterministic under every supported order.
+  Single-field sorting now works across CLI, REST, and HTML for dotted fields, path, collection, or ID with stable missing-value and mixed-type rules before pagination. Add ordered multi-field keys and define a URL/CLI syntax that preserves deterministic ties.
 
 - [ ] **P1 — Field projections.**
   Add `--select` and an HTTP equivalent so callers can request only selected front matter fields, identity/path fields, or optionally Markdown.
@@ -245,6 +245,6 @@ Priorities:
 - [x] Saved Kanban views with schema-ordered lanes, drag-and-drop plus accessible move forms, schema validation, CSRF protection, and normal audit events.
 - [x] Schema-driven create and edit forms with typed scalar controls, enum and multi-enum selection, complex-value YAML fallback, additional attributes, and escaped schema metadata.
 - [x] Schema-aware multi-condition filter builder with typed comparison, containment, and empty-value operators; constrained controls; AND/OR composition; saved-view scoping; URL persistence; bounded decoding; and progressive row management.
-- [x] Schema-aware view sorting with accessible table-header toggles, typed YAML ordering, missing-last rules, deterministic ties, pre-pagination application, and Kanban card ordering.
+- [x] Shared single-field sorting across CLI, REST, OpenAPI, tables, and Kanban with accessible table-header toggles, typed YAML ordering, missing-last rules, deterministic ties, and pre-pagination application.
 - [x] Versioned subprocess sync adapters with JSONL upsert/delete/checkpoint messages, clean-state verification, limits, overlap locks, checkpointing, and `source: sync` audit provenance.
 - [x] Unit, CLI, concurrency, direct-edit, in-process HTTP, and real TCP server tests.

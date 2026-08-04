@@ -258,12 +258,52 @@ fn list_combines_typed_nested_filters_and_orders_results() {
         serde_json::json!([])
     );
 
+    run_success(database.command().args([
+        "create",
+        "candidates",
+        "noah",
+        "--set",
+        "stage=screening",
+    ]));
+    let sorted = run_success(database.command().args([
+        "list",
+        "candidates",
+        "--sort",
+        "score",
+        "--desc",
+        "--json",
+    ]));
+    let sorted: Value = serde_json::from_str(&sorted).unwrap();
+    assert_eq!(
+        sorted
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "records/candidates/mira.md",
+            "records/candidates/zoe.md",
+            "records/candidates/amy.md",
+            "records/candidates/noah.md",
+        ]
+    );
+
+    let invalid_sort =
+        run_failure(
+            database
+                .command()
+                .args(["list", "candidates", "--sort", "contact..country"]),
+        );
+    assert!(invalid_sort.contains("contains an empty segment"));
+
     let ordered = run_success(database.command().args(["list", "candidates"]));
     assert_eq!(
         ordered.lines().collect::<Vec<_>>(),
         [
             "records/candidates/amy.md",
             "records/candidates/mira.md",
+            "records/candidates/noah.md",
             "records/candidates/zoe.md"
         ]
     );

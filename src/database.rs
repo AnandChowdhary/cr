@@ -14,7 +14,7 @@ use yaml_serde::{Mapping, Value};
 use crate::{
     audit::{record_hash, AuditLog, AuditMutation, ReconciledMutation},
     frontmatter::Document,
-    value::{get_path, parse_path, remove_path},
+    value::{compare_yaml_values, get_path, parse_path, remove_path},
     Assignment, AuditAction, AuditEntry, AuditHead, AuditSource, AuditVerification, SearchQuery,
 };
 
@@ -82,6 +82,13 @@ pub struct Record {
     pub body: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkingChangeKind {
@@ -124,6 +131,54 @@ impl Record {
     pub fn field(&self, path: &str) -> Result<Option<&Value>> {
         let path = parse_path(path)?;
         Ok(get_path(&self.attributes, &path))
+    }
+}
+
+pub fn sort_records_by_field(
+    records: &mut [Record],
+    field: &str,
+    direction: SortDirection,
+) -> Result<()> {
+    let field = field.trim();
+    if field.is_empty() {
+        bail!("sort field cannot be empty");
+    }
+    if !matches!(field, "$id" | "$collection" | "$path") {
+        parse_path(field)?;
+    }
+
+    records.sort_by(|left, right| {
+        let ordering = match field {
+            "$id" => direction_ordering(left.id.cmp(&right.id), direction),
+            "$collection" => direction_ordering(left.collection.cmp(&right.collection), direction),
+            "$path" => direction_ordering(left.path.cmp(&right.path), direction),
+            _ => {
+                let left_value = left.field(field).expect("sort field path was validated");
+                let right_value = right.field(field).expect("sort field path was validated");
+                match (left_value, right_value) {
+                    (Some(left), Some(right)) => {
+                        direction_ordering(compare_yaml_values(left, right), direction)
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            }
+        };
+        ordering
+            .then_with(|| left.collection.cmp(&right.collection))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(())
+}
+
+fn direction_ordering(
+    ordering: std::cmp::Ordering,
+    direction: SortDirection,
+) -> std::cmp::Ordering {
+    match direction {
+        SortDirection::Asc => ordering,
+        SortDirection::Desc => ordering.reverse(),
     }
 }
 

@@ -203,6 +203,10 @@ fn path_traversal_and_invalid_assignments_are_rejected() {
         );
     assert!(expression_error.contains("expected a filter expression"));
 
+    let sort_error = run_failure(database.command().args(["list", "candidates", "--desc"]));
+    assert!(sort_error.contains("--sort <FIELD>"));
+    assert!(sort_error.contains("required"));
+
     assert!(!database.root.join("outside.md").exists());
     assert!(!database.root.join("records/candidates/jane.md").exists());
 }

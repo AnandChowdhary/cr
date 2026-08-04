@@ -51,6 +51,9 @@ fn query_help_documents_typed_filter_expressions() {
         let stdout = String::from_utf8(output.stdout).expect("help output was not UTF-8");
         assert!(stdout.contains("--where-expr <EXPRESSION>"));
         assert!(stdout.contains("value>=10000"));
+        assert!(stdout.contains("--sort <FIELD>"));
+        assert!(stdout.contains("--desc"));
+        assert!(stdout.contains("Missing fields stay last"));
     }
 }
 
