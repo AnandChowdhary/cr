@@ -717,6 +717,8 @@ The filter builder combines up to 20 conditions with either **all** (AND) or **a
 
 Every generated page also has schema-aware sorting. Choose a field and direction in the query panel, or click a table column heading to toggle ascending and descending order. Numbers sort numerically, strings and normalized ISO dates sort lexicographically, missing values stay last in both directions, and record ID is the deterministic tie-breaker. Sorting happens before pagination and remains in pagination URLs; Kanban uses the same order for cards inside each lane.
 
+Open **Columns** in the same panel to choose the visible table fields or Kanban card details. The selection is encoded as `columns=custom` plus repeated `column` parameters, so it survives sorting and pagination and can be shared as part of the URL. At least one of the fields available from the saved view, schema, or current records must remain selected. The record ID stays visible as the stable link in tables and is not part of the field selection.
+
 ### Use schema-driven record forms
 
 When a collection has a JSON Schema, create and edit pages generate one control per declared top-level attribute:
@@ -852,7 +854,7 @@ sort_direction: desc
 page_size: 50
 ```
 
-Every table and Kanban page also has a **Save as view** control. It creates a new definition from the current applied filters, all/any match mode, columns, layout, and sorting. The source view's mandatory predicates are copied, and the current browser filter becomes a separate `filter_groups` entry, so saving an **any** query preserves its Boolean meaning instead of flattening it into AND:
+Every table and Kanban page also has a **Save as view** control. It creates a new definition from the current applied filters, all/any match mode, currently visible columns, layout, and sorting. The source view's mandatory predicates are copied, and the current browser filter becomes a separate `filter_groups` entry, so saving an **any** query preserves its Boolean meaning instead of flattening it into AND:
 
 ```yaml
 filter_groups:

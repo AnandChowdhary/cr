@@ -144,6 +144,13 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(automatic.text().contains("Any condition matches"));
     assert!(automatic.text().contains("aria-label=\"Sort by\""));
     assert!(automatic.text().contains("aria-label=\"Sort direction\""));
+    assert!(automatic.text().contains("aria-label=\"Visible columns\""));
+    assert!(automatic
+        .text()
+        .contains("name=\"columns\" value=\"custom\""));
+    assert!(automatic
+        .text()
+        .contains("name=\"column\" value=\"name\" checked"));
     assert!(automatic.text().contains("Missing values stay last"));
     assert!(automatic.text().contains("Sort by Value ascending"));
     assert!(automatic.text().contains("md:grid-cols-2 xl:grid-cols-12"));
@@ -183,6 +190,8 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
         ("filter_value", "12000"),
         ("sort_field", "value"),
         ("sort_direction", "desc"),
+        ("column", "name"),
+        ("column", "value"),
     ]);
     let preset_saved = request(
         &app,
@@ -206,6 +215,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     );
     assert_eq!(preset.sort_by.as_deref(), Some("value"));
     assert_eq!(preset.sort_direction, cr::SortDirection::Desc);
+    assert_eq!(preset.columns, ["name", "value"]);
 
     let preset_page = request(&app, Method::GET, "/sales-focus", None, &[]).await;
     assert_eq!(preset_page.status, StatusCode::OK);
@@ -311,6 +321,58 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     .await;
     assert_eq!(invalid_sort.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(invalid_sort.text().contains("contains an empty segment"));
+
+    let projected = request(
+        &app,
+        Method::GET,
+        "/deals?columns=custom&column=name&column=value&limit=1",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(projected.status, StatusCode::OK);
+    assert!(projected.text().contains("2 shown"));
+    assert!(projected.text().contains("Sort by Name ascending"));
+    assert!(projected.text().contains("Sort by Value ascending"));
+    assert!(!projected.text().contains("Sort by Status ascending"));
+    assert!(projected.text().contains(
+        "sort_field=name&amp;sort_direction=asc&amp;columns=custom&amp;column=name&amp;column=value"
+    ));
+    assert!(projected
+        .text()
+        .contains("columns=custom&amp;column=name&amp;column=value&amp;limit=1&amp;offset=1"));
+
+    let empty_projection = request(&app, Method::GET, "/deals?columns=custom", None, &[]).await;
+    assert_eq!(empty_projection.status, StatusCode::BAD_REQUEST);
+    assert!(empty_projection
+        .text()
+        .contains("select at least one visible column"));
+
+    let unknown_projection = request(
+        &app,
+        Method::GET,
+        "/deals?columns=custom&column=unknown",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(unknown_projection.status, StatusCode::BAD_REQUEST);
+    assert!(unknown_projection
+        .text()
+        .contains("column 'unknown' is not available"));
+
+    let duplicate_projection = request(
+        &app,
+        Method::GET,
+        "/deals?columns=custom&column=name&column=name",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(duplicate_projection.status, StatusCode::BAD_REQUEST);
+    assert!(duplicate_projection
+        .text()
+        .contains("cannot be selected more than once"));
 
     let saved = request(&app, Method::GET, "/open-deals", None, &[]).await;
     assert_eq!(saved.status, StatusCode::OK);
@@ -574,6 +636,20 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
         board.text().find("/pipeline/records/gamma").unwrap()
             < board.text().find("/pipeline/records/beta").unwrap()
     );
+
+    let projected_board = request(
+        &app,
+        Method::GET,
+        "/pipeline?columns=custom&column=name",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(projected_board.status, StatusCode::OK);
+    assert!(projected_board.text().contains("1 shown"));
+    assert!(projected_board.text().contains(">name</dt>"));
+    assert!(!projected_board.text().contains(">owner</dt>"));
+    assert!(!projected_board.text().contains(">score</dt>"));
 
     let typed_filter = request(
         &app,

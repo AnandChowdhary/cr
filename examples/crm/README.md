@@ -25,9 +25,11 @@ List and Kanban pages also derive their filter controls from the schema. Add mul
 
 Use the Sorting controls to order deals by value, close date, owner, or any other schema field. Table column headings toggle direction directly; Kanban sorts cards within each stage lane. The saved pipeline opens with its persisted `value` descending default, which the current URL can override or clear.
 
+Open **Columns** to show only the fields you need. The same control chooses table columns and Kanban card details, and the selection stays in the URL through sorting and pagination.
+
 The `high-value-deals` route demonstrates a reusable typed saved query. Its YAML combines `status=open` with `value>=50000`; browser filters remain additive and cannot escape that scope.
 
-Use **Save as view** on any table or Kanban page to turn the currently applied filters and sorting into another named route. The form preserves **all** versus **any** matching and creates a new file under `.cr/views/`; search text remains in the shareable URL rather than being persisted.
+Use **Save as view** on any table or Kanban page to turn the currently applied filters, visible columns, and sorting into another named route. The form preserves **all** versus **any** matching and creates a new file under `.cr/views/`; search text remains in the shareable URL rather than being persisted.
 
 Useful CLI queries:
 

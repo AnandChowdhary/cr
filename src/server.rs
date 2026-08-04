@@ -34,6 +34,7 @@ const DEFAULT_MAX_PAGE_SIZE: usize = 200;
 const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PAGE_OFFSET: usize = 1_000_000;
 const MAX_VIEW_FILTERS: usize = 20;
+const MAX_VIEW_COLUMNS: usize = 50;
 const ACTOR_HEADER: &str = "x-cr-actor";
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -180,9 +181,21 @@ struct ViewQuery {
     sort_field: Option<String>,
     #[serde(default)]
     sort_direction: ViewSortDirection,
+    #[serde(default)]
+    columns: ViewColumnsMode,
+    #[serde(default)]
+    column: Vec<String>,
     limit: Option<usize>,
     offset: Option<usize>,
     notice: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ViewColumnsMode {
+    #[default]
+    Default,
+    Custom,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -447,6 +460,8 @@ struct HtmlSaveViewForm {
     sort_field: Option<String>,
     #[serde(default)]
     sort_direction: ViewSortDirection,
+    #[serde(default)]
+    column: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -907,7 +922,8 @@ async fn view_records(
             };
         }
 
-        let columns = view_columns(&view, &records, schema.as_ref());
+        let available_columns = view_available_columns(&view, &records, schema.as_ref());
+        let columns = selected_view_columns(&view, &query, &available_columns)?;
         sort_view_records(&mut records, &query)?;
         let bounds = page_bounds(
             query
@@ -920,6 +936,7 @@ async fn view_records(
         Ok(render_view_records(
             &view,
             &columns,
+            &available_columns,
             &page,
             &query,
             schema.as_ref(),
@@ -965,6 +982,11 @@ async fn save_view_form(
             if let Some(filter_group) = filter_group {
                 filter_groups.push(filter_group);
             }
+            let columns = if form.column.is_empty() {
+                source.columns.clone()
+            } else {
+                form.column.clone()
+            };
             database.create_view_with_options(
                 &name,
                 title.as_deref(),
@@ -972,7 +994,7 @@ async fn save_view_form(
                 source.filters.clone(),
                 source.where_expr.clone(),
                 filter_groups,
-                source.columns.clone(),
+                columns,
                 source.page_size,
                 source.layout,
                 source.group_by.clone(),
@@ -2403,6 +2425,7 @@ const FILTER_BUILDER_SCRIPT: &str = r#"(() => {
 fn render_view_records(
     view: &ViewDefinition,
     columns: &[String],
+    available_columns: &[String],
     page: &Page<Record>,
     query: &ViewQuery,
     schema: Option<&JsonValue>,
@@ -2416,7 +2439,7 @@ fn render_view_records(
         page.pagination.offset + 1
     };
     let last = page.pagination.offset + page.pagination.returned;
-    let filter_fields = view_filter_fields(schema, columns);
+    let filter_fields = view_filter_fields(schema, available_columns);
     let mut filter_rows = query
         .filter_field
         .iter()
@@ -2477,7 +2500,7 @@ fn render_view_records(
                     }
                 }
                 div class="flex flex-wrap items-center gap-2" {
-                    (render_save_view_control(view, query, csrf_token))
+                    (render_save_view_control(view, query, columns, csrf_token))
                     a href=(new_url) class="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700" {
                         "+ New record"
                     }
@@ -2515,6 +2538,26 @@ fn render_view_records(
                     }
                     template data-filter-template="true" {
                         (render_filter_row(&filter_fields, 0, "", ViewFilterOperator::default(), ""))
+                    }
+                }
+                div class="border-t border-slate-100 pt-4" {
+                    details open[query_columns_custom(query)] {
+                        summary class="cursor-pointer list-none text-sm font-bold text-slate-900" {
+                            span class="inline-flex items-center gap-2" {
+                                "Columns"
+                                span class="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-600" { (columns.len()) " shown" }
+                            }
+                        }
+                        input type="hidden" name="columns" value="custom";
+                        p class="mt-1 text-xs text-slate-500" { "Choose the fields shown in the table or on Kanban cards. Select at least one." }
+                        div role="group" aria-label="Visible columns" class="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" {
+                            @for column in available_columns {
+                                label class="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 hover:border-indigo-300 hover:bg-indigo-50/40" {
+                                    input type="checkbox" name="column" value=(column) checked[columns.contains(column)] class="size-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500";
+                                    span class="truncate" title=(column) { (humanize_field_name(column)) }
+                                }
+                            }
+                        }
                     }
                 }
                 div class="border-t border-slate-100 pt-4" {
@@ -2614,7 +2657,12 @@ fn render_view_records(
     )
 }
 
-fn render_save_view_control(view: &ViewDefinition, query: &ViewQuery, csrf_token: &str) -> Markup {
+fn render_save_view_control(
+    view: &ViewDefinition,
+    query: &ViewQuery,
+    columns: &[String],
+    csrf_token: &str,
+) -> Markup {
     let action = format!("/{}/save-view", encode_segment(&view.name));
     html! {
         details class="relative" {
@@ -2634,6 +2682,9 @@ fn render_save_view_control(view: &ViewDefinition, query: &ViewQuery, csrf_token
                         input type="hidden" name="sort_field" value=(field);
                     }
                     input type="hidden" name="sort_direction" value=(query.sort_direction.as_str());
+                    @for column in columns {
+                        input type="hidden" name="column" value=(column);
+                    }
                     div {
                         h2 class="text-sm font-bold text-slate-900" { "Save current view" }
                         p class="mt-1 text-xs leading-5 text-slate-500" { "Preserves applied filters, all/any matching, layout, columns, and sorting. Search text remains shareable in the URL." }
@@ -3368,28 +3419,89 @@ fn page_layout(title: &str, content: Markup) -> Markup {
     }
 }
 
-fn view_columns(
+fn view_available_columns(
     view: &ViewDefinition,
     records: &[Record],
     schema: Option<&JsonValue>,
 ) -> Vec<String> {
-    if !view.columns.is_empty() {
-        return view.columns.clone();
+    let mut columns = Vec::new();
+    let mut known = BTreeSet::new();
+    for column in &view.columns {
+        if known.insert(column.clone()) {
+            columns.push(column.clone());
+        }
     }
-    let mut columns = BTreeSet::new();
+
+    let mut additional = BTreeSet::new();
     if let Some(properties) = schema
         .and_then(|schema| schema.get("properties"))
         .and_then(JsonValue::as_object)
     {
-        columns.extend(properties.keys().cloned());
+        additional.extend(properties.keys().cloned());
     }
     for record in records {
-        columns.extend(record.attributes.keys().filter_map(|key| match key {
+        additional.extend(record.attributes.keys().filter_map(|key| match key {
             YamlValue::String(key) => Some(key.clone()),
             _ => None,
         }));
     }
-    columns.into_iter().take(12).collect()
+    columns.extend(
+        additional
+            .into_iter()
+            .filter(|column| known.insert(column.clone())),
+    );
+    columns
+}
+
+fn selected_view_columns(
+    view: &ViewDefinition,
+    query: &ViewQuery,
+    available: &[String],
+) -> ApiResult<Vec<String>> {
+    if !query_columns_custom(query) {
+        return Ok(if view.columns.is_empty() {
+            available.iter().take(12).cloned().collect()
+        } else {
+            view.columns.clone()
+        });
+    }
+    if query.column.is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_columns",
+            "select at least one visible column",
+        ));
+    }
+    if query.column.len() > MAX_VIEW_COLUMNS {
+        return Err(ApiError::bad_request(
+            "invalid_columns",
+            format!("a view can show at most {MAX_VIEW_COLUMNS} columns"),
+        ));
+    }
+
+    let available = available
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut known = BTreeSet::new();
+    for column in &query.column {
+        if !known.insert(column.as_str()) {
+            return Err(ApiError::bad_request(
+                "invalid_columns",
+                format!("column '{column}' cannot be selected more than once"),
+            ));
+        }
+        if !available.contains(column.as_str()) {
+            return Err(ApiError::bad_request(
+                "invalid_columns",
+                format!("column '{column}' is not available in this view"),
+            ));
+        }
+    }
+    Ok(query.column.clone())
+}
+
+fn query_columns_custom(query: &ViewQuery) -> bool {
+    query.columns == ViewColumnsMode::Custom || !query.column.is_empty()
 }
 
 fn record_value(record: &Record, column: &str) -> String {
@@ -3631,6 +3743,12 @@ fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset:
         serializer.append_pair("sort_field", field.trim());
         if !field.trim().is_empty() {
             serializer.append_pair("sort_direction", query.sort_direction.as_str());
+        }
+    }
+    if query_columns_custom(query) {
+        serializer.append_pair("columns", "custom");
+        for column in &query.column {
+            serializer.append_pair("column", column);
         }
     }
     serializer.append_pair("limit", &limit.to_string());
