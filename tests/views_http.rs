@@ -7,7 +7,7 @@ use axum::{
 };
 use cr::{
     server::{router, ServerConfig},
-    Assignment, AuditAction, AuditSource, Database, ViewLayout,
+    Assignment, AuditAction, AuditSource, Database, ViewLayout, ViewPredicateMatch,
 };
 use http_body_util::BodyExt;
 use tempfile::TempDir;
@@ -120,7 +120,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
             1,
         )
         .unwrap();
-    let app = router(database, ServerConfig::default()).unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
 
     let home = request(&app, Method::GET, "/", None, &[]).await;
     assert_eq!(home.status, StatusCode::OK);
@@ -157,6 +157,117 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(!automatic.text().to_lowercase().contains("react"));
     assert_eq!(automatic.headers[header::CACHE_CONTROL], "no-store");
     assert_eq!(automatic.headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    assert!(automatic.text().contains("Save as view"));
+    assert!(automatic.text().contains("Save current view"));
+
+    let preset_source = request(
+        &app,
+        Method::GET,
+        "/deals?filter_match=any&filter_field=status&filter_operator=eq&filter_value=won&filter_field=value&filter_operator=gte&filter_value=12000&sort_field=value&sort_direction=desc",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(preset_source.status, StatusCode::OK);
+    let preset_token = csrf(preset_source.text()).to_owned();
+    let preset_form = form(&[
+        ("_csrf", &preset_token),
+        ("name", "sales-focus"),
+        ("title", "Sales focus"),
+        ("filter_match", "any"),
+        ("filter_field", "status"),
+        ("filter_operator", "eq"),
+        ("filter_value", "won"),
+        ("filter_field", "value"),
+        ("filter_operator", "gte"),
+        ("filter_value", "12000"),
+        ("sort_field", "value"),
+        ("sort_direction", "desc"),
+    ]);
+    let preset_saved = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(preset_form.clone()),
+        &[],
+    )
+    .await;
+    assert_eq!(preset_saved.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        preset_saved.headers[header::LOCATION],
+        "/sales-focus?notice=View+saved"
+    );
+    let preset = database.view("sales-focus").unwrap();
+    assert_eq!(preset.filter_groups.len(), 1);
+    assert_eq!(preset.filter_groups[0].match_mode, ViewPredicateMatch::Any);
+    assert_eq!(
+        preset.filter_groups[0].expressions,
+        ["status=won", "value>=12000"]
+    );
+    assert_eq!(preset.sort_by.as_deref(), Some("value"));
+    assert_eq!(preset.sort_direction, cr::SortDirection::Desc);
+
+    let preset_page = request(&app, Method::GET, "/sales-focus", None, &[]).await;
+    assert_eq!(preset_page.status, StatusCode::OK);
+    assert!(preset_page.text().contains("Any: "));
+    assert!(preset_page.text().contains("status=won"));
+    assert!(preset_page.text().contains("value&gt;=12000"));
+    assert!(
+        preset_page
+            .text()
+            .find("/sales-focus/records/alpha")
+            .unwrap()
+            < preset_page
+                .text()
+                .find("/sales-focus/records/beta")
+                .unwrap()
+    );
+
+    let duplicate = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(preset_form),
+        &[],
+    )
+    .await;
+    assert_eq!(duplicate.status, StatusCode::CONFLICT);
+
+    let cleared_sort = request(
+        &app,
+        Method::POST,
+        "/open-deals/save-view",
+        Some(form(&[
+            ("_csrf", &preset_token),
+            ("name", "open-deals-unsorted"),
+            ("filter_match", "all"),
+            ("sort_field", ""),
+            ("sort_direction", "desc"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(cleared_sort.status, StatusCode::SEE_OTHER);
+    let unsorted = database.view("open-deals-unsorted").unwrap();
+    assert_eq!(unsorted.filters, ["status=open"]);
+    assert_eq!(unsorted.sort_by, None);
+    assert_eq!(unsorted.sort_direction, cr::SortDirection::Asc);
+
+    let invalid_csrf = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(form(&[
+            ("_csrf", "wrong"),
+            ("name", "unsafe-view"),
+            ("filter_match", "all"),
+            ("sort_direction", "asc"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(invalid_csrf.status, StatusCode::FORBIDDEN);
+    assert!(database.view("unsafe-view").is_err());
 
     let sorted = request(
         &app,
@@ -426,6 +537,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
             "deals",
             vec![],
             vec!["score>=40".into()],
+            vec![],
             vec!["name".into(), "owner".into(), "stage".into()],
             50,
             ViewLayout::Kanban,

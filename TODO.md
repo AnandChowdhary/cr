@@ -248,5 +248,6 @@ Priorities:
 - [x] Shared single-field sorting across CLI, REST, OpenAPI, tables, and Kanban with accessible table-header toggles, typed YAML ordering, missing-last rules, deterministic ties, and pre-pagination application.
 - [x] Persisted saved-view default ordering with CLI/YAML configuration, legacy defaults, URL overrides, explicit clearing, and Kanban lane application.
 - [x] Persisted typed saved-view expressions with CLI/YAML configuration, immutable AND scoping, legacy defaults, and visible query chips.
+- [x] In-page Save as view with CSRF protection, atomic no-clobber creation, preserved all/any filter groups, inherited immutable scopes, effective sorting, redirects, and conflict/error coverage.
 - [x] Versioned subprocess sync adapters with JSONL upsert/delete/checkpoint messages, clean-state verification, limits, overlap locks, checkpointing, and `source: sync` audit provenance.
 - [x] Unit, CLI, concurrency, direct-edit, in-process HTTP, and real TCP server tests.

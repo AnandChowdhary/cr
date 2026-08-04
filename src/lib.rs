@@ -15,4 +15,4 @@ pub use database::{
 pub use search::{SearchQuery, SearchTarget};
 pub use sync::{SyncDefinition, SyncRunSummary};
 pub use value::{compare_yaml_values, Assignment, FilterExpression, FilterOperator};
-pub use views::{ViewDefinition, ViewLayout};
+pub use views::{ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch};

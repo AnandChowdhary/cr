@@ -12,6 +12,8 @@ use crate::{
 const VIEW_FORMAT_VERSION: u32 = 1;
 const DEFAULT_VIEW_PAGE_SIZE: usize = 50;
 const MAX_VIEW_PAGE_SIZE: usize = 1_000;
+const MAX_VIEW_FILTER_GROUPS: usize = 20;
+const MAX_VIEW_GROUP_EXPRESSIONS: usize = 20;
 const RESERVED_VIEW_NAMES: &[&str] = &["api", "audit", "health", "openapi.json"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -22,6 +24,7 @@ pub struct ViewDefinition {
     pub collection: String,
     pub filters: Vec<String>,
     pub where_expr: Vec<String>,
+    pub filter_groups: Vec<ViewFilterGroup>,
     pub columns: Vec<String>,
     pub layout: ViewLayout,
     pub group_by: Option<String>,
@@ -39,6 +42,22 @@ pub enum ViewLayout {
     Kanban,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ViewPredicateMatch {
+    #[default]
+    All,
+    Any,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewFilterGroup {
+    #[serde(default, rename = "match")]
+    pub match_mode: ViewPredicateMatch,
+    pub expressions: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredViewDefinition {
@@ -49,6 +68,8 @@ struct StoredViewDefinition {
     filters: Vec<String>,
     #[serde(default)]
     where_expr: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    filter_groups: Vec<ViewFilterGroup>,
     #[serde(default)]
     columns: Vec<String>,
     #[serde(default)]
@@ -103,6 +124,7 @@ impl Database {
             collection,
             filters,
             Vec::new(),
+            Vec::new(),
             columns,
             page_size,
             layout,
@@ -120,6 +142,7 @@ impl Database {
         collection: &str,
         filters: Vec<String>,
         where_expr: Vec<String>,
+        filter_groups: Vec<ViewFilterGroup>,
         columns: Vec<String>,
         page_size: usize,
         layout: ViewLayout,
@@ -140,6 +163,7 @@ impl Database {
             collection: collection.to_owned(),
             filters,
             where_expr,
+            filter_groups,
             columns,
             layout,
             group_by,
@@ -278,6 +302,28 @@ fn validate_stored(name: &str, view: &StoredViewDefinition) -> Result<()> {
         crate::FilterExpression::from_str(expression)
             .with_context(|| format!("view '{name}' has invalid where_expr '{expression}'"))?;
     }
+    if view.filter_groups.len() > MAX_VIEW_FILTER_GROUPS {
+        bail!("view '{name}' can contain at most {MAX_VIEW_FILTER_GROUPS} filter groups");
+    }
+    for (index, group) in view.filter_groups.iter().enumerate() {
+        if group.expressions.is_empty() {
+            bail!("view '{name}' filter group {} cannot be empty", index + 1);
+        }
+        if group.expressions.len() > MAX_VIEW_GROUP_EXPRESSIONS {
+            bail!(
+                "view '{name}' filter group {} can contain at most {MAX_VIEW_GROUP_EXPRESSIONS} expressions",
+                index + 1
+            );
+        }
+        for expression in &group.expressions {
+            crate::FilterExpression::from_str(expression).with_context(|| {
+                format!(
+                    "view '{name}' filter group {} has invalid expression '{expression}'",
+                    index + 1
+                )
+            })?;
+        }
+    }
     for column in &view.columns {
         parse_path(column)
             .with_context(|| format!("view '{name}' has invalid column '{column}'"))?;
@@ -319,6 +365,7 @@ fn automatic_view(collection: &str) -> ViewDefinition {
         collection: collection.to_owned(),
         filters: Vec::new(),
         where_expr: Vec::new(),
+        filter_groups: Vec::new(),
         columns: Vec::new(),
         layout: ViewLayout::Table,
         group_by: None,
@@ -337,6 +384,7 @@ fn to_public(name: &str, stored: StoredViewDefinition, saved: bool) -> ViewDefin
         collection: stored.collection,
         filters: stored.filters,
         where_expr: stored.where_expr,
+        filter_groups: stored.filter_groups,
         columns: stored.columns,
         layout: stored.layout,
         group_by: stored.group_by,
@@ -401,6 +449,10 @@ mod tests {
                 "deals",
                 vec![],
                 vec!["value>=10000".into()],
+                vec![ViewFilterGroup {
+                    match_mode: ViewPredicateMatch::Any,
+                    expressions: vec!["stage=proposal".into(), "stage=negotiation".into()],
+                }],
                 vec!["name".into(), "value".into()],
                 200,
                 ViewLayout::Kanban,
@@ -414,10 +466,15 @@ mod tests {
         assert_eq!(kanban.sort_by.as_deref(), Some("value"));
         assert_eq!(kanban.sort_direction, SortDirection::Desc);
         assert_eq!(kanban.where_expr, ["value>=10000"]);
+        assert_eq!(kanban.filter_groups.len(), 1);
+        assert_eq!(kanban.filter_groups[0].match_mode, ViewPredicateMatch::Any);
         let stored = fs::read_to_string(database.root().join(".cr/views/pipeline.yaml")).unwrap();
         assert!(stored.contains("layout: kanban"));
         assert!(stored.contains("group_by: stage"));
         assert!(stored.contains("- value>=10000"));
+        assert!(stored.contains("filter_groups:"));
+        assert!(stored.contains("match: any"));
+        assert!(stored.contains("- stage=proposal"));
         assert!(stored.contains("sort_by: value"));
         assert!(stored.contains("sort_direction: desc"));
 
@@ -430,6 +487,7 @@ mod tests {
         assert_eq!(legacy.layout, ViewLayout::Table);
         assert_eq!(legacy.group_by, None);
         assert!(legacy.where_expr.is_empty());
+        assert!(legacy.filter_groups.is_empty());
         assert_eq!(legacy.sort_by, None);
         assert_eq!(legacy.sort_direction, SortDirection::Asc);
     }
@@ -474,6 +532,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
                 50,
                 ViewLayout::Table,
                 None,
@@ -491,6 +550,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
                 50,
                 ViewLayout::Table,
                 None,
@@ -500,6 +560,27 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requires sort_by"));
+        assert!(database
+            .create_view_with_options(
+                "empty-group",
+                None,
+                "deals",
+                vec![],
+                vec![],
+                vec![ViewFilterGroup {
+                    match_mode: ViewPredicateMatch::All,
+                    expressions: vec![],
+                }],
+                vec![],
+                50,
+                ViewLayout::Table,
+                None,
+                None,
+                SortDirection::Asc,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be empty"));
         assert!(database
             .create_view_with_layout(
                 "missing-group",

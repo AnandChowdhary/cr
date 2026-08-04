@@ -852,6 +852,18 @@ sort_direction: desc
 page_size: 50
 ```
 
+Every table and Kanban page also has a **Save as view** control. It creates a new definition from the current applied filters, all/any match mode, columns, layout, and sorting. The source view's mandatory predicates are copied, and the current browser filter becomes a separate `filter_groups` entry, so saving an **any** query preserves its Boolean meaning instead of flattening it into AND:
+
+```yaml
+filter_groups:
+- match: any
+  expressions:
+  - stage=proposal
+  - value>=50000
+```
+
+Search text is intentionally not persisted yet; it remains shareable in the current URL. Saving is CSRF-protected, rejects duplicate or invalid names without replacing files, and writes the normal Git-friendly `.cr/views/<name>.yaml` configuration file. View configuration history remains separate from the record audit journal.
+
 A Kanban definition adds two fields:
 
 ```yaml

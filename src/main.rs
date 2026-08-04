@@ -610,6 +610,7 @@ fn run() -> Result<()> {
                     &collection,
                     filters,
                     expressions,
+                    Vec::new(),
                     columns,
                     page_size,
                     layout.into(),

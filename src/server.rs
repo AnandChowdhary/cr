@@ -26,7 +26,7 @@ use yaml_serde::{Mapping, Value as YamlValue};
 use crate::{
     audit::AuditChange, sort_records_by_field, Assignment, AuditEntry, AuditSource,
     CollectionModel, Database, FilterExpression, FilterOperator, Record, SearchQuery, SearchTarget,
-    SortDirection, ViewDefinition, ViewLayout,
+    SortDirection, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -292,6 +292,23 @@ impl ViewFilterOperator {
     fn requires_value(self) -> bool {
         !matches!(self, Self::IsEmpty | Self::IsNotEmpty)
     }
+
+    fn expression_token(self) -> &'static str {
+        match self {
+            Self::Eq => "=",
+            Self::Ne => "!=",
+            Self::Gt => ">",
+            Self::Gte => ">=",
+            Self::Lt => "<",
+            Self::Lte => "<=",
+            Self::Contains => " contains ",
+            Self::NotContains => " not-contains ",
+            Self::StartsWith => " starts-with ",
+            Self::EndsWith => " ends-with ",
+            Self::IsEmpty => " is-empty",
+            Self::IsNotEmpty => " is-not-empty",
+        }
+    }
 }
 
 impl From<ViewFilterOperator> for FilterOperator {
@@ -320,6 +337,21 @@ impl ViewFilterMatch {
                 Self::All => filters.iter().all(|filter| filter.matches(attributes)),
                 Self::Any => filters.iter().any(|filter| filter.matches(attributes)),
             }
+    }
+}
+
+fn saved_filter_group_matches(
+    match_mode: ViewPredicateMatch,
+    expressions: &[FilterExpression],
+    attributes: &Mapping,
+) -> bool {
+    match match_mode {
+        ViewPredicateMatch::All => expressions
+            .iter()
+            .all(|expression| expression.matches(attributes)),
+        ViewPredicateMatch::Any => expressions
+            .iter()
+            .any(|expression| expression.matches(attributes)),
     }
 }
 
@@ -394,6 +426,27 @@ struct HtmlKanbanMoveForm {
     #[serde(rename = "_csrf")]
     csrf: String,
     target: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HtmlSaveViewForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    name: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    filter_match: ViewFilterMatch,
+    #[serde(default)]
+    filter_field: Vec<String>,
+    #[serde(default)]
+    filter_operator: Vec<ViewFilterOperator>,
+    #[serde(default)]
+    filter_value: Vec<String>,
+    sort_field: Option<String>,
+    #[serde(default)]
+    sort_direction: ViewSortDirection,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -554,7 +607,7 @@ impl ApiError {
     fn from_database(error: anyhow::Error) -> Self {
         let message = format!("{error:#}");
         let lower = message.to_lowercase();
-        if lower.contains("already exists") {
+        if lower.contains("already exists") || lower.contains("file exists") {
             Self::new(StatusCode::CONFLICT, "already_exists", message)
         } else if lower.contains("does not exist")
             || lower.contains("no such file or directory")
@@ -629,6 +682,7 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         .route("/", get(views_home))
         .route("/audit", get(audit_view))
         .route("/{view}", get(view_records))
+        .route("/{view}/save-view", post(save_view_form))
         .route("/{view}/new", get(new_record_form))
         .route("/{view}/records", post(create_record_form))
         .route(
@@ -806,6 +860,18 @@ async fn view_records(
                 .iter()
                 .map(|expression| FilterExpression::from_str(expression))
                 .collect::<Result<Vec<_>>>()?;
+            let view_filter_groups = view
+                .filter_groups
+                .iter()
+                .map(|group| {
+                    let expressions = group
+                        .expressions
+                        .iter()
+                        .map(|expression| FilterExpression::from_str(expression))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok((group.match_mode, expressions))
+                })
+                .collect::<Result<Vec<_>>>()?;
             let mut records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
                 Some(pattern) => {
                     let search = SearchQuery::new(pattern, SearchTarget::Document, false, true)?;
@@ -817,6 +883,9 @@ async fn view_records(
                 view_expressions
                     .iter()
                     .all(|expression| expression.matches(&record.attributes))
+                    && view_filter_groups.iter().all(|(match_mode, expressions)| {
+                        saved_filter_group_matches(*match_mode, expressions, &record.attributes)
+                    })
                     && query_for_database
                         .filter_match
                         .matches(&ad_hoc_filters, &record.attributes)
@@ -859,6 +928,63 @@ async fn view_records(
     }
     .await;
     html_result(result)
+}
+
+async fn save_view_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(view_name): Path<String>,
+    RawForm(raw): RawForm,
+) -> Response {
+    let result: ApiResult<Response> = async {
+        let form: HtmlSaveViewForm = parse_html_form(&raw)?;
+        verify_csrf(&state, &form.csrf)?;
+        let name = form.name.trim().to_owned();
+        if name.is_empty() {
+            return Err(ApiError::bad_request(
+                "invalid_form",
+                "view name cannot be empty",
+            ));
+        }
+        let title = (!form.title.trim().is_empty()).then(|| form.title.trim().to_owned());
+        let filter_group = save_view_filter_group(&form)?;
+        let sort_by = form
+            .sort_field
+            .as_deref()
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+            .map(str::to_owned);
+        let sort_direction = match (sort_by.as_ref(), form.sort_direction) {
+            (None, _) | (Some(_), ViewSortDirection::Asc) => SortDirection::Asc,
+            (Some(_), ViewSortDirection::Desc) => SortDirection::Desc,
+        };
+        let requested_view = view_name;
+        let saved = run_database(&state, &headers, move |database| {
+            let source = database.view(&requested_view)?;
+            let mut filter_groups = source.filter_groups.clone();
+            if let Some(filter_group) = filter_group {
+                filter_groups.push(filter_group);
+            }
+            database.create_view_with_options(
+                &name,
+                title.as_deref(),
+                &source.collection,
+                source.filters.clone(),
+                source.where_expr.clone(),
+                filter_groups,
+                source.columns.clone(),
+                source.page_size,
+                source.layout,
+                source.group_by.clone(),
+                sort_by,
+                sort_direction,
+            )
+        })
+        .await?;
+        see_other(&notice_url(&saved.name, "View saved"))
+    }
+    .await;
+    result.unwrap_or_else(html_error)
 }
 
 async fn new_record_form(
@@ -1800,7 +1926,7 @@ fn render_views_home(views: &[ViewDefinition]) -> Markup {
                                     span class="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700" { "kanban" }
                                 }
                             }
-                            @if view.filters.is_empty() && view.where_expr.is_empty() {
+                            @if view.filters.is_empty() && view.where_expr.is_empty() && view.filter_groups.is_empty() {
                                 p class="mt-5 text-sm text-slate-500" { "All records" }
                             } @else {
                                 div class="mt-5 flex flex-wrap gap-2" {
@@ -1809,6 +1935,12 @@ fn render_views_home(views: &[ViewDefinition]) -> Markup {
                                     }
                                     @for expression in &view.where_expr {
                                         span class="rounded-lg bg-violet-50 px-2 py-1 font-mono text-xs text-violet-700" { (expression) }
+                                    }
+                                    @for group in &view.filter_groups {
+                                        span class="rounded-lg bg-fuchsia-50 px-2 py-1 font-mono text-xs text-fuchsia-700" {
+                                            (match group.match_mode { ViewPredicateMatch::All => "All: ", ViewPredicateMatch::Any => "Any: " })
+                                            (group.expressions.join(" · "))
+                                        }
                                     }
                                 }
                             }
@@ -2327,7 +2459,7 @@ fn render_view_records(
                     p class="mt-2 text-sm text-slate-600" {
                         "Collection " code class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs" { (&view.collection) }
                     }
-                    @if !view.filters.is_empty() || !view.where_expr.is_empty() {
+                    @if !view.filters.is_empty() || !view.where_expr.is_empty() || !view.filter_groups.is_empty() {
                         div class="mt-3 flex flex-wrap gap-2" {
                             @for filter in &view.filters {
                                 span class="rounded-lg bg-indigo-50 px-2 py-1 font-mono text-xs text-indigo-700" { (filter) }
@@ -2335,11 +2467,20 @@ fn render_view_records(
                             @for expression in &view.where_expr {
                                 span class="rounded-lg bg-violet-50 px-2 py-1 font-mono text-xs text-violet-700" { (expression) }
                             }
+                            @for group in &view.filter_groups {
+                                span class="rounded-lg bg-fuchsia-50 px-2 py-1 font-mono text-xs text-fuchsia-700" {
+                                    (match group.match_mode { ViewPredicateMatch::All => "All: ", ViewPredicateMatch::Any => "Any: " })
+                                    (group.expressions.join(" · "))
+                                }
+                            }
                         }
                     }
                 }
-                a href=(new_url) class="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700" {
-                    "+ New record"
+                div class="flex flex-wrap items-center gap-2" {
+                    (render_save_view_control(view, query, csrf_token))
+                    a href=(new_url) class="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700" {
+                        "+ New record"
+                    }
                 }
             }
             @if let Some(notice) = query.notice.as_deref() {
@@ -2471,6 +2612,45 @@ fn render_view_records(
             }
         },
     )
+}
+
+fn render_save_view_control(view: &ViewDefinition, query: &ViewQuery, csrf_token: &str) -> Markup {
+    let action = format!("/{}/save-view", encode_segment(&view.name));
+    html! {
+        details class="relative" {
+            summary class="cursor-pointer list-none rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm hover:border-indigo-300 hover:text-indigo-700" {
+                "Save as view"
+            }
+            div class="absolute right-0 z-20 mt-2 w-80 rounded-2xl border border-slate-200 bg-white p-4 shadow-xl" {
+                form method="post" action=(action) class="space-y-3" {
+                    input type="hidden" name="_csrf" value=(csrf_token);
+                    input type="hidden" name="filter_match" value=(match query.filter_match { ViewFilterMatch::All => "all", ViewFilterMatch::Any => "any" });
+                    @for (index, (field, value)) in query.filter_field.iter().zip(&query.filter_value).enumerate() {
+                        input type="hidden" name="filter_field" value=(field);
+                        input type="hidden" name="filter_operator" value=(query.filter_operator.get(index).copied().unwrap_or_default().as_str());
+                        input type="hidden" name="filter_value" value=(value);
+                    }
+                    @if let Some(field) = query.sort_field.as_deref() {
+                        input type="hidden" name="sort_field" value=(field);
+                    }
+                    input type="hidden" name="sort_direction" value=(query.sort_direction.as_str());
+                    div {
+                        h2 class="text-sm font-bold text-slate-900" { "Save current view" }
+                        p class="mt-1 text-xs leading-5 text-slate-500" { "Preserves applied filters, all/any matching, layout, columns, and sorting. Search text remains shareable in the URL." }
+                    }
+                    label class="block" {
+                        span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "View name" }
+                        input required name="name" placeholder="enterprise-deals" autocomplete="off" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+                    }
+                    label class="block" {
+                        span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Title (optional)" }
+                        input name="title" placeholder=(format!("{} copy", view.title)) autocomplete="off" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+                    }
+                    button type="submit" class="w-full rounded-lg bg-indigo-600 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-700" { "Save view" }
+                }
+            }
+        }
+    }
 }
 
 fn render_kanban_board(
@@ -3356,6 +3536,49 @@ fn view_filter_expressions(query: &ViewQuery) -> ApiResult<Vec<FilterExpression>
             }
         })
         .collect()
+}
+
+fn save_view_filter_group(form: &HtmlSaveViewForm) -> ApiResult<Option<ViewFilterGroup>> {
+    let query = ViewQuery {
+        filter_match: form.filter_match,
+        filter_field: form.filter_field.clone(),
+        filter_operator: form.filter_operator.clone(),
+        filter_value: form.filter_value.clone(),
+        ..ViewQuery::default()
+    };
+    view_filter_expressions(&query)?;
+
+    let mut expressions = Vec::new();
+    for (index, (field, value)) in form.filter_field.iter().zip(&form.filter_value).enumerate() {
+        if field.is_empty() && value.is_empty() {
+            continue;
+        }
+        let operator = form.filter_operator.get(index).copied().unwrap_or_default();
+        let expression = if operator.requires_value() {
+            format!(
+                "{}{}{}",
+                field.trim(),
+                operator.expression_token(),
+                value.trim()
+            )
+        } else {
+            format!("{}{}", field.trim(), operator.expression_token())
+        };
+        FilterExpression::from_str(&expression).map_err(ApiError::from_database)?;
+        expressions.push(expression);
+    }
+
+    if expressions.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(ViewFilterGroup {
+            match_mode: match form.filter_match {
+                ViewFilterMatch::All => ViewPredicateMatch::All,
+                ViewFilterMatch::Any => ViewPredicateMatch::Any,
+            },
+            expressions,
+        }))
+    }
 }
 
 fn view_sort_field(query: &ViewQuery) -> Option<&str> {

@@ -27,6 +27,8 @@ Use the Sorting controls to order deals by value, close date, owner, or any othe
 
 The `high-value-deals` route demonstrates a reusable typed saved query. Its YAML combines `status=open` with `value>=50000`; browser filters remain additive and cannot escape that scope.
 
+Use **Save as view** on any table or Kanban page to turn the currently applied filters and sorting into another named route. The form preserves **all** versus **any** matching and creates a new file under `.cr/views/`; search text remains in the shareable URL rather than being persisted.
+
 Useful CLI queries:
 
 ```sh
