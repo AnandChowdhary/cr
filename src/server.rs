@@ -2533,10 +2533,10 @@ fn render_view_records(
                         csrf_token,
                     ))
                     form method="get" action=(reset_url.clone()) data-filter-builder="true" data-max-filters=(MAX_VIEW_FILTERS) class="contents" {
-                        label class="relative block min-w-48 flex-1 sm:flex-none" {
-                            span class="sr-only" { "Search records" }
-                            span aria-hidden="true" class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-slate-400" { "⌕" }
-                            input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Search records" placeholder="Search records…" data-view-search="true" class="w-full rounded-xl border border-slate-300 bg-white py-2.5 pl-9 pr-3 text-sm outline-none ring-indigo-500 placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 sm:w-56";
+                        div class="relative min-w-48 flex-1 sm:flex-none" {
+                            label class="sr-only" { "Search records" }
+                            input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Search records" placeholder="Search records…" data-view-search="true" class="w-full rounded-xl border border-slate-300 bg-white py-2.5 pl-3 pr-10 text-sm outline-none ring-indigo-500 placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 sm:w-56";
+                            button type="submit" aria-label="Submit search" title="Search" class="absolute inset-y-1 right-1 inline-flex w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-indigo-700" { "⌕" }
                         }
                         details class="relative" data-filter-disclosure="true" data-active-filters=(active_filter_count) {
                             summary class="inline-flex cursor-pointer list-none items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm hover:border-indigo-300 hover:text-indigo-700" {

@@ -139,6 +139,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(automatic.text().contains("href=\"/deals/records/alpha\""));
     assert!(automatic.text().contains("data-filter-builder=\"true\""));
     assert!(automatic.text().contains("data-view-search=\"true\""));
+    assert!(automatic.text().contains("aria-label=\"Submit search\""));
     assert!(automatic
         .text()
         .contains("data-filter-disclosure=\"true\" data-active-filters=\"0\""));
