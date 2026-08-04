@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use maud::{html, Markup, DOCTYPE};
+use maud::{html, Markup, PreEscaped, DOCTYPE};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value as JsonValue};
@@ -19,7 +19,7 @@ use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
     audit::AuditChange, Assignment, AuditEntry, AuditSource, CollectionModel, Database, Record,
-    SearchQuery, SearchTarget, ViewDefinition,
+    SearchQuery, SearchTarget, ViewDefinition, ViewLayout,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -187,6 +187,27 @@ struct HtmlDocumentForm {
 struct HtmlDeleteForm {
     #[serde(rename = "_csrf")]
     csrf: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HtmlKanbanMoveForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    target: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum KanbanTarget {
+    Value { value: String },
+    Unset,
+}
+
+struct KanbanLane<'a> {
+    target: KanbanTarget,
+    label: String,
+    records: Vec<&'a Record>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -409,6 +430,7 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
             "/{view}/records/{id}",
             get(edit_record_form).post(update_record_form),
         )
+        .route("/{view}/records/{id}/move", post(move_kanban_card))
         .route("/{view}/records/{id}/delete", post(delete_record_form))
         .nest(
             "/api/v1",
@@ -618,7 +640,14 @@ async fn view_records(
             state.max_page_size,
         )?;
         let page = paginate(records, bounds);
-        Ok(render_view_records(&view, &columns, &page, &query))
+        Ok(render_view_records(
+            &view,
+            &columns,
+            &page,
+            &query,
+            schema.as_ref(),
+            &state.csrf_token,
+        ))
     }
     .await;
     html_result(result)
@@ -729,6 +758,63 @@ async fn update_record_form(
         })
         .await?;
         see_other(&notice_url(&view_name, "Record updated"))
+    }
+    .await;
+    result.unwrap_or_else(html_error)
+}
+
+async fn move_kanban_card(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((view_name, id)): Path<(String, String)>,
+    RawForm(raw): RawForm,
+) -> Response {
+    let result: ApiResult<Response> = async {
+        let form: HtmlKanbanMoveForm = parse_html_form(&raw)?;
+        verify_csrf(&state, &form.csrf)?;
+        let target: KanbanTarget = serde_json::from_str(&form.target).map_err(|error| {
+            ApiError::bad_request("invalid_kanban_target", error.to_string())
+        })?;
+        let requested_view = view_name.clone();
+        run_database(&state, &headers, move |database| {
+            let view = database.view(&requested_view)?;
+            if view.layout != ViewLayout::Kanban {
+                bail!(
+                    "cannot move a card through view '{}' because it does not use the kanban layout",
+                    view.name
+                );
+            }
+            let group_by = view
+                .group_by
+                .as_deref()
+                .context("kanban view is missing group_by")?;
+            let record = database.get(&view.collection, &id)?;
+            match target {
+                KanbanTarget::Value { value } => {
+                    let target_value: YamlValue = yaml_serde::from_str(&value)
+                        .with_context(|| format!("kanban target '{value}' is not valid YAML"))?;
+                    if record.field(group_by)? == Some(&target_value) {
+                        return Ok(record);
+                    }
+                    let assignment = Assignment::from_str(&format!("{group_by}={value}"))?;
+                    database.update(&view.collection, &id, &[assignment], None)
+                }
+                KanbanTarget::Unset => {
+                    if record.field(group_by)?.is_none() {
+                        return Ok(record);
+                    }
+                    database.patch(
+                        &view.collection,
+                        &id,
+                        &Mapping::new(),
+                        &[group_by.to_owned()],
+                        None,
+                    )
+                }
+            }
+        })
+        .await?;
+        see_other(&notice_url(&view_name, "Card moved"))
     }
     .await;
     result.unwrap_or_else(html_error)
@@ -1452,6 +1538,9 @@ fn render_views_home(views: &[ViewDefinition]) -> Markup {
                                 span class="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600" {
                                     @if view.saved { "saved" } @else { "automatic" }
                                 }
+                                @if view.layout == ViewLayout::Kanban {
+                                    span class="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700" { "kanban" }
+                                }
                             }
                             @if view.filters.is_empty() {
                                 p class="mt-5 text-sm text-slate-500" { "All records" }
@@ -1597,6 +1686,8 @@ fn render_view_records(
     columns: &[String],
     page: &Page<Record>,
     query: &ViewQuery,
+    schema: Option<&JsonValue>,
+    csrf_token: &str,
 ) -> Markup {
     let new_url = format!("/{}/new", encode_segment(&view.name));
     let reset_url = format!("/{}", encode_segment(&view.name));
@@ -1620,6 +1711,9 @@ fn render_view_records(
                         h1 class="text-3xl font-bold capitalize tracking-tight text-slate-950" { (&view.title) }
                         span class="rounded-full bg-slate-200 px-2.5 py-1 text-xs font-medium text-slate-700" {
                             @if view.saved { "saved view" } @else { "automatic view" }
+                        }
+                        @if view.layout == ViewLayout::Kanban {
+                            span class="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700" { "kanban" }
                         }
                     }
                     p class="mt-2 text-sm text-slate-600" {
@@ -1658,6 +1752,9 @@ fn render_view_records(
                     a href=(reset_url) class="rounded-lg px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100" { "Reset" }
                 }
             }
+            @if view.layout == ViewLayout::Kanban {
+                (render_kanban_board(view, columns, page, query, schema, csrf_token))
+            } @else {
             div class="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" {
                 div class="overflow-x-auto" {
                     table class="min-w-full divide-y divide-slate-200 text-left text-sm" {
@@ -1708,7 +1805,263 @@ fn render_view_records(
                     }
                 }
             }
+            }
         },
+    )
+}
+
+fn render_kanban_board(
+    view: &ViewDefinition,
+    columns: &[String],
+    page: &Page<Record>,
+    query: &ViewQuery,
+    schema: Option<&JsonValue>,
+    csrf_token: &str,
+) -> Markup {
+    let group_by = view
+        .group_by
+        .as_deref()
+        .expect("validated Kanban views have a group_by field");
+    let lanes = kanban_lanes(&page.data, group_by, schema);
+    let card_columns = columns
+        .iter()
+        .filter(|column| column.as_str() != group_by)
+        .take(5)
+        .collect::<Vec<_>>();
+    let first = if page.pagination.returned == 0 {
+        0
+    } else {
+        page.pagination.offset + 1
+    };
+    let last = page.pagination.offset + page.pagination.returned;
+
+    html! {
+        div class="mb-3 flex flex-wrap items-center justify-between gap-2 text-sm text-slate-600" {
+            p {
+                "Kanban grouped by " code class="rounded bg-slate-200 px-1.5 py-0.5 font-mono text-xs font-semibold text-slate-800" { (group_by) }
+            }
+            p { "Drag cards between lanes or use each card’s move control." }
+        }
+        div class="overflow-x-auto pb-3" {
+            div data-kanban-board="true" class="flex min-w-max items-start gap-4" {
+                @for lane in &lanes {
+                    section
+                        data-kanban-lane="true"
+                        data-kanban-target=(kanban_target_json(&lane.target))
+                        data-kanban-csrf=(csrf_token)
+                        class="w-80 shrink-0 rounded-2xl border border-slate-200 bg-slate-200/70 p-3 transition-colors"
+                    {
+                        div class="mb-3 flex items-center justify-between gap-3 px-1" {
+                            h2 class="font-semibold text-slate-900" { (&lane.label) }
+                            span class="rounded-full bg-white px-2 py-0.5 text-xs font-bold text-slate-600 shadow-sm" { (lane.records.len()) }
+                        }
+                        div class="min-h-24 space-y-3" {
+                            @if lane.records.is_empty() {
+                                p class="rounded-xl border border-dashed border-slate-300 px-4 py-8 text-center text-xs text-slate-500" { "Drop cards here" }
+                            }
+                            @for record in &lane.records {
+                                article
+                                    draggable="true"
+                                    data-kanban-card="true"
+                                    data-move-url=(kanban_move_url(view, &record.id))
+                                    class="cursor-grab rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition hover:border-indigo-300 hover:shadow active:cursor-grabbing"
+                                {
+                                    div class="flex items-start justify-between gap-3" {
+                                        a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="break-all font-mono text-sm font-bold text-slate-950 hover:text-indigo-700 hover:underline" { (&record.id) }
+                                        span aria-hidden="true" class="select-none text-slate-300" { "⠿" }
+                                    }
+                                    @if !card_columns.is_empty() {
+                                        dl class="mt-3 space-y-2" {
+                                            @for column in &card_columns {
+                                                div {
+                                                    dt class="text-[0.65rem] font-bold uppercase tracking-wide text-slate-400" { (column) }
+                                                    dd class="mt-0.5 line-clamp-2 text-sm text-slate-700" { (record_value(record, column)) }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    form method="post" action=(kanban_move_url(view, &record.id)) class="mt-4 flex items-center gap-2 border-t border-slate-100 pt-3" {
+                                        input type="hidden" name="_csrf" value=(csrf_token);
+                                        label class="min-w-0 flex-1" {
+                                            span class="sr-only" { "Move " (&record.id) " to" }
+                                            select name="target" aria-label=(format!("Move {} to", record.id)) class="w-full rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs outline-none ring-indigo-500 focus:ring-2" {
+                                                @for option_lane in &lanes {
+                                                    @if option_lane.target == lane.target {
+                                                        option value=(kanban_target_json(&option_lane.target)) selected { (&option_lane.label) }
+                                                    } @else {
+                                                        option value=(kanban_target_json(&option_lane.target)) { (&option_lane.label) }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        button type="submit" class="rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-700" { "Move" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        div class="mt-2 flex flex-col gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm shadow-sm sm:flex-row sm:items-center sm:justify-between" {
+            p class="text-slate-600" {
+                "Showing " (first) "–" (last)
+                @if let Some(total) = page.pagination.total { " of " (total) }
+            }
+            div class="flex items-center gap-2" {
+                @if let Some(offset) = page.pagination.previous_offset {
+                    a href=(view_page_url(view, query, page.pagination.limit, offset)) class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100" { "Previous" }
+                }
+                @if let Some(offset) = page.pagination.next_offset {
+                    a href=(view_page_url(view, query, page.pagination.limit, offset)) class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100" { "Next" }
+                }
+            }
+        }
+        script { (PreEscaped(KANBAN_SCRIPT)) }
+    }
+}
+
+const KANBAN_SCRIPT: &str = r#"(() => {
+  const board = document.querySelector('[data-kanban-board]');
+  if (!board) return;
+  let draggedCard = null;
+
+  board.querySelectorAll('[data-kanban-card]').forEach((card) => {
+    card.addEventListener('dragstart', () => {
+      draggedCard = card;
+      card.classList.add('opacity-50');
+    });
+    card.addEventListener('dragend', () => {
+      draggedCard = null;
+      card.classList.remove('opacity-50');
+      board.querySelectorAll('[data-kanban-lane]').forEach((lane) => lane.classList.remove('ring-2', 'ring-indigo-400'));
+    });
+  });
+
+  board.querySelectorAll('[data-kanban-lane]').forEach((lane) => {
+    lane.addEventListener('dragover', (event) => {
+      event.preventDefault();
+      lane.classList.add('ring-2', 'ring-indigo-400');
+    });
+    lane.addEventListener('dragleave', () => lane.classList.remove('ring-2', 'ring-indigo-400'));
+    lane.addEventListener('drop', (event) => {
+      event.preventDefault();
+      if (!draggedCard) return;
+      const form = document.createElement('form');
+      form.method = 'post';
+      form.action = draggedCard.dataset.moveUrl;
+      const append = (name, value) => {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = name;
+        input.value = value;
+        form.appendChild(input);
+      };
+      append('_csrf', lane.dataset.kanbanCsrf);
+      append('target', lane.dataset.kanbanTarget);
+      document.body.appendChild(form);
+      form.submit();
+    });
+  });
+})();"#;
+
+fn kanban_lanes<'a>(
+    records: &'a [Record],
+    group_by: &str,
+    schema: Option<&JsonValue>,
+) -> Vec<KanbanLane<'a>> {
+    let mut lane_values = Vec::new();
+    let mut known = BTreeSet::new();
+    for value in kanban_schema_values(schema, group_by) {
+        let serialized = serialize_yaml_value(&value);
+        if known.insert(serialized.clone()) {
+            lane_values.push((serialized, yaml_value(&value)));
+        }
+    }
+
+    let mut observed = BTreeSet::new();
+    let mut has_unassigned = false;
+    for record in records {
+        match record.field(group_by).ok().flatten() {
+            Some(value) => {
+                let serialized = serialize_yaml_value(value);
+                if !known.contains(&serialized) {
+                    observed.insert((serialized, yaml_value(value)));
+                }
+            }
+            None => has_unassigned = true,
+        }
+    }
+    lane_values.extend(observed);
+
+    let mut lanes = lane_values
+        .into_iter()
+        .map(|(value, label)| KanbanLane {
+            target: KanbanTarget::Value { value },
+            label,
+            records: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    if has_unassigned || lanes.is_empty() {
+        lanes.push(KanbanLane {
+            target: KanbanTarget::Unset,
+            label: "Unassigned".to_owned(),
+            records: Vec::new(),
+        });
+    }
+
+    for record in records {
+        let target = match record.field(group_by).ok().flatten() {
+            Some(value) => KanbanTarget::Value {
+                value: serialize_yaml_value(value),
+            },
+            None => KanbanTarget::Unset,
+        };
+        if let Some(lane) = lanes.iter_mut().find(|lane| lane.target == target) {
+            lane.records.push(record);
+        }
+    }
+    lanes
+}
+
+fn kanban_schema_values(schema: Option<&JsonValue>, group_by: &str) -> Vec<YamlValue> {
+    let Some(mut current) = schema else {
+        return Vec::new();
+    };
+    for segment in group_by.split('.') {
+        let Some(next) = current
+            .get("properties")
+            .and_then(JsonValue::as_object)
+            .and_then(|properties| properties.get(segment))
+        else {
+            return Vec::new();
+        };
+        current = next;
+    }
+    current
+        .get("enum")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| serde_json::from_value(value.clone()).ok())
+        .collect()
+}
+
+fn serialize_yaml_value(value: &YamlValue) -> String {
+    yaml_serde::to_string(value)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|_| "null".to_owned())
+}
+
+fn kanban_target_json(target: &KanbanTarget) -> String {
+    serde_json::to_string(target).expect("Kanban target is JSON serializable")
+}
+
+fn kanban_move_url(view: &ViewDefinition, id: &str) -> String {
+    format!(
+        "/{}/records/{}/move",
+        encode_segment(&view.name),
+        encode_segment(id)
     )
 }
 

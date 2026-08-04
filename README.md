@@ -701,7 +701,7 @@ Open [http://127.0.0.1:3000/](http://127.0.0.1:3000/) to see every collection. E
 http://127.0.0.1:3000/deals
 ```
 
-The table infers columns from the collection schema and current front matter. It includes case-insensitive document search, one typed exact-value filter, bounded pagination, create and edit forms, and audited deletion. Click a record ID, field value, or its **View** action to open the record editor and its newest audit events. Form front matter is YAML, so numbers, booleans, arrays, nested maps, strings, and `null` retain their types. Every mutation is schema-validated and recorded with `source: api`.
+The table infers columns from the collection schema and current front matter. It includes case-insensitive document search, one typed exact-value filter, bounded pagination, create and edit forms, and audited deletion. Click a record ID, field value, or its **View** action to open the record editor and its newest audit events. Saved views can switch the same query to a Kanban layout. Form front matter is YAML, so numbers, booleans, arrays, nested maps, strings, and `null` retain their types. Every mutation is schema-validated and recorded with `source: api`.
 
 ### Browse audit history
 
@@ -711,7 +711,7 @@ Every existing record page embeds its newest audit history with actor, source, t
 
 ### Create saved views
 
-A saved view gives a stable route a title, collection, default equality filters, explicit columns, and page size. This CRM example makes `/deals` show only open deals:
+A saved view gives a stable route a title, collection, default equality filters, explicit columns or card details, layout, and page size. This CRM example makes `/deals` show only open deals as a table:
 
 ```sh
 cr view create deals \
@@ -738,6 +738,39 @@ cr view create interviews \
   --column recruiter.email
 ```
 
+### Create a Kanban pipeline
+
+Choose the `kanban` layout and a dotted front matter field to group by. A sales pipeline can expose every deal at `/pipeline`:
+
+```sh
+cr view create pipeline \
+  --collection deals \
+  --title "Sales pipeline" \
+  --layout kanban \
+  --group-by stage \
+  --column name \
+  --column value \
+  --column currency \
+  --column owner \
+  --page-size 200
+```
+
+For an ATS, the same layout can group candidates by hiring stage:
+
+```sh
+cr view create hiring-pipeline \
+  --collection candidates \
+  --title "Hiring pipeline" \
+  --layout kanban \
+  --group-by stage \
+  --column name \
+  --column role \
+  --column recruiter.email \
+  --page-size 200
+```
+
+If the grouping field has an `enum` in the collection's JSON Schema, lanes follow that declared order and empty stages remain visible. Other observed values are added deterministically; records without the field appear under **Unassigned**. Drag a card to another lane, or use its move selector and button. Both interactions submit the same CSRF-protected form, set or remove the chosen front matter field, validate the complete record, and append the normal field-level audit event.
+
 Inspect all routes or one definition:
 
 ```sh
@@ -760,12 +793,29 @@ columns:
   - status
   - value
   - owner.email
+layout: table
 page_size: 50
+```
+
+A Kanban definition adds two fields:
+
+```yaml
+version: 1
+title: Sales pipeline
+collection: deals
+filters: []
+columns:
+  - name
+  - value
+  - owner
+layout: kanban
+group_by: stage
+page_size: 200
 ```
 
 You can edit these files directly. The server reloads them on each request. View filters use the same typed `KEY=YAML` equality semantics as `cr list`; comparison and Boolean expressions remain roadmap work.
 
-The UI is plain server-rendered HTML—there is no React, Next.js, client-side application state, or JavaScript data API. Templates escape database and audit values, mutating forms carry a per-server CSRF token, and successful POSTs return `303 See Other` before the browser reloads the table. Styling currently uses Tailwind's Play CDN as requested; the official Tailwind documentation labels that browser CDN development-only, so compiling and bundling CSS is tracked in `TODO.md`.
+The UI is plain server-rendered HTML—there is no React, Next.js, client-side application state, or JavaScript data API. Kanban adds a small vanilla-JavaScript drag-and-drop enhancement over native HTML move forms, so the board remains usable without dragging. Templates escape database and audit values, mutating forms carry a per-server CSRF token, and successful POSTs return `303 See Other` before the browser reloads the view. Styling currently uses Tailwind's Play CDN as requested; the official Tailwind documentation labels that browser CDN development-only, so compiling and bundling CSS is tracked in `TODO.md`.
 
 ### Authentication and identity
 

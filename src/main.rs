@@ -1,8 +1,8 @@
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
-use cr::{Assignment, Database, Record, SearchQuery, SearchTarget};
+use clap::{Parser, Subcommand, ValueEnum};
+use cr::{Assignment, Database, Record, SearchQuery, SearchTarget, ViewLayout};
 use serde::Serialize;
 use yaml_serde::Mapping;
 
@@ -248,9 +248,17 @@ enum ViewCommand {
         #[arg(short = 'w', long = "where", value_name = "KEY=YAML")]
         filters: Vec<String>,
 
-        /// Show this dotted front matter field as a table column.
+        /// Show this dotted front matter field as a table column or Kanban card detail.
         #[arg(short, long = "column", value_name = "FIELD")]
         columns: Vec<String>,
+
+        /// Render records as a table or Kanban board.
+        #[arg(long, value_enum, default_value_t = ViewLayoutArgument::Table)]
+        layout: ViewLayoutArgument,
+
+        /// Group Kanban lanes by this dotted front matter field.
+        #[arg(long, value_name = "FIELD")]
+        group_by: Option<String>,
 
         /// Default records per page.
         #[arg(long, default_value_t = 50)]
@@ -270,6 +278,21 @@ enum ViewCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ViewLayoutArgument {
+    Table,
+    Kanban,
+}
+
+impl From<ViewLayoutArgument> for ViewLayout {
+    fn from(value: ViewLayoutArgument) -> Self {
+        match value {
+            ViewLayoutArgument::Table => Self::Table,
+            ViewLayoutArgument::Kanban => Self::Kanban,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -482,15 +505,19 @@ fn run() -> Result<()> {
                 title,
                 filters,
                 columns,
+                layout,
+                group_by,
                 page_size,
             } => {
-                let view = database.create_view(
+                let view = database.create_view_with_layout(
                     &name,
                     title.as_deref(),
                     &collection,
                     filters,
                     columns,
                     page_size,
+                    layout.into(),
+                    group_by,
                 )?;
                 println!("/{}", view.name);
             }

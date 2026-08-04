@@ -7,7 +7,7 @@ use axum::{
 };
 use cr::{
     server::{router, ServerConfig},
-    Assignment, AuditAction, AuditSource, Database,
+    Assignment, AuditAction, AuditSource, Database, ViewLayout,
 };
 use http_body_util::BodyExt;
 use tempfile::TempDir;
@@ -186,6 +186,184 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     let second_page = request(&app, Method::GET, "/deals?limit=1&offset=1", None, &[]).await;
     assert!(!second_page.text().contains("alpha"));
     assert!(second_page.text().contains("beta"));
+}
+
+#[tokio::test]
+async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited_updates() {
+    let (_temporary, database) = test_database("kanban-views");
+    fs::write(
+        database.root().join(".cr/schemas/deals.json"),
+        r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["name"],
+  "properties": {
+    "name": { "type": "string" },
+    "stage": { "enum": ["qualification", "interview", "offer", "won", "lost"] },
+    "owner": { "type": "string" }
+  },
+  "additionalProperties": true
+}"#,
+    )
+    .unwrap();
+    database
+        .create(
+            "deals",
+            "alpha",
+            &[
+                Assignment::from_str("name=\"<script>alert('x')</script>\"").unwrap(),
+                Assignment::from_str("stage=qualification").unwrap(),
+                Assignment::from_str("owner=Ana").unwrap(),
+            ],
+            "",
+        )
+        .unwrap();
+    database
+        .create(
+            "deals",
+            "beta",
+            &[
+                Assignment::from_str("name=Beta").unwrap(),
+                Assignment::from_str("stage=offer").unwrap(),
+            ],
+            "",
+        )
+        .unwrap();
+    database
+        .create(
+            "deals",
+            "unassigned",
+            &[Assignment::from_str("name=Unassigned").unwrap()],
+            "",
+        )
+        .unwrap();
+    database
+        .create_view_with_layout(
+            "pipeline",
+            Some("Sales pipeline"),
+            "deals",
+            vec![],
+            vec!["name".into(), "owner".into(), "stage".into()],
+            50,
+            ViewLayout::Kanban,
+            Some("stage".into()),
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let board = request(&app, Method::GET, "/pipeline", None, &[]).await;
+    assert_eq!(board.status, StatusCode::OK);
+    assert!(board.text().contains("Kanban grouped by"));
+    assert!(board.text().contains("data-kanban-board=\"true\""));
+    assert!(board.text().contains("draggable=\"true\""));
+    assert!(board.text().contains("form.submit()"));
+    assert!(board.text().contains("Move alpha to"));
+    assert!(board.text().contains("Unassigned"));
+    assert!(board
+        .text()
+        .contains("&lt;script&gt;alert('x')&lt;/script&gt;"));
+    assert!(!board.text().contains("<script>alert('x')</script>"));
+    let qualification = board.text().find(">qualification<").unwrap();
+    let interview = board.text().find(">interview<").unwrap();
+    let offer = board.text().find(">offer<").unwrap();
+    let won = board.text().find(">won<").unwrap();
+    let lost = board.text().find(">lost<").unwrap();
+    assert!(qualification < interview && interview < offer && offer < won && won < lost);
+
+    let token = csrf(board.text()).to_owned();
+    let target = r#"{"kind":"value","value":"interview"}"#;
+    let moved = request(
+        &app,
+        Method::POST,
+        "/pipeline/records/alpha/move",
+        Some(form(&[("_csrf", &token), ("target", target)])),
+        &[("x-cr-actor", "pipeline@example.com")],
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        moved.headers[header::LOCATION],
+        "/pipeline?notice=Card+moved"
+    );
+    assert_eq!(
+        database.get("deals", "alpha").unwrap().attributes["stage"],
+        "interview"
+    );
+    let audit = database
+        .audit_recent(1, Some("deals"), Some("alpha"))
+        .unwrap();
+    assert_eq!(audit[0].payload.action, AuditAction::Update);
+    assert_eq!(audit[0].payload.source, AuditSource::Api);
+    assert_eq!(audit[0].payload.actor, "pipeline@example.com");
+
+    let moved_board = request(&app, Method::GET, "/pipeline?notice=Card+moved", None, &[]).await;
+    assert_eq!(moved_board.status, StatusCode::OK);
+    assert!(moved_board.text().contains("Card moved"));
+    let record_page = request(&app, Method::GET, "/pipeline/records/alpha", None, &[]).await;
+    assert!(record_page.text().contains("/attributes/stage"));
+    assert!(record_page.text().contains("qualification"));
+    assert!(record_page.text().contains("interview"));
+
+    let unset_target = r#"{"kind":"unset"}"#;
+    let unassigned = request(
+        &app,
+        Method::POST,
+        "/pipeline/records/beta/move",
+        Some(form(&[("_csrf", &token), ("target", unset_target)])),
+        &[("x-cr-actor", "pipeline@example.com")],
+    )
+    .await;
+    assert_eq!(unassigned.status, StatusCode::SEE_OTHER);
+    assert!(database
+        .get("deals", "beta")
+        .unwrap()
+        .field("stage")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        database
+            .audit_recent(1, Some("deals"), Some("beta"))
+            .unwrap()[0]
+            .payload
+            .action,
+        AuditAction::Update
+    );
+
+    let invalid_target = r#"{"kind":"value","value":"not-a-stage"}"#;
+    let invalid = request(
+        &app,
+        Method::POST,
+        "/pipeline/records/alpha/move",
+        Some(form(&[("_csrf", &token), ("target", invalid_target)])),
+        &[],
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        database.get("deals", "alpha").unwrap().attributes["stage"],
+        "interview"
+    );
+
+    let bad_csrf = request(
+        &app,
+        Method::POST,
+        "/pipeline/records/alpha/move",
+        Some(form(&[("_csrf", "wrong"), ("target", target)])),
+        &[],
+    )
+    .await;
+    assert_eq!(bad_csrf.status, StatusCode::FORBIDDEN);
+
+    let table_move = request(
+        &app,
+        Method::POST,
+        "/deals/records/alpha/move",
+        Some(form(&[("_csrf", &token), ("target", target)])),
+        &[],
+    )
+    .await;
+    assert_eq!(table_move.status, StatusCode::UNPROCESSABLE_ENTITY);
+    database.audit_verify(None).unwrap();
 }
 
 #[tokio::test]

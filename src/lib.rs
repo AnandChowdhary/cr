@@ -12,4 +12,4 @@ pub use database::{CollectionModel, Database, Record, WorkingChange, WorkingChan
 pub use search::{SearchQuery, SearchTarget};
 pub use sync::{SyncDefinition, SyncRunSummary};
 pub use value::Assignment;
-pub use views::ViewDefinition;
+pub use views::{ViewDefinition, ViewLayout};

@@ -1,0 +1,13 @@
+version: 1
+title: Sales pipeline
+collection: deals
+filters: []
+columns:
+- name
+- value
+- currency
+- probability
+- owner
+layout: kanban
+group_by: stage
+page_size: 200

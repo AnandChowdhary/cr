@@ -84,6 +84,9 @@ Priorities:
 - [ ] **P2 — Preserve submitted form values on validation errors.**
   HTML mutations correctly remain atomic and audit-neutral on failure, but the generic error page requires navigating back and may lose unsaved browser input. Re-render the form with escaped submitted values and field-level schema diagnostics.
 
+- [ ] **P2 — Define large-board Kanban loading and ordering.**
+  Kanban lanes group the current bounded result page so the server never loads an unbounded collection. Define cursor-based incremental loading or an explicit board-size policy for pipelines larger than the configured page limit, plus optional card sorting within lanes.
+
 ## Query and result capabilities
 
 - [ ] **P1 — Comparison expressions.**
@@ -239,5 +242,6 @@ Priorities:
 - [x] Live OpenAPI 3.1 collection-schema components.
 - [x] Automatic collection tables and saved server-rendered HTML views with CSRF-protected audited forms.
 - [x] Per-record and global server-rendered audit history with filtering, pagination, attribution, and expandable field diffs.
+- [x] Saved Kanban views with schema-ordered lanes, drag-and-drop plus accessible move forms, schema validation, CSRF protection, and normal audit events.
 - [x] Versioned subprocess sync adapters with JSONL upsert/delete/checkpoint messages, clean-state verification, limits, overlap locks, checkpointing, and `source: sync` audit provenance.
 - [x] Unit, CLI, concurrency, direct-edit, in-process HTTP, and real TCP server tests.

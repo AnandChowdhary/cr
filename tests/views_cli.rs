@@ -20,6 +20,8 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
     .unwrap();
     assert_eq!(automatic["collection"], "deals");
     assert_eq!(automatic["saved"], false);
+    assert_eq!(automatic["layout"], "table");
+    assert!(automatic["group_by"].is_null());
     assert_eq!(automatic["page_size"], 50);
 
     assert_eq!(
@@ -37,6 +39,10 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
             "name",
             "--column",
             "owner.email",
+            "--layout",
+            "kanban",
+            "--group-by",
+            "stage",
             "--page-size",
             "25",
         ])),
@@ -49,6 +55,8 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
     assert!(stored.contains("collection: deals"));
     assert!(stored.contains("- status=open"));
     assert!(stored.contains("- owner.email"));
+    assert!(stored.contains("layout: kanban"));
+    assert!(stored.contains("group_by: stage"));
 
     let shown: Value = serde_json::from_str(&run_success(database.command().args([
         "view",
@@ -61,6 +69,8 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
     assert_eq!(shown["title"], "Open deals");
     assert_eq!(shown["filters"], serde_json::json!(["status=open"]));
     assert_eq!(shown["columns"], serde_json::json!(["name", "owner.email"]));
+    assert_eq!(shown["layout"], "kanban");
+    assert_eq!(shown["group_by"], "stage");
     assert_eq!(shown["page_size"], 25);
     assert_eq!(shown["saved"], true);
 
@@ -117,6 +127,28 @@ fn view_cli_rejects_invalid_duplicate_reserved_and_malformed_definitions() {
         "0",
     ]));
     assert!(invalid_page_size.contains("page_size must be between"));
+
+    let missing_group = run_failure(database.command().args([
+        "view",
+        "create",
+        "missing-group",
+        "--collection",
+        "deals",
+        "--layout",
+        "kanban",
+    ]));
+    assert!(missing_group.contains("requires group_by"));
+
+    let table_group = run_failure(database.command().args([
+        "view",
+        "create",
+        "table-group",
+        "--collection",
+        "deals",
+        "--group-by",
+        "stage",
+    ]));
+    assert!(table_group.contains("only valid for the kanban layout"));
 
     let reserved =
         run_failure(

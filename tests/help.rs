@@ -52,6 +52,9 @@ fn view_help_documents_saved_view_controls() {
     assert!(stdout.contains("--collection <COLLECTION>"));
     assert!(stdout.contains("--where <KEY=YAML>"));
     assert!(stdout.contains("--column <FIELD>"));
+    assert!(stdout.contains("--layout <LAYOUT>"));
+    assert!(stdout.contains("[possible values: table, kanban]"));
+    assert!(stdout.contains("--group-by <FIELD>"));
     assert!(stdout.contains("--page-size <PAGE_SIZE>"));
 }
 
