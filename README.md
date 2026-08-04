@@ -36,6 +36,17 @@ cr --help
 
 During development, you can use `cargo run --` instead of the installed `cr` command. For example, `cargo run -- --help`.
 
+## Try the sample CRM
+
+The repository includes a complete example database with companies, contacts, deals, relationships, schemas, audit history, and saved views:
+
+```sh
+cr --database examples/crm audit verify
+cr --database examples/crm serve
+```
+
+Open `http://127.0.0.1:3000/` for the home page or `http://127.0.0.1:3000/deals` for the open-deals view. Browser form submissions write to the example's Markdown records and audit journal.
+
 ## Create your first database
 
 Initialize a new database and enter its directory:

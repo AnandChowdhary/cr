@@ -1,0 +1,11 @@
+version: 1
+title: Won deals
+collection: deals
+filters:
+- stage=won
+columns:
+- name
+- value
+- currency
+- owner
+page_size: 25

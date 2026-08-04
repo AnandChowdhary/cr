@@ -1,0 +1,14 @@
+version: 1
+title: Open deals
+collection: deals
+filters:
+- status=open
+columns:
+- name
+- stage
+- value
+- currency
+- probability
+- expected_close
+- owner
+page_size: 25

@@ -1,0 +1,5 @@
+version: 1
+data_dir: records
+audit:
+  segment_max_events: 256
+  segment_max_bytes: 8388608

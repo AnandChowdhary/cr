@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["name", "email", "title", "status"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "email": { "type": "string", "minLength": 3 },
+    "title": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["active", "inactive"] },
+    "last_contacted": { "type": "string" },
+    "relations": { "type": "object" }
+  },
+  "additionalProperties": true
+}

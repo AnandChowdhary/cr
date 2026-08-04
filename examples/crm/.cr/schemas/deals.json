@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["name", "stage", "status", "value", "currency", "owner"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "stage": {
+      "enum": ["qualification", "discovery", "proposal", "negotiation", "won", "lost"]
+    },
+    "status": { "enum": ["open", "closed"] },
+    "value": { "type": "integer", "minimum": 0 },
+    "currency": { "enum": ["USD", "EUR", "GBP"] },
+    "probability": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "expected_close": { "type": "string" },
+    "owner": { "type": "string", "minLength": 1 },
+    "relations": { "type": "object" }
+  },
+  "additionalProperties": true
+}
