@@ -1,28 +1,56 @@
-# cr
+<div align="center">
+  <h1>cr</h1>
+  <p><strong>A local-first database made from Markdown.</strong></p>
+  <p>Typed front matter · audited changes · CLI · REST API · server-rendered views</p>
+  <p>
+    <a href="#quick-start">Quick start</a> ·
+    <a href="#see-it-in-action">Screenshots</a> ·
+    <a href="#how-records-work">Data model</a> ·
+    <a href="#serve-the-database-over-http">HTTP API</a> ·
+    <a href="TODO.md">Roadmap</a>
+  </p>
+</div>
 
-`cr` is a local database stored as ordinary Markdown files with YAML front matter.
+![The cr database home showing automatic and saved CRM views](docs/screenshots/database-views.jpg)
 
-You choose the collections and fields. The same CLI can therefore be used as a CRM, an applicant tracking system (ATS), a project tracker, a knowledge base, or another small custom database.
+`cr` turns a folder of ordinary Markdown files with YAML front matter into a queryable database. Choose any collections and fields, then use the same project as a CRM, applicant tracking system, project tracker, knowledge base, or another custom data tool.
 
-Every change made through the CLI is recorded in a tamper-evident audit journal. You can also edit Markdown files directly, review those edits with `cr status`, and record them with `cr save`.
+> Your editor can edit it. Git can diff it. `cr` can validate, query, audit, sync, and serve it.
 
-Current capabilities include:
+| Own the source | Model what you need |
+| --- | --- |
+| Each record is a readable Markdown file. Direct edits are first-class and reviewed with `cr status` and `cr save`. | Collections and typed YAML fields are arbitrary, with optional JSON Schema validation and relationships. |
+| **Query everywhere** | **Trust the history** |
+| Filter, compare, sort, search, and page through the same data from the CLI, REST API, tables, or Kanban boards. | Every accepted create, update, link, move, direct edit, sync, and delete extends a tamper-evident audit chain. |
 
-- arbitrary collections and typed YAML front matter;
-- audited CRUD and relationships;
-- typed equality, comparison, containment, empty-value filtering, and dotted field paths;
-- literal, case-insensitive, field-scoped, and regular-expression search;
-- direct Markdown editing with reviewed audit reconciliation;
-- scheduled, checkpointed external sync adapters with audited upserts and deletes;
-- optional JSON Schema validation;
-- saved and automatic server-rendered HTML views with audited forms;
-- a REST API with pagination, authentication, and live OpenAPI 3.1 generation.
+## See it in action
 
-The examples below cover both CLI and HTTP usage. Future work—including a full Boolean expression grammar, projections, relationship traversal, and indexes—is tracked in [`TODO.md`](TODO.md).
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/high-value-deals.jpg" alt="A filtered table of high-value CRM deals">
+      <br><sub><strong>Saved tables</strong> — searchable, filterable, sortable, and editable.</sub>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/sales-pipeline.jpg" alt="A sales pipeline rendered as a Kanban board">
+      <br><sub><strong>Kanban pipelines</strong> — moving a card updates and audits its grouping property.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/record-audit-history.jpg" alt="Audit history embedded on a CRM record page">
+      <br><sub><strong>Record history</strong> — actor, source, timestamp, and field-level changes.</sub>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/audit-log.jpg" alt="The global audit log filtered to one CRM deal">
+      <br><sub><strong>Global audit log</strong> — filtered, paginated, and independently verifiable.</sub>
+    </td>
+  </tr>
+</table>
 
-## Install the CLI
+## Quick start
 
-You need a current Rust toolchain. From this repository, run:
+You need a current Rust toolchain. Install the CLI from this repository:
 
 ```sh
 cargo install --path .
@@ -34,18 +62,18 @@ Confirm that the command is available:
 cr --help
 ```
 
-During development, you can use `cargo run --` instead of the installed `cr` command. For example, `cargo run -- --help`.
+During development, use `cargo run --` instead of the installed command—for example, `cargo run -- --help`.
 
-## Try the sample CRM
-
-The repository includes a complete example database with companies, contacts, deals, relationships, schemas, audit history, and saved views:
+The repository includes a complete CRM with companies, contacts, deals, relationships, schemas, audit history, saved tables, and a Kanban pipeline:
 
 ```sh
 cr --database examples/crm audit verify
 cr --database examples/crm serve
 ```
 
-Open `http://127.0.0.1:3000/` for the home page or `http://127.0.0.1:3000/deals` for the open-deals view. Browser form submissions write to the example's Markdown records and audit journal.
+Open [http://127.0.0.1:3000/](http://127.0.0.1:3000/) for the database home, `/deals` for open deals, `/pipeline` for Kanban, or `/audit` for the journal. Browser forms write through the same validated, audited operations as the CLI and REST API.
+
+The sections below cover the complete CLI and HTTP surface. Planned work—including nested Boolean expressions, projections, relationship traversal, and indexes—is tracked in [`TODO.md`](TODO.md).
 
 ## Create your first database
 
