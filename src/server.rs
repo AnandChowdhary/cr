@@ -1847,8 +1847,8 @@ fn render_filter_row(
 ) -> Markup {
     let selected_known = fields.iter().any(|field| field.key == selected_field);
     html! {
-        div data-filter-row="true" class="grid gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto] sm:items-center" {
-            select name="filter_field" data-filter-field="true" aria-label=(format!("Filter field {}", index + 1)) class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+        div data-filter-row="true" class="grid gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 md:grid-cols-2 xl:grid-cols-12 xl:items-center" {
+            select name="filter_field" data-filter-field="true" aria-label=(format!("Filter field {}", index + 1)) class="min-w-0 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 xl:col-span-5" {
                 option value="" selected[selected_field.is_empty()] data-filter-kind="input" data-filter-input-type="text" data-filter-options="[]" { "Choose a field…" }
                 @for field in fields {
                     @let (kind, input_type) = filter_kind_data(&field.kind);
@@ -1858,11 +1858,11 @@ fn render_filter_row(
                     option value=(selected_field) selected data-filter-kind="input" data-filter-input-type="text" data-filter-options="[]" { (selected_field) " (custom)" }
                 }
             }
-            span class="text-center text-xs font-bold uppercase tracking-wide text-slate-400" { "is" }
-            div data-filter-value-slot="true" {
+            span class="hidden text-center text-xs font-bold uppercase tracking-wide text-slate-400 xl:col-span-1 xl:block" { "is" }
+            div data-filter-value-slot="true" class="min-w-0 xl:col-span-5" {
                 (render_filter_value_control(fields, index, selected_field, value))
             }
-            button type="button" data-remove-filter="true" aria-label=(format!("Remove filter {}", index + 1)) class="rounded-lg px-3 py-2 text-sm font-semibold text-slate-500 hover:bg-red-50 hover:text-red-700" { "Remove" }
+            button type="button" data-remove-filter="true" aria-label=(format!("Remove filter {}", index + 1)) class="justify-self-start rounded-lg px-3 py-2 text-sm font-semibold text-slate-500 hover:bg-red-50 hover:text-red-700 md:col-span-2 xl:col-span-1 xl:justify-self-end" { "Remove" }
         }
     }
 }

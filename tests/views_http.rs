@@ -140,6 +140,10 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(automatic.text().contains("data-filter-builder=\"true\""));
     assert!(automatic.text().contains("+ Add condition"));
     assert!(automatic.text().contains("All conditions match"));
+    assert!(automatic.text().contains("md:grid-cols-2 xl:grid-cols-12"));
+    assert!(automatic
+        .text()
+        .contains("md:col-span-2 xl:col-span-1 xl:justify-self-end"));
     assert!(automatic
         .text()
         .contains("&lt;script&gt;alert('x')&lt;/script&gt;"));
