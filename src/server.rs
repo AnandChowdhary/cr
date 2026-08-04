@@ -790,7 +790,7 @@ async fn view_records(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let result: ApiResult<Markup> = async {
-        let query: ViewQuery = parse_query(raw)?;
+        let mut query: ViewQuery = parse_query(raw)?;
         let ad_hoc_filters = view_filter_expressions(&query)?;
         let query_for_database = query.clone();
         let requested_view = view_name.clone();
@@ -821,6 +821,14 @@ async fn view_records(
             Ok((view, records, schema))
         })
         .await?;
+
+        if query.sort_field.is_none() {
+            query.sort_field = view.sort_by.clone();
+            query.sort_direction = match view.sort_direction {
+                SortDirection::Asc => ViewSortDirection::Asc,
+                SortDirection::Desc => ViewSortDirection::Desc,
+            };
+        }
 
         let columns = view_columns(&view, &records, schema.as_ref());
         sort_view_records(&mut records, &query)?;
@@ -3382,9 +3390,11 @@ fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset:
         );
         serializer.append_pair("filter_value", value);
     }
-    if let Some(field) = view_sort_field(query) {
-        serializer.append_pair("sort_field", field);
-        serializer.append_pair("sort_direction", query.sort_direction.as_str());
+    if let Some(field) = query.sort_field.as_deref() {
+        serializer.append_pair("sort_field", field.trim());
+        if !field.trim().is_empty() {
+            serializer.append_pair("sort_direction", query.sort_direction.as_str());
+        }
     }
     serializer.append_pair("limit", &limit.to_string());
     serializer.append_pair("offset", &offset.to_string());

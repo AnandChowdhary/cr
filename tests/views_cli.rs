@@ -22,6 +22,8 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
     assert_eq!(automatic["saved"], false);
     assert_eq!(automatic["layout"], "table");
     assert!(automatic["group_by"].is_null());
+    assert!(automatic["sort_by"].is_null());
+    assert_eq!(automatic["sort_direction"], "asc");
     assert_eq!(automatic["page_size"], 50);
 
     assert_eq!(
@@ -43,6 +45,10 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
             "kanban",
             "--group-by",
             "stage",
+            "--sort-by",
+            "value",
+            "--sort-direction",
+            "desc",
             "--page-size",
             "25",
         ])),
@@ -57,6 +63,8 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
     assert!(stored.contains("- owner.email"));
     assert!(stored.contains("layout: kanban"));
     assert!(stored.contains("group_by: stage"));
+    assert!(stored.contains("sort_by: value"));
+    assert!(stored.contains("sort_direction: desc"));
 
     let shown: Value = serde_json::from_str(&run_success(database.command().args([
         "view",
@@ -71,6 +79,8 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
     assert_eq!(shown["columns"], serde_json::json!(["name", "owner.email"]));
     assert_eq!(shown["layout"], "kanban");
     assert_eq!(shown["group_by"], "stage");
+    assert_eq!(shown["sort_by"], "value");
+    assert_eq!(shown["sort_direction"], "desc");
     assert_eq!(shown["page_size"], 25);
     assert_eq!(shown["saved"], true);
 
@@ -127,6 +137,29 @@ fn view_cli_rejects_invalid_duplicate_reserved_and_malformed_definitions() {
         "0",
     ]));
     assert!(invalid_page_size.contains("page_size must be between"));
+
+    let invalid_sort = run_failure(database.command().args([
+        "view",
+        "create",
+        "bad-sort",
+        "--collection",
+        "deals",
+        "--sort-by",
+        "owner..email",
+    ]));
+    assert!(invalid_sort.contains("invalid sort_by field"));
+
+    let missing_sort = run_failure(database.command().args([
+        "view",
+        "create",
+        "missing-sort",
+        "--collection",
+        "deals",
+        "--sort-direction",
+        "desc",
+    ]));
+    assert!(missing_sort.contains("--sort-by <FIELD>"));
+    assert!(missing_sort.contains("required"));
 
     let missing_group = run_failure(database.command().args([
         "view",

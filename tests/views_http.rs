@@ -405,7 +405,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
         )
         .unwrap();
     database
-        .create_view_with_layout(
+        .create_view_with_options(
             "pipeline",
             Some("Sales pipeline"),
             "deals",
@@ -414,6 +414,8 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
             50,
             ViewLayout::Kanban,
             Some("stage".into()),
+            Some("score".into()),
+            cr::SortDirection::Asc,
         )
         .unwrap();
     let app = router(database.clone(), ServerConfig::default()).unwrap();
@@ -425,6 +427,8 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     assert!(board.text().contains("draggable=\"true\""));
     assert!(board.text().contains("form.submit()"));
     assert!(board.text().contains("Move alpha to"));
+    assert!(board.text().contains("value=\"score\" selected"));
+    assert!(board.text().contains("value=\"asc\" selected"));
     assert!(board.text().contains("Unassigned"));
     assert!(board
         .text()
@@ -436,6 +440,10 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     let won = board.text().find(">won<").unwrap();
     let lost = board.text().find(">lost<").unwrap();
     assert!(qualification < interview && interview < offer && offer < won && won < lost);
+    assert!(
+        board.text().find("/pipeline/records/gamma").unwrap()
+            < board.text().find("/pipeline/records/beta").unwrap()
+    );
 
     let typed_filter = request(
         &app,
@@ -473,16 +481,20 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     let sorted_lane = request(
         &app,
         Method::GET,
-        "/pipeline?sort_field=score&sort_direction=asc",
+        "/pipeline?sort_field=score&sort_direction=desc",
         None,
         &[],
     )
     .await;
     assert_eq!(sorted_lane.status, StatusCode::OK);
     assert!(
-        sorted_lane.text().find("/pipeline/records/gamma").unwrap()
-            < sorted_lane.text().find("/pipeline/records/beta").unwrap()
+        sorted_lane.text().find("/pipeline/records/beta").unwrap()
+            < sorted_lane.text().find("/pipeline/records/gamma").unwrap()
     );
+
+    let cleared_sort = request(&app, Method::GET, "/pipeline?sort_field=", None, &[]).await;
+    assert_eq!(cleared_sort.status, StatusCode::OK);
+    assert!(cleared_sort.text().contains("value=\"\" selected"));
 
     let token = csrf(board.text()).to_owned();
     let target = r#"{"kind":"value","value":"interview"}"#;

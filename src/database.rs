@@ -82,7 +82,8 @@ pub struct Record {
     pub body: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SortDirection {
     #[default]
     Asc,

@@ -753,7 +753,7 @@ Every existing record page embeds its newest audit history with actor, source, t
 
 ### Create saved views
 
-A saved view gives a stable route a title, collection, default equality filters, explicit columns or card details, layout, and page size. This CRM example makes `/deals` show only open deals as a table:
+A saved view gives a stable route a title, collection, default equality filters, explicit columns or card details, layout, default ordering, and page size. This CRM example makes `/deals` show only open deals as a table, with the largest opportunities first:
 
 ```sh
 cr view create deals \
@@ -764,6 +764,8 @@ cr view create deals \
   --column status \
   --column value \
   --column owner.email \
+  --sort-by value \
+  --sort-direction desc \
   --page-size 50
 ```
 
@@ -777,7 +779,9 @@ cr view create interviews \
   --column name \
   --column role \
   --column stage \
-  --column recruiter.email
+  --column recruiter.email \
+  --sort-by score \
+  --sort-direction desc
 ```
 
 ### Create a Kanban pipeline
@@ -794,6 +798,8 @@ cr view create pipeline \
   --column value \
   --column currency \
   --column owner \
+  --sort-by value \
+  --sort-direction desc \
   --page-size 200
 ```
 
@@ -808,10 +814,12 @@ cr view create hiring-pipeline \
   --column name \
   --column role \
   --column recruiter.email \
+  --sort-by score \
+  --sort-direction desc \
   --page-size 200
 ```
 
-If the grouping field has an `enum` in the collection's JSON Schema, lanes follow that declared order and empty stages remain visible. Other observed values are added deterministically; records without the field appear under **Unassigned**. Drag a card to another lane, or use its move selector and button. Both interactions submit the same CSRF-protected form, set or remove the chosen front matter field, validate the complete record, and append the normal field-level audit event.
+If the grouping field has an `enum` in the collection's JSON Schema, lanes follow that declared order and empty stages remain visible. Other observed values are added deterministically; records without the field appear under **Unassigned**. `--sort-by` controls the default card order inside every lane; the page controls can override or clear it for the current URL. Drag a card to another lane, or use its move selector and button. Both interactions submit the same CSRF-protected form, set or remove the chosen front matter field, validate the complete record, and append the normal field-level audit event.
 
 Inspect all routes or one definition:
 
@@ -836,6 +844,8 @@ columns:
   - value
   - owner.email
 layout: table
+sort_by: value
+sort_direction: desc
 page_size: 50
 ```
 
@@ -1078,6 +1088,12 @@ cr update COLLECTION ID [--set KEY=YAML]... [--body TEXT]
 cr link SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
 cr delete COLLECTION ID --yes
 cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N]
+
+cr view create NAME --collection COLLECTION [--where KEY=YAML]... [--column FIELD]...
+                    [--layout table|kanban] [--group-by FIELD]
+                    [--sort-by FIELD] [--sort-direction asc|desc] [--page-size N]
+cr view list [--json]
+cr view show NAME [--json]
 
 cr sync create NAME [--actor IDENTITY] [--timeout-seconds N] -- COMMAND...
 cr sync list [--json]

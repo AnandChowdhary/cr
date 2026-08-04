@@ -10,4 +10,6 @@ columns:
 - owner
 layout: kanban
 group_by: stage
+sort_by: value
+sort_direction: desc
 page_size: 200

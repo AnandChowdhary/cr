@@ -287,6 +287,14 @@ enum ViewCommand {
         #[arg(long, value_name = "FIELD")]
         group_by: Option<String>,
 
+        /// Default ordering field. Accepts dotted front matter, $id, $collection, or $path.
+        #[arg(long, value_name = "FIELD")]
+        sort_by: Option<String>,
+
+        /// Default ordering direction for --sort-by.
+        #[arg(long, value_enum, requires = "sort_by")]
+        sort_direction: Option<ViewSortDirectionArgument>,
+
         /// Default records per page.
         #[arg(long, default_value_t = 50)]
         page_size: usize,
@@ -311,6 +319,21 @@ enum ViewCommand {
 enum ViewLayoutArgument {
     Table,
     Kanban,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ViewSortDirectionArgument {
+    Asc,
+    Desc,
+}
+
+impl From<ViewSortDirectionArgument> for SortDirection {
+    fn from(value: ViewSortDirectionArgument) -> Self {
+        match value {
+            ViewSortDirectionArgument::Asc => Self::Asc,
+            ViewSortDirectionArgument::Desc => Self::Desc,
+        }
+    }
 }
 
 impl From<ViewLayoutArgument> for ViewLayout {
@@ -572,9 +595,11 @@ fn run() -> Result<()> {
                 columns,
                 layout,
                 group_by,
+                sort_by,
+                sort_direction,
                 page_size,
             } => {
-                let view = database.create_view_with_layout(
+                let view = database.create_view_with_options(
                     &name,
                     title.as_deref(),
                     &collection,
@@ -583,6 +608,10 @@ fn run() -> Result<()> {
                     page_size,
                     layout.into(),
                     group_by,
+                    sort_by,
+                    sort_direction
+                        .map(SortDirection::from)
+                        .unwrap_or(SortDirection::Asc),
                 )?;
                 println!("/{}", view.name);
             }

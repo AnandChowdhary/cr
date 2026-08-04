@@ -72,6 +72,9 @@ fn view_help_documents_saved_view_controls() {
     assert!(stdout.contains("--layout <LAYOUT>"));
     assert!(stdout.contains("[possible values: table, kanban]"));
     assert!(stdout.contains("--group-by <FIELD>"));
+    assert!(stdout.contains("--sort-by <FIELD>"));
+    assert!(stdout.contains("--sort-direction <SORT_DIRECTION>"));
+    assert!(stdout.contains("[possible values: asc, desc]"));
     assert!(stdout.contains("--page-size <PAGE_SIZE>"));
 }
 

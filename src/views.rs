@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     database::{validate_component, write_new},
     value::parse_path,
-    Assignment, Database,
+    Assignment, Database, SortDirection,
 };
 
 const VIEW_FORMAT_VERSION: u32 = 1;
@@ -24,6 +24,8 @@ pub struct ViewDefinition {
     pub columns: Vec<String>,
     pub layout: ViewLayout,
     pub group_by: Option<String>,
+    pub sort_by: Option<String>,
+    pub sort_direction: SortDirection,
     pub page_size: usize,
     pub saved: bool,
 }
@@ -50,6 +52,10 @@ struct StoredViewDefinition {
     layout: ViewLayout,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     group_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sort_by: Option<String>,
+    #[serde(default, skip_serializing_if = "is_ascending")]
+    sort_direction: SortDirection,
     #[serde(default = "default_page_size")]
     page_size: usize,
 }
@@ -88,6 +94,34 @@ impl Database {
         layout: ViewLayout,
         group_by: Option<String>,
     ) -> Result<ViewDefinition> {
+        self.create_view_with_options(
+            name,
+            title,
+            collection,
+            filters,
+            columns,
+            page_size,
+            layout,
+            group_by,
+            None,
+            SortDirection::Asc,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_view_with_options(
+        &self,
+        name: &str,
+        title: Option<&str>,
+        collection: &str,
+        filters: Vec<String>,
+        columns: Vec<String>,
+        page_size: usize,
+        layout: ViewLayout,
+        group_by: Option<String>,
+        sort_by: Option<String>,
+        sort_direction: SortDirection,
+    ) -> Result<ViewDefinition> {
         validate_view_name(name)?;
         validate_component(collection, "collection")?;
         let title = title.unwrap_or(name).trim();
@@ -103,6 +137,8 @@ impl Database {
             columns,
             layout,
             group_by,
+            sort_by,
+            sort_direction,
             page_size,
         };
         validate_stored(name, &stored)?;
@@ -236,6 +272,19 @@ fn validate_stored(name: &str, view: &StoredViewDefinition) -> Result<()> {
         parse_path(column)
             .with_context(|| format!("view '{name}' has invalid column '{column}'"))?;
     }
+    match (view.sort_by.as_deref(), view.sort_direction) {
+        (None, SortDirection::Desc) => {
+            bail!("view '{name}' sort_direction requires sort_by")
+        }
+        (Some(field), _) if field.trim().is_empty() => {
+            bail!("view '{name}' sort_by cannot be empty")
+        }
+        (Some(field), _) if !matches!(field, "$id" | "$collection" | "$path") => {
+            parse_path(field)
+                .with_context(|| format!("view '{name}' has invalid sort_by field '{field}'"))?;
+        }
+        _ => {}
+    }
     match (view.layout, view.group_by.as_deref()) {
         (ViewLayout::Table, Some(_)) => {
             bail!("view '{name}' group_by is only valid for the kanban layout")
@@ -262,6 +311,8 @@ fn automatic_view(collection: &str) -> ViewDefinition {
         columns: Vec::new(),
         layout: ViewLayout::Table,
         group_by: None,
+        sort_by: None,
+        sort_direction: SortDirection::Asc,
         page_size: DEFAULT_VIEW_PAGE_SIZE,
         saved: false,
     }
@@ -277,6 +328,8 @@ fn to_public(name: &str, stored: StoredViewDefinition, saved: bool) -> ViewDefin
         columns: stored.columns,
         layout: stored.layout,
         group_by: stored.group_by,
+        sort_by: stored.sort_by,
+        sort_direction: stored.sort_direction,
         page_size: stored.page_size,
         saved,
     }
@@ -284,6 +337,10 @@ fn to_public(name: &str, stored: StoredViewDefinition, saved: bool) -> ViewDefin
 
 const fn default_page_size() -> usize {
     DEFAULT_VIEW_PAGE_SIZE
+}
+
+fn is_ascending(direction: &SortDirection) -> bool {
+    *direction == SortDirection::Asc
 }
 
 #[cfg(test)]
@@ -316,6 +373,8 @@ mod tests {
         assert!(views[0].saved);
         assert_eq!(views[0].layout, ViewLayout::Table);
         assert_eq!(views[0].group_by, None);
+        assert_eq!(views[0].sort_by, None);
+        assert_eq!(views[0].sort_direction, SortDirection::Asc);
         assert_eq!(database.view("deals").unwrap(), views[0]);
     }
 
@@ -324,7 +383,7 @@ mod tests {
         let temporary = tempdir().unwrap();
         let database = Database::init(temporary.path().join("database")).unwrap();
         let kanban = database
-            .create_view_with_layout(
+            .create_view_with_options(
                 "pipeline",
                 Some("Sales pipeline"),
                 "deals",
@@ -333,13 +392,19 @@ mod tests {
                 200,
                 ViewLayout::Kanban,
                 Some("stage".into()),
+                Some("value".into()),
+                SortDirection::Desc,
             )
             .unwrap();
         assert_eq!(kanban.layout, ViewLayout::Kanban);
         assert_eq!(kanban.group_by.as_deref(), Some("stage"));
+        assert_eq!(kanban.sort_by.as_deref(), Some("value"));
+        assert_eq!(kanban.sort_direction, SortDirection::Desc);
         let stored = fs::read_to_string(database.root().join(".cr/views/pipeline.yaml")).unwrap();
         assert!(stored.contains("layout: kanban"));
         assert!(stored.contains("group_by: stage"));
+        assert!(stored.contains("sort_by: value"));
+        assert!(stored.contains("sort_direction: desc"));
 
         fs::write(
             database.root().join(".cr/views/legacy.yaml"),
@@ -349,6 +414,8 @@ mod tests {
         let legacy = database.view("legacy").unwrap();
         assert_eq!(legacy.layout, ViewLayout::Table);
         assert_eq!(legacy.group_by, None);
+        assert_eq!(legacy.sort_by, None);
+        assert_eq!(legacy.sort_direction, SortDirection::Asc);
     }
 
     #[test]
@@ -383,6 +450,38 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid column"));
+        assert!(database
+            .create_view_with_options(
+                "bad-sort",
+                None,
+                "deals",
+                vec![],
+                vec![],
+                50,
+                ViewLayout::Table,
+                None,
+                Some("owner..email".into()),
+                SortDirection::Asc,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("invalid sort_by"));
+        assert!(database
+            .create_view_with_options(
+                "missing-sort",
+                None,
+                "deals",
+                vec![],
+                vec![],
+                50,
+                ViewLayout::Table,
+                None,
+                None,
+                SortDirection::Desc,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("requires sort_by"));
         assert!(database
             .create_view_with_layout(
                 "missing-group",
