@@ -196,6 +196,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
         r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
+  "x-cr-ui": { "order": ["name", "email", "stage", "budget", "active", "tags"] },
   "required": ["name"],
   "properties": {
     "name": { "type": "string" },
@@ -431,8 +432,13 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
 
     let edit_page = request(&app, Method::GET, "/open-deals/records/acme", None, &[]).await;
     assert_eq!(edit_page.status, StatusCode::OK);
-    assert!(edit_page.text().contains("status: open"));
-    assert!(edit_page.text().contains("value: 12500"));
+    assert!(edit_page.text().contains("Schema-powered"));
+    assert!(edit_page.text().contains("name=\"attribute.status\""));
+    assert!(edit_page
+        .text()
+        .contains("value=\"open\" selected>Open</option>"));
+    assert!(edit_page.text().contains("name=\"attribute.value\""));
+    assert!(edit_page.text().contains("value=\"12500\""));
     assert!(edit_page.text().contains("Audit history"));
     assert!(edit_page.text().contains("sales@example.com"));
     assert!(edit_page.text().contains("create"));
@@ -518,6 +524,172 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
         .unwrap();
     assert_eq!(audit[0].payload.action, AuditAction::Delete);
     assert_eq!(audit[0].payload.source, AuditSource::Api);
+    database.audit_verify(None).unwrap();
+}
+
+#[tokio::test]
+async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
+    let (_temporary, database) = test_database("structured-forms");
+    fs::write(
+        database.root().join(".cr/schemas/candidates.json"),
+        r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["name", "email", "stage", "budget"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "title": "Candidate <name>",
+      "description": "Displayed <script>alert('schema')</script> name",
+      "minLength": 1
+    },
+    "email": { "type": "string", "format": "email", "description": "Primary email address" },
+    "stage": { "enum": ["applied", "interview", "offer"] },
+    "budget": { "type": "number", "minimum": 0, "maximum": 1000000 },
+    "active": { "type": "boolean" },
+    "tags": { "type": "array", "items": { "enum": ["rust", "remote", "referred"] } },
+    "profile": { "type": "object" }
+  },
+  "additionalProperties": true
+}"#,
+    )
+    .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let new_page = request(&app, Method::GET, "/candidates/new", None, &[]).await;
+    assert_eq!(new_page.status, StatusCode::OK);
+    assert!(new_page.text().contains("Schema-powered"));
+    assert!(new_page
+        .text()
+        .contains("name=\"_form_mode\" value=\"structured\""));
+    assert!(new_page.text().contains("Candidate &lt;name&gt;"));
+    assert!(new_page
+        .text()
+        .contains("Displayed &lt;script&gt;alert('schema')&lt;/script&gt; name"));
+    assert!(!new_page.text().contains("<script>alert('schema')</script>"));
+    assert!(new_page
+        .text()
+        .contains("type=\"email\" name=\"attribute.email\""));
+    assert!(new_page
+        .text()
+        .contains("type=\"number\" step=\"any\" name=\"attribute.budget\""));
+    assert!(new_page
+        .text()
+        .contains("select id=\"field-stage\" name=\"attribute.stage\""));
+    assert!(new_page.text().contains("Single select"));
+    assert!(new_page.text().contains("Multi-select"));
+    assert!(new_page
+        .text()
+        .contains("type=\"checkbox\" name=\"attribute.tags\""));
+    assert!(new_page.text().contains("Structured YAML"));
+    assert!(new_page.text().contains("+ Additional attributes"));
+    assert!(
+        new_page.text().find("Candidate &lt;name&gt;").unwrap()
+            < new_page.text().find("Primary email address").unwrap()
+    );
+
+    let token = csrf(new_page.text()).to_owned();
+    let created = request(
+        &app,
+        Method::POST,
+        "/candidates/records",
+        Some(form(&[
+            ("_csrf", &token),
+            ("_form_mode", "structured"),
+            ("id", "jane-doe"),
+            ("attribute.name", "Jane Doe"),
+            ("attribute.email", "jane@example.com"),
+            ("attribute.stage", "interview"),
+            ("attribute.budget", "125000.5"),
+            ("attribute.active", "true"),
+            ("attribute.tags", "rust"),
+            ("attribute.tags", "remote"),
+            ("attribute.profile", "team: platform\nlevel: senior"),
+            ("_additional_attributes", "source: referral"),
+            ("markdown", "# Jane\n\nStrong systems background."),
+        ])),
+        &[("x-cr-actor", "recruiter@example.com")],
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::SEE_OTHER);
+    let record = database.get("candidates", "jane-doe").unwrap();
+    assert_eq!(record.attributes["name"], "Jane Doe");
+    assert_eq!(record.attributes["email"], "jane@example.com");
+    assert_eq!(record.attributes["stage"], "interview");
+    assert_eq!(record.attributes["active"], true);
+    assert_eq!(record.attributes["tags"][0], "rust");
+    assert_eq!(record.attributes["tags"][1], "remote");
+    assert_eq!(record.attributes["profile"]["team"], "platform");
+    assert_eq!(record.attributes["source"], "referral");
+    assert_eq!(record.body, "# Jane\n\nStrong systems background.");
+    let audit = database
+        .audit_recent(1, Some("candidates"), Some("jane-doe"))
+        .unwrap();
+    assert_eq!(audit[0].payload.action, AuditAction::Create);
+    assert_eq!(audit[0].payload.source, AuditSource::Api);
+    assert_eq!(audit[0].payload.actor, "recruiter@example.com");
+
+    let edit_page = request(&app, Method::GET, "/candidates/records/jane-doe", None, &[]).await;
+    assert_eq!(edit_page.status, StatusCode::OK);
+    assert!(edit_page.text().contains("value=\"jane@example.com\""));
+    assert!(edit_page
+        .text()
+        .contains("value=\"interview\" selected>Interview</option>"));
+    assert!(edit_page
+        .text()
+        .contains("name=\"attribute.tags\" value=\"rust\" checked"));
+    assert!(edit_page.text().contains("source: referral"));
+
+    let invalid = request(
+        &app,
+        Method::POST,
+        "/candidates/records/jane-doe",
+        Some(form(&[
+            ("_csrf", &token),
+            ("_form_mode", "structured"),
+            ("attribute.name", "Jane Doe"),
+            ("attribute.email", "jane@example.com"),
+            ("attribute.stage", "offer"),
+            ("attribute.budget", "-1"),
+            ("attribute.active", "false"),
+            ("attribute.profile", "{}"),
+            ("_additional_attributes", "{}"),
+            ("markdown", "Invalid update"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        database.get("candidates", "jane-doe").unwrap().body,
+        "# Jane\n\nStrong systems background."
+    );
+    assert_eq!(
+        database
+            .audit_recent(10, Some("candidates"), Some("jane-doe"))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let unknown_option = request(
+        &app,
+        Method::POST,
+        "/candidates/records/jane-doe",
+        Some(form(&[
+            ("_csrf", &token),
+            ("_form_mode", "structured"),
+            ("attribute.name", "Jane Doe"),
+            ("attribute.email", "jane@example.com"),
+            ("attribute.stage", "hacked"),
+            ("attribute.budget", "10"),
+            ("_additional_attributes", "{}"),
+            ("markdown", "Invalid option"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(unknown_option.status, StatusCode::BAD_REQUEST);
     database.audit_verify(None).unwrap();
 }
 

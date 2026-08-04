@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, io::Write, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Write,
+    net::SocketAddr,
+    str::FromStr,
+    sync::Arc,
+};
 
 use anyhow::{bail, Context, Result};
 use axum::{
@@ -172,14 +178,46 @@ struct AuditViewQuery {
     offset: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct HtmlDocumentForm {
-    #[serde(rename = "_csrf")]
     csrf: String,
     id: Option<String>,
-    front_matter: String,
+    front_matter: Option<String>,
     markdown: String,
+    structured: bool,
+    additional_attributes: String,
+    fields: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Debug)]
+struct SchemaFormField {
+    key: String,
+    label: String,
+    description: Option<String>,
+    required: bool,
+    value: Option<YamlValue>,
+    kind: SchemaFieldKind,
+}
+
+#[derive(Clone, Debug)]
+enum SchemaFieldKind {
+    Select(Vec<YamlValue>),
+    MultiSelect(Vec<YamlValue>),
+    String {
+        input_type: &'static str,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
+    },
+    Integer {
+        minimum: Option<String>,
+        maximum: Option<String>,
+    },
+    Number {
+        minimum: Option<String>,
+        maximum: Option<String>,
+    },
+    Boolean,
+    Yaml,
 }
 
 #[derive(Debug, Deserialize)]
@@ -660,14 +698,17 @@ async fn new_record_form(
 ) -> Response {
     let result: ApiResult<Markup> = async {
         let requested_view = view_name.clone();
-        let view = run_database(&state, &headers, move |database| {
-            database.view(&requested_view)
+        let (view, schema) = run_database(&state, &headers, move |database| {
+            let view = database.view(&requested_view)?;
+            let schema = collection_schema(database, &view.collection)?;
+            Ok((view, schema))
         })
         .await?;
         Ok(render_record_form(
             &view,
             None,
             &[],
+            schema.as_ref(),
             &state.csrf_token,
             None,
         ))
@@ -684,21 +725,24 @@ async fn edit_record_form(
     let result: ApiResult<Markup> = async {
         let requested_view = view_name.clone();
         let requested_id = id.clone();
-        let (view, record, audit_entries) = run_database(&state, &headers, move |database| {
-            let view = database.view(&requested_view)?;
-            let record = database.get(&view.collection, &requested_id)?;
-            let audit_entries = database.audit_recent(
-                DEFAULT_PAGE_SIZE,
-                Some(&view.collection),
-                Some(&requested_id),
-            )?;
-            Ok((view, record, audit_entries))
-        })
-        .await?;
+        let (view, record, audit_entries, schema) =
+            run_database(&state, &headers, move |database| {
+                let view = database.view(&requested_view)?;
+                let record = database.get(&view.collection, &requested_id)?;
+                let audit_entries = database.audit_recent(
+                    DEFAULT_PAGE_SIZE,
+                    Some(&view.collection),
+                    Some(&requested_id),
+                )?;
+                let schema = collection_schema(database, &view.collection)?;
+                Ok((view, record, audit_entries, schema))
+            })
+            .await?;
         Ok(render_record_form(
             &view,
             Some(&record),
             &audit_entries,
+            schema.as_ref(),
             &state.csrf_token,
             None,
         ))
@@ -714,19 +758,26 @@ async fn create_record_form(
     RawForm(raw): RawForm,
 ) -> Response {
     let result: ApiResult<Response> = async {
-        let form: HtmlDocumentForm = parse_html_form(&raw)?;
+        let form = parse_document_form(&raw)?;
         verify_csrf(&state, &form.csrf)?;
         let id = form
             .id
             .as_deref()
             .filter(|id| !id.is_empty())
-            .ok_or_else(|| ApiError::bad_request("invalid_form", "record ID cannot be empty"))?;
-        let attributes = parse_front_matter(&form.front_matter)?;
+            .ok_or_else(|| ApiError::bad_request("invalid_form", "record ID cannot be empty"))?
+            .to_owned();
         let requested_view = view_name.clone();
-        let id = id.to_owned();
-        run_database(&state, &headers, move |database| {
+        let (view, schema) = run_database(&state, &headers, move |database| {
             let view = database.view(&requested_view)?;
-            database.create_record(&view.collection, &id, attributes, &form.markdown)
+            let schema = collection_schema(database, &view.collection)?;
+            Ok((view, schema))
+        })
+        .await?;
+        let attributes = document_form_attributes(&form, schema.as_ref())?;
+        let collection = view.collection;
+        let markdown = form.markdown;
+        run_database(&state, &headers, move |database| {
+            database.create_record(&collection, &id, attributes, &markdown)
         })
         .await?;
         see_other(&notice_url(&view_name, "Record created"))
@@ -742,7 +793,7 @@ async fn update_record_form(
     RawForm(raw): RawForm,
 ) -> Response {
     let result: ApiResult<Response> = async {
-        let form: HtmlDocumentForm = parse_html_form(&raw)?;
+        let form = parse_document_form(&raw)?;
         verify_csrf(&state, &form.csrf)?;
         if form.id.is_some() {
             return Err(ApiError::bad_request(
@@ -750,11 +801,18 @@ async fn update_record_form(
                 "record ID cannot be changed",
             ));
         }
-        let attributes = parse_front_matter(&form.front_matter)?;
         let requested_view = view_name.clone();
-        run_database(&state, &headers, move |database| {
+        let (view, schema) = run_database(&state, &headers, move |database| {
             let view = database.view(&requested_view)?;
-            database.replace(&view.collection, &id, attributes, &form.markdown)
+            let schema = collection_schema(database, &view.collection)?;
+            Ok((view, schema))
+        })
+        .await?;
+        let attributes = document_form_attributes(&form, schema.as_ref())?;
+        let collection = view.collection;
+        let markdown = form.markdown;
+        run_database(&state, &headers, move |database| {
+            database.replace(&collection, &id, attributes, &markdown)
         })
         .await?;
         see_other(&notice_url(&view_name, "Record updated"))
@@ -2065,10 +2123,285 @@ fn kanban_move_url(view: &ViewDefinition, id: &str) -> String {
     )
 }
 
+fn collection_schema(database: &Database, collection: &str) -> Result<Option<JsonValue>> {
+    Ok(database
+        .collection_models()?
+        .into_iter()
+        .find(|model| model.name == collection)
+        .and_then(|model| model.schema))
+}
+
+fn schema_form_fields(schema: &JsonValue, attributes: &Mapping) -> Option<Vec<SchemaFormField>> {
+    let properties = schema.get("properties")?.as_object()?;
+    let required = schema
+        .get("required")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .collect::<BTreeSet<_>>();
+    let configured_order = schema
+        .get("x-cr-ui")
+        .and_then(|ui| ui.get("order"))
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .enumerate()
+        .map(|(index, key)| (key.to_owned(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut fields = properties
+        .iter()
+        .map(|(key, definition)| SchemaFormField {
+            key: key.clone(),
+            label: definition
+                .get("title")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| humanize_field_name(key)),
+            description: definition
+                .get("description")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned),
+            required: required.contains(key.as_str()),
+            value: attributes.get(YamlValue::String(key.clone())).cloned(),
+            kind: schema_field_kind(definition),
+        })
+        .collect::<Vec<_>>();
+    fields.sort_by(|left, right| {
+        let left_rank = configured_order
+            .get(&left.key)
+            .copied()
+            .unwrap_or(usize::MAX);
+        let right_rank = configured_order
+            .get(&right.key)
+            .copied()
+            .unwrap_or(usize::MAX);
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| right.required.cmp(&left.required))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    Some(fields)
+}
+
+fn schema_field_kind(definition: &JsonValue) -> SchemaFieldKind {
+    if let Some(values) = definition.get("enum").and_then(JsonValue::as_array) {
+        return SchemaFieldKind::Select(json_values_as_yaml(values));
+    }
+    let field_type = definition.get("type").and_then(JsonValue::as_str);
+    if field_type == Some("array") {
+        if let Some(values) = definition
+            .get("items")
+            .and_then(|items| items.get("enum"))
+            .and_then(JsonValue::as_array)
+        {
+            return SchemaFieldKind::MultiSelect(json_values_as_yaml(values));
+        }
+        return SchemaFieldKind::Yaml;
+    }
+    match field_type {
+        Some("string") => SchemaFieldKind::String {
+            input_type: match definition.get("format").and_then(JsonValue::as_str) {
+                Some("email") => "email",
+                Some("uri") | Some("url") => "url",
+                Some("date") => "date",
+                Some("time") => "time",
+                Some("date-time") => "datetime-local",
+                _ => "text",
+            },
+            min_length: definition
+                .get("minLength")
+                .and_then(JsonValue::as_u64)
+                .and_then(|value| usize::try_from(value).ok()),
+            max_length: definition
+                .get("maxLength")
+                .and_then(JsonValue::as_u64)
+                .and_then(|value| usize::try_from(value).ok()),
+        },
+        Some("integer") => SchemaFieldKind::Integer {
+            minimum: schema_number_constraint(definition, "minimum"),
+            maximum: schema_number_constraint(definition, "maximum"),
+        },
+        Some("number") => SchemaFieldKind::Number {
+            minimum: schema_number_constraint(definition, "minimum"),
+            maximum: schema_number_constraint(definition, "maximum"),
+        },
+        Some("boolean") => SchemaFieldKind::Boolean,
+        _ => SchemaFieldKind::Yaml,
+    }
+}
+
+fn json_values_as_yaml(values: &[JsonValue]) -> Vec<YamlValue> {
+    values
+        .iter()
+        .filter_map(|value| serde_json::from_value(value.clone()).ok())
+        .collect()
+}
+
+fn schema_number_constraint(definition: &JsonValue, name: &str) -> Option<String> {
+    definition.get(name).and_then(|value| match value {
+        JsonValue::Number(_) => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn humanize_field_name(name: &str) -> String {
+    name.split(['_', '-', '.'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            match characters.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), characters.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn schema_value_label(value: &YamlValue) -> String {
+    match value {
+        YamlValue::String(value) => humanize_field_name(value),
+        _ => yaml_value(value),
+    }
+}
+
+fn schema_field_type_label(kind: &SchemaFieldKind) -> &'static str {
+    match kind {
+        SchemaFieldKind::Select(_) => "Single select",
+        SchemaFieldKind::MultiSelect(_) => "Multi-select",
+        SchemaFieldKind::String { input_type, .. } => match *input_type {
+            "email" => "Email",
+            "url" => "URL",
+            "date" => "Date",
+            "time" => "Time",
+            "datetime-local" => "Date & time",
+            _ => "Text",
+        },
+        SchemaFieldKind::Integer { .. } => "Integer",
+        SchemaFieldKind::Number { .. } => "Number",
+        SchemaFieldKind::Boolean => "Boolean",
+        SchemaFieldKind::Yaml => "Structured YAML",
+    }
+}
+
+fn schema_field_is_wide(kind: &SchemaFieldKind) -> bool {
+    matches!(
+        kind,
+        SchemaFieldKind::MultiSelect(_) | SchemaFieldKind::Yaml
+    )
+}
+
+fn field_text_value(value: Option<&YamlValue>) -> String {
+    match value {
+        Some(YamlValue::String(value)) => value.clone(),
+        Some(value) => serialize_yaml_value(value),
+        None => String::new(),
+    }
+}
+
+fn render_schema_field(field: &SchemaFormField) -> Markup {
+    let name = format!("attribute.{}", field.key);
+    let wide = schema_field_is_wide(&field.kind);
+    let current = field.value.as_ref();
+    html! {
+        div class=(if wide { "rounded-xl border border-slate-200 bg-slate-50 p-4 sm:col-span-2" } else { "rounded-xl border border-slate-200 bg-slate-50 p-4" }) {
+            div class="mb-2 flex items-start justify-between gap-3" {
+                label for=(format!("field-{}", field.key)) class="text-sm font-semibold text-slate-900" {
+                    (&field.label)
+                    @if field.required {
+                        span class="ml-1 text-red-500" aria-hidden="true" { "*" }
+                    }
+                }
+                span class="shrink-0 rounded-md bg-white px-2 py-0.5 text-[0.65rem] font-bold uppercase tracking-wide text-slate-500 shadow-sm" {
+                    (schema_field_type_label(&field.kind))
+                }
+            }
+            @if let Some(description) = &field.description {
+                p class="mb-3 text-xs leading-5 text-slate-500" { (description) }
+            }
+            @match &field.kind {
+                SchemaFieldKind::Select(options) => {
+                    select id=(format!("field-{}", field.key)) name=(name) required[field.required] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                        option value="" selected[current.is_none()] disabled[field.required] {
+                            @if field.required { "Select a value…" } @else { "Not set" }
+                        }
+                        @for option in options {
+                            option value=(serialize_yaml_value(option)) selected[current == Some(option)] { (schema_value_label(option)) }
+                        }
+                    }
+                }
+                SchemaFieldKind::MultiSelect(options) => {
+                    div id=(format!("field-{}", field.key)) class="flex flex-wrap gap-2" {
+                        @for option in options {
+                            @let checked = match current {
+                                Some(YamlValue::Sequence(values)) => values.contains(option),
+                                _ => false,
+                            };
+                            label class="inline-flex cursor-pointer items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 has-checked:border-indigo-500 has-checked:bg-indigo-50 has-checked:text-indigo-800" {
+                                input type="checkbox" name=(name.clone()) value=(serialize_yaml_value(option)) checked[checked] class="size-4 accent-indigo-600";
+                                (schema_value_label(option))
+                            }
+                        }
+                    }
+                }
+                SchemaFieldKind::String { input_type, min_length, max_length } => {
+                    input id=(format!("field-{}", field.key)) type=(input_type) name=(name) value=(field_text_value(current)) required[field.required] minlength=[*min_length] maxlength=[*max_length] autocomplete=(if *input_type == "email" { "email" } else { "off" }) class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
+                }
+                SchemaFieldKind::Integer { minimum, maximum } => {
+                    input id=(format!("field-{}", field.key)) type="number" step="1" name=(name) value=(field_text_value(current)) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
+                }
+                SchemaFieldKind::Number { minimum, maximum } => {
+                    input id=(format!("field-{}", field.key)) type="number" step="any" name=(name) value=(field_text_value(current)) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
+                }
+                SchemaFieldKind::Boolean => {
+                    select id=(format!("field-{}", field.key)) name=(name) required[field.required] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                        option value="" selected[current.is_none()] disabled[field.required] {
+                            @if field.required { "Choose true or false…" } @else { "Not set" }
+                        }
+                        option value="true" selected[current == Some(&YamlValue::Bool(true))] { "True" }
+                        option value="false" selected[current == Some(&YamlValue::Bool(false))] { "False" }
+                    }
+                }
+                SchemaFieldKind::Yaml => {
+                    textarea id=(format!("field-{}", field.key)) name=(name) rows="5" spellcheck="false" required[field.required] placeholder="{}" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (current.map(serialize_yaml_value).unwrap_or_default()) }
+                }
+            }
+        }
+    }
+}
+
+fn additional_attributes(attributes: &Mapping, schema: &JsonValue) -> Mapping {
+    let declared = schema
+        .get("properties")
+        .and_then(JsonValue::as_object)
+        .map(|properties| {
+            properties
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    attributes
+        .iter()
+        .filter(|(key, _)| match key {
+            YamlValue::String(key) => !declared.contains(key.as_str()),
+            _ => true,
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn schema_allows_additional_attributes(schema: &JsonValue) -> bool {
+    schema.get("additionalProperties") != Some(&JsonValue::Bool(false))
+}
+
 fn render_record_form(
     view: &ViewDefinition,
     record: Option<&Record>,
     audit_entries: &[AuditEntry],
+    schema: Option<&JsonValue>,
     csrf_token: &str,
     error: Option<&str>,
 ) -> Markup {
@@ -2085,9 +2418,19 @@ fn render_record_form(
             )
         })
         .unwrap_or_else(|| format!("/{}/records", encode_segment(&view.name)));
-    let front_matter = record
-        .map(|record| yaml_serde::to_string(&record.attributes).unwrap_or_default())
-        .unwrap_or_else(|| "{}\n".to_owned());
+    let empty_attributes = Mapping::new();
+    let attributes = record
+        .map(|record| &record.attributes)
+        .unwrap_or(&empty_attributes);
+    let schema_fields = schema.and_then(|schema| schema_form_fields(schema, attributes));
+    let structured = schema_fields.is_some();
+    let schema_fields = schema_fields.unwrap_or_default();
+    let front_matter = yaml_serde::to_string(attributes).unwrap_or_else(|_| "{}\n".to_owned());
+    let additional = schema
+        .map(|schema| additional_attributes(attributes, schema))
+        .unwrap_or_default();
+    let additional_yaml = yaml_serde::to_string(&additional).unwrap_or_else(|_| "{}\n".to_owned());
+    let allows_additional = schema.is_some_and(schema_allows_additional_attributes);
     let markdown = record.map(|record| record.body.as_str()).unwrap_or("");
     let back = format!("/{}", encode_segment(&view.name));
     page_layout(
@@ -2100,7 +2443,7 @@ fn render_record_form(
                 span { "/" }
                 span class="text-slate-900" { (&title) }
             }
-            div class="mx-auto max-w-4xl" {
+            div class="mx-auto max-w-5xl" {
                 div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
                     h1 class="text-3xl font-bold tracking-tight text-slate-950" { (&title) }
                     @if editing {
@@ -2109,29 +2452,75 @@ fn render_record_form(
                         }
                     }
                 }
-                p class="mt-2 text-sm text-slate-600" { "YAML values retain their types. Saving validates the complete front matter against the collection schema." }
+                p class="mt-2 text-sm text-slate-600" {
+                    @if structured {
+                        "Edit typed fields generated from the collection schema. Saving validates the complete record and writes normal Markdown with YAML front matter."
+                    } @else {
+                        "This collection has no field schema yet, so front matter remains available as typed YAML."
+                    }
+                }
                 @if let Some(error) = error {
                     div role="alert" class="mt-5 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" { (error) }
                 }
-                form method="post" action=(action) class="mt-6 space-y-5 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm" {
+                form method="post" action=(action) class="mt-6 space-y-6" {
                     input type="hidden" name="_csrf" value=(csrf_token);
-                    @if !editing {
-                        label class="block" {
-                            span class="mb-1.5 block text-sm font-semibold text-slate-800" { "Record ID" }
-                            input type="text" name="id" required pattern="[^/\\]+" placeholder="acme-renewal" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+                    @if structured {
+                        input type="hidden" name="_form_mode" value="structured";
+                    }
+                    section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm" {
+                        div class="mb-5 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" {
+                            div {
+                                h2 class="text-lg font-bold text-slate-950" { "Record details" }
+                                p class="mt-1 text-sm text-slate-500" {
+                                    @if structured { "Fields and controls follow this collection’s JSON Schema." } @else { "Front matter accepts any YAML mapping." }
+                                }
+                            }
+                            @if structured {
+                                span class="rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700" { "Schema-powered" }
+                            }
+                        }
+                        @if !editing {
+                            div class="mb-4 rounded-xl border border-indigo-100 bg-indigo-50/60 p-4" {
+                                label for="record-id" class="mb-1.5 block text-sm font-semibold text-slate-900" { "Record ID " span class="text-red-500" aria-hidden="true" { "*" } }
+                                input id="record-id" type="text" name="id" required pattern="[^/\\]+" placeholder="acme-renewal" aria-describedby="record-id-help" class="w-full rounded-lg border border-indigo-200 bg-white px-3 py-2.5 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+                                span id="record-id-help" class="mt-1.5 block text-xs text-slate-500" { "Stable URL and filename identifier. It cannot be changed later." }
+                            }
+                        }
+                        @if structured {
+                            div class="grid gap-4 sm:grid-cols-2" {
+                                @for field in &schema_fields {
+                                    (render_schema_field(field))
+                                }
+                            }
+                            @if allows_additional {
+                                details class="mt-5 rounded-xl border border-dashed border-slate-300 bg-slate-50" open[!additional.is_empty()] {
+                                    summary class="cursor-pointer px-4 py-3 text-sm font-semibold text-slate-700 hover:text-indigo-700" { "+ Additional attributes" }
+                                    div class="border-t border-slate-200 p-4" {
+                                        p class="mb-2 text-xs leading-5 text-slate-500" { "Optional front matter not declared in the schema. Declared fields above cannot be overridden here." }
+                                        textarea name="_additional_attributes" rows="5" spellcheck="false" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (additional_yaml) }
+                                    }
+                                }
+                            }
+                        } @else {
+                            label class="block" {
+                                span class="mb-1.5 block text-sm font-semibold text-slate-800" { "Front matter" }
+                                textarea name="front_matter" rows="14" spellcheck="false" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (front_matter) }
+                            }
                         }
                     }
-                    label class="block" {
-                        span class="mb-1.5 block text-sm font-semibold text-slate-800" { "Front matter" }
-                        textarea name="front_matter" rows="14" spellcheck="false" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (front_matter) }
+                    section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm" {
+                        div class="mb-3 flex items-center justify-between gap-3" {
+                            div {
+                                h2 class="text-lg font-bold text-slate-950" { "Notes" }
+                                p class="mt-1 text-sm text-slate-500" { "Long-form context stored as the Markdown body." }
+                            }
+                            span class="rounded-md bg-slate-100 px-2 py-1 font-mono text-xs font-semibold text-slate-500" { "Markdown" }
+                        }
+                        textarea name="markdown" aria-label="Markdown notes" rows="12" class="w-full rounded-lg border border-slate-300 px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (markdown) }
                     }
-                    label class="block" {
-                        span class="mb-1.5 block text-sm font-semibold text-slate-800" { "Markdown" }
-                        textarea name="markdown" rows="12" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (markdown) }
-                    }
-                    div class="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-5" {
+                    div class="sticky bottom-4 z-10 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white/95 p-4 shadow-lg backdrop-blur" {
                         a href=(back.clone()) class="rounded-lg px-3 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-100" { "Cancel" }
-                        button type="submit" class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700" {
+                        button type="submit" class="rounded-xl bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700" {
                             @if editing { "Save changes" } @else { "Create record" }
                         }
                     }
@@ -2328,6 +2717,265 @@ fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset:
     serializer.append_pair("limit", &limit.to_string());
     serializer.append_pair("offset", &offset.to_string());
     format!("/{}?{}", encode_segment(&view.name), serializer.finish())
+}
+
+fn parse_document_form(raw: &[u8]) -> ApiResult<HtmlDocumentForm> {
+    let mut csrf = None;
+    let mut id = None;
+    let mut front_matter = None;
+    let mut markdown = None;
+    let mut mode = None;
+    let mut additional_attributes = None;
+    let mut fields: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for (name, value) in form_urlencoded::parse(raw) {
+        let name = name.into_owned();
+        let value = value.into_owned();
+        match name.as_str() {
+            "_csrf" => set_form_value(&mut csrf, value, "_csrf")?,
+            "id" => set_form_value(&mut id, value, "id")?,
+            "front_matter" => set_form_value(&mut front_matter, value, "front_matter")?,
+            "markdown" => set_form_value(&mut markdown, value, "markdown")?,
+            "_form_mode" => set_form_value(&mut mode, value, "_form_mode")?,
+            "_additional_attributes" => {
+                set_form_value(&mut additional_attributes, value, "_additional_attributes")?
+            }
+            _ => {
+                let Some(field) = name.strip_prefix("attribute.") else {
+                    return Err(ApiError::bad_request(
+                        "invalid_form",
+                        format!("unknown form field '{name}'"),
+                    ));
+                };
+                if field.is_empty() {
+                    return Err(ApiError::bad_request(
+                        "invalid_form",
+                        "attribute field name cannot be empty",
+                    ));
+                }
+                fields.entry(field.to_owned()).or_default().push(value);
+            }
+        }
+    }
+
+    let structured = match mode.as_deref() {
+        Some("structured") => true,
+        Some(other) => {
+            return Err(ApiError::bad_request(
+                "invalid_form",
+                format!("unsupported form mode '{other}'"),
+            ))
+        }
+        None => false,
+    };
+    if structured && front_matter.is_some() {
+        return Err(ApiError::bad_request(
+            "invalid_form",
+            "structured fields and raw front matter cannot be submitted together",
+        ));
+    }
+    if !structured && front_matter.is_none() {
+        return Err(ApiError::bad_request(
+            "invalid_form",
+            "front_matter is required when structured fields are not used",
+        ));
+    }
+
+    Ok(HtmlDocumentForm {
+        csrf: csrf.ok_or_else(|| ApiError::bad_request("invalid_form", "_csrf is required"))?,
+        id,
+        front_matter,
+        markdown: markdown
+            .ok_or_else(|| ApiError::bad_request("invalid_form", "markdown is required"))?,
+        structured,
+        additional_attributes: additional_attributes.unwrap_or_else(|| "{}".to_owned()),
+        fields,
+    })
+}
+
+fn set_form_value(destination: &mut Option<String>, value: String, name: &str) -> ApiResult<()> {
+    if destination.replace(value).is_some() {
+        Err(ApiError::bad_request(
+            "invalid_form",
+            format!("form field '{name}' cannot be repeated"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn document_form_attributes(
+    form: &HtmlDocumentForm,
+    schema: Option<&JsonValue>,
+) -> ApiResult<Mapping> {
+    if !form.structured {
+        return parse_front_matter(
+            form.front_matter
+                .as_deref()
+                .expect("raw forms have front matter"),
+        );
+    }
+    let schema = schema.ok_or_else(|| {
+        ApiError::bad_request(
+            "invalid_form",
+            "structured fields require a collection schema",
+        )
+    })?;
+    parse_structured_attributes(form, schema)
+}
+
+fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> ApiResult<Mapping> {
+    let properties = schema
+        .get("properties")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid_form",
+                "structured fields require schema properties",
+            )
+        })?;
+    for field in form.fields.keys() {
+        if !properties.contains_key(field) {
+            return Err(ApiError::bad_request(
+                "invalid_form",
+                format!("attribute '{field}' is not declared by the collection schema"),
+            ));
+        }
+    }
+
+    let mut attributes = parse_front_matter(&form.additional_attributes)?;
+    for key in attributes.keys() {
+        if let YamlValue::String(key) = key {
+            if properties.contains_key(key) {
+                return Err(ApiError::bad_request(
+                    "invalid_form",
+                    format!("declared attribute '{key}' cannot be overridden in additional YAML"),
+                ));
+            }
+        }
+    }
+    if !schema_allows_additional_attributes(schema) && !attributes.is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_form",
+            "this collection schema does not allow additional attributes",
+        ));
+    }
+
+    let required = schema
+        .get("required")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .collect::<BTreeSet<_>>();
+    for (key, definition) in properties {
+        let values = form.fields.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        if let Some(value) =
+            parse_schema_form_value(key, definition, required.contains(key.as_str()), values)?
+        {
+            attributes.insert(YamlValue::String(key.clone()), value);
+        }
+    }
+    Ok(attributes)
+}
+
+fn parse_schema_form_value(
+    key: &str,
+    definition: &JsonValue,
+    required: bool,
+    values: &[String],
+) -> ApiResult<Option<YamlValue>> {
+    let kind = schema_field_kind(definition);
+    match kind {
+        SchemaFieldKind::MultiSelect(options) => {
+            let mut selected = Vec::new();
+            for raw in values.iter().filter(|value| !value.is_empty()) {
+                let value = parse_form_yaml_value(key, raw)?;
+                if !options.contains(&value) {
+                    return Err(ApiError::bad_request(
+                        "invalid_form",
+                        format!("attribute '{key}' contains a value outside its allowed options"),
+                    ));
+                }
+                if !selected.contains(&value) {
+                    selected.push(value);
+                }
+            }
+            if selected.is_empty() && !required {
+                Ok(None)
+            } else {
+                Ok(Some(YamlValue::Sequence(selected)))
+            }
+        }
+        SchemaFieldKind::Select(options) => {
+            let Some(raw) = single_schema_form_value(key, values)? else {
+                return Ok(None);
+            };
+            if raw.is_empty() {
+                return Ok(None);
+            }
+            let value = parse_form_yaml_value(key, raw)?;
+            if !options.contains(&value) {
+                return Err(ApiError::bad_request(
+                    "invalid_form",
+                    format!("attribute '{key}' is outside its allowed options"),
+                ));
+            }
+            Ok(Some(value))
+        }
+        SchemaFieldKind::String { .. } => {
+            let Some(raw) = single_schema_form_value(key, values)? else {
+                return Ok(None);
+            };
+            if raw.is_empty() && !required {
+                Ok(None)
+            } else {
+                Ok(Some(YamlValue::String(raw.to_owned())))
+            }
+        }
+        SchemaFieldKind::Integer { .. }
+        | SchemaFieldKind::Number { .. }
+        | SchemaFieldKind::Boolean => {
+            let Some(raw) = single_schema_form_value(key, values)? else {
+                return Ok(None);
+            };
+            if raw.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(parse_form_yaml_value(key, raw)?))
+            }
+        }
+        SchemaFieldKind::Yaml => {
+            let Some(raw) = single_schema_form_value(key, values)? else {
+                return Ok(None);
+            };
+            if raw.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(parse_form_yaml_value(key, raw)?))
+            }
+        }
+    }
+}
+
+fn single_schema_form_value<'a>(key: &str, values: &'a [String]) -> ApiResult<Option<&'a str>> {
+    match values {
+        [] => Ok(None),
+        [value] => Ok(Some(value)),
+        _ => Err(ApiError::bad_request(
+            "invalid_form",
+            format!("attribute '{key}' cannot be repeated"),
+        )),
+    }
+}
+
+fn parse_form_yaml_value(key: &str, raw: &str) -> ApiResult<YamlValue> {
+    yaml_serde::from_str(raw).map_err(|error| {
+        ApiError::bad_request(
+            "invalid_form",
+            format!("attribute '{key}' is not valid typed YAML: {error}"),
+        )
+    })
 }
 
 fn notice_url(view: &str, notice: &str) -> String {

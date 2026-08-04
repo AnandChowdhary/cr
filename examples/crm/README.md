@@ -18,7 +18,7 @@ Then open:
 - `http://127.0.0.1:3000/audit` for the complete audit timeline;
 - `http://127.0.0.1:3000/openapi.json` for the generated API contract.
 
-The HTML forms are live: creating, editing, deleting, or moving a Kanban card changes the Markdown files in this directory and appends to its audit journal. Drag a card between stage lanes, or use its accessible move selector and button.
+The HTML forms are live: creating, editing, deleting, or moving a Kanban card changes the Markdown files in this directory and appends to its audit journal. Record pages derive typed inputs, select controls, descriptions, and validation hints from the CRM schemas. Drag a card between stage lanes, or use its accessible move selector and button.
 
 Useful CLI queries:
 

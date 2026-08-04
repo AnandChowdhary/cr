@@ -701,7 +701,35 @@ Open [http://127.0.0.1:3000/](http://127.0.0.1:3000/) to see every collection. E
 http://127.0.0.1:3000/deals
 ```
 
-The table infers columns from the collection schema and current front matter. It includes case-insensitive document search, one typed exact-value filter, bounded pagination, create and edit forms, and audited deletion. Click a record ID, field value, or its **View** action to open the record editor and its newest audit events. Saved views can switch the same query to a Kanban layout. Form front matter is YAML, so numbers, booleans, arrays, nested maps, strings, and `null` retain their types. Every mutation is schema-validated and recorded with `source: api`.
+The table infers columns from the collection schema and current front matter. It includes case-insensitive document search, one typed exact-value filter, bounded pagination, create and edit forms, and audited deletion. Click a record ID, field value, or its **View** action to open the record editor and its newest audit events. Saved views can switch the same query to a Kanban layout. Every mutation is schema-validated and recorded with `source: api`.
+
+### Use schema-driven record forms
+
+When a collection has a JSON Schema, create and edit pages generate one control per declared top-level attribute:
+
+- string formats become text, email, URL, date, time, or date-time inputs;
+- integers and numbers become constrained numeric inputs;
+- enums become single-select dropdowns;
+- arrays whose items have an enum become multi-select checkbox chips;
+- booleans become true/false selectors;
+- objects and other complex values retain a focused typed-YAML editor.
+
+Required fields, titles, descriptions, length limits, and numeric bounds come from the schema. Schema-permitted undeclared front matter remains available under **Additional attributes** and cannot override a declared field. Collections without schema properties retain the complete raw-YAML editor. Both modes preserve typed YAML values and use the same atomic, audited database mutations.
+
+Use the optional `x-cr-ui.order` schema extension to control field order without changing validation semantics:
+
+```json
+{
+  "type": "object",
+  "x-cr-ui": { "order": ["name", "stage", "owner", "value"] },
+  "properties": {
+    "name": { "type": "string" },
+    "stage": { "enum": ["new", "qualified", "won"] }
+  }
+}
+```
+
+Fields omitted from the order remain visible after configured fields, with required fields first.
 
 ### Browse audit history
 
@@ -815,7 +843,7 @@ page_size: 200
 
 You can edit these files directly. The server reloads them on each request. View filters use the same typed `KEY=YAML` equality semantics as `cr list`; comparison and Boolean expressions remain roadmap work.
 
-The UI is plain server-rendered HTML—there is no React, Next.js, client-side application state, or JavaScript data API. Kanban adds a small vanilla-JavaScript drag-and-drop enhancement over native HTML move forms, so the board remains usable without dragging. Templates escape database and audit values, mutating forms carry a per-server CSRF token, and successful POSTs return `303 See Other` before the browser reloads the view. Styling currently uses Tailwind's Play CDN as requested; the official Tailwind documentation labels that browser CDN development-only, so compiling and bundling CSS is tracked in `TODO.md`.
+The UI is plain server-rendered HTML—there is no React, Next.js, client-side application state, or JavaScript data API. Kanban adds a small vanilla-JavaScript drag-and-drop enhancement over native HTML move forms, so the board remains usable without dragging. Templates escape database, schema, and audit values; mutating forms carry a per-server CSRF token; and successful POSTs return `303 See Other` before the browser reloads the view. Styling currently uses Tailwind's Play CDN as requested; the official Tailwind documentation labels that browser CDN development-only, so compiling and bundling CSS is tracked in `TODO.md`.
 
 ### Authentication and identity
 

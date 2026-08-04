@@ -243,5 +243,6 @@ Priorities:
 - [x] Automatic collection tables and saved server-rendered HTML views with CSRF-protected audited forms.
 - [x] Per-record and global server-rendered audit history with filtering, pagination, attribution, and expandable field diffs.
 - [x] Saved Kanban views with schema-ordered lanes, drag-and-drop plus accessible move forms, schema validation, CSRF protection, and normal audit events.
+- [x] Schema-driven create and edit forms with typed scalar controls, enum and multi-enum selection, complex-value YAML fallback, additional attributes, and escaped schema metadata.
 - [x] Versioned subprocess sync adapters with JSONL upsert/delete/checkpoint messages, clean-state verification, limits, overlap locks, checkpointing, and `source: sync` audit provenance.
 - [x] Unit, CLI, concurrency, direct-edit, in-process HTTP, and real TCP server tests.

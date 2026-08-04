@@ -1,18 +1,28 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
+  "x-cr-ui": {
+    "order": ["name", "stage", "status", "value", "currency", "probability", "expected_close", "owner", "strategic", "tags", "relations"]
+  },
   "required": ["name", "stage", "status", "value", "currency", "owner"],
   "properties": {
-    "name": { "type": "string", "minLength": 1 },
+    "name": { "type": "string", "minLength": 1, "description": "Short opportunity name shown on lists and cards." },
     "stage": {
-      "enum": ["qualification", "discovery", "proposal", "negotiation", "won", "lost"]
+      "enum": ["qualification", "discovery", "proposal", "negotiation", "won", "lost"],
+      "description": "Current pipeline stage; changing it also moves the Kanban card."
     },
-    "status": { "enum": ["open", "closed"] },
-    "value": { "type": "integer", "minimum": 0 },
+    "status": { "enum": ["open", "closed"], "description": "High-level lifecycle state." },
+    "value": { "type": "integer", "minimum": 0, "description": "Expected contract value in the selected currency." },
     "currency": { "enum": ["USD", "EUR", "GBP"] },
     "probability": { "type": "integer", "minimum": 0, "maximum": 100 },
-    "expected_close": { "type": "string" },
+    "expected_close": { "type": "string", "format": "date" },
     "owner": { "type": "string", "minLength": 1 },
+    "strategic": { "type": "boolean", "description": "Mark high-priority opportunities for leadership attention." },
+    "tags": {
+      "type": "array",
+      "items": { "enum": ["enterprise", "expansion", "renewal", "pilot"] },
+      "description": "Reusable categories for reporting and saved views."
+    },
     "relations": { "type": "object" }
   },
   "additionalProperties": true

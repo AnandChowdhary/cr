@@ -1,13 +1,16 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
+  "x-cr-ui": {
+    "order": ["name", "email", "title", "status", "last_contacted", "relations"]
+  },
   "required": ["name", "email", "title", "status"],
   "properties": {
-    "name": { "type": "string", "minLength": 1 },
-    "email": { "type": "string", "minLength": 3 },
-    "title": { "type": "string", "minLength": 1 },
-    "status": { "enum": ["active", "inactive"] },
-    "last_contacted": { "type": "string" },
+    "name": { "type": "string", "minLength": 1, "description": "Full name shown throughout the CRM." },
+    "email": { "type": "string", "format": "email", "minLength": 3, "description": "Primary work email address." },
+    "title": { "type": "string", "minLength": 1, "description": "Current role or job title." },
+    "status": { "enum": ["active", "inactive"], "description": "Whether this contact is actively engaged." },
+    "last_contacted": { "type": "string", "format": "date", "description": "Most recent completed interaction." },
     "relations": { "type": "object" }
   },
   "additionalProperties": true
