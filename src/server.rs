@@ -462,6 +462,8 @@ struct HtmlSaveViewForm {
     sort_direction: ViewSortDirection,
     #[serde(default)]
     column: Vec<String>,
+    layout: Option<ViewLayout>,
+    group_by: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -987,6 +989,25 @@ async fn save_view_form(
             } else {
                 form.column.clone()
             };
+            let layout = form.layout.unwrap_or(source.layout);
+            let submitted_group_by = form
+                .group_by
+                .as_deref()
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .map(str::to_owned);
+            let group_by = match layout {
+                ViewLayout::Table => None,
+                ViewLayout::Kanban => Some(
+                    submitted_group_by
+                        .or_else(|| {
+                            (source.layout == ViewLayout::Kanban)
+                                .then(|| source.group_by.clone())
+                                .flatten()
+                        })
+                        .context("Kanban layout must provide group_by")?,
+                ),
+            };
             database.create_view_with_options(
                 &name,
                 title.as_deref(),
@@ -996,8 +1017,8 @@ async fn save_view_form(
                 filter_groups,
                 columns,
                 source.page_size,
-                source.layout,
-                source.group_by.clone(),
+                layout,
+                group_by,
                 sort_by,
                 sort_direction,
             )
@@ -2500,7 +2521,13 @@ fn render_view_records(
                     }
                 }
                 div class="flex flex-wrap items-center gap-2" {
-                    (render_save_view_control(view, query, columns, csrf_token))
+                    (render_save_view_control(
+                        view,
+                        query,
+                        columns,
+                        available_columns,
+                        csrf_token,
+                    ))
                     a href=(new_url) class="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700" {
                         "+ New record"
                     }
@@ -2661,6 +2688,7 @@ fn render_save_view_control(
     view: &ViewDefinition,
     query: &ViewQuery,
     columns: &[String],
+    available_columns: &[String],
     csrf_token: &str,
 ) -> Markup {
     let action = format!("/{}/save-view", encode_segment(&view.name));
@@ -2697,12 +2725,48 @@ fn render_save_view_control(
                         span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Title (optional)" }
                         input name="title" placeholder=(format!("{} copy", view.title)) autocomplete="off" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
                     }
+                    div class="grid gap-3 sm:grid-cols-2" {
+                        label class="block" {
+                            span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Layout" }
+                            select name="layout" aria-label="Layout" data-view-layout="true" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                                option value="table" selected[view.layout == ViewLayout::Table] { "Table" }
+                                option value="kanban" selected[view.layout == ViewLayout::Kanban] { "Kanban" }
+                            }
+                        }
+                        label class="block" {
+                            span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Group Kanban by" }
+                            select name="group_by" aria-label="Group Kanban by" data-view-group-by="true" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400" {
+                                option value="" selected[view.group_by.is_none()] { "Choose a field…" }
+                                @for column in available_columns {
+                                    option value=(column) selected[view.group_by.as_deref() == Some(column.as_str())] { (humanize_field_name(column)) }
+                                }
+                            }
+                        }
+                    }
+                    p class="text-xs leading-5 text-slate-500" { "Kanban uses the chosen front matter field as lanes; moving a card updates that field through the audited database path." }
                     button type="submit" class="w-full rounded-lg bg-indigo-600 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-700" { "Save view" }
                 }
             }
         }
+        script { (PreEscaped(SAVE_VIEW_LAYOUT_SCRIPT)) }
     }
 }
+
+const SAVE_VIEW_LAYOUT_SCRIPT: &str = r#"(() => {
+  document.querySelectorAll('[data-view-layout]').forEach((layout) => {
+    const form = layout.closest('form');
+    const groupBy = form && form.querySelector('[data-view-group-by]');
+    if (!groupBy) return;
+    const update = () => {
+      const kanban = layout.value === 'kanban';
+      groupBy.disabled = !kanban;
+      groupBy.required = kanban;
+      if (!kanban) groupBy.value = '';
+    };
+    layout.addEventListener('change', update);
+    update();
+  });
+})();"#;
 
 fn render_kanban_board(
     view: &ViewDefinition,

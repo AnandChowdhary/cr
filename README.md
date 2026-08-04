@@ -864,6 +864,8 @@ filter_groups:
   - value>=50000
 ```
 
+The save form can keep a table layout or create a Kanban layout directly in the browser. Choose **Kanban**, then choose the front matter field whose values should become lanes. Schema and current-record fields are offered automatically. The resulting route is a normal persisted Kanban view, so its drag-and-drop and move controls update that chosen property through the validated, audited mutation path.
+
 Search text is intentionally not persisted yet; it remains shareable in the current URL. Saving is CSRF-protected, rejects duplicate or invalid names without replacing files, and writes the normal Git-friendly `.cr/views/<name>.yaml` configuration file. View configuration history remains separate from the record audit journal.
 
 A Kanban definition adds two fields:

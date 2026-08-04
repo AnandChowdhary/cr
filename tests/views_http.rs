@@ -166,6 +166,9 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert_eq!(automatic.headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
     assert!(automatic.text().contains("Save as view"));
     assert!(automatic.text().contains("Save current view"));
+    assert!(automatic.text().contains("aria-label=\"Layout\""));
+    assert!(automatic.text().contains("aria-label=\"Group Kanban by\""));
+    assert!(automatic.text().contains("data-view-layout=\"true\""));
 
     let preset_source = request(
         &app,
@@ -216,6 +219,62 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert_eq!(preset.sort_by.as_deref(), Some("value"));
     assert_eq!(preset.sort_direction, cr::SortDirection::Desc);
     assert_eq!(preset.columns, ["name", "value"]);
+
+    let browser_pipeline = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(form(&[
+            ("_csrf", &preset_token),
+            ("name", "browser-pipeline"),
+            ("title", "Browser pipeline"),
+            ("filter_match", "all"),
+            ("sort_direction", "asc"),
+            ("column", "name"),
+            ("column", "status"),
+            ("column", "value"),
+            ("layout", "kanban"),
+            ("group_by", "status"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(browser_pipeline.status, StatusCode::SEE_OTHER);
+    let browser_pipeline_definition = database.view("browser-pipeline").unwrap();
+    assert_eq!(browser_pipeline_definition.layout, ViewLayout::Kanban);
+    assert_eq!(
+        browser_pipeline_definition.group_by.as_deref(),
+        Some("status")
+    );
+    assert_eq!(
+        browser_pipeline_definition.columns,
+        ["name", "status", "value"]
+    );
+    let browser_pipeline_page = request(&app, Method::GET, "/browser-pipeline", None, &[]).await;
+    assert_eq!(browser_pipeline_page.status, StatusCode::OK);
+    assert!(browser_pipeline_page.text().contains("Kanban grouped by"));
+    assert!(browser_pipeline_page
+        .text()
+        .contains("data-kanban-board=\"true\""));
+
+    let missing_group = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(form(&[
+            ("_csrf", &preset_token),
+            ("name", "invalid-browser-pipeline"),
+            ("filter_match", "all"),
+            ("sort_direction", "asc"),
+            ("layout", "kanban"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(missing_group.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(missing_group
+        .text()
+        .contains("Kanban layout must provide group_by"));
 
     let preset_page = request(&app, Method::GET, "/sales-focus", None, &[]).await;
     assert_eq!(preset_page.status, StatusCode::OK);
@@ -636,6 +695,24 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
         board.text().find("/pipeline/records/gamma").unwrap()
             < board.text().find("/pipeline/records/beta").unwrap()
     );
+
+    let inherited_board = request(
+        &app,
+        Method::POST,
+        "/pipeline/save-view",
+        Some(form(&[
+            ("_csrf", csrf(board.text())),
+            ("name", "pipeline-copy"),
+            ("filter_match", "all"),
+            ("sort_direction", "asc"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(inherited_board.status, StatusCode::SEE_OTHER);
+    let inherited_definition = database.view("pipeline-copy").unwrap();
+    assert_eq!(inherited_definition.layout, ViewLayout::Kanban);
+    assert_eq!(inherited_definition.group_by.as_deref(), Some("stage"));
 
     let projected_board = request(
         &app,
