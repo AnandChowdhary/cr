@@ -128,6 +128,8 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(home.text().contains("href=\"/audit\""));
     assert!(home.text().contains("href=\"/deals\""));
     assert!(home.text().contains("href=\"/open-deals\""));
+    assert!(home.text().contains("href=\"#main-content\""));
+    assert!(home.text().contains("data-design-system=\"cr-clean\""));
 
     let automatic = request(&app, Method::GET, "/deals", None, &[]).await;
     assert_eq!(automatic.status, StatusCode::OK);
@@ -152,6 +154,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     let new_record_position = automatic.text().find("href=\"/deals/new\"").unwrap();
     assert!(search_position < filter_position && filter_position < new_record_position);
     assert!(automatic.text().contains("+ Add condition"));
+    assert!(automatic.text().contains("data-close-filter=\"true\""));
     assert!(automatic.text().contains("All conditions match"));
     assert!(automatic.text().contains("name=\"filter_match\""));
     assert!(automatic.text().contains("Any condition matches"));

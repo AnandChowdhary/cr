@@ -1931,21 +1931,21 @@ fn render_views_home(views: &[ViewDefinition]) -> Markup {
     page_layout(
         "Database views",
         html! {
-            div class="mb-10 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between" {
+            div class="cr-page-heading mb-8 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between" {
                 div {
-                    p class="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600" { "cr database" }
-                    h1 class="mt-2 text-3xl font-bold tracking-tight text-slate-950" { "Database views" }
-                    p class="mt-2 max-w-2xl text-sm text-slate-600" {
+                    p class="cr-eyebrow" { "Markdown database" }
+                    h1 class="cr-title mt-2" { "Database views" }
+                    p class="cr-lede mt-2 max-w-2xl" {
                         "Browse every collection or open a saved, filtered view. All changes use the same validated and audited database operations as the CLI and REST API."
                     }
                 }
-                div class="flex items-center gap-4" {
-                    a href="/audit" class="text-sm font-semibold text-indigo-700 hover:text-indigo-900" { "Audit log" }
-                    a href="/openapi.json" class="text-sm font-semibold text-indigo-700 hover:text-indigo-900" { "OpenAPI ↗" }
+                div class="flex items-center gap-2" {
+                    a href="/audit" class="cr-button" { "Audit log" }
+                    a href="/openapi.json" class="cr-button" { "OpenAPI" span aria-hidden="true" { " ↗" } }
                 }
             }
             @if views.is_empty() {
-                div class="rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center shadow-sm" {
+                div class="cr-empty-state" {
                     h2 class="text-lg font-semibold text-slate-900" { "No collections yet" }
                     p class="mt-2 text-sm text-slate-600" {
                         "Create a record with the CLI, or add a saved view with "
@@ -1954,39 +1954,43 @@ fn render_views_home(views: &[ViewDefinition]) -> Markup {
                     }
                 }
             } @else {
-                div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3" {
+                section class="cr-view-index" aria-label="Available database views" {
+                    div class="cr-view-index-header" aria-hidden="true" {
+                        span { "View" }
+                        span { "Type" }
+                        span { "Open" }
+                    }
                     @for view in views {
-                        a href=(format!("/{}", encode_segment(&view.name))) class="group rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition hover:-translate-y-0.5 hover:border-indigo-300 hover:shadow-md" {
-                            div class="flex items-start justify-between gap-4" {
-                                div {
-                                    h2 class="text-lg font-semibold capitalize text-slate-950 group-hover:text-indigo-700" { (&view.title) }
-                                    p class="mt-1 font-mono text-xs text-slate-500" { (&view.collection) }
-                                }
-                                span class="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600" {
+                        a href=(format!("/{}", encode_segment(&view.name))) class="cr-view-row group" {
+                            div class="min-w-0" {
+                                h2 class="truncate text-[0.95rem] font-semibold text-slate-950" { (&view.title) }
+                                p class="cr-path mt-1 truncate" { "records/" (&view.collection) }
+                            }
+                            div class="flex min-w-0 flex-wrap items-center gap-2" {
+                                span class="cr-pill" {
                                     @if view.saved { "saved" } @else { "automatic" }
                                 }
                                 @if view.layout == ViewLayout::Kanban {
-                                    span class="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700" { "kanban" }
+                                    span class="cr-pill cr-pill-accent" { "kanban" }
                                 }
-                            }
-                            @if view.filters.is_empty() && view.where_expr.is_empty() && view.filter_groups.is_empty() {
-                                p class="mt-5 text-sm text-slate-500" { "All records" }
-                            } @else {
-                                div class="mt-5 flex flex-wrap gap-2" {
+                                @if view.filters.is_empty() && view.where_expr.is_empty() && view.filter_groups.is_empty() {
+                                    span class="text-xs text-slate-500" { "All records" }
+                                } @else {
                                     @for filter in &view.filters {
-                                        span class="rounded-lg bg-indigo-50 px-2 py-1 font-mono text-xs text-indigo-700" { (filter) }
+                                        code class="cr-filter-tag" { (filter) }
                                     }
                                     @for expression in &view.where_expr {
-                                        span class="rounded-lg bg-violet-50 px-2 py-1 font-mono text-xs text-violet-700" { (expression) }
+                                        code class="cr-filter-tag" { (expression) }
                                     }
                                     @for group in &view.filter_groups {
-                                        span class="rounded-lg bg-fuchsia-50 px-2 py-1 font-mono text-xs text-fuchsia-700" {
+                                        code class="cr-filter-tag" {
                                             (match group.match_mode { ViewPredicateMatch::All => "All: ", ViewPredicateMatch::Any => "Any: " })
                                             (group.expressions.join(" · "))
                                         }
                                     }
                                 }
                             }
+                            span class="cr-view-arrow" aria-hidden="true" { "→" }
                         }
                     }
                 }
@@ -2006,44 +2010,44 @@ fn render_audit_view(page: &Page<AuditEntry>, query: &AuditViewQuery) -> Markup 
     page_layout(
         "Audit log",
         html! {
-            nav class="mb-6 flex items-center gap-2 text-sm text-slate-500" {
-                a href="/" class="font-medium hover:text-indigo-700" { "Views" }
-                span { "/" }
+            nav aria-label="Breadcrumb" class="mb-6 flex items-center gap-2 text-sm text-slate-500" {
+                a href="/" class="font-medium hover:text-blue-700" { "Views" }
+                span aria-hidden="true" { "/" }
                 span class="text-slate-900" { "Audit log" }
             }
-            div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between" {
+            div class="cr-page-heading mb-6 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between" {
                 div {
-                    p class="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-600" { "Tamper-evident journal" }
-                    h1 class="mt-2 text-3xl font-bold tracking-tight text-slate-950" { "Global audit log" }
-                    p class="mt-2 max-w-2xl text-sm text-slate-600" {
+                    p class="cr-eyebrow" { "Tamper-evident journal" }
+                    h1 class="cr-title mt-2" { "Global audit log" }
+                    p class="cr-lede mt-2 max-w-2xl" {
                         "Every accepted record mutation, newest first. Expand an event to inspect its field-level changes."
                     }
                 }
-                a href="/api/v1/audit/log" class="text-sm font-semibold text-indigo-700 hover:text-indigo-900" { "JSON API ↗" }
+                a href="/api/v1/audit/log" class="cr-button" { "JSON API" span aria-hidden="true" { " ↗" } }
             }
-            form method="get" action=(reset_url) class="mb-6 grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:grid-cols-[1fr_1fr_auto]" {
+            form method="get" action=(reset_url) class="cr-surface mb-5 grid gap-3 p-4 sm:grid-cols-[1fr_1fr_auto]" {
                 label class="block" {
-                    span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Collection" }
-                    input type="text" name="collection" value=(query.collection.as_deref().unwrap_or("")) placeholder="deals" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+                    span class="mb-1 block text-xs font-semibold text-slate-600" { "Collection" }
+                    input type="text" name="collection" value=(query.collection.as_deref().unwrap_or("")) placeholder="deals" autocomplete="off" spellcheck="false" class="w-full border px-3 py-2 font-mono text-sm outline-none";
                 }
                 label class="block" {
-                    span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Record ID" }
-                    input type="text" name="id" value=(query.id.as_deref().unwrap_or("")) placeholder="acme-renewal" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+                    span class="mb-1 block text-xs font-semibold text-slate-600" { "Record ID" }
+                    input type="text" name="id" value=(query.id.as_deref().unwrap_or("")) placeholder="acme-renewal" autocomplete="off" spellcheck="false" class="w-full border px-3 py-2 font-mono text-sm outline-none";
                 }
                 div class="flex items-end gap-2" {
-                    button type="submit" class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Filter" }
-                    a href=(reset_url) class="rounded-lg px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100" { "Reset" }
+                    button type="submit" class="cr-button cr-button-primary" { "Filter events" }
+                    a href=(reset_url) class="cr-button" { "Reset" }
                 }
             }
             (render_audit_entries(&page.data))
-            div class="mt-4 flex flex-col gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm sm:flex-row sm:items-center sm:justify-between" {
+            div class="cr-surface mt-4 flex flex-col gap-3 px-4 py-3 text-sm sm:flex-row sm:items-center sm:justify-between" {
                 p class="text-slate-600" { "Showing events " (first) "–" (last) " newest first" }
                 div class="flex items-center gap-2" {
                     @if let Some(offset) = page.pagination.previous_offset {
-                        a href=(audit_page_url(query, page.pagination.limit, offset)) class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100" { "Previous" }
+                        a href=(audit_page_url(query, page.pagination.limit, offset)) class="cr-button" { "Previous" }
                     }
                     @if let Some(offset) = page.pagination.next_offset {
-                        a href=(audit_page_url(query, page.pagination.limit, offset)) class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100" { "Next" }
+                        a href=(audit_page_url(query, page.pagination.limit, offset)) class="cr-button" { "Next" }
                     }
                 }
             }
@@ -2053,22 +2057,22 @@ fn render_audit_view(page: &Page<AuditEntry>, query: &AuditViewQuery) -> Markup 
 
 fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
     html! {
-        div class="space-y-3" {
+        div class="cr-audit-list" {
             @if entries.is_empty() {
-                div class="rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center text-sm text-slate-500 shadow-sm" {
+                div class="p-10 text-center text-sm text-slate-500" {
                     "No audit events match this filter."
                 }
             } @else {
                 @for entry in entries {
-                    article id=(format!("event-{}", entry.payload.sequence)) class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" {
+                    article id=(format!("event-{}", entry.payload.sequence)) class="cr-audit-entry scroll-mt-20" {
                         div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between" {
                             div class="min-w-0" {
                                 div class="flex flex-wrap items-center gap-2" {
-                                    span class="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-bold uppercase tracking-wide text-indigo-700" { (entry.payload.action.to_string()) }
-                                    span class="font-mono text-xs text-slate-500" { "#" (entry.payload.sequence) }
-                                    span class="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600" { (audit_source_label(&entry.payload.source)) }
+                                    span class="cr-pill cr-pill-accent" { (entry.payload.action.to_string()) }
+                                    span class="cr-data" { "#" (entry.payload.sequence) }
+                                    span class="cr-pill" { (audit_source_label(&entry.payload.source)) }
                                 }
-                                a href=(audit_filter_url(&entry.payload.record.collection, &entry.payload.record.id)) class="mt-3 block truncate font-mono text-sm font-semibold text-slate-950 hover:text-indigo-700" {
+                                a href=(audit_filter_url(&entry.payload.record.collection, &entry.payload.record.id)) class="mt-3 block truncate font-mono text-sm font-semibold text-slate-950 hover:text-blue-700" {
                                     (entry.payload.record.reference())
                                 }
                                 p class="mt-1 text-xs text-slate-500" {
@@ -2079,15 +2083,15 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
                                     p class="mt-2 text-sm text-slate-600" { (message) }
                                 }
                             }
-                            span class="shrink-0 font-mono text-xs text-slate-400" { (short_hash(&entry.hash)) }
+                            span class="cr-data shrink-0" title=(&entry.hash) { (short_hash(&entry.hash)) }
                         }
                         details class="mt-4 border-t border-slate-100 pt-4" {
-                            summary class="cursor-pointer text-sm font-semibold text-indigo-700 hover:text-indigo-900" {
+                            summary class="cursor-pointer text-sm font-semibold text-blue-700 hover:text-blue-900" {
                                 (entry.payload.changes.len()) " field-level " @if entry.payload.changes.len() == 1 { "change" } @else { "changes" }
                             }
                             div class="mt-3 space-y-3" {
                                 @for change in &entry.payload.changes {
-                                    div class="rounded-xl bg-slate-50 p-3" {
+                                    div class="rounded-lg border border-slate-200 bg-slate-50 p-3" {
                                         div class="flex flex-wrap items-center gap-2" {
                                             span class="rounded bg-slate-200 px-2 py-0.5 text-xs font-bold uppercase text-slate-700" { (audit_change_operation(change)) }
                                             code class="text-xs text-slate-700" { (audit_change_path(change)) }
@@ -2339,10 +2343,23 @@ fn render_filter_row(
 const FILTER_BUILDER_SCRIPT: &str = r#"(() => {
   const builder = document.querySelector('[data-filter-builder]');
   if (!builder) return;
+  const disclosure = builder.querySelector('[data-filter-disclosure]');
   const list = builder.querySelector('[data-filter-list]');
   const template = builder.querySelector('template[data-filter-template]');
   const addButton = builder.querySelector('[data-add-filter]');
+  const closeButton = builder.querySelector('[data-close-filter]');
   const maximum = Number(builder.dataset.maxFilters || '20');
+
+  const closeDisclosure = () => {
+    if (!disclosure) return;
+    disclosure.open = false;
+    disclosure.querySelector('summary')?.focus();
+  };
+
+  closeButton?.addEventListener('click', closeDisclosure);
+  builder.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && disclosure?.open) closeDisclosure();
+  });
 
   const reindex = () => {
     const rows = [...list.querySelectorAll('[data-filter-row]')];
@@ -2488,35 +2505,35 @@ fn render_view_records(
     page_layout(
         &view.title,
         html! {
-            nav class="mb-6 flex items-center gap-2 text-sm text-slate-500" {
-                a href="/" class="font-medium hover:text-indigo-700" { "Views" }
-                span { "/" }
+            nav aria-label="Breadcrumb" class="mb-6 flex items-center gap-2 text-sm text-slate-500" {
+                a href="/" class="font-medium hover:text-blue-700" { "Views" }
+                span aria-hidden="true" { "/" }
                 span class="text-slate-900" { (&view.title) }
             }
-            div class="mb-6 flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between" {
+            div class="cr-page-heading mb-6 flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between" {
                 div {
                     div class="flex flex-wrap items-center gap-3" {
-                        h1 class="text-3xl font-bold capitalize tracking-tight text-slate-950" { (&view.title) }
-                        span class="rounded-full bg-slate-200 px-2.5 py-1 text-xs font-medium text-slate-700" {
+                        h1 class="cr-title capitalize" { (&view.title) }
+                        span class="cr-pill" {
                             @if view.saved { "saved view" } @else { "automatic view" }
                         }
                         @if view.layout == ViewLayout::Kanban {
-                            span class="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700" { "kanban" }
+                            span class="cr-pill cr-pill-accent" { "kanban" }
                         }
                     }
-                    p class="mt-2 text-sm text-slate-600" {
-                        "Collection " code class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs" { (&view.collection) }
+                    p class="cr-lede mt-2" {
+                        "Collection " code class="cr-filter-tag" { (&view.collection) }
                     }
                     @if !view.filters.is_empty() || !view.where_expr.is_empty() || !view.filter_groups.is_empty() {
                         div class="mt-3 flex flex-wrap gap-2" {
                             @for filter in &view.filters {
-                                span class="rounded-lg bg-indigo-50 px-2 py-1 font-mono text-xs text-indigo-700" { (filter) }
+                                code class="cr-filter-tag" { (filter) }
                             }
                             @for expression in &view.where_expr {
-                                span class="rounded-lg bg-violet-50 px-2 py-1 font-mono text-xs text-violet-700" { (expression) }
+                                code class="cr-filter-tag" { (expression) }
                             }
                             @for group in &view.filter_groups {
-                                span class="rounded-lg bg-fuchsia-50 px-2 py-1 font-mono text-xs text-fuchsia-700" {
+                                code class="cr-filter-tag" {
                                     (match group.match_mode { ViewPredicateMatch::All => "All: ", ViewPredicateMatch::Any => "Any: " })
                                     (group.expressions.join(" · "))
                                 }
@@ -2535,17 +2552,17 @@ fn render_view_records(
                     form method="get" action=(reset_url.clone()) data-filter-builder="true" data-max-filters=(MAX_VIEW_FILTERS) class="contents" {
                         div class="relative min-w-48 flex-1 sm:flex-none" {
                             label class="sr-only" { "Search records" }
-                            input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Search records" placeholder="Search records…" data-view-search="true" class="w-full rounded-xl border border-slate-300 bg-white py-2.5 pl-3 pr-10 text-sm outline-none ring-indigo-500 placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 sm:w-56";
-                            button type="submit" aria-label="Submit search" title="Search" class="absolute inset-y-1 right-1 inline-flex w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-indigo-700" { "⌕" }
+                            input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Search records" placeholder="Search records…" autocomplete="off" data-view-search="true" class="w-full border bg-white py-2 pl-3 pr-10 text-sm outline-none placeholder:text-slate-400 sm:w-56";
+                            button type="submit" aria-label="Submit search" title="Search" class="absolute inset-y-1 right-1 inline-flex w-8 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-blue-700" { "⌕" }
                         }
                         details class="relative" data-filter-disclosure="true" data-active-filters=(active_filter_count) {
-                            summary class="inline-flex cursor-pointer list-none items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm hover:border-indigo-300 hover:text-indigo-700" {
+                            summary class="cr-button cursor-pointer list-none gap-2" {
                                 "Filter"
                                 @if active_filter_count > 0 {
-                                    span class="rounded-full bg-indigo-100 px-2 py-0.5 text-xs font-bold text-indigo-700" { (active_filter_count) }
+                                    span class="cr-pill cr-pill-accent" { (active_filter_count) }
                                 }
                             }
-                            div data-filter-panel="true" class="absolute right-0 z-30 mt-2 max-h-[calc(100vh-7rem)] w-[min(42rem,calc(100vw-2rem))] space-y-4 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl sm:p-5" {
+                            div data-filter-panel="true" class="cr-popover cr-filter-popover z-30 space-y-4 overflow-y-auto p-4 sm:p-5" {
                                 div {
                                     div class="mb-3 flex flex-wrap items-center justify-between gap-3" {
                                         div {
@@ -2561,7 +2578,10 @@ fn render_view_records(
                                             }
                                             p class="mt-1 text-xs text-slate-500" { "Field controls and allowed values come from the collection schema." }
                                         }
-                                        button type="button" data-add-filter="true" class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:border-indigo-300 hover:text-indigo-700 disabled:cursor-not-allowed disabled:opacity-40" { "+ Add condition" }
+                                        div class="flex items-center gap-2" {
+                                            button type="button" data-add-filter="true" class="cr-button disabled:cursor-not-allowed disabled:opacity-40" { "+ Add condition" }
+                                            button type="button" data-close-filter="true" class="cr-button" { "Close" }
+                                        }
                                     }
                                     div data-filter-list="true" class="space-y-2" {
                                         @for (index, (field, operator, value)) in filter_rows.iter().enumerate() {
@@ -2618,14 +2638,14 @@ fn render_view_records(
                                     }
                                 }
                                 div class="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-4" {
-                                    a href=(reset_url.clone()) class="rounded-lg px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100" { "Clear all" }
-                                    button type="submit" class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Apply view" }
+                                    a href=(reset_url.clone()) class="cr-button" { "Clear all" }
+                                    button type="submit" class="cr-button cr-button-primary" { "Apply view" }
                                 }
                             }
                         }
                     }
-                    a href=(new_url) class="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700" {
-                        "+ New record"
+                    a href=(new_url) class="cr-button cr-button-primary" {
+                        "New record"
                     }
                 }
             }
@@ -2636,10 +2656,10 @@ fn render_view_records(
             @if view.layout == ViewLayout::Kanban {
                 (render_kanban_board(view, columns, page, query, schema, csrf_token))
             } @else {
-            div class="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" {
+            div class="cr-table-shell" {
                 div class="overflow-x-auto" {
                     table class="min-w-full divide-y divide-slate-200 text-left text-sm" {
-                        thead class="bg-slate-50" {
+                        thead {
                             tr {
                                 th scope="col" aria-sort=(sort_aria_state(query, "$id")) class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" {
                                     a href=(view_sort_url(view, query, "$id", page.pagination.limit)) aria-label=(sort_link_label(query, "record ID", "$id")) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
@@ -2661,7 +2681,7 @@ fn render_view_records(
                                 tr { td colspan=(columns.len() + 2) class="px-4 py-12 text-center text-slate-500" { "No records match this view." } }
                             } @else {
                                 @for record in &page.data {
-                                    tr class="hover:bg-slate-50/80" {
+                                    tr {
                                         td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold" {
                                             a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="text-slate-900 hover:text-indigo-700 hover:underline" { (&record.id) }
                                         }
@@ -2686,10 +2706,10 @@ fn render_view_records(
                     }
                     div class="flex items-center gap-2" {
                         @if let Some(offset) = page.pagination.previous_offset {
-                            a href=(view_page_url(view, query, page.pagination.limit, offset)) class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100" { "Previous" }
+                            a href=(view_page_url(view, query, page.pagination.limit, offset)) class="cr-button" { "Previous" }
                         }
                         @if let Some(offset) = page.pagination.next_offset {
-                            a href=(view_page_url(view, query, page.pagination.limit, offset)) class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100" { "Next" }
+                            a href=(view_page_url(view, query, page.pagination.limit, offset)) class="cr-button" { "Next" }
                         }
                     }
                 }
@@ -2709,10 +2729,10 @@ fn render_save_view_control(
     let action = format!("/{}/save-view", encode_segment(&view.name));
     html! {
         details class="relative" {
-            summary class="cursor-pointer list-none rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm hover:border-indigo-300 hover:text-indigo-700" {
+            summary class="cr-button cursor-pointer list-none" {
                 "Save as view"
             }
-            div class="absolute right-0 z-20 mt-2 w-80 rounded-2xl border border-slate-200 bg-white p-4 shadow-xl" {
+            div class="cr-popover absolute right-0 z-20 mt-2 w-80 p-4" {
                 form method="post" action=(action) class="space-y-3" {
                     input type="hidden" name="_csrf" value=(csrf_token);
                     input type="hidden" name="filter_match" value=(match query.filter_match { ViewFilterMatch::All => "all", ViewFilterMatch::Any => "any" });
@@ -2759,7 +2779,7 @@ fn render_save_view_control(
                         }
                     }
                     p class="text-xs leading-5 text-slate-500" { "Kanban uses the chosen front matter field as lanes; moving a card updates that field through the audited database path." }
-                    button type="submit" class="w-full rounded-lg bg-indigo-600 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-700" { "Save view" }
+                    button type="submit" class="cr-button cr-button-primary w-full" { "Save view" }
                 }
             }
         }
@@ -2822,11 +2842,11 @@ fn render_kanban_board(
                         data-kanban-lane="true"
                         data-kanban-target=(kanban_target_json(&lane.target))
                         data-kanban-csrf=(csrf_token)
-                        class="w-80 shrink-0 rounded-2xl border border-slate-200 bg-slate-200/70 p-3 transition-colors"
+                        class="cr-kanban-lane w-80 shrink-0 p-3 transition-colors"
                     {
                         div class="mb-3 flex items-center justify-between gap-3 px-1" {
                             h2 class="font-semibold text-slate-900" { (&lane.label) }
-                            span class="rounded-full bg-white px-2 py-0.5 text-xs font-bold text-slate-600 shadow-sm" { (lane.records.len()) }
+                            span class="cr-pill bg-white" { (lane.records.len()) }
                         }
                         div class="min-h-24 space-y-3" {
                             @if lane.records.is_empty() {
@@ -2837,7 +2857,7 @@ fn render_kanban_board(
                                     draggable="true"
                                     data-kanban-card="true"
                                     data-move-url=(kanban_move_url(view, &record.id))
-                                    class="cursor-grab rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition hover:border-indigo-300 hover:shadow active:cursor-grabbing"
+                                    class="cr-kanban-card cursor-grab p-4 active:cursor-grabbing"
                                 {
                                     div class="flex items-start justify-between gap-3" {
                                         a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="break-all font-mono text-sm font-bold text-slate-950 hover:text-indigo-700 hover:underline" { (&record.id) }
@@ -2867,7 +2887,7 @@ fn render_kanban_board(
                                                 }
                                             }
                                         }
-                                        button type="submit" class="rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-700" { "Move" }
+                                        button type="submit" class="cr-button cr-button-primary min-h-0 px-2.5 py-1.5 text-xs" { "Move" }
                                     }
                                 }
                             }
@@ -2876,17 +2896,17 @@ fn render_kanban_board(
                 }
             }
         }
-        div class="mt-2 flex flex-col gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm shadow-sm sm:flex-row sm:items-center sm:justify-between" {
+        div class="cr-surface mt-2 flex flex-col gap-3 px-4 py-3 text-sm sm:flex-row sm:items-center sm:justify-between" {
             p class="text-slate-600" {
                 "Showing " (first) "–" (last)
                 @if let Some(total) = page.pagination.total { " of " (total) }
             }
             div class="flex items-center gap-2" {
                 @if let Some(offset) = page.pagination.previous_offset {
-                    a href=(view_page_url(view, query, page.pagination.limit, offset)) class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100" { "Previous" }
+                    a href=(view_page_url(view, query, page.pagination.limit, offset)) class="cr-button" { "Previous" }
                 }
                 @if let Some(offset) = page.pagination.next_offset {
-                    a href=(view_page_url(view, query, page.pagination.limit, offset)) class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100" { "Next" }
+                    a href=(view_page_url(view, query, page.pagination.limit, offset)) class="cr-button" { "Next" }
                 }
             }
         }
@@ -2907,16 +2927,16 @@ const KANBAN_SCRIPT: &str = r#"(() => {
     card.addEventListener('dragend', () => {
       draggedCard = null;
       card.classList.remove('opacity-50');
-      board.querySelectorAll('[data-kanban-lane]').forEach((lane) => lane.classList.remove('ring-2', 'ring-indigo-400'));
+      board.querySelectorAll('[data-kanban-lane]').forEach((lane) => lane.classList.remove('ring-2', 'ring-blue-400'));
     });
   });
 
   board.querySelectorAll('[data-kanban-lane]').forEach((lane) => {
     lane.addEventListener('dragover', (event) => {
       event.preventDefault();
-      lane.classList.add('ring-2', 'ring-indigo-400');
+      lane.classList.add('ring-2', 'ring-blue-400');
     });
-    lane.addEventListener('dragleave', () => lane.classList.remove('ring-2', 'ring-indigo-400'));
+    lane.addEventListener('dragleave', () => lane.classList.remove('ring-2', 'ring-blue-400'));
     lane.addEventListener('drop', (event) => {
       event.preventDefault();
       if (!draggedCard) return;
@@ -3221,7 +3241,7 @@ fn render_schema_field(field: &SchemaFormField) -> Markup {
     let wide = schema_field_is_wide(&field.kind);
     let current = field.value.as_ref();
     html! {
-        div class=(if wide { "rounded-xl border border-slate-200 bg-slate-50 p-4 sm:col-span-2" } else { "rounded-xl border border-slate-200 bg-slate-50 p-4" }) {
+        div class=(if wide { "cr-field p-4 sm:col-span-2" } else { "cr-field p-4" }) {
             div class="mb-2 flex items-start justify-between gap-3" {
                 label for=(format!("field-{}", field.key)) class="text-sm font-semibold text-slate-900" {
                     (&field.label)
@@ -3351,23 +3371,23 @@ fn render_record_form(
     page_layout(
         &title,
         html! {
-            nav class="mb-6 flex items-center gap-2 text-sm text-slate-500" {
-                a href="/" class="font-medium hover:text-indigo-700" { "Views" }
-                span { "/" }
-                a href=(back.clone()) class="font-medium hover:text-indigo-700" { (&view.title) }
-                span { "/" }
+            nav aria-label="Breadcrumb" class="mb-6 flex items-center gap-2 text-sm text-slate-500" {
+                a href="/" class="font-medium hover:text-blue-700" { "Views" }
+                span aria-hidden="true" { "/" }
+                a href=(back.clone()) class="font-medium hover:text-blue-700" { (&view.title) }
+                span aria-hidden="true" { "/" }
                 span class="text-slate-900" { (&title) }
             }
             div class="mx-auto max-w-5xl" {
                 div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
-                    h1 class="text-3xl font-bold tracking-tight text-slate-950" { (&title) }
+                    h1 class="cr-title" { (&title) }
                     @if editing {
-                        a href="#audit-history" class="inline-flex items-center rounded-lg bg-indigo-50 px-3 py-2 text-sm font-semibold text-indigo-700 hover:bg-indigo-100" {
+                        a href="#audit-history" class="cr-button" {
                             (audit_entries.len()) " audit " @if audit_entries.len() == 1 { "event" } @else { "events" } " ↓"
                         }
                     }
                 }
-                p class="mt-2 text-sm text-slate-600" {
+                p class="cr-lede mt-2" {
                     @if structured {
                         "Edit typed fields generated from the collection schema. Saving validates the complete record and writes normal Markdown with YAML front matter."
                     } @else {
@@ -3382,7 +3402,7 @@ fn render_record_form(
                     @if structured {
                         input type="hidden" name="_form_mode" value="structured";
                     }
-                    section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm" {
+                    section class="cr-form-section p-5 sm:p-6" {
                         div class="mb-5 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" {
                             div {
                                 h2 class="text-lg font-bold text-slate-950" { "Record details" }
@@ -3423,7 +3443,7 @@ fn render_record_form(
                             }
                         }
                     }
-                    section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm" {
+                    section class="cr-form-section p-5 sm:p-6" {
                         div class="mb-3 flex items-center justify-between gap-3" {
                             div {
                                 h2 class="text-lg font-bold text-slate-950" { "Notes" }
@@ -3433,25 +3453,25 @@ fn render_record_form(
                         }
                         textarea name="markdown" aria-label="Markdown notes" rows="12" class="w-full rounded-lg border border-slate-300 px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (markdown) }
                     }
-                    div class="sticky bottom-4 z-10 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white/95 p-4 shadow-lg backdrop-blur" {
-                        a href=(back.clone()) class="rounded-lg px-3 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-100" { "Cancel" }
-                        button type="submit" class="rounded-xl bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700" {
+                    div class="cr-surface flex flex-wrap items-center justify-between gap-3 p-3" {
+                        a href=(back.clone()) class="cr-button" { "Cancel" }
+                        button type="submit" class="cr-button cr-button-primary" {
                             @if editing { "Save changes" } @else { "Create record" }
                         }
                     }
                 }
                 @if let Some(record) = record {
-                    section id="audit-history" class="mt-6 scroll-mt-6 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm" {
+                    section id="audit-history" class="mt-10 scroll-mt-20" {
                         div class="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between" {
                             div {
                                 h2 class="text-xl font-bold text-slate-950" { "Audit history" }
                                 p class="mt-1 text-sm text-slate-600" { "Newest accepted changes to this record, with actor and source attribution." }
                             }
-                            a href=(audit_filter_url(&view.collection, &record.id)) class="text-sm font-semibold text-indigo-700 hover:text-indigo-900" { "View complete history →" }
+                            a href=(audit_filter_url(&view.collection, &record.id)) class="cr-button" { "Complete history" span aria-hidden="true" { " →" } }
                         }
                         (render_audit_entries(audit_entries))
                     }
-                    form method="post" action=(format!("/{}/records/{}/delete", encode_segment(&view.name), encode_segment(&record.id))) class="mt-6 rounded-2xl border border-red-200 bg-red-50 p-5" {
+                    form method="post" action=(format!("/{}/records/{}/delete", encode_segment(&view.name), encode_segment(&record.id))) onsubmit="return window.confirm('Delete this record? This cannot be undone from the web app.');" class="mt-8 rounded-lg border border-red-200 bg-red-50 p-5" {
                         input type="hidden" name="_csrf" value=(csrf_token);
                         div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
                             div {
@@ -3467,31 +3487,366 @@ fn render_record_form(
     )
 }
 
+const GLOBAL_STYLES: &str = r#"
+:root {
+  --cr-canvas: #f7f7f8;
+  --cr-surface: #ffffff;
+  --cr-surface-subtle: #fafafa;
+  --cr-ink: #18181b;
+  --cr-muted: #71717a;
+  --cr-line: #e4e4e7;
+  --cr-line-strong: #d4d4d8;
+  --cr-accent: #2563eb;
+  --cr-accent-hover: #1d4ed8;
+  --cr-accent-soft: #eff6ff;
+  --cr-danger: #b91c1c;
+  --cr-radius: 10px;
+  --cr-shadow-popover: 0 16px 40px rgb(24 24 27 / 0.12), 0 2px 8px rgb(24 24 27 / 0.06);
+}
+
+* { box-sizing: border-box; }
+
+html {
+  background: var(--cr-canvas);
+  color-scheme: light;
+  scroll-behavior: smooth;
+}
+
+.cr-app {
+  background: var(--cr-canvas);
+  color: var(--cr-ink);
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 15px;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+.cr-app a,
+.cr-app button,
+.cr-app input,
+.cr-app select,
+.cr-app textarea,
+.cr-app summary {
+  touch-action: manipulation;
+}
+
+.cr-app :focus-visible {
+  outline: 2px solid var(--cr-accent);
+  outline-offset: 2px;
+}
+
+.cr-skip-link {
+  position: fixed;
+  top: 8px;
+  left: 8px;
+  z-index: 100;
+  transform: translateY(-150%);
+  border-radius: 6px;
+  background: var(--cr-ink);
+  color: white;
+  padding: 8px 12px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  transition: transform 120ms ease-out;
+}
+
+.cr-skip-link:focus { transform: translateY(0); }
+
+.cr-header {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  border-bottom: 1px solid var(--cr-line);
+  background: rgb(255 255 255 / 0.94);
+  backdrop-filter: blur(12px);
+}
+
+.cr-wordmark {
+  display: inline-flex;
+  height: 30px;
+  align-items: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+}
+
+.cr-nav-link {
+  border-radius: 6px;
+  color: #52525b;
+  padding: 6px 8px;
+  font-size: 0.825rem;
+  font-weight: 550;
+  transition: background-color 120ms ease-out, color 120ms ease-out;
+}
+
+.cr-nav-link:hover { background: #f4f4f5; color: var(--cr-ink); }
+
+.cr-main { min-height: calc(100vh - 116px); }
+
+.cr-eyebrow {
+  color: var(--cr-accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.cr-title {
+  color: var(--cr-ink);
+  font-size: clamp(1.75rem, 3vw, 2.25rem);
+  font-weight: 680;
+  letter-spacing: -0.035em;
+  line-height: 1.08;
+  text-wrap: balance;
+}
+
+.cr-lede {
+  color: #52525b;
+  font-size: 0.9rem;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.cr-button {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--cr-line-strong);
+  border-radius: 7px;
+  background: var(--cr-surface);
+  color: #3f3f46;
+  padding: 7px 11px;
+  font-size: 0.825rem;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  transition: border-color 120ms ease-out, background-color 120ms ease-out, color 120ms ease-out, transform 80ms ease-out;
+}
+
+.cr-button > span[aria-hidden="true"] { margin-left: 0.2em; }
+
+.cr-button:hover { border-color: #a1a1aa; background: #fafafa; color: var(--cr-ink); }
+.cr-button:active { transform: translateY(1px); }
+
+.cr-button-primary {
+  border-color: var(--cr-ink);
+  background: var(--cr-ink);
+  color: white;
+}
+
+.cr-button-primary:hover { border-color: #27272a; background: #27272a; color: white; }
+
+.cr-empty-state {
+  border: 1px dashed var(--cr-line-strong);
+  border-radius: var(--cr-radius);
+  background: var(--cr-surface);
+  padding: 56px 24px;
+  text-align: center;
+}
+
+.cr-view-index {
+  overflow: hidden;
+  border: 1px solid var(--cr-line);
+  border-radius: var(--cr-radius);
+  background: var(--cr-surface);
+}
+
+.cr-view-index-header,
+.cr-view-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.9fr) minmax(0, 1.7fr) 32px;
+  align-items: center;
+  column-gap: 24px;
+}
+
+.cr-view-index-header {
+  border-bottom: 1px solid var(--cr-line);
+  background: var(--cr-surface-subtle);
+  color: #71717a;
+  padding: 9px 16px;
+  font-size: 0.68rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.cr-view-row {
+  min-height: 72px;
+  border-bottom: 1px solid var(--cr-line);
+  padding: 13px 16px;
+  transition: background-color 120ms ease-out;
+}
+
+.cr-view-row:last-child { border-bottom: 0; }
+.cr-view-row:hover { background: #fafafa; }
+.cr-view-row:hover h2 { color: var(--cr-accent); }
+
+.cr-view-arrow {
+  color: #a1a1aa;
+  font-size: 1rem;
+  text-align: right;
+  transition: color 120ms ease-out, transform 120ms ease-out;
+}
+
+.cr-view-row:hover .cr-view-arrow { color: var(--cr-accent); transform: translateX(2px); }
+
+.cr-path,
+.cr-data {
+  color: var(--cr-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.cr-pill,
+.cr-filter-tag {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--cr-line);
+  border-radius: 999px;
+  background: #fafafa;
+  color: #52525b;
+  padding: 3px 7px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.cr-pill-accent { border-color: #bfdbfe; background: var(--cr-accent-soft); color: #1d4ed8; }
+
+.cr-filter-tag {
+  border-radius: 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-weight: 500;
+}
+
+.cr-surface {
+  border: 1px solid var(--cr-line);
+  border-radius: var(--cr-radius);
+  background: var(--cr-surface);
+  box-shadow: none;
+}
+
+.cr-app input:not([type="checkbox"]):not([type="radio"]),
+.cr-app select,
+.cr-app textarea {
+  border-color: var(--cr-line-strong);
+  border-radius: 7px;
+  background-color: white;
+  color: var(--cr-ink);
+}
+
+.cr-app input:not([type="checkbox"]):not([type="radio"]):hover,
+.cr-app select:hover,
+.cr-app textarea:hover { border-color: #a1a1aa; }
+
+.cr-app input:not([type="checkbox"]):not([type="radio"]):focus,
+.cr-app select:focus,
+.cr-app textarea:focus { border-color: var(--cr-accent); box-shadow: 0 0 0 3px rgb(37 99 235 / 0.12); }
+
+.cr-table-shell { overflow: hidden; border: 1px solid var(--cr-line); border-radius: var(--cr-radius); background: white; }
+.cr-table-shell table { font-variant-numeric: tabular-nums; }
+.cr-table-shell thead { background: var(--cr-surface-subtle); }
+.cr-table-shell tbody tr { transition: background-color 100ms ease-out; }
+.cr-table-shell tbody tr:hover { background: #fafafa; }
+
+.cr-popover {
+  border: 1px solid var(--cr-line);
+  border-radius: var(--cr-radius);
+  background: white;
+  box-shadow: var(--cr-shadow-popover);
+}
+
+.cr-filter-popover {
+  position: fixed;
+  top: 72px;
+  right: max(16px, env(safe-area-inset-right));
+  width: min(42rem, calc(100vw - 32px));
+  max-height: calc(100vh - 88px);
+  overscroll-behavior: contain;
+}
+
+.cr-audit-list { overflow: hidden; border: 1px solid var(--cr-line); border-radius: var(--cr-radius); background: white; }
+.cr-audit-entry { border-bottom: 1px solid var(--cr-line); background: white; padding: 18px; }
+.cr-audit-entry:last-child { border-bottom: 0; }
+.cr-audit-entry:target { background: var(--cr-accent-soft); }
+
+.cr-kanban-lane {
+  border: 1px solid var(--cr-line);
+  border-radius: var(--cr-radius);
+  background: #f1f1f3;
+  box-shadow: none;
+}
+
+.cr-kanban-card {
+  border: 1px solid var(--cr-line-strong);
+  border-radius: 8px;
+  background: white;
+  box-shadow: 0 1px 2px rgb(24 24 27 / 0.04);
+  transition: border-color 120ms ease-out, box-shadow 120ms ease-out, transform 80ms ease-out;
+}
+
+.cr-kanban-card:hover { border-color: #a1a1aa; box-shadow: 0 3px 8px rgb(24 24 27 / 0.07); }
+.cr-kanban-card:active { transform: rotate(0.25deg); }
+
+.cr-form-section,
+.cr-field {
+  border: 1px solid var(--cr-line);
+  border-radius: var(--cr-radius);
+  background: white;
+  box-shadow: none;
+}
+
+.cr-field { background: var(--cr-surface-subtle); }
+
+.cr-footer { border-top: 1px solid var(--cr-line); }
+
+@media (max-width: 640px) {
+  .cr-view-index-header { display: none; }
+  .cr-view-row { grid-template-columns: minmax(0, 1fr) 24px; gap: 10px; }
+  .cr-view-row > :nth-child(2) { grid-column: 1; }
+  .cr-view-arrow { grid-column: 2; grid-row: 1 / span 2; }
+  .cr-header nav { gap: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .cr-app *, .cr-app *::before, .cr-app *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+"#;
+
 fn page_layout(title: &str, content: Markup) -> Markup {
     html! {
         (DOCTYPE)
-        html lang="en" class="h-full bg-slate-100" {
+        html lang="en" class="h-full" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="color-scheme" content="light";
+                meta name="theme-color" content="#f7f7f8";
                 title { (title) " · cr" }
                 script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4" {}
+                style { (PreEscaped(GLOBAL_STYLES)) }
             }
-            body class="min-h-full text-slate-900 antialiased" {
-                header class="border-b border-slate-200 bg-white" {
-                    div class="mx-auto flex w-full max-w-7xl items-center justify-between px-4 py-3 sm:px-6 lg:px-8" {
-                        a href="/" class="font-bold tracking-tight text-slate-950 hover:text-indigo-700" { "cr" }
-                        nav aria-label="Primary" class="flex items-center gap-4 text-sm font-semibold" {
-                            a href="/" class="text-slate-600 hover:text-indigo-700" { "Views" }
-                            a href="/audit" class="text-slate-600 hover:text-indigo-700" { "Audit log" }
-                            a href="/openapi.json" class="text-slate-600 hover:text-indigo-700" { "OpenAPI" }
+            body class="cr-app min-h-full antialiased" data-design-system="cr-clean" {
+                a href="#main-content" class="cr-skip-link" { "Skip to content" }
+                header class="cr-header" {
+                    div class="mx-auto flex w-full max-w-[90rem] items-center justify-between px-4 py-2 sm:px-6 lg:px-8" {
+                        a href="/" class="cr-wordmark" translate="no" aria-label="cr home" { "cr" }
+                        nav aria-label="Primary" class="flex items-center gap-1" {
+                            a href="/" class="cr-nav-link" { "Views" }
+                            a href="/audit" class="cr-nav-link" { "Audit log" }
+                            a href="/openapi.json" class="cr-nav-link" { "OpenAPI" }
                         }
                     }
                 }
-                main class="mx-auto w-full max-w-7xl px-4 py-8 sm:px-6 lg:px-8" { (content) }
-                footer class="mx-auto w-full max-w-7xl px-4 pb-8 text-xs text-slate-500 sm:px-6 lg:px-8" {
-                    "Server-rendered by cr · records remain Markdown with YAML front matter"
+                main id="main-content" class="cr-main mx-auto w-full max-w-[90rem] px-4 py-7 sm:px-6 sm:py-9 lg:px-8" tabindex="-1" { (content) }
+                footer class="cr-footer mt-2" {
+                    div class="mx-auto flex w-full max-w-[90rem] flex-col gap-1 px-4 py-5 text-xs text-slate-500 sm:flex-row sm:items-center sm:justify-between sm:px-6 lg:px-8" {
+                        span { "Markdown in. Structured data out." }
+                        span translate="no" class="cr-data" { "cr serve" }
+                    }
                 }
             }
         }
