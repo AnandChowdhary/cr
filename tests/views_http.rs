@@ -140,6 +140,8 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(automatic.text().contains("data-filter-builder=\"true\""));
     assert!(automatic.text().contains("+ Add condition"));
     assert!(automatic.text().contains("All conditions match"));
+    assert!(automatic.text().contains("name=\"filter_match\""));
+    assert!(automatic.text().contains("Any condition matches"));
     assert!(automatic.text().contains("md:grid-cols-2 xl:grid-cols-12"));
     assert!(automatic
         .text()
@@ -186,6 +188,47 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
         combined.text().matches("data-filter-row=\"true\"").count(),
         3
     );
+
+    let any = request(
+        &app,
+        Method::GET,
+        "/deals?filter_match=any&filter_field=status&filter_value=open&filter_field=value&filter_value=8000",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(any.status, StatusCode::OK);
+    assert!(any.text().contains("value=\"any\" selected"));
+    assert!(any.text().contains("alpha"));
+    assert!(any.text().contains("beta"));
+
+    let saved_any = request(
+        &app,
+        Method::GET,
+        "/open-deals?filter_match=any&filter_field=status&filter_value=won&filter_field=value&filter_value=12000",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(saved_any.status, StatusCode::OK);
+    assert!(saved_any.text().contains("alpha"));
+    assert!(!saved_any.text().contains("beta"));
+
+    let any_first_page = request(
+        &app,
+        Method::GET,
+        "/deals?filter_match=any&filter_field=status&filter_value=open&filter_field=value&filter_value=8000&limit=1",
+        None,
+        &[],
+    )
+    .await;
+    assert!(any_first_page
+        .text()
+        .contains("filter_match=any&amp;filter_field=status"));
+    assert!(any_first_page.text().contains("limit=1&amp;offset=1"));
+
+    let invalid_match = request(&app, Method::GET, "/deals?filter_match=neither", None, &[]).await;
+    assert_eq!(invalid_match.status, StatusCode::BAD_REQUEST);
 
     let searched = request(&app, Method::GET, "/deals?q=ENTERPRISE", None, &[]).await;
     assert_eq!(searched.status, StatusCode::OK);

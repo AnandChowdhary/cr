@@ -164,12 +164,32 @@ struct ListQuery {
 struct ViewQuery {
     q: Option<String>,
     #[serde(default)]
+    filter_match: ViewFilterMatch,
+    #[serde(default)]
     filter_field: Vec<String>,
     #[serde(default)]
     filter_value: Vec<String>,
     limit: Option<usize>,
     offset: Option<usize>,
     notice: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ViewFilterMatch {
+    #[default]
+    All,
+    Any,
+}
+
+impl ViewFilterMatch {
+    fn matches(self, filters: &[Assignment], attributes: &Mapping) -> bool {
+        filters.is_empty()
+            || match self {
+                Self::All => filters.iter().all(|filter| filter.matches(attributes)),
+                Self::Any => filters.iter().any(|filter| filter.matches(attributes)),
+            }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -639,21 +659,27 @@ async fn view_records(
         let requested_view = view_name.clone();
         let (view, records, schema) = run_database(&state, &headers, move |database| {
             let view = database.view(&requested_view)?;
-            let mut filters = view
+            let view_filters = view
                 .filters
                 .iter()
                 .map(|filter| Assignment::from_str(filter))
                 .collect::<Result<Vec<_>>>()?;
-            for filter in ad_hoc_filters {
-                filters.push(Assignment::from_str(&filter)?);
-            }
-            let records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
+            let ad_hoc_filters = ad_hoc_filters
+                .into_iter()
+                .map(|filter| Assignment::from_str(&filter))
+                .collect::<Result<Vec<_>>>()?;
+            let mut records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
                 Some(pattern) => {
                     let search = SearchQuery::new(pattern, SearchTarget::Document, false, true)?;
-                    database.search(Some(&view.collection), &filters, &search)?
+                    database.search(Some(&view.collection), &view_filters, &search)?
                 }
-                None => database.list(&view.collection, &filters)?,
+                None => database.list(&view.collection, &view_filters)?,
             };
+            records.retain(|record| {
+                query_for_database
+                    .filter_match
+                    .matches(&ad_hoc_filters, &record.attributes)
+            });
             let schema = database
                 .collection_models()?
                 .into_iter()
@@ -2016,7 +2042,13 @@ fn render_view_records(
                         div {
                             div class="flex items-center gap-2" {
                                 h2 class="text-sm font-bold text-slate-900" { "Filters" }
-                                span class="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500" { "All conditions match" }
+                                label {
+                                    span class="sr-only" { "Condition match mode" }
+                                    select name="filter_match" aria-label="Condition match mode" class="rounded-full border-0 bg-slate-100 py-1 pl-2.5 pr-8 text-xs font-semibold text-slate-600 outline-none ring-indigo-500 focus:ring-2" {
+                                        option value="all" selected[query.filter_match == ViewFilterMatch::All] { "All conditions match" }
+                                        option value="any" selected[query.filter_match == ViewFilterMatch::Any] { "Any condition matches" }
+                                    }
+                                }
                             }
                             p class="mt-1 text-xs text-slate-500" { "Field controls and allowed values come from the collection schema." }
                         }
@@ -2969,6 +3001,13 @@ fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset:
     if let Some(q) = query.q.as_deref().filter(|value| !value.is_empty()) {
         serializer.append_pair("q", q);
     }
+    serializer.append_pair(
+        "filter_match",
+        match query.filter_match {
+            ViewFilterMatch::All => "all",
+            ViewFilterMatch::Any => "any",
+        },
+    );
     for (field, value) in query.filter_field.iter().zip(&query.filter_value) {
         serializer.append_pair("filter_field", field);
         serializer.append_pair("filter_value", value);
