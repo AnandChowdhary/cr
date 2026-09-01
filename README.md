@@ -832,7 +832,8 @@ It reports:
 - **invalid record names** — files and directories that cannot be a record ID or a collection. Every other command refuses such a database outright, so this is the one finding `check` exists to be able to report: it names the offending filename and keeps scanning the records around it;
 - **unreadable records** — Markdown that cannot be parsed, and anything behind a symbolic link;
 - **audit reconciliation problems** — records with no audit history, audited records whose file has gone, files whose content does not match the audited state, a journal whose chain cannot be replayed, and a stored change set that does not match the approval recorded beside it;
-- **interrupted sync runs** — a `cr sync run` that stopped partway, leaving part of an import applied and its checkpoint behind.
+- **interrupted sync runs** — a `cr sync run` that stopped partway, leaving part of an import applied and its checkpoint behind;
+- **audit anchor problems** — a `.cr-audit-head.json` that does not agree with the journal (an error), one that lags behind it (a warning), and a journal with events that nothing anchors at all (a warning).
 
 Every finding names a record as `collection/id`, or a sync by name. A file that cannot be a record is named by its filename inside its collection, because that is the only way to say which file to remove. None of them ever prints a filesystem path.
 
@@ -902,6 +903,57 @@ The audit journal is tamper-evident, not magically tamper-proof if an attacker c
 
 ```sh
 cr audit verify --expected-head 'sha256:YOUR_SAVED_HASH'
+```
+
+### Anchor the head in Git
+
+Every audit event but the newest is pinned by the hash recorded in the event after it. The newest one is pinned by nothing, so its actor, timestamp, message, and results can be rewritten and re-hashed, and `cr audit verify` will not notice. The fix has always been to keep a copy of the head hash somewhere the forger cannot reach — and the reason it did not help is that saving one by hand is a step nobody performs.
+
+`cr` now keeps that copy for you, in `.cr-audit-head.json` at the root of the database:
+
+```json
+{
+  "version": 1,
+  "sequence": 42,
+  "hash": "sha256:9f2c…",
+  "timestamp": "2026-03-04T11:22:33Z"
+}
+```
+
+Every command that records an audit event rewrites it, and `cr audit verify` checks it with no arguments. Inspect or repair it directly:
+
+```sh
+cr audit anchor           # show the recorded anchor
+cr audit anchor --json
+cr audit anchor --write   # (re)write it to the current head
+```
+
+**Commit it, or it is worth nothing.** This file sits at the database root, so anybody who can rewrite `.cr/audit/` can rewrite it in the same pass — forge the event, recompute the hash, update the anchor, and verification goes quiet again. Its protection comes entirely from the copy in your **Git history**: a pushed, distributed history is a second place to write that a local process cannot reach. So keep the database in version control and commit the anchor alongside the records it attests:
+
+```sh
+git add records .cr-audit-head.json
+git commit -m 'Move alex-smith to offer'
+```
+
+Nothing in `cr` writes a `.gitignore`, and the anchor must never be excluded by one.
+
+When you review a commit, the anchor tells you two useful things. The hash should change in exactly the commits that also change records or `.cr/audit/`, and the sequence should only ever go **up**. An anchor that moved on its own, went backwards, or jumped is worth stopping on.
+
+If `cr audit verify` reports a mismatch, it means the journal on disk is not the journal your anchor attests to. Compare the anchor in your working copy against the last one in `git log -p -- .cr-audit-head.json`, and against what a colleague or your server has. Whichever side moved without a commit to explain it is the side to distrust.
+
+A **behind** notice is different, and says so:
+
+```text
+Verified 12 audit events and 4 records; head sha256:6b1a…
+notice: the audit anchor is behind at sequence 9 of 12; the journal still agrees with it, so this is a lagging anchor rather than altered history
+```
+
+That is not tampering. The journal still contains exactly the event the anchor names, at the sequence it names — it has simply grown past it, which is what a crash between writing the event and writing the anchor leaves behind. Events after the anchored sequence are unpinned until you catch up, so run `cr audit anchor --write` and commit. `cr check` reports the same thing as a warning, and reports a real mismatch as an error.
+
+A database created before this feature has no anchor at all. It keeps working and says so; adopt it with one command and a commit:
+
+```sh
+cr audit anchor --write && git add .cr-audit-head.json
 ```
 
 For records that existed before audit logging was introduced, establish their starting state once:
@@ -1597,6 +1649,7 @@ cr save --all [--message TEXT] [--json] [--preview] [ATTRIBUTION]
 cr audit log [COLLECTION] [ID] [--agent AGENT] [--session SESSION] [--limit N] [--json]
 cr audit verify [--expected-head HASH]
 cr audit head [--json]
+cr audit anchor [--write] [--json]
 cr audit baseline
 
 ATTRIBUTION = [--agent AGENT] [--agent-version V] [--agent-model MODEL]
@@ -1618,6 +1671,21 @@ Run commands inside the database directory, or pass its root explicitly:
 ```sh
 cr --database /path/to/my-database list companies
 ```
+
+### Audit verification reports an anchor mismatch
+
+`cr` is telling you that the journal on disk is not the journal `.cr-audit-head.json` attests to. The chain itself is intact — that would be a different message — so either the journal was rewritten or the anchor was. Do not run `cr audit anchor --write`; it refuses in this state on purpose, because rewriting the anchor would destroy the evidence.
+
+Find out which side moved, using the history the anchor exists for:
+
+```sh
+git log -p -- .cr-audit-head.json
+cr audit log --limit 20
+```
+
+If the anchor in your last commit matches the journal, something rewrote the file locally. If it matches the file and not the journal, something rewrote the journal. Restore from the version-controlled copy you trust, and treat the database as suspect until you know which.
+
+A **behind** notice is not this. See "Anchor the head in Git" above: it means the anchor lags a journal that still agrees with it, and `cr audit anchor --write` is the right response.
 
 ### Audit verification fails after editing Markdown
 
@@ -1660,7 +1728,7 @@ Prefer changing the adapter to emit `upsert` or `delete` messages so future runs
 
 ## Backups and sensitive data
 
-Back up the whole database directory, not only `records/`. The `.cr/audit/` directory is necessary to verify history and reconcile direct edits, while `.cr/syncs/` and `.cr/sync/state/` are needed to resume configured incremental imports.
+Back up the whole database directory, not only `records/`. The `.cr/audit/` directory is necessary to verify history and reconcile direct edits, while `.cr/syncs/` and `.cr/sync/state/` are needed to resume configured incremental imports. Include `.cr-audit-head.json`, and prefer a backup that keeps history—a Git remote rather than a mirror of the current directory—because a backup taken after a tamper is a copy of the tamper, while a history is a record of when it appeared.
 
 CRM and ATS records often contain personal or confidential information. Apply appropriate filesystem permissions, disk encryption, backup retention, and access controls.
 

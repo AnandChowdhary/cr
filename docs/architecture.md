@@ -55,6 +55,7 @@ Research sources:
 
 ```text
 database-root/
+├── .cr-audit-head.json    # the audit anchor, committed to version control
 ├── .cr/
 │   ├── config.yaml        # optional overrides
 │   ├── audit/
@@ -83,6 +84,7 @@ database-root/
         └── acme.md
 ```
 
+- `.cr-audit-head.json` is the audit anchor: the newest event's sequence, hash, and timestamp, kept outside `.cr/` so that an ordinary `git add .` picks it up. It is derived state — deleting it loses a guarantee, never data.
 - `.cr/` is the database marker. An absent `.cr/config.yaml` uses format version 1, `records/`, 256 events per audit segment, and an 8 MiB segment limit. A present config can override any subset while unknown, malformed, unsafe, or unsupported settings remain errors.
 - A collection is a directory; a record ID is its Markdown filename without `.md`. See [What a record is](#what-a-record-is) for what happens when a filename cannot be one.
 - Front matter contains arbitrary model attributes.
@@ -133,6 +135,30 @@ Each stored line is a small JSON wrapper containing a SHA-256 hash and an exact 
 Create and baseline events store the complete after-state. Delete events store the complete before-state. Updates and links recursively diff objects while treating arrays and scalar values as replaceable units. Version 2 changes use explicit `add`, `remove`, and `replace` operations, so an absent value remains distinguishable from a present `null`. The reader accepts and safely converts version 1 change objects while retaining their original hashed bytes.
 
 Verification replays these operations independently for each record. Every event's `before_hash` must equal that record's prior audited hash, every change's before-value must equal the replayed semantic state, and record presence must agree with `after_hash`. This replay makes the prior document available even after somebody directly edits or deletes its Markdown file.
+
+### The audit anchor
+
+The newest event is the one weak point of a hash chain: every other event is pinned by the `previous_hash` of the event after it, and the last one has no successor. `audit head` and `audit verify --expected-head` have always been the mitigation, and their weakness was never cryptographic — it was that using them is a manual step, so nobody did.
+
+`.cr-audit-head.json` at the database root makes that step automatic. It holds `{version, sequence, hash, timestamp}` for the newest event, one field per line, in a stable order, newline-terminated, so a commit diff shows the head hash moving and a reviewer can reason about it. Every field is derived from the journal, and the timestamp is the anchored *event's* timestamp rather than the moment of writing, so the file is a pure function of the chain: `cr` can recompute what it should contain, and two databases holding the same journal hold byte-identical anchors.
+
+**What this buys, stated plainly.** A file at the database root is writable by anybody who can write `.cr/`. On its own it stops nothing: an attacker forges the head event, recomputes its hash, and rewrites the anchor in the same pass, and verification goes quiet again. `tests/audit_corruption.rs::a_forged_head_event_is_accepted_by_verification_and_caught_only_by_a_checkpoint` performs exactly that pair of writes and still passes. The protection comes entirely from **committing the anchor to Git**: a pushed, distributed history is a second write boundary that a local filesystem write cannot reach, and a reviewer who sees the head hash change in a diff that contains no records — or sees it change to a value nobody's working copy produced — is looking at the tamper. The feature being shipped is ergonomics and a default-on check, not a new cryptographic guarantee.
+
+**When it is written.** Inside the single `append` that every chain-advancing path funnels through — `create`, `update`, `link`, `delete`, `save`, `sync`, `audit baseline`, and pending-mutation recovery — immediately after the event is durable. Writing it *before* the append would let the anchor lead the journal, which is indistinguishable from events having been removed. Writing it after means a crash in between leaves the anchor exactly one event behind, which is a state the design has to handle rather than avoid.
+
+**Stale versus tampered.** This is the design's main risk, and it is resolved by anchoring a *position* rather than only a hash. Because the journal is append-only and hash-linked, the event at a given sequence is fixed for all time. So `verify` does not ask "does the anchor equal the head?"; it recomputes the anchor the journal implies at the anchor's own sequence and gets three separable answers:
+
+| Journal at the anchored sequence | Meaning | Result |
+| --- | --- | --- |
+| does not reach it | events were removed, or the anchor was rolled forward | `DomainError::AnchorMismatch` |
+| holds a different event | history at or before that point was rewritten | `DomainError::AnchorMismatch` |
+| holds the same event, and more after it | the anchor merely lags | pass, with a notice naming both sequences |
+
+Lagging can never produce either failure, and neither failure can be produced by lagging. A lag is still a real reduction — the events past the anchored sequence are pinned by nothing again, exactly as before the anchor existed — so `verify` prints it, `check` reports `audit_anchor_behind` at warning severity, and `cr audit anchor --write` repairs it without needing a mutation. That command refuses while the anchor disagrees with the journal, so `cr` is never the tool that launders a forgery into a fresh attestation.
+
+`AnchorMismatch` is its own classification, `409 anchor_mismatch` over HTTP, for the same reason `ApprovalMismatch` is: an auditor told "the chain is corrupt" when the chain is intact and the *anchor* disagrees will go looking in the wrong place.
+
+**Absent, unreadable, and overridden.** An absent anchor passes with a notice rather than failing, so databases that predate the file keep working and adoption is `cr audit anchor --write` plus a commit; `check` reports `audit_anchor_missing` at warning severity. An anchor that cannot be parsed, or that names a format version this build does not know, is a refusal rather than an "absent" — treating a scribble as a missing file would let one stray byte silently turn the default check off. An explicit `--expected-head` wins over the file and says so, because the flag arrives from outside the database while the file sits inside the blast radius of anybody who can edit the journal.
 
 ### Agent attribution
 
@@ -263,7 +289,7 @@ Adapters are trusted local executables, not a sandbox. They inherit the caller's
 
 ### Threat boundary
 
-The hash chain detects modified payloads, missing or reordered middle events, segment gaps, internally inconsistent record changes, and current-record divergence. It cannot by itself prove that the final events were not removed or that an attacker with full write access did not rewrite the entire chain. The *newest* event is the specific weak point, and for the same reason: every other event is pinned by the `previous_hash` of the event after it, and that one has no successor. Two things still constrain it — the replay checks each change's `before` value against the state it reconstructed, and record reconciliation pins `after_hash` to the file on disk — but the rest of it, including `actor`, `timestamp`, `message`, attribution, and the `after` value of every change, can be rewritten and re-hashed without `audit verify` objecting. Verification also does not cross-check the replayed document against `after_hash`, only its presence. `audit head` exists so the sequence and head hash can be signed, timestamped, committed, or uploaded outside the database; `audit verify --expected-head` checks such a checkpoint. Stronger deployments can later automate Ed25519-signed checkpoints or remote transparency-log anchoring without changing event files.
+The hash chain detects modified payloads, missing or reordered middle events, segment gaps, internally inconsistent record changes, and current-record divergence. It cannot by itself prove that the final events were not removed or that an attacker with full write access did not rewrite the entire chain. The *newest* event is the specific weak point, and for the same reason: every other event is pinned by the `previous_hash` of the event after it, and that one has no successor. Two things still constrain it — the replay checks each change's `before` value against the state it reconstructed, and record reconciliation pins `after_hash` to the file on disk — but the rest of it, including `actor`, `timestamp`, `message`, attribution, and the `after` value of every change, can be rewritten and re-hashed without `audit verify` objecting. Verification also does not cross-check the replayed document against `after_hash`, only its presence. `audit head` exists so the sequence and head hash can be signed, timestamped, committed, or uploaded outside the database; `audit verify --expected-head` checks such a checkpoint, and `.cr-audit-head.json` maintains one automatically so that `audit verify` performs the check by default. That anchor moves the practice from "remember to do this" to "already done", and it moves nothing else: it lives at the database root, so the same write access that rewrites the journal rewrites it, and its value depends entirely on the copy in a pushed Git history rather than on the copy on disk. Stronger deployments can later automate Ed25519-signed checkpoints or remote transparency-log anchoring without changing event files.
 
 Actor values are assertions supplied by the process, not authenticated principals. Resolution prefers the explicit CLI override and `CR_*` environment, then Git author environment/configuration, then common email and OS-user fallbacks. Signed events or trusted operating-system identity integration would be required to authenticate them.
 
@@ -334,6 +360,7 @@ Mutating forms include a cryptographically random token generated when the serve
 - Creation never overwrites an existing record.
 - Updates and links validate the complete next front matter before atomically replacing a file and committing its audit event.
 - Links validate that their target exists and matches its latest audited content hash. Manual deletion can still produce a dangling reference after the link is created; `cr check` reports every such reference, and delete policies remain future work.
+- The audit anchor at the database root is maintained by every path that appends an event and checked by `audit verify` by default. It is not a second custodian of the head: it is as writable as the journal, and it is worth something only once it is committed and pushed. A lagging anchor is reported as lagging and never as tampering, and an absent one is a notice rather than a failure, so neither can be mistaken for the other.
 - A database-wide filesystem lock serializes audited mutations, and a pending-operation journal recovers single-record crash windows. There are no multi-record transactions.
 - Per-sync filesystem locks reject overlapping runs of one adapter. Different syncs may fetch concurrently, but a separate application lock plus the initial audit-head comparison rejects stale output if another sync or ordinary mutation committed first. The audit lock still serializes individual record mutations during a run.
 - A run that stops partway through leaves a durable ledger under `.cr/sync/runs/`, so committed work and a lagging checkpoint can never disagree unnoticed. The next run refuses until the interrupted one is completed by `cr sync recover`, which replays the recorded stream forward and never deletes an audit event.

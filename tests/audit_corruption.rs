@@ -218,6 +218,14 @@ fn a_forged_head_event_is_accepted_by_verification_and_caught_only_by_a_checkpoi
         .trim_end()
         .to_owned();
     write_lines(&segment, &stored);
+    // The forger's second move, which costs them nothing. `.cr-audit-head.json`
+    // is a plain file at the database root, so the same write access that
+    // rewrote the journal rewrites the anchor to match in the same pass. This
+    // is the whole reason the anchor's protection comes from committing it to
+    // Git rather than from its being on disk, and why the assertions below are
+    // still true. `tests/audit_anchor.rs` holds the other half: the same
+    // forgery, without this line, is caught.
+    chain::reanchor(&database.root);
 
     // The bad news, asserted rather than glossed over.
     let verification = run_success(database.command().args(["audit", "verify"]));
@@ -450,6 +458,11 @@ fn a_truncated_chain_is_caught_by_reconciliation_and_by_an_external_checkpoint()
     let mut stored = lines(&segment);
     stored.pop();
     write_lines(&segment, &stored);
+    // Rolling the anchor back with the chain, for the same reason as in the
+    // forged-head test: an attacker who can delete the newest event can delete
+    // the newest anchor. Left in place, the anchor catches this on its own —
+    // see `tests/audit_anchor.rs`.
+    chain::reanchor(&database.root);
 
     // The record still holds the state the removed event produced.
     verify_fails_with(&database, "does not match its latest audited state");

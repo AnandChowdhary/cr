@@ -710,7 +710,8 @@ impl ApiError {
             DomainError::NotFound(_) => StatusCode::NOT_FOUND,
             DomainError::AlreadyExists(_)
             | DomainError::Conflict(_)
-            | DomainError::ApprovalMismatch(_) => StatusCode::CONFLICT,
+            | DomainError::ApprovalMismatch(_)
+            | DomainError::AnchorMismatch(_) => StatusCode::CONFLICT,
             DomainError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
         };
         let code = domain.code();
@@ -2065,7 +2066,8 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                     "dangling_link", "malformed_relation", "schema_violation", "unusable_schema",
                     "invalid_record_name", "unreadable_record", "unaudited_record", "missing_record",
                     "record_content_mismatch", "audit_chain_broken", "approval_mismatch",
-                    "interrupted_sync_run"
+                    "interrupted_sync_run", "audit_anchor_mismatch", "audit_anchor_behind",
+                    "audit_anchor_missing"
                 ] },
                 "collection": { "type": "string" },
                 "id": { "type": "string" },
@@ -2140,11 +2142,22 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
             }
         },
         "AuditVerification": {
-            "type": "object", "required": ["entries", "records_checked", "head"],
+            "type": "object", "required": ["entries", "records_checked", "head", "anchor"],
             "properties": {
                 "entries": { "type": "integer", "minimum": 0 },
                 "records_checked": { "type": "integer", "minimum": 0 },
-                "head": { "$ref": "#/components/schemas/AuditHead" }
+                "head": { "$ref": "#/components/schemas/AuditHead" },
+                "anchor": { "$ref": "#/components/schemas/AnchorStatus" }
+            }
+        },
+        "AnchorStatus": {
+            "type": "object",
+            "required": ["state"],
+            "description": "How the anchor file at the database root relates to the journal head. A mismatch is not reported here: it fails the request with 409 anchor_mismatch.",
+            "properties": {
+                "state": { "enum": ["empty", "absent", "matched", "behind", "overridden"], "description": "behind means the anchor lags a still-agreeing journal, which is a reduced guarantee rather than altered history." },
+                "sequence": { "type": "integer", "minimum": 1, "description": "The audit sequence the anchor attests to." },
+                "head": { "type": "integer", "minimum": 1, "description": "The current head sequence, present when the anchor is behind." }
             }
         },
         "BaselineResponse": {

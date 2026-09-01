@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use yaml_serde::{Mapping, Value};
 
 use crate::{
-    Assignment, AuditAction, AuditEntry, AuditHead, AuditSource, AuditVerification, SearchQuery,
+    AnchorReport, Assignment, AuditAction, AuditAnchor, AuditEntry, AuditHead, AuditSource,
+    AuditVerification, SearchQuery,
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     audit::{AuditFilter, AuditLog, AuditMutation, ChangePreview, ReconciledMutation, record_hash},
     check::{CheckReport, CheckScope},
@@ -1182,6 +1183,29 @@ impl Database {
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         audit.head()
+    }
+
+    /// Report the audit anchor recorded at the database root.
+    ///
+    /// Fails when it disagrees with the journal, so this is an inspection that
+    /// can refuse rather than a status that always prints.
+    pub fn audit_anchor(&self) -> Result<AnchorReport> {
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        audit.anchor_report()
+    }
+
+    /// Rewrite the audit anchor to the current head.
+    ///
+    /// For adopting the anchor on a database that predates it, and for
+    /// repairing one a crash left behind. Refuses when the stored anchor
+    /// already disagrees with the journal.
+    pub fn audit_anchor_write(&self) -> Result<AuditAnchor> {
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        audit.write_anchor()
     }
 
     pub fn audit_verify(&self, expected_head: Option<&str>) -> Result<AuditVerification> {

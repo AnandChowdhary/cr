@@ -657,6 +657,22 @@ enum AuditCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Show the audit anchor recorded in .cr-audit-head.json at the database root.
+    ///
+    /// The anchor is maintained automatically by every command that appends an
+    /// audit event, and `audit verify` checks it by default. Commit it to Git
+    /// alongside the records it attests: the file is writable by anyone who can
+    /// rewrite the journal, so its protection comes from the pushed history,
+    /// not from its location on disk.
+    Anchor {
+        /// Rewrite the anchor to the current head. Refuses if it disagrees.
+        #[arg(long)]
+        write: bool,
+
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Exit status for a command that ran successfully and found problems.
@@ -1182,6 +1198,9 @@ fn run() -> Result<ExitCode> {
                     verification.records_checked,
                     verification.head.hash.as_deref().unwrap_or("none")
                 );
+                if let Some(notice) = verification.anchor.notice() {
+                    println!("{notice}");
+                }
             }
             AuditCommand::Head { json } => {
                 let head = database.audit_head()?;
@@ -1193,6 +1212,31 @@ fn run() -> Result<ExitCode> {
                         head.sequence,
                         head.hash.as_deref().unwrap_or("none")
                     );
+                }
+            }
+            AuditCommand::Anchor { write, json } if write => {
+                let anchor = database.audit_anchor_write()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&anchor)?);
+                } else {
+                    println!(
+                        "Anchored sequence {} at {}; commit .cr-audit-head.json",
+                        anchor.sequence, anchor.hash
+                    );
+                }
+            }
+            AuditCommand::Anchor { json, .. } => {
+                let report = database.audit_anchor()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    match &report.anchor {
+                        Some(anchor) => println!("{} {}", anchor.sequence, anchor.hash),
+                        None => println!("none"),
+                    }
+                    if let Some(notice) = report.status.notice() {
+                        println!("{notice}");
+                    }
                 }
             }
         },

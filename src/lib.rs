@@ -17,8 +17,8 @@ pub use attribution::{
     parse_intent,
 };
 pub use audit::{
-    AuditAction, AuditChange, AuditEntry, AuditFilter, AuditHead, AuditSource, AuditVerification,
-    ChangePreview,
+    AnchorReport, AnchorStatus, AuditAction, AuditAnchor, AuditChange, AuditEntry, AuditFilter,
+    AuditHead, AuditSource, AuditVerification, ChangePreview,
 };
 pub use check::{
     CheckReport, CheckScope, CheckSummary, Finding, FindingKind, Severity, parse_threshold,

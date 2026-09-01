@@ -17,7 +17,7 @@ use crate::{
         CollectionEntry, RECORDS_LABEL, collection_directory_name, collection_entry, record_label,
         validate_component,
     },
-    error::{approval_mismatch, conflict},
+    error::{DomainError, anchor_mismatch, approval_mismatch, conflict},
     frontmatter::Document,
     paths::{self, EntryKind},
 };
@@ -30,6 +30,23 @@ const SEGMENT_DIRECTORY_LABEL: &str = "the audit segment directory";
 const SEGMENT_LABEL: &str = "an audit segment";
 const PENDING_LABEL: &str = "the pending audit mutation";
 const LOCK_LABEL: &str = "the audit lock";
+
+/// Where the head anchor lives: at the database *root*, deliberately outside
+/// `.cr/`, so that an ordinary `git add .` picks it up and a reviewer sees it
+/// change in the same commit as the records it attests.
+///
+/// The name is prefixed so it sorts next to `.cr/`, says what it holds rather
+/// than what feature produced it, and carries `.json` so editors, Git, and code
+/// review render it. Nothing about the location makes it harder to rewrite than
+/// the journal itself; see the module note on [`AuditAnchor`] for what it is
+/// actually worth.
+const ANCHOR_PATH: &str = ".cr-audit-head.json";
+const ANCHOR_LABEL: &str = "the audit anchor";
+/// Format version of the anchor file, independent of [`AUDIT_VERSION`].
+///
+/// The anchor is derived state with its own shape, so it versions on its own
+/// and a change here never touches an audit payload or a stored hash.
+const ANCHOR_VERSION: u32 = 1;
 
 const AUDIT_VERSION: u32 = 2;
 const MIN_AUDIT_VERSION: u32 = 1;
@@ -278,6 +295,144 @@ pub struct AuditVerification {
     pub entries: u64,
     pub records_checked: usize,
     pub head: AuditHead,
+    /// How the anchor stored at the database root relates to that head.
+    pub anchor: AnchorStatus,
+}
+
+/// The audit head written to a file at the database root for Git to carry.
+///
+/// # What this is, honestly
+///
+/// Every audit event but the newest is pinned by the `previous_hash` of the
+/// event after it. The newest is pinned by nothing, so its `actor`,
+/// `timestamp`, `message`, attribution, and every change's `after` value can be
+/// rewritten and re-hashed, after which the chain is internally perfect. The
+/// only thing that has ever caught that is a copy of the head hash kept where
+/// the forger cannot reach it, compared back with `audit verify --expected-head`.
+///
+/// This file is *not* such a place. It sits at the database root, writable by
+/// anybody who can write `.cr/`, so an attacker forges the event, recomputes
+/// the hash, and rewrites this file in the same pass. On its own it stops
+/// nothing.
+///
+/// Its entire value is that it makes the *Git*-based version of that practice
+/// automatic. The second write boundary is a pushed, distributed history, which
+/// a local filesystem write cannot reach; committing this file alongside the
+/// records it attests puts the head hash there on every mutation, without
+/// anybody remembering to run `audit head` and paste the result somewhere. The
+/// feature being shipped is the ergonomics and the default-on check, not a new
+/// cryptographic guarantee.
+///
+/// # Why it is fully derived
+///
+/// Every field is a function of the journal: the sequence, that event's stored
+/// hash, and that event's own timestamp — never "now". So `cr` can recompute
+/// the file the journal implies and compare, two databases with the same
+/// journal produce byte-identical anchors, and the file has no state of its own
+/// that could drift.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditAnchor {
+    /// Format version of this file, not of the audit payload.
+    pub version: u32,
+    /// The audit sequence this anchor attests to.
+    pub sequence: u64,
+    /// The stored hash of the event at `sequence`.
+    pub hash: String,
+    /// That event's timestamp, so a reviewer reading a diff can date it.
+    pub timestamp: String,
+}
+
+impl AuditAnchor {
+    /// The anchor an event at `sequence` implies.
+    fn at(sequence: u64, hash: &str, timestamp: &str) -> Self {
+        Self {
+            version: ANCHOR_VERSION,
+            sequence,
+            hash: hash.to_owned(),
+            timestamp: timestamp.to_owned(),
+        }
+    }
+
+    /// The anchor an already-stored event implies.
+    fn of(entry: &AuditEntry) -> Self {
+        Self::at(
+            entry.payload.sequence,
+            &entry.hash,
+            &entry.payload.timestamp,
+        )
+    }
+
+    /// The exact bytes this anchor is stored as: stable field order, two-space
+    /// indentation, one field per line, newline-terminated. Chosen so a commit
+    /// diff shows the head hash moving on its own line and nothing else.
+    fn serialize(&self) -> Result<Vec<u8>> {
+        let mut bytes =
+            serde_json::to_vec_pretty(self).context("could not serialize the audit anchor")?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+
+/// How the stored anchor relates to the journal it sits beside.
+///
+/// The distinction that matters is [`Self::Behind`] versus the
+/// [`DomainError::AnchorMismatch`] that is returned instead of a status. An
+/// anchor may legitimately lag — a crash between appending the event and
+/// rewriting the anchor leaves exactly that state — and a lagging anchor must
+/// never be reported as, or confused with, a rewritten journal. Because the
+/// chain is append-only and hash-linked, the two are separable *exactly*: a
+/// lagging anchor's hash is still present in the journal at its own sequence,
+/// and a rewritten journal's is not.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AnchorStatus {
+    /// The journal holds no events, so there is nothing to anchor yet.
+    Empty,
+    /// The journal has a head and no anchor attests to it.
+    Absent,
+    /// The anchor attests to the current head.
+    Matched { sequence: u64 },
+    /// The anchor attests to an earlier event the journal still agrees with.
+    ///
+    /// Not a failure. It is a reduced guarantee, and it says so: events after
+    /// `sequence` are anchored by nothing, which is the pre-anchor situation
+    /// for that tail alone.
+    Behind { sequence: u64, head: u64 },
+    /// A checkpoint was supplied explicitly, so the stored file was not read.
+    Overridden,
+}
+
+impl AnchorStatus {
+    /// A sentence worth printing beside a successful verification, or `None`
+    /// when the anchor has nothing to say.
+    pub fn notice(&self) -> Option<String> {
+        match self {
+            Self::Empty | Self::Matched { .. } => None,
+            Self::Absent => Some(
+                "notice: no audit anchor is recorded, so the newest event is pinned by nothing; run 'cr audit anchor --write' and commit the result"
+                    .to_owned(),
+            ),
+            Self::Behind { sequence, head } => Some(format!(
+                "notice: the audit anchor is behind at sequence {sequence} of {head}; the journal still agrees with it, so this is a lagging anchor rather than altered history"
+            )),
+            Self::Overridden => Some(
+                "notice: an expected head was supplied, so the recorded audit anchor was not consulted"
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
+/// Everything `cr audit anchor` reports.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AnchorReport {
+    /// The anchor stored at the database root, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<AuditAnchor>,
+    /// The head the anchor was judged against.
+    pub head: AuditHead,
+    pub status: AnchorStatus,
 }
 
 /// A change set computed without writing it, and the digest that commits to it.
@@ -750,17 +905,33 @@ impl<'a> AuditLog<'a> {
         })
     }
 
+    /// Replay the chain, reconcile it with the records, and check the head.
+    ///
+    /// The head is checked against `expected_head` when the caller supplied
+    /// one, and otherwise against the anchor recorded at the database root.
+    /// An explicit checkpoint wins deliberately: it arrives from outside the
+    /// database, while the anchor file sits inside the blast radius of anyone
+    /// who can edit the journal, so a caller holding an out-of-band value must
+    /// not have their answer decided by an in-band file. `cr check` reports the
+    /// anchor either way.
+    ///
+    /// Ordering matters. The chain is replayed first, so a damaged journal is
+    /// reported as a damaged journal and never as an anchor problem.
     pub fn verify(&self, expected_head: Option<&str>) -> Result<AuditVerification> {
         let (latest, state) = self.states(true)?;
 
-        if let Some(expected) = expected_head
-            && state.head_hash.as_deref() != Some(expected)
-        {
-            return Err(conflict(format!(
-                "audit head does not match expected checkpoint (actual: {})",
-                state.head_hash.as_deref().unwrap_or("none")
-            )));
-        }
+        let anchor = match expected_head {
+            Some(expected) => {
+                if state.head_hash.as_deref() != Some(expected) {
+                    return Err(conflict(format!(
+                        "audit head does not match expected checkpoint (actual: {})",
+                        state.head_hash.as_deref().unwrap_or("none")
+                    )));
+                }
+                AnchorStatus::Overridden
+            }
+            None => self.anchor_status(self.load_anchor()?.as_ref(), &state)?,
+        };
 
         let latest_hashes = latest
             .iter()
@@ -774,7 +945,181 @@ impl<'a> AuditLog<'a> {
                 sequence: state.entries,
                 hash: state.head_hash,
             },
+            anchor,
         })
+    }
+
+    /// Read the anchor and judge it against a freshly replayed chain.
+    ///
+    /// Fails with [`DomainError::AnchorMismatch`] when the two disagree, so a
+    /// read-only inspection of a tampered database is a failure rather than a
+    /// report. Replays the chain itself, which costs one extra pass over the
+    /// journal; `check` and `verify` are already O(events).
+    pub fn anchor_report(&self) -> Result<AnchorReport> {
+        let state = self.verify_chain(|_, _| Ok(()))?;
+        let stored = self.load_anchor()?;
+        let status = self.anchor_status(stored.as_ref(), &state)?;
+        Ok(AnchorReport {
+            anchor: stored,
+            head: AuditHead {
+                sequence: state.entries,
+                hash: state.head_hash,
+            },
+            status,
+        })
+    }
+
+    /// Write the anchor the current head implies.
+    ///
+    /// Refuses when the stored anchor already disagrees with the journal. `cr`
+    /// must never be the tool that launders a forgery into a fresh attestation:
+    /// an attacker with write access can of course overwrite the file directly,
+    /// but they will not be handed a command that does it for them and reports
+    /// success. Adopting the anchor on an existing database, and repairing one
+    /// left behind by a crash, both go through here.
+    pub fn write_anchor(&self) -> Result<AuditAnchor> {
+        let state = self.verify_chain(|_, _| Ok(()))?;
+        self.anchor_status(self.load_anchor()?.as_ref(), &state)?;
+        let Some(anchor) = self.anchor_at(state.entries)? else {
+            return Err(conflict("there are no audit events to anchor"));
+        };
+        self.store_anchor(&anchor)?;
+        Ok(anchor)
+    }
+
+    /// Judge `stored` against a chain that has already been replayed.
+    ///
+    /// The whole stale-versus-tampered question is decided here, and it is
+    /// decided by *position* rather than by comparing head hashes. An anchor
+    /// names a sequence as well as a hash, and the journal is append-only, so
+    /// the event at that sequence is fixed for all time. Recomputing the anchor
+    /// the journal implies at exactly that sequence gives three separable
+    /// answers instead of one "does not match":
+    ///
+    /// - the journal is shorter than the anchor claims — events were removed,
+    ///   or the anchor was rolled forward past them;
+    /// - the journal has a different event there — history at or before the
+    ///   anchored point was rewritten;
+    /// - the journal has the same event there and more events after it — the
+    ///   anchor merely lags, which is what a crash between appending the event
+    ///   and rewriting the anchor leaves behind.
+    ///
+    /// Only the first two are failures, and neither can be produced by lagging.
+    fn anchor_status(
+        &self,
+        stored: Option<&AuditAnchor>,
+        state: &ChainState,
+    ) -> Result<AnchorStatus> {
+        let Some(stored) = stored else {
+            return Ok(if state.entries == 0 {
+                AnchorStatus::Empty
+            } else {
+                AnchorStatus::Absent
+            });
+        };
+        if stored.sequence == 0 {
+            return Err(anchor_mismatch(
+                "the audit anchor does not name an audit event",
+            ));
+        }
+        let Some(derived) = self.anchor_at(stored.sequence)? else {
+            return Err(anchor_mismatch(format!(
+                "the audit anchor attests to sequence {} but the journal ends at sequence {}",
+                stored.sequence, state.entries
+            )));
+        };
+        if derived.hash != stored.hash {
+            return Err(anchor_mismatch(format!(
+                "the audit event at sequence {} does not match the audit anchor (anchored {}, actual {})",
+                stored.sequence, stored.hash, derived.hash
+            )));
+        }
+        if derived != *stored {
+            return Err(anchor_mismatch(format!(
+                "the audit anchor does not describe the audit event at sequence {} it names",
+                stored.sequence
+            )));
+        }
+        Ok(if stored.sequence == state.entries {
+            AnchorStatus::Matched {
+                sequence: stored.sequence,
+            }
+        } else {
+            AnchorStatus::Behind {
+                sequence: stored.sequence,
+                head: state.entries,
+            }
+        })
+    }
+
+    /// The anchor the stored journal implies at `sequence`, or `None` when the
+    /// journal does not reach that far.
+    ///
+    /// Reads only the one segment that can hold it, rather than walking the
+    /// chain again. Callers run this after a full replay has already checked
+    /// sequence continuity, so the segment that starts at or before `sequence`
+    /// is the only one that can contain it.
+    fn anchor_at(&self, sequence: u64) -> Result<Option<AuditAnchor>> {
+        if sequence == 0 {
+            return Ok(None);
+        }
+        let mut chosen = None;
+        for path in self.segment_paths()? {
+            if segment_start(&path)? > sequence {
+                break;
+            }
+            chosen = Some(path);
+        }
+        let Some(path) = chosen else {
+            return Ok(None);
+        };
+        Ok(self
+            .read_segment(&path)?
+            .iter()
+            .find(|stored| stored.entry.payload.sequence == sequence)
+            .map(|stored| AuditAnchor::of(&stored.entry)))
+    }
+
+    /// Read the anchor file, classifying anything unreadable as a mismatch.
+    ///
+    /// A file that cannot be interpreted is not the same as no file: somebody
+    /// or something wrote it. Reporting it as absent would let a single
+    /// scribble silently downgrade verification, so it fails instead.
+    fn load_anchor(&self) -> Result<Option<AuditAnchor>> {
+        let Some(bytes) = paths::read_optional(self.root, Path::new(ANCHOR_PATH), ANCHOR_LABEL)?
+        else {
+            return Ok(None);
+        };
+        let value: Value = serde_json::from_slice(&bytes).map_err(unreadable_anchor)?;
+        match value.get("version").and_then(Value::as_u64) {
+            Some(version) if version == u64::from(ANCHOR_VERSION) => {}
+            Some(version) => {
+                return Err(anchor_mismatch(format!(
+                    "the audit anchor records checkpoint format version {version}, and this build understands version {ANCHOR_VERSION}"
+                )));
+            }
+            None => {
+                return Err(unreadable_anchor(serde::de::Error::missing_field(
+                    "version",
+                )));
+            }
+        }
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(unreadable_anchor)
+    }
+
+    /// Publish `anchor` at the database root, creating or replacing it.
+    fn store_anchor(&self, anchor: &AuditAnchor) -> Result<()> {
+        let relative = Path::new(ANCHOR_PATH);
+        let bytes = anchor.serialize()?;
+        match paths::entry_kind(self.root, relative, ANCHOR_LABEL)? {
+            Some(EntryKind::File) => {
+                paths::write_replace(self.root, relative, &bytes, ANCHOR_LABEL)
+            }
+            Some(kind) => Err(paths::refuse_entry(ANCHOR_LABEL, kind)),
+            None => paths::write_new(self.root, relative, &bytes, ANCHOR_LABEL),
+        }
     }
 
     pub fn record_states(&self) -> Result<AuditedRecordStates> {
@@ -884,7 +1229,26 @@ impl<'a> AuditLog<'a> {
                 paths::write_new(self.root, &path, line.as_bytes(), SEGMENT_LABEL)?;
             }
         }
-        Ok(())
+
+        // The anchor is rewritten here, after the event is durable, because
+        // every path that advances the chain — `commit`, `accept`, pending
+        // recovery, and therefore `save`, `sync`, and `audit baseline` — funnels
+        // through this one function. Writing it before the append would let the
+        // anchor lead the journal, which is indistinguishable from events having
+        // been removed; writing it after means a crash in between leaves the
+        // anchor one event behind, which `anchor_status` reports as lagging and
+        // never as tampering.
+        //
+        // A failure here is propagated rather than swallowed. The event is
+        // already committed, and the message says so: a silently unmaintained
+        // anchor is a security downgrade that nothing else would report, and
+        // the caller's next command recovers the pending mutation cleanly.
+        self.store_anchor(&AuditAnchor::at(
+            entry.parsed.sequence,
+            &entry.hash,
+            &entry.parsed.timestamp,
+        ))
+        .context("the audit event was committed but the audit anchor could not be updated")
     }
 
     fn load_head(&self) -> Result<Option<LoadedHead>> {
@@ -1114,6 +1478,14 @@ struct LoadedHead {
     entry: AuditEntry,
     segment_path: PathBuf,
     segment_entries: usize,
+}
+
+/// Classify an anchor whose bytes cannot be interpreted, keeping the parse
+/// failure in the chain for logs and out of the caller-facing message.
+fn unreadable_anchor(error: serde_json::Error) -> anyhow::Error {
+    anyhow::Error::new(error).context(DomainError::AnchorMismatch(
+        "the audit anchor is not a readable checkpoint".to_owned(),
+    ))
 }
 
 fn stored_line(hash: &str, payload: &str) -> Result<String> {
