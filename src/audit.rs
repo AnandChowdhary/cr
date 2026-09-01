@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
+    access::AccessDecision,
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     database::{
         CollectionEntry, RECORDS_LABEL, collection_directory_name, collection_entry, record_label,
@@ -205,6 +206,10 @@ pub struct AuditPayload {
     /// What was asked, and what the agent thought it was doing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<AuditIntent>,
+    /// The authenticated principal and effective role that permitted this
+    /// mutation. Absent for legacy and access-control-disabled databases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<AccessDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub action: AuditAction,
@@ -529,6 +534,7 @@ pub(crate) struct AuditMutation<'a> {
     pub after_bytes: Option<&'a [u8]>,
     pub source: AuditSource,
     pub message: Option<&'a str>,
+    pub access: Option<&'a AccessDecision>,
 }
 
 pub(crate) struct ReconciledMutation<'a> {
@@ -541,6 +547,7 @@ pub(crate) struct ReconciledMutation<'a> {
     pub after_bytes: Option<&'a [u8]>,
     pub had_history: bool,
     pub message: Option<&'a str>,
+    pub access: Option<&'a AccessDecision>,
 }
 
 struct PayloadMutation<'a> {
@@ -554,6 +561,7 @@ struct PayloadMutation<'a> {
     chain: ChainState,
     source: AuditSource,
     message: Option<&'a str>,
+    access: Option<&'a AccessDecision>,
 }
 
 #[derive(Clone)]
@@ -633,6 +641,7 @@ impl<'a> AuditLog<'a> {
             chain,
             source: mutation.source,
             message: mutation.message,
+            access: mutation.access,
         })
     }
 
@@ -657,6 +666,7 @@ impl<'a> AuditLog<'a> {
             chain,
             source: AuditSource::Filesystem,
             message: mutation.message,
+            access: mutation.access,
         })
     }
 
@@ -676,6 +686,7 @@ impl<'a> AuditLog<'a> {
             agent: self.attribution.agent.clone(),
             authorization: self.attribution.authorization.clone(),
             intent: self.attribution.intent.clone(),
+            access: mutation.access.cloned(),
             message: mutation.message.map(str::to_owned),
             action: mutation.action,
             record: AuditRecord {
@@ -1918,6 +1929,7 @@ mod tests {
                     at: None,
                 }),
             }),
+            access: None,
             message: None,
             action: AuditAction::Update,
             record: AuditRecord {
@@ -2318,6 +2330,7 @@ mod tests {
                 after_bytes: Some(original_raw.as_bytes()),
                 source: AuditSource::Cli,
                 message: None,
+                access: None,
             })
             .unwrap();
         audit
@@ -2343,6 +2356,7 @@ mod tests {
                 after_bytes: Some(accepted_raw.as_bytes()),
                 had_history: true,
                 message: None,
+                access: None,
             })
             .unwrap();
         std::fs::write(root.path().join(target), "---\n---\nChanged again\n").unwrap();
@@ -2386,6 +2400,7 @@ mod tests {
                 after_bytes: Some(rendered.as_bytes()),
                 source: AuditSource::Cli,
                 message: None,
+                access: None,
             })
             .unwrap();
         store_pending(&committed, &entry, PathBuf::from("records/items/one.md"));
@@ -2424,6 +2439,7 @@ mod tests {
                 after_bytes: Some(rendered.as_bytes()),
                 source: AuditSource::Cli,
                 message: None,
+                access: None,
             })
             .unwrap();
         store_pending(&aborted, &entry, PathBuf::from("records/items/one.md"));

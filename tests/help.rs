@@ -94,3 +94,26 @@ fn sync_help_documents_protocol_safety_controls() {
     assert!(stdout.contains("--actor <ACTOR>"));
     assert!(stdout.contains("<COMMAND>..."));
 }
+
+#[test]
+fn access_help_documents_users_roles_and_resource_scopes() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["access", "grant", "--help"])
+        .output()
+        .expect("failed to run cr access grant --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("help output was not UTF-8");
+    assert!(stdout.contains("Set a user's direct role"));
+    assert!(stdout.contains("<USER>"));
+    assert!(stdout.contains("<ROLE>"));
+    assert!(stdout.contains("<RESOURCE>"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["user", "add", "--help"])
+        .output()
+        .expect("failed to run cr user add --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("help output was not UTF-8");
+    assert!(stdout.contains("fixed-schema users collection"));
+    assert!(stdout.contains("--service"));
+}

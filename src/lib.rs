@@ -1,3 +1,4 @@
+mod access;
 mod attribution;
 mod audit;
 mod check;
@@ -11,6 +12,10 @@ mod sync;
 mod value;
 mod views;
 
+pub use access::{
+    AccessAction, AccessDecision, AccessGrant, AccessIdentity, Resource as AccessResource, Role,
+    USERS_COLLECTION, User, UserKind, UserStatus, principal_id,
+};
 pub use attribution::{
     AgentEvidence, Attribution, AttributionOverrides, AuditAgent, AuditAuthorization, AuditIntent,
     AuditIntentPart, AuthorizationMode, IntentAuthor, parse_agent, parse_authorization,
