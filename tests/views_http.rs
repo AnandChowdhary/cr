@@ -1378,9 +1378,17 @@ async fn html_error_pages_are_redacted_and_carry_a_request_id() {
     let root = database.root().display().to_string();
     database.create("deals", "alpha", &[], "Alpha\n").unwrap();
     fs::create_dir(database.root().join("records/deals/broken.md")).unwrap();
+    #[cfg(unix)]
+    {
+        let outside = database.root().join("outside.md");
+        fs::write(&outside, "---\nstatus: leaked\n---\n").unwrap();
+        std::os::unix::fs::symlink(&outside, database.root().join("records/deals/linked.md"))
+            .unwrap();
+    }
     let app = router(database, ServerConfig::default()).unwrap();
 
-    let cases = [
+    #[allow(unused_mut)]
+    let mut cases = vec![
         (
             "/missing-view",
             StatusCode::NOT_FOUND,
@@ -1393,10 +1401,16 @@ async fn html_error_pages_are_redacted_and_carry_a_request_id() {
         ),
         (
             "/deals/records/broken",
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "quote the request ID",
+            StatusCode::CONFLICT,
+            "record deals/broken is not a regular file",
         ),
     ];
+    #[cfg(unix)]
+    cases.push((
+        "/deals/records/linked",
+        StatusCode::CONFLICT,
+        "is stored behind a symbolic link",
+    ));
 
     for (uri, status, expected) in cases {
         let response = request(&app, Method::GET, uri, None, &[]).await;
@@ -1406,10 +1420,7 @@ async fn html_error_pages_are_redacted_and_carry_a_request_id() {
         assert!(text.contains(expected), "{uri}: {text}");
         assert!(!text.contains(&root), "{uri} leaked the database root");
         assert!(!text.contains("os error"), "{uri} leaked an OS error");
-        assert!(
-            !text.contains("must be a regular file"),
-            "{uri} leaked internal context"
-        );
+        assert!(!text.contains(" at /"), "{uri} leaked a filesystem path");
 
         let request_id = response
             .headers
@@ -1422,4 +1433,26 @@ async fn html_error_pages_are_redacted_and_carry_a_request_id() {
             "{uri} did not show its request ID"
         );
     }
+}
+
+/// An HTML failure nobody can act on still says nothing beyond a request ID.
+#[tokio::test]
+async fn unclassified_html_failures_stay_generic() {
+    let (_temporary, database) = test_database("views-internal");
+    let root = database.root().display().to_string();
+    fs::write(
+        database
+            .root()
+            .join(".cr/audit/segments/00000000000000000001.jsonl"),
+        "{\"hash\":\"sha256:none\",\"payload\":{}}",
+    )
+    .unwrap();
+    let app = router(database, ServerConfig::default()).unwrap();
+
+    let response = request(&app, Method::GET, "/audit", None, &[]).await;
+    assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let text = response.text();
+    assert!(text.contains("quote the request ID"), "{text}");
+    assert!(!text.contains(&root), "leaked the database root");
+    assert!(!text.contains("truncated tail"), "leaked internal context");
 }

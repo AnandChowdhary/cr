@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -17,10 +17,19 @@ use tempfile::NamedTempFile;
 use yaml_serde::Mapping;
 
 use crate::{
-    database::{validate_component, write_new, write_replace},
+    database::validate_component,
+    error::is_missing,
+    paths::{self, EntryKind},
     AuditSource, Database,
 };
 
+/// Where sync definitions, checkpoints, and locks live beneath the root.
+pub(crate) const SYNC_DEFINITION_DIRECTORY: &str = ".cr/syncs";
+pub(crate) const SYNC_STATE_DIRECTORY: &str = ".cr/sync/state";
+pub(crate) const SYNC_LOCK_DIRECTORY: &str = ".cr/sync/locks";
+const SYNC_WORK_DIRECTORY: &str = ".cr/sync";
+const SYNC_DIRECTORY_LABEL: &str = "the sync directory";
+const SYNC_WORK_LABEL: &str = "the sync working directory";
 const SYNC_FORMAT_VERSION: u32 = 1;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
 const MAX_TIMEOUT_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -109,21 +118,25 @@ impl Database {
         validate_stored(name, &stored)?;
         let serialized =
             yaml_serde::to_string(&stored).context("could not serialize sync definition")?;
-        write_new(&self.sync_path(name), serialized.as_bytes())
-            .with_context(|| format!("could not create sync '{name}'"))?;
+        paths::write_new(
+            self.root(),
+            &sync_path(name),
+            serialized.as_bytes(),
+            &sync_label(name),
+        )?;
         Ok(to_public(name, stored))
     }
 
     pub fn sync(&self, name: &str) -> Result<SyncDefinition> {
         validate_component(name, "sync")?;
-        let path = self.sync_path(name);
-        let metadata =
-            fs::symlink_metadata(&path).with_context(|| format!("sync '{name}' does not exist"))?;
-        if !metadata.file_type().is_file() {
-            bail!("sync path {} must be a regular file", path.display());
-        }
-        let serialized =
-            fs::read_to_string(&path).with_context(|| format!("could not read sync '{name}'"))?;
+        let serialized = paths::read_to_string(self.root(), &sync_path(name), &sync_label(name))
+            .map_err(|error| {
+                if is_missing(&error) {
+                    error.context(format!("sync '{name}' does not exist"))
+                } else {
+                    error
+                }
+            })?;
         let stored: StoredSyncDefinition = yaml_serde::from_str(&serialized)
             .with_context(|| format!("sync '{name}' is not valid YAML"))?;
         validate_stored(name, &stored)?;
@@ -131,31 +144,23 @@ impl Database {
     }
 
     pub fn syncs(&self) -> Result<Vec<SyncDefinition>> {
-        let directory = self.root().join(".cr/syncs");
-        let metadata = match fs::symlink_metadata(&directory) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("could not inspect sync directory {}", directory.display())
-                })
-            }
+        let Some(entries) = paths::list_directory(
+            self.root(),
+            Path::new(SYNC_DEFINITION_DIRECTORY),
+            SYNC_DIRECTORY_LABEL,
+        )?
+        else {
+            return Ok(Vec::new());
         };
-        if !metadata.file_type().is_dir() {
-            bail!("sync path {} must be a directory", directory.display());
-        }
         let mut names = Vec::new();
-        for entry in fs::read_dir(&directory)
-            .with_context(|| format!("could not read sync directory {}", directory.display()))?
-        {
-            let entry = entry?;
-            if !entry.file_type()?.is_file()
-                || entry.path().extension().and_then(|value| value.to_str()) != Some("yaml")
+        for entry in entries {
+            let entry_path = Path::new(&entry.name);
+            if !entry.kind.is_file()
+                || entry_path.extension().and_then(|value| value.to_str()) != Some("yaml")
             {
                 continue;
             }
-            let name = entry
-                .path()
+            let name = entry_path
                 .file_stem()
                 .and_then(|value| value.to_str())
                 .context("sync filename is not valid UTF-8")?
@@ -169,20 +174,14 @@ impl Database {
 
     pub fn sync_state(&self, name: &str) -> Result<Option<JsonValue>> {
         validate_component(name, "sync")?;
-        let path = self.sync_state_path(name);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("could not inspect sync state {}", path.display()))
-            }
+        let Some(serialized) = paths::read_to_string_optional(
+            self.root(),
+            &sync_state_path(name),
+            &sync_state_label(name),
+        )?
+        else {
+            return Ok(None);
         };
-        if !metadata.file_type().is_file() {
-            bail!("sync state path {} must be a regular file", path.display());
-        }
-        let serialized = fs::read_to_string(&path)
-            .with_context(|| format!("could not read sync state for '{name}'"))?;
         serde_json::from_str(&serialized)
             .with_context(|| format!("sync state for '{name}' is not valid JSON"))
             .map(Some)
@@ -196,9 +195,15 @@ impl Database {
             .context("database must be clean before a sync can run")?;
 
         let run_id = random_run_id()?;
-        let sync_directory = self.root().join(".cr/sync");
-        fs::create_dir_all(&sync_directory)
-            .with_context(|| format!("could not create {}", sync_directory.display()))?;
+        // Verified rather than merely created: `.cr/sync` must be a real
+        // directory beneath the root before adapter output is staged in it.
+        let sync_directory = paths::create_directory_all(
+            self.root(),
+            Path::new(SYNC_WORK_DIRECTORY),
+            SYNC_WORK_LABEL,
+        )?
+        .path()
+        .to_path_buf();
         let output = NamedTempFile::new_in(&sync_directory)
             .context("could not create temporary sync output")?;
         let mut state_input = NamedTempFile::new_in(&sync_directory)
@@ -347,72 +352,50 @@ impl Database {
         if current.as_ref() == Some(state) {
             return Ok(false);
         }
-        let path = self.sync_state_path(name);
+        let path = sync_state_path(name);
+        let label = sync_state_label(name);
         let mut serialized =
             serde_json::to_vec_pretty(state).context("could not serialize sync checkpoint")?;
         serialized.push(b'\n');
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_file() => write_replace(&path, &serialized)?,
-            Ok(_) => bail!("sync state path {} must be a regular file", path.display()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                write_new(&path, &serialized)?
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("could not inspect sync state {}", path.display()))
-            }
+        match paths::entry_kind(self.root(), &path, &label)? {
+            Some(EntryKind::File) => paths::write_replace(self.root(), &path, &serialized, &label)?,
+            None => paths::write_new(self.root(), &path, &serialized, &label)?,
+            Some(_) => bail!("{label} is not a regular file"),
         }
         Ok(true)
     }
 
     fn acquire_sync_lock(&self, name: &str) -> Result<File> {
-        let path = self
-            .root()
-            .join(".cr/sync/locks")
-            .join(format!("{name}.lock"));
-        let parent = path.parent().context("sync lock has no parent directory")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("could not open sync lock {}", path.display()))?;
+        let path = Path::new(SYNC_LOCK_DIRECTORY).join(format!("{name}.lock"));
+        let lock = paths::open_lock_file(self.root(), &path, "the sync lock")?;
         lock.try_lock()
             .with_context(|| format!("sync '{name}' is already running"))?;
         Ok(lock)
     }
 
     fn acquire_sync_application_lock(&self) -> Result<File> {
-        let path = self.root().join(".cr/sync/locks/application.lock");
-        let parent = path
-            .parent()
-            .context("sync application lock has no parent directory")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("could not open sync application lock {}", path.display()))?;
+        let path = Path::new(SYNC_LOCK_DIRECTORY).join("application.lock");
+        let lock = paths::open_lock_file(self.root(), &path, "the sync application lock")?;
         lock.lock()
             .context("could not lock sync operation application")?;
         Ok(lock)
     }
+}
 
-    fn sync_path(&self, name: &str) -> PathBuf {
-        self.root().join(".cr/syncs").join(format!("{name}.yaml"))
-    }
+fn sync_path(name: &str) -> PathBuf {
+    Path::new(SYNC_DEFINITION_DIRECTORY).join(format!("{name}.yaml"))
+}
 
-    fn sync_state_path(&self, name: &str) -> PathBuf {
-        self.root()
-            .join(".cr/sync/state")
-            .join(format!("{name}.json"))
-    }
+fn sync_state_path(name: &str) -> PathBuf {
+    Path::new(SYNC_STATE_DIRECTORY).join(format!("{name}.json"))
+}
+
+fn sync_label(name: &str) -> String {
+    format!("sync '{name}'")
+}
+
+fn sync_state_label(name: &str) -> String {
+    format!("the checkpoint for sync '{name}'")
 }
 
 fn validate_stored(name: &str, sync: &StoredSyncDefinition) -> Result<()> {

@@ -1,27 +1,51 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::Write,
+    fs,
     path::{Component, Path, PathBuf},
     process::Command,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 use yaml_serde::{Mapping, Value};
 
 use crate::{
     audit::{record_hash, AuditLog, AuditMutation, ReconciledMutation},
     error::{conflict, invalid, is_already_exists, is_missing, DomainError},
     frontmatter::Document,
+    paths,
+    sync::{SYNC_DEFINITION_DIRECTORY, SYNC_LOCK_DIRECTORY, SYNC_STATE_DIRECTORY},
     value::{compare_yaml_values, get_path, parse_path, remove_path},
+    views::VIEW_DIRECTORY,
     Assignment, AuditAction, AuditEntry, AuditHead, AuditSource, AuditVerification, SearchQuery,
 };
 
 const CONFIG_PATH: &str = ".cr/config.yaml";
 const DATABASE_DIRECTORY: &str = ".cr";
+const SCHEMA_DIRECTORY: &str = ".cr/schemas";
 const CURRENT_FORMAT_VERSION: u32 = 1;
+
+/// How the database directory itself is named to a caller.
+pub(crate) const DATABASE_LABEL: &str = "the database directory";
+/// How the configured records directory is named to a caller.
+pub(crate) const RECORDS_LABEL: &str = "the records directory";
+/// How the collection schema directory is named to a caller.
+const SCHEMA_LABEL: &str = "the schema directory";
+
+/// Name one collection's JSON Schema in caller-facing words.
+fn schema_label(collection: &str) -> String {
+    format!("the JSON Schema for collection '{collection}'")
+}
+
+/// Name one record in caller-facing words, never by path.
+pub(crate) fn record_label(collection: &str, id: &str) -> String {
+    format!("record {collection}/{id}")
+}
+
+/// Name one collection in caller-facing words, never by path.
+fn collection_label(collection: &str) -> String {
+    format!("collection '{collection}'")
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -193,21 +217,24 @@ impl Database {
         let root = root
             .canonicalize()
             .with_context(|| format!("could not resolve database root {}", root.display()))?;
-        let database_directory = root.join(DATABASE_DIRECTORY);
 
-        if database_directory.exists() {
+        // A dangling or hostile symbolic link named `.cr` must not be treated as
+        // absent and then created through, so existence is judged without
+        // following links.
+        if paths::entry_kind(&root, Path::new(DATABASE_DIRECTORY), DATABASE_LABEL)?.is_some() {
             bail!("a database already exists at {}", root.display());
         }
 
-        fs::create_dir_all(root.join(".cr/schemas"))
-            .context("could not create schema directory")?;
-        fs::create_dir_all(root.join(".cr/views")).context("could not create view directory")?;
-        fs::create_dir_all(root.join(".cr/syncs")).context("could not create sync directory")?;
-        fs::create_dir_all(root.join(".cr/sync/state"))
-            .context("could not create sync state directory")?;
-        fs::create_dir_all(root.join(".cr/sync/locks"))
-            .context("could not create sync lock directory")?;
-        fs::create_dir_all(root.join("records")).context("could not create records directory")?;
+        for (relative, label) in [
+            (SCHEMA_DIRECTORY, "the schema directory"),
+            (VIEW_DIRECTORY, "the view directory"),
+            (SYNC_DEFINITION_DIRECTORY, "the sync directory"),
+            (SYNC_STATE_DIRECTORY, "the sync state directory"),
+            (SYNC_LOCK_DIRECTORY, "the sync lock directory"),
+            ("records", RECORDS_LABEL),
+        ] {
+            paths::create_directory_all(&root, Path::new(relative), label)?;
+        }
 
         let database = Self {
             root,
@@ -237,22 +264,25 @@ impl Database {
             }
         };
 
-        if !root.join(DATABASE_DIRECTORY).is_dir() {
+        // Refuses a `.cr` that is a symbolic link rather than a real directory,
+        // which would otherwise relocate the whole database.
+        if paths::open_directory_optional(&root, Path::new(DATABASE_DIRECTORY), DATABASE_LABEL)?
+            .is_none()
+        {
             bail!(
                 "no database found at {}; run 'cr init' first",
                 root.display()
             );
         }
 
-        let config_path = root.join(CONFIG_PATH);
-        let config = match fs::read_to_string(&config_path) {
-            Ok(serialized) => yaml_serde::from_str(&serialized)
-                .with_context(|| format!("{} is not valid YAML", config_path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("could not read {}", config_path.display()))
-            }
+        let config = match paths::read_to_string_optional(
+            &root,
+            Path::new(CONFIG_PATH),
+            "the database configuration",
+        )? {
+            Some(serialized) => yaml_serde::from_str(&serialized)
+                .context("the database configuration is not valid YAML")?,
+            None => Config::default(),
         };
 
         if config.version != CURRENT_FORMAT_VERSION {
@@ -263,6 +293,9 @@ impl Database {
             );
         }
         validate_relative_path(&config.data_dir, "data_dir")?;
+        // The configured records directory, and every directory above it, must
+        // be a real directory beneath the root rather than a redirection.
+        paths::open_directory_optional(&root, &config.data_dir, RECORDS_LABEL)?;
         if config.audit.segment_max_events == 0 {
             bail!("audit.segment_max_events must be greater than zero");
         }
@@ -335,10 +368,11 @@ impl Database {
         body: &str,
     ) -> Result<Record> {
         let path = self.record_path(collection, id)?;
+        let label = record_label(collection, id);
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        if path.exists() {
+        if paths::entry_kind(&self.root, &path, &label)?.is_some() {
             return Err(DomainError::record_exists(collection, id).into());
         }
         let document = Document {
@@ -359,7 +393,7 @@ impl Database {
             message: self.audit_message.as_deref(),
         })?;
         audit.commit(event, &path, || {
-            write_new(&path, rendered.as_bytes()).map_err(|error| {
+            paths::write_new(&self.root, &path, rendered.as_bytes(), &label).map_err(|error| {
                 if is_already_exists(&error) {
                     error.context(DomainError::record_exists(collection, id))
                 } else {
@@ -367,81 +401,66 @@ impl Database {
                 }
             })
         })?;
-        self.record_from_document(collection, id, path, document)
+        Ok(record_from_document(collection, id, path, document))
     }
 
     pub fn get(&self, collection: &str, id: &str) -> Result<Record> {
         let path = self.record_path(collection, id)?;
         let document = self.read_document(collection, id, &path)?;
-        self.record_from_document(collection, id, path, document)
+        Ok(record_from_document(collection, id, path, document))
     }
 
     pub fn get_optional(&self, collection: &str, id: &str) -> Result<Option<Record>> {
         let path = self.record_path(collection, id)?;
-        match fs::symlink_metadata(&path) {
-            Ok(_) => self.get(collection, id).map(Some),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => {
-                Err(error).with_context(|| format!("could not inspect record {collection}/{id}"))
-            }
+        match paths::entry_kind(&self.root, &path, &record_label(collection, id))? {
+            Some(_) => self.get(collection, id).map(Some),
+            None => Ok(None),
         }
     }
 
     pub fn read_raw(&self, collection: &str, id: &str) -> Result<String> {
         let path = self.record_path(collection, id)?;
-        read_record(collection, id, &path)
+        self.read_record(collection, id, &path)
     }
 
     pub fn list(&self, collection: &str, filters: &[Assignment]) -> Result<Vec<Record>> {
         validate_component(collection, "collection")?;
-        let directory = self.root.join(&self.config.data_dir).join(collection);
-        let metadata = match fs::symlink_metadata(&directory) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("could not inspect collection {}", directory.display())
-                })
-            }
-        };
-        if !metadata.file_type().is_dir() {
+        let directory = self.config.data_dir.join(collection);
+        let label = collection_label(collection);
+        let Some(entries) = paths::list_directory(&self.root, &directory, &label)? else {
             return Ok(Vec::new());
-        }
+        };
 
-        let mut paths = Vec::new();
-        for entry in fs::read_dir(&directory)
-            .with_context(|| format!("could not read collection {}", directory.display()))?
-        {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
+        let mut identifiers = Vec::new();
+        for entry in entries {
+            if !entry.kind.is_file() {
                 continue;
             }
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) == Some("md") {
-                paths.push(path);
+            let name = Path::new(&entry.name);
+            if name.extension().and_then(|value| value.to_str()) != Some("md") {
+                continue;
             }
+            let id = name
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .with_context(|| {
+                    DomainError::Invalid(format!(
+                        "{label} contains a record filename that is not valid UTF-8"
+                    ))
+                })?
+                .to_owned();
+            identifiers.push(id);
         }
-        paths.sort();
+        identifiers.sort();
 
-        paths
+        identifiers
             .into_iter()
-            .map(|path| {
-                let id = path
-                    .file_stem()
-                    .context("record path has no filename")?
-                    .to_str()
-                    .with_context(|| {
-                        format!("record filename {} is not valid UTF-8", path.display())
-                    })?
-                    .to_owned();
-                Ok((id, path))
-            })
-            .map(|result: Result<(String, PathBuf)>| {
-                let (id, path) = result?;
+            .map(|id| {
+                let path = directory.join(format!("{id}.md"));
                 let document = self.read_document(collection, &id, &path)?;
-                self.record_from_document(collection, &id, path, document)
+                Ok(record_from_document(collection, &id, path, document))
             })
-            .filter(|record| {
+            .filter(|record: &Result<Record>| {
                 record
                     .as_ref()
                     .map(|record| {
@@ -471,8 +490,7 @@ impl Database {
         let mut matches = Vec::new();
         for collection in collections {
             for record in self.list(&collection, filters)? {
-                let path = self.root.join(&record.path);
-                let raw_document = read_regular_string(&path)?;
+                let raw_document = self.read_record(&collection, &record.id, &record.path)?;
                 if query.matches(&record, &raw_document)? {
                     matches.push(record);
                 }
@@ -487,35 +505,28 @@ impl Database {
             .into_iter()
             .map(|name| (name, None))
             .collect();
-        let schema_root = self.root.join(".cr/schemas");
-        let metadata = fs::symlink_metadata(&schema_root).with_context(|| {
-            format!(
-                "could not inspect schema directory {}",
-                schema_root.display()
-            )
-        })?;
-        if !metadata.file_type().is_dir() {
-            bail!("schema path {} must be a directory", schema_root.display());
-        }
+        let schema_root = Path::new(SCHEMA_DIRECTORY);
+        let entries =
+            paths::list_directory(&self.root, schema_root, SCHEMA_LABEL)?.unwrap_or_default();
 
-        for entry in fs::read_dir(&schema_root)
-            .with_context(|| format!("could not read schema directory {}", schema_root.display()))?
-        {
-            let entry = entry?;
-            if !entry.file_type()?.is_file()
-                || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+        for entry in entries {
+            let entry_path = Path::new(&entry.name);
+            if !entry.kind.is_file()
+                || entry_path.extension().and_then(|value| value.to_str()) != Some("json")
             {
                 continue;
             }
-            let name = entry
-                .path()
+            let name = entry_path
                 .file_stem()
                 .and_then(|value| value.to_str())
                 .context("schema filename is not valid UTF-8")?
                 .to_owned();
             validate_component(&name, "collection")?;
-            let serialized = fs::read_to_string(entry.path())
-                .with_context(|| format!("could not read schema for collection '{name}'"))?;
+            let serialized = paths::read_to_string(
+                &self.root,
+                &schema_root.join(&entry.name),
+                &schema_label(&name),
+            )?;
             let schema: serde_json::Value =
                 serde_json::from_str(&serialized).with_context(|| {
                     DomainError::Invalid(format!(
@@ -611,10 +622,11 @@ impl Database {
         mutate: impl FnOnce(&mut Document) -> Result<()>,
     ) -> Result<Record> {
         let path = self.record_path(collection, id)?;
+        let label = record_label(collection, id);
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        let before_raw = read_record(collection, id, &path)?;
+        let before_raw = self.read_record(collection, id, &path)?;
         let before = parse_record(collection, id, &before_raw)?;
         let mut document = before.clone();
         mutate(&mut document)?;
@@ -631,8 +643,10 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
         })?;
-        audit.commit(event, &path, || write_replace(&path, rendered.as_bytes()))?;
-        self.record_from_document(collection, id, path, document)
+        audit.commit(event, &path, || {
+            paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
+        })?;
+        Ok(record_from_document(collection, id, path, document))
     }
 
     pub fn link(
@@ -648,16 +662,23 @@ impl Database {
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         let target_path = self.record_path(target_collection, target_id)?;
-        let target_raw = read_regular_string(&target_path).map_err(|error| {
-            error.context(DomainError::NotFound(format!(
-                "relation target {target_collection}/{target_id} does not exist"
-            )))
-        })?;
+        let target_raw = self
+            .read_record(target_collection, target_id, &target_path)
+            .map_err(|error| {
+                if is_missing(&error) {
+                    error.context(DomainError::NotFound(format!(
+                        "relation target {target_collection}/{target_id} does not exist"
+                    )))
+                } else {
+                    error
+                }
+            })?;
         parse_record(target_collection, target_id, &target_raw)?;
         audit.assert_current(target_collection, target_id, target_raw.as_bytes())?;
 
         let path = self.record_path(collection, id)?;
-        let before_raw = read_record(collection, id, &path)?;
+        let label = record_label(collection, id);
+        let before_raw = self.read_record(collection, id, &path)?;
         let before = parse_record(collection, id, &before_raw)?;
         let mut document = before.clone();
         let relations = mapping_field(&mut document.attributes, "relations")?;
@@ -681,16 +702,19 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
         })?;
-        audit.commit(event, &path, || write_replace(&path, rendered.as_bytes()))?;
-        self.record_from_document(collection, id, path, document)
+        audit.commit(event, &path, || {
+            paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
+        })?;
+        Ok(record_from_document(collection, id, path, document))
     }
 
     pub fn delete(&self, collection: &str, id: &str) -> Result<Record> {
         let path = self.record_path(collection, id)?;
+        let label = record_label(collection, id);
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        let before_raw = read_record(collection, id, &path)?;
+        let before_raw = self.read_record(collection, id, &path)?;
         let document = parse_record(collection, id, &before_raw)?;
         let event = audit.prepare(AuditMutation {
             action: AuditAction::Delete,
@@ -703,13 +727,10 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
         })?;
-        let parent = path.parent().context("record has no parent directory")?;
         audit.commit(event, &path, || {
-            fs::remove_file(&path)
-                .with_context(|| format!("could not delete record {}", path.display()))?;
-            sync_parent(parent)
+            paths::remove_file(&self.root, &path, &label)
         })?;
-        self.record_from_document(collection, id, path, document)
+        Ok(record_from_document(collection, id, path, document))
     }
 
     pub fn status(&self) -> Result<Vec<WorkingChange>> {
@@ -773,11 +794,10 @@ impl Database {
                 .and_then(|state| state.document.as_ref())
                 .map(Document::from_audit_value)
                 .transpose()?;
-            let path = self.root.join(&change.path);
             let after_raw = match change.status {
                 WorkingChangeKind::Deleted => None,
                 WorkingChangeKind::Added | WorkingChangeKind::Modified => {
-                    Some(read_record(&change.collection, &change.id, &path)?)
+                    Some(self.read_record(&change.collection, &change.id, &change.path)?)
                 }
             };
             let after = after_raw
@@ -808,7 +828,7 @@ impl Database {
                 had_history: states.contains_key(&(change.collection.clone(), change.id.clone())),
                 message,
             })?;
-            entries.push(audit.accept(event, &self.root.join(&change.path))?);
+            entries.push(audit.accept(event, &change.path)?);
         }
         Ok(entries)
     }
@@ -858,7 +878,7 @@ impl Database {
             if audit.has_history(&collection, &id)? {
                 continue;
             }
-            let raw = read_record(&collection, &id, &path)?;
+            let raw = self.read_record(&collection, &id, &path)?;
             let document = parse_record(&collection, &id, &raw)?;
             let event = audit.prepare(AuditMutation {
                 action: AuditAction::Baseline,
@@ -890,9 +910,7 @@ impl Database {
     ) -> Result<Vec<WorkingChange>> {
         let mut current = BTreeMap::new();
         for (collection, id, path) in self.record_files()? {
-            ensure_regular_record(&path)?;
-            let contents = fs::read(&path)
-                .with_context(|| format!("could not hash record {}", path.display()))?;
+            let contents = paths::read(&self.root, &path, &record_label(&collection, &id))?;
             current.insert((collection, id), (path, record_hash(&contents)));
         }
         let references: BTreeSet<_> = states
@@ -916,12 +934,10 @@ impl Database {
                 (true, true) => WorkingChangeKind::Modified,
                 (false, false) => continue,
             };
-            let path = current_entry
-                .map(|(path, _)| path.clone())
-                .unwrap_or(self.record_path(&collection, &id)?)
-                .strip_prefix(&self.root)
-                .context("record path is outside the database")?
-                .to_path_buf();
+            let path = match current_entry {
+                Some((path, _)) => path.clone(),
+                None => self.record_path(&collection, &id)?,
+            };
             changes.push(WorkingChange {
                 status,
                 collection,
@@ -934,70 +950,58 @@ impl Database {
         Ok(changes)
     }
 
+    /// A record's location relative to the database root.
+    ///
+    /// The path is never resolved here; every component is opened safely when
+    /// the record is actually read or written.
     fn record_path(&self, collection: &str, id: &str) -> Result<PathBuf> {
         validate_component(collection, "collection")?;
         validate_component(id, "id")?;
         Ok(self
-            .root
-            .join(&self.config.data_dir)
+            .config
+            .data_dir
             .join(collection)
             .join(format!("{id}.md")))
     }
 
-    fn read_document(&self, collection: &str, id: &str, path: &Path) -> Result<Document> {
-        let input = read_record(collection, id, path)?;
-        parse_record(collection, id, &input)
-    }
-
-    fn record_from_document(
-        &self,
-        collection: &str,
-        id: &str,
-        path: PathBuf,
-        document: Document,
-    ) -> Result<Record> {
-        let relative_path = path
-            .strip_prefix(&self.root)
-            .context("record path is outside the database")?
-            .to_path_buf();
-        Ok(Record {
-            collection: collection.to_owned(),
-            id: id.to_owned(),
-            path: relative_path,
-            attributes: document.attributes,
-            body: document.body,
+    /// Read a record's exact bytes through verified path components,
+    /// classifying a missing file as a typed not-found failure.
+    fn read_record(&self, collection: &str, id: &str, path: &Path) -> Result<String> {
+        paths::read_to_string(&self.root, path, &record_label(collection, id)).map_err(|error| {
+            if is_missing(&error) {
+                error.context(DomainError::record_not_found(collection, id))
+            } else {
+                error
+            }
         })
     }
 
+    fn read_document(&self, collection: &str, id: &str, path: &Path) -> Result<Document> {
+        let input = self.read_record(collection, id, path)?;
+        parse_record(collection, id, &input)
+    }
+
     fn validate(&self, collection: &str, attributes: &Mapping) -> Result<()> {
-        let schema_path = self
-            .root
-            .join(".cr/schemas")
-            .join(format!("{collection}.json"));
-        if !schema_path.exists() {
+        let schema_path = Path::new(SCHEMA_DIRECTORY).join(format!("{collection}.json"));
+        let label = schema_label(collection);
+        let Some(serialized) = paths::read_to_string_optional(&self.root, &schema_path, &label)?
+        else {
             return Ok(());
-        }
+        };
 
         let unusable = || {
             DomainError::Invalid(format!(
                 "collection '{collection}' has an unusable JSON Schema"
             ))
         };
-        let serialized = fs::read_to_string(&schema_path)
-            .with_context(|| format!("could not read schema {}", schema_path.display()))?;
         let schema: serde_json::Value = serde_json::from_str(&serialized)
-            .with_context(|| format!("{} is not valid JSON", schema_path.display()))
+            .with_context(|| format!("{label} is not valid JSON"))
             .with_context(unusable)?;
         jsonschema::meta::validate(&schema)
-            .map_err(|error| anyhow!("invalid JSON Schema {}: {error}", schema_path.display()))
+            .map_err(|error| anyhow!("invalid JSON Schema for {label}: {error}"))
             .with_context(unusable)?;
         let validator = jsonschema::validator_for(&schema)
-            .map_err(|error| {
-                anyhow!(
-                    "could not compile schema {}: {error}",
-                    schema_path.display()
-                )
-            })
+            .map_err(|error| anyhow!("could not compile {label}: {error}"))
             .with_context(unusable)?;
         let instance = serde_json::to_value(attributes)
             .context("front matter cannot be represented as JSON for schema validation")?;
@@ -1017,38 +1021,30 @@ impl Database {
     }
 
     fn record_files(&self) -> Result<Vec<(String, String, PathBuf)>> {
-        let records_root = self.root.join(&self.config.data_dir);
-        if !records_root.exists() {
-            return Ok(Vec::new());
-        }
         let mut records = Vec::new();
-        for collection in fs::read_dir(&records_root)? {
-            let collection = collection?;
-            if !collection.file_type()?.is_dir() {
-                continue;
-            }
-            let collection_name = collection
-                .file_name()
-                .to_str()
-                .context("collection filename is not valid UTF-8")?
-                .to_owned();
-            validate_component(&collection_name, "collection")?;
-            for record in fs::read_dir(collection.path())? {
-                let record = record?;
-                let path = record.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("md") {
+        for collection_name in self.collection_names()? {
+            let directory = self.config.data_dir.join(&collection_name);
+            let label = collection_label(&collection_name);
+            let entries =
+                paths::list_directory(&self.root, &directory, &label)?.unwrap_or_default();
+            for entry in entries {
+                let name = Path::new(&entry.name);
+                if name.extension().and_then(|value| value.to_str()) != Some("md") {
                     continue;
                 }
-                if !record.file_type()?.is_file() {
-                    bail!("record path {} must be a regular file", path.display());
-                }
-                let id = path
+                let id = name
                     .file_stem()
                     .and_then(|value| value.to_str())
                     .context("record filename is not valid UTF-8")?
                     .to_owned();
                 validate_component(&id, "id")?;
-                records.push((collection_name.clone(), id, path));
+                if !entry.kind.is_file() {
+                    return Err(paths::refuse_entry(
+                        &record_label(&collection_name, &id),
+                        entry.kind,
+                    ));
+                }
+                records.push((collection_name.clone(), id, directory.join(&entry.name)));
             }
         }
         records.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
@@ -1056,24 +1052,19 @@ impl Database {
     }
 
     fn collection_names(&self) -> Result<Vec<String>> {
-        let records_root = self.root.join(&self.config.data_dir);
-        if !records_root.exists() {
+        let Some(entries) =
+            paths::list_directory(&self.root, &self.config.data_dir, RECORDS_LABEL)?
+        else {
             return Ok(Vec::new());
-        }
+        };
 
         let mut collections = Vec::new();
-        for entry in fs::read_dir(&records_root).with_context(|| {
-            format!(
-                "could not read records directory {}",
-                records_root.display()
-            )
-        })? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+        for entry in entries {
+            if !entry.kind.is_directory() {
                 continue;
             }
             let name = entry
-                .file_name()
+                .name
                 .to_str()
                 .context("collection filename is not valid UTF-8")?
                 .to_owned();
@@ -1216,30 +1207,14 @@ fn relation_value(collection: &str, id: &str) -> Value {
     Value::Mapping(reference)
 }
 
-fn ensure_regular_record(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("could not read record {}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        bail!("record path {} must be a regular file", path.display());
+fn record_from_document(collection: &str, id: &str, path: PathBuf, document: Document) -> Record {
+    Record {
+        collection: collection.to_owned(),
+        id: id.to_owned(),
+        path,
+        attributes: document.attributes,
+        body: document.body,
     }
-    Ok(())
-}
-
-fn read_regular_string(path: &Path) -> Result<String> {
-    ensure_regular_record(path)?;
-    fs::read_to_string(path).with_context(|| format!("could not read record {}", path.display()))
-}
-
-/// Read a record's exact bytes, classifying a missing file as a typed
-/// not-found failure so callers never inspect the operating-system message.
-fn read_record(collection: &str, id: &str, path: &Path) -> Result<String> {
-    read_regular_string(path).map_err(|error| {
-        if is_missing(&error) {
-            error.context(DomainError::record_not_found(collection, id))
-        } else {
-            error
-        }
-    })
 }
 
 /// Parse a stored record, naming it by collection and ID rather than by path.
@@ -1273,72 +1248,10 @@ fn validate_relative_path(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn write_new(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("{} has no parent directory", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("could not create directory {}", parent.display()))?;
-
-    let mut temporary = NamedTempFile::new_in(parent)
-        .with_context(|| format!("could not create temporary file in {}", parent.display()))?;
-    temporary
-        .write_all(contents)
-        .with_context(|| format!("could not write temporary file for {}", path.display()))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("could not sync temporary file for {}", path.display()))?;
-    temporary.persist_noclobber(path).map_err(|error| {
-        anyhow!(error.error).context(format!("could not create {}", path.display()))
-    })?;
-    sync_parent(parent)?;
-    Ok(())
-}
-
-pub(crate) fn write_replace(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("{} has no parent directory", path.display()))?;
-    let permissions = fs::metadata(path)
-        .with_context(|| format!("could not inspect {}", path.display()))?
-        .permissions();
-    let mut temporary = NamedTempFile::new_in(parent)
-        .with_context(|| format!("could not create temporary file in {}", parent.display()))?;
-    temporary
-        .as_file()
-        .set_permissions(permissions)
-        .with_context(|| format!("could not preserve permissions for {}", path.display()))?;
-    temporary
-        .write_all(contents)
-        .with_context(|| format!("could not write temporary file for {}", path.display()))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("could not sync temporary file for {}", path.display()))?;
-    temporary.persist(path).map_err(|error| {
-        anyhow!(error.error).context(format!("could not replace {}", path.display()))
-    })?;
-    sync_parent(parent)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-pub(crate) fn sync_parent(parent: &Path) -> Result<()> {
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .with_context(|| format!("could not sync directory {}", parent.display()))
-}
-
-#[cfg(not(unix))]
-pub(crate) fn sync_parent(_parent: &Path) -> Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{validate_component, validate_relative_path, write_new, write_replace};
-    use std::{fs, path::Path};
+    use super::{validate_component, validate_relative_path};
+    use std::path::Path;
 
     #[test]
     fn path_validation_blocks_traversal_but_allows_unicode() {
@@ -1353,52 +1266,5 @@ mod tests {
         assert!(validate_relative_path(Path::new("data/records"), "data_dir").is_ok());
         assert!(validate_relative_path(Path::new("../records"), "data_dir").is_err());
         assert!(validate_relative_path(Path::new("/records"), "data_dir").is_err());
-    }
-
-    #[test]
-    fn new_file_write_never_clobbers_existing_content() {
-        let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("record.md");
-        write_new(&path, b"original").unwrap();
-
-        assert!(write_new(&path, b"replacement").is_err());
-        assert_eq!(fs::read(path).unwrap(), b"original");
-    }
-
-    #[test]
-    fn replacement_write_publishes_the_complete_next_value() {
-        let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("record.md");
-        write_new(&path, b"original").unwrap();
-
-        write_replace(&path, b"replacement").unwrap();
-        assert_eq!(fs::read(path).unwrap(), b"replacement");
-    }
-
-    #[test]
-    fn replacement_failure_does_not_destroy_the_destination() {
-        let temporary = tempfile::tempdir().unwrap();
-        let destination = temporary.path().join("destination");
-        fs::create_dir(&destination).unwrap();
-
-        assert!(write_replace(&destination, b"replacement").is_err());
-        assert!(destination.is_dir());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn replacement_preserves_unix_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("record.md");
-        write_new(&path, b"original").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-
-        write_replace(&path, b"replacement").unwrap();
-        assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o640
-        );
     }
 }

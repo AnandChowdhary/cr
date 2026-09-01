@@ -1,21 +1,31 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    fs::{self, File, OpenOptions},
+    fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::{value::RawValue, Value};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
-    database::{sync_parent, validate_component, write_new, write_replace},
+    database::{record_label, validate_component, RECORDS_LABEL},
     error::conflict,
     frontmatter::Document,
+    paths::{self, EntryKind},
 };
+
+/// Where the tamper-evident journal lives beneath the database root.
+const SEGMENT_DIRECTORY: &str = ".cr/audit/segments";
+const PENDING_PATH: &str = ".cr/audit/pending.json";
+const LOCK_PATH: &str = ".cr/audit/lock";
+const SEGMENT_DIRECTORY_LABEL: &str = "the audit segment directory";
+const SEGMENT_LABEL: &str = "an audit segment";
+const PENDING_LABEL: &str = "the pending audit mutation";
+const LOCK_LABEL: &str = "the audit lock";
 
 const AUDIT_VERSION: u32 = 2;
 const MIN_AUDIT_VERSION: u32 = 1;
@@ -286,21 +296,18 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn ensure_layout(&self) -> Result<()> {
-        fs::create_dir_all(self.segments_dir()).context("could not create audit segments directory")
+        paths::create_directory_all(
+            self.root,
+            Path::new(SEGMENT_DIRECTORY),
+            SEGMENT_DIRECTORY_LABEL,
+        )
+        .map(|_| ())
     }
 
     pub fn lock(&self) -> Result<File> {
         self.ensure_layout()?;
-        let lock_path = self.audit_dir().join("lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .with_context(|| format!("could not open audit lock {}", lock_path.display()))?;
-        lock.lock()
-            .with_context(|| format!("could not lock audit log {}", lock_path.display()))?;
+        let lock = paths::open_lock_file(self.root, Path::new(LOCK_PATH), LOCK_LABEL)?;
+        lock.lock().context("could not lock the audit journal")?;
         Ok(lock)
     }
 
@@ -417,10 +424,7 @@ impl<'a> AuditLog<'a> {
     where
         F: FnOnce() -> Result<()>,
     {
-        let target = target
-            .strip_prefix(self.root)
-            .context("audit target is outside the database")?
-            .to_path_buf();
+        let target = target.to_path_buf();
         validate_relative_target(&target)?;
         let expected_target = self
             .records_dir
@@ -438,10 +442,19 @@ impl<'a> AuditLog<'a> {
         };
         let pending_bytes = serde_json::to_vec_pretty(&pending)
             .context("could not serialize pending audit mutation")?;
-        write_new(&self.pending_path(), &pending_bytes)?;
+        paths::write_new(
+            self.root,
+            Path::new(PENDING_PATH),
+            &pending_bytes,
+            PENDING_LABEL,
+        )?;
 
         let result = apply();
-        let current_hash = file_hash_optional(&self.root.join(&pending.target))?;
+        let current_hash = self.record_file_hash(
+            &pending.target,
+            &entry.parsed.record.collection,
+            &entry.parsed.record.id,
+        )?;
 
         if current_hash == pending.after_hash {
             self.append(&entry)?;
@@ -460,10 +473,7 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn accept(&self, entry: PreparedEntry, target: &Path) -> Result<AuditEntry> {
-        let target = target
-            .strip_prefix(self.root)
-            .context("audit target is outside the database")?
-            .to_path_buf();
+        let target = target.to_path_buf();
         validate_relative_target(&target)?;
         let expected_target = self
             .records_dir
@@ -472,7 +482,11 @@ impl<'a> AuditLog<'a> {
         if target != expected_target {
             bail!("audit target does not match its record identity");
         }
-        let current_hash = file_hash_optional(&self.root.join(target))?;
+        let current_hash = self.record_file_hash(
+            &target,
+            &entry.parsed.record.collection,
+            &entry.parsed.record.id,
+        )?;
         if current_hash != entry.parsed.after_hash {
             return Err(conflict(format!(
                 "record {}/{} changed while it was being saved",
@@ -488,15 +502,14 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn recover_pending(&self) -> Result<()> {
-        let path = self.pending_path();
-        if !path.exists() {
+        let Some(serialized) =
+            paths::read_optional(self.root, Path::new(PENDING_PATH), PENDING_LABEL)?
+        else {
             return Ok(());
-        }
+        };
 
-        let serialized = fs::read(&path)
-            .with_context(|| format!("could not read pending mutation {}", path.display()))?;
-        let pending: PendingMutation = serde_json::from_slice(&serialized)
-            .with_context(|| format!("pending mutation {} is invalid", path.display()))?;
+        let pending: PendingMutation =
+            serde_json::from_slice(&serialized).context("the pending audit mutation is invalid")?;
         validate_relative_target(&pending.target)?;
         let payload: AuditPayload =
             serde_json::from_str(&pending.payload).context("pending audit payload is invalid")?;
@@ -516,7 +529,11 @@ impl<'a> AuditLog<'a> {
             bail!("pending audit mutation target does not match its record identity");
         }
 
-        let current_hash = file_hash_optional(&self.root.join(&pending.target))?;
+        let current_hash = self.record_file_hash(
+            &pending.target,
+            &payload.record.collection,
+            &payload.record.id,
+        )?;
         let head = self.load_head()?;
 
         if let Some(head) = head {
@@ -687,29 +704,21 @@ impl<'a> AuditLog<'a> {
         match head {
             Some(head)
                 if head.segment_entries < self.segment_max_events
-                    && fs::metadata(&head.segment_path)?.len() + line.len() as u64
+                    && paths::file_length(self.root, &head.segment_path, SEGMENT_LABEL)?
+                        + line.len() as u64
                         <= self.segment_max_bytes =>
             {
-                let mut contents = fs::read(&head.segment_path).with_context(|| {
-                    format!(
-                        "could not read audit segment {}",
-                        head.segment_path.display()
-                    )
-                })?;
+                let mut contents = self.read_segment_bytes(&head.segment_path)?;
                 if !contents.ends_with(b"\n") {
-                    bail!(
-                        "audit segment {} has a truncated tail",
-                        head.segment_path.display()
-                    );
+                    bail!("an audit segment has a truncated tail");
                 }
                 contents.extend_from_slice(line.as_bytes());
-                write_replace(&head.segment_path, &contents)?;
+                paths::write_replace(self.root, &head.segment_path, &contents, SEGMENT_LABEL)?;
             }
             _ => {
-                let path = self
-                    .segments_dir()
+                let path = Path::new(SEGMENT_DIRECTORY)
                     .join(format!("{:020}.jsonl", entry.parsed.sequence));
-                write_new(&path, line.as_bytes())?;
+                paths::write_new(self.root, &path, line.as_bytes(), SEGMENT_LABEL)?;
             }
         }
         Ok(())
@@ -760,8 +769,7 @@ impl<'a> AuditLog<'a> {
             if segment_start(&path)? != expected_sequence {
                 bail!("audit segment sequence gap at {expected_sequence}");
             }
-            let file = File::open(&path)
-                .with_context(|| format!("could not open audit segment {}", path.display()))?;
+            let file = paths::open_file(self.root, &path, SEGMENT_LABEL)?;
             let mut reader = BufReader::new(file);
             let mut segment_entries = 0usize;
 
@@ -819,12 +827,8 @@ impl<'a> AuditLog<'a> {
         for ((collection, id), expected_hash) in latest {
             validate_component(collection, "collection")?;
             validate_component(id, "id")?;
-            let path = self
-                .root
-                .join(self.records_dir)
-                .join(collection)
-                .join(format!("{id}.md"));
-            let actual_hash = file_hash_optional(&path)?;
+            let path = self.records_dir.join(collection).join(format!("{id}.md"));
+            let actual_hash = self.record_file_hash(&path, collection, id)?;
             if &actual_hash != expected_hash {
                 return Err(conflict(format!(
                     "record {collection}/{id} does not match its latest audited state"
@@ -832,35 +836,36 @@ impl<'a> AuditLog<'a> {
             }
         }
 
-        let records_root = self.root.join(self.records_dir);
-        if !records_root.exists() {
-            return Ok(());
-        }
-        for collection in fs::read_dir(&records_root)? {
-            let collection = collection?;
-            if !collection.file_type()?.is_dir() {
+        let collections =
+            paths::list_directory(self.root, self.records_dir, RECORDS_LABEL)?.unwrap_or_default();
+        for collection in collections {
+            if !collection.kind.is_directory() {
                 continue;
             }
             let collection_name = collection
-                .file_name()
+                .name
                 .to_str()
                 .context("collection filename is not valid UTF-8")?
                 .to_owned();
-            for record in fs::read_dir(collection.path())? {
-                let record = record?;
-                let path = record.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("md") {
+            let directory = self.records_dir.join(&collection.name);
+            let label = format!("collection '{collection_name}'");
+            let records = paths::list_directory(self.root, &directory, &label)?.unwrap_or_default();
+            for record in records {
+                let name = Path::new(&record.name);
+                if name.extension().and_then(|value| value.to_str()) != Some("md") {
                     continue;
                 }
-                if !record.file_type()?.is_file() {
-                    bail!("record path {} must be a regular file", path.display());
-                }
-                let id = record
-                    .path()
+                let id = name
                     .file_stem()
                     .and_then(|value| value.to_str())
                     .context("record filename is not valid UTF-8")?
                     .to_owned();
+                if !record.kind.is_file() {
+                    return Err(paths::refuse_entry(
+                        &record_label(&collection_name, &id),
+                        record.kind,
+                    ));
+                }
                 if !latest.contains_key(&(collection_name.clone(), id.clone())) {
                     return Err(conflict(format!(
                         "record {collection_name}/{id} has no audit history"
@@ -871,9 +876,26 @@ impl<'a> AuditLog<'a> {
         Ok(())
     }
 
+    /// The exact bytes of one audit segment, read through verified components.
+    fn read_segment_bytes(&self, path: &Path) -> Result<Vec<u8>> {
+        paths::read(self.root, path, SEGMENT_LABEL)
+    }
+
+    /// Hash a record file, refusing anything reached through a symbolic link
+    /// and reporting a missing record as `None`.
+    fn record_file_hash(&self, path: &Path, collection: &str, id: &str) -> Result<Option<String>> {
+        let label = record_label(collection, id);
+        match paths::entry_kind(self.root, path, &label)? {
+            None => Ok(None),
+            Some(EntryKind::File) => {
+                paths::read(self.root, path, &label).map(|contents| Some(record_hash(&contents)))
+            }
+            Some(kind) => Err(paths::refuse_entry(&label, kind)),
+        }
+    }
+
     fn read_segment(&self, path: &Path) -> Result<Vec<StoredEntry>> {
-        let file = File::open(path)
-            .with_context(|| format!("could not open audit segment {}", path.display()))?;
+        let file = paths::open_file(self.root, path, SEGMENT_LABEL)?;
         let mut reader = BufReader::new(file);
         let mut entries = Vec::new();
         loop {
@@ -893,42 +915,30 @@ impl<'a> AuditLog<'a> {
 
     fn segment_paths(&self) -> Result<Vec<PathBuf>> {
         self.ensure_layout()?;
-        let mut paths = Vec::new();
-        for entry in fs::read_dir(self.segments_dir())? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
+        let directory = Path::new(SEGMENT_DIRECTORY);
+        let entries = paths::list_directory(self.root, directory, SEGMENT_DIRECTORY_LABEL)?
+            .unwrap_or_default();
+        let mut segments = Vec::new();
+        for entry in entries {
+            if !entry.kind.is_file() {
                 continue;
             }
-            let path = entry.path();
+            let path = directory.join(&entry.name);
             if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
                 segment_start(&path)?;
-                paths.push(path);
+                segments.push(path);
             }
         }
-        paths.sort();
-        Ok(paths)
+        segments.sort();
+        Ok(segments)
     }
 
     fn clear_pending(&self) -> Result<()> {
-        let path = self.pending_path();
-        if path.exists() {
-            fs::remove_file(&path)
-                .with_context(|| format!("could not remove pending mutation {}", path.display()))?;
-            sync_parent(self.audit_dir().as_path())?;
+        let path = Path::new(PENDING_PATH);
+        if paths::entry_kind(self.root, path, PENDING_LABEL)?.is_some() {
+            paths::remove_file(self.root, path, PENDING_LABEL)?;
         }
         Ok(())
-    }
-
-    fn audit_dir(&self) -> PathBuf {
-        self.root.join(".cr/audit")
-    }
-
-    fn segments_dir(&self) -> PathBuf {
-        self.audit_dir().join("segments")
-    }
-
-    fn pending_path(&self) -> PathBuf {
-        self.audit_dir().join("pending.json")
     }
 }
 
@@ -1228,29 +1238,14 @@ fn digest(domain: &[u8], contents: &[u8]) -> String {
     value
 }
 
-fn file_hash_optional(path: &Path) -> Result<Option<String>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.file_type().is_file() => {
-            bail!("record path {} must be a regular file", path.display())
-        }
-        Ok(_) => fs::read(path)
-            .map(|contents| Some(record_hash(&contents)))
-            .with_context(|| format!("could not hash {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(anyhow!(error)).with_context(|| format!("could not hash {}", path.display()))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         apply_changes, diff_documents, event_hash, parse_line, record_hash, stored_line,
         AuditAction, AuditChange, AuditLog, AuditMutation, AuditSource, PendingMutation,
-        PreparedEntry, ReconciledMutation,
+        PreparedEntry, ReconciledMutation, PENDING_PATH,
     };
-    use crate::{database::write_new, frontmatter::Document};
+    use crate::{frontmatter::Document, paths};
     use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
     use yaml_serde::Mapping;
@@ -1367,7 +1362,7 @@ mod tests {
             body: "Original\n".to_owned(),
         };
         let original_raw = original.render().unwrap();
-        let target = root.path().join("records/items/one.md");
+        let target = Path::new("records/items/one.md");
         let created = audit
             .prepare(AuditMutation {
                 action: AuditAction::Create,
@@ -1382,8 +1377,8 @@ mod tests {
             })
             .unwrap();
         audit
-            .commit(created, &target, || {
-                write_new(&target, original_raw.as_bytes())
+            .commit(created, target, || {
+                paths::write_new(root.path(), target, original_raw.as_bytes(), "the record")
             })
             .unwrap();
 
@@ -1392,7 +1387,7 @@ mod tests {
             body: "Accepted\n".to_owned(),
         };
         let accepted_raw = accepted.render().unwrap();
-        std::fs::write(&target, &accepted_raw).unwrap();
+        std::fs::write(root.path().join(target), &accepted_raw).unwrap();
         let event = audit
             .prepare_reconciled(ReconciledMutation {
                 action: AuditAction::Update,
@@ -1406,8 +1401,8 @@ mod tests {
                 message: None,
             })
             .unwrap();
-        std::fs::write(&target, "---\n---\nChanged again\n").unwrap();
-        let error = audit.accept(event, &target).unwrap_err();
+        std::fs::write(root.path().join(target), "---\n---\nChanged again\n").unwrap();
+        let error = audit.accept(event, target).unwrap_err();
         assert!(error
             .to_string()
             .contains("changed while it was being saved"));
@@ -1431,7 +1426,7 @@ mod tests {
             body: "Committed\n".to_owned(),
         };
         let rendered = document.render().unwrap();
-        let target = committed_root.path().join("records/items/one.md");
+        let target = Path::new("records/items/one.md");
         let entry = committed
             .prepare(AuditMutation {
                 action: AuditAction::Create,
@@ -1446,10 +1441,16 @@ mod tests {
             })
             .unwrap();
         store_pending(&committed, &entry, PathBuf::from("records/items/one.md"));
-        write_new(&target, rendered.as_bytes()).unwrap();
+        paths::write_new(
+            committed_root.path(),
+            target,
+            rendered.as_bytes(),
+            "the record",
+        )
+        .unwrap();
 
         committed.recover_pending().unwrap();
-        assert!(!committed.pending_path().exists());
+        assert!(!committed_root.path().join(PENDING_PATH).exists());
         assert_eq!(committed.head().unwrap().sequence, 1);
         assert_eq!(committed.verify(None).unwrap().records_checked, 1);
 
@@ -1479,7 +1480,7 @@ mod tests {
         store_pending(&aborted, &entry, PathBuf::from("records/items/one.md"));
 
         aborted.recover_pending().unwrap();
-        assert!(!aborted.pending_path().exists());
+        assert!(!aborted_root.path().join(PENDING_PATH).exists());
         assert_eq!(aborted.head().unwrap().sequence, 0);
     }
 
@@ -1491,9 +1492,11 @@ mod tests {
             hash: entry.hash.clone(),
             payload: entry.payload.clone(),
         };
-        write_new(
-            &audit.pending_path(),
+        paths::write_new(
+            audit.root,
+            Path::new(PENDING_PATH),
             &serde_json::to_vec_pretty(&pending).unwrap(),
+            "the pending audit mutation",
         )
         .unwrap();
     }

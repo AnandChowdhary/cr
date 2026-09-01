@@ -89,6 +89,16 @@ database-root/
 - A saved view is an optional versioned query/display definition. Collections also receive automatic views without a file.
 - A saved sync is an optional versioned command definition. Its mutable JSON checkpoint and advisory lock are stored separately from configuration.
 
+### Path resolution
+
+The root is resolved once, when a database is opened or discovered, so a user may keep the database behind a symbolic link. Everything below it is treated as hostile input: an editor, a sync adapter, a synchronized checkout, or another local process can create entries there, and none of them may cause `cr` to touch anything outside the root.
+
+A database-relative path is therefore never handed to the operating system as one string. `src/paths.rs` walks it component by component from a descriptor for the root, opening each component with `openat` and `O_NOFOLLOW`, and then opens, replaces, links, renames, or unlinks the final entry through the descriptor of its verified parent. Only plain components are accepted, so `.`, `..`, an absolute path, and a NUL byte are refused before any syscall. Files are opened `O_NONBLOCK` and checked to be regular, so a named pipe cannot stall a read and a device cannot be mistaken for Markdown. Atomic publication uses `linkat` for a create that must not clobber and `renameat` for a replacement that preserves the destination's permissions, both relative to that same descriptor, followed by an `fsync` of the directory.
+
+This makes the check and the operation the same act rather than two racing ones. A symbolic link planted before the walk is refused whatever it points at, including one pointing back inside the database, and a link swapped in after the walk cannot redirect a descriptor that is already open. Two smaller windows remain and are accepted deliberately for a local-first single-user tool. Directory *listings* are read from the resolved path rather than the descriptor, which is harmless because a listing is never trusted on its own: every name it yields is reopened through the same walk before it is read. And the sync working directory is verified before the adapter's output is staged in it with `tempfile`, which is a check-then-use window rather than a descriptor-relative write. Platforms without `openat` fall back to checking each component with `symlink_metadata`, which refuses the same planted links without closing the race.
+
+Refusals are classified `DomainError::Conflict`, so they reach a caller as `409` with wording that names the record, collection, view, or configuration directory involved. The resolved location stays underneath the classification in the `anyhow` chain, where the CLI and the server log can use it and a response cannot.
+
 ## Audit protocol
 
 Each stored line is a small JSON wrapper containing a SHA-256 hash and an exact JSON payload. The payload contains:
@@ -216,8 +226,9 @@ Mutating forms include a cryptographically random token generated when the serve
 
 ## Integrity boundaries
 
-- Collection names and IDs are single path components, preventing path traversal.
-- Markdown record paths must be regular files. Single-record CRUD, status, save, and audit verification reject symlinks and other special file types rather than trusting them by content hash; ordinary collection listings continue to ignore non-file entries.
+- Collection names and IDs are single path components, preventing path traversal. `data_dir` must be a relative path of plain components.
+- No directory between the root and a target may be a symbolic link. That covers `data_dir`, its intermediate directories, each collection directory, `.cr/`, and the audit, schema, view, and sync directories beneath it. A configured directory replaced by a link is refused rather than followed.
+- Markdown record paths must be regular files. Single-record CRUD, status, save, and audit verification reject symlinks and other special file types rather than trusting them by content hash; ordinary collection, schema, view, and sync listings continue to ignore non-file entries, and every name they do yield is reopened safely before it is read.
 - Creation never overwrites an existing record.
 - Updates and links validate the complete next front matter before atomically replacing a file and committing its audit event.
 - Links validate that their target exists and matches its latest audited content hash. Manual deletion can still produce a dangling reference after the link is created; a future `cr check` command should scan links and delete policies.
