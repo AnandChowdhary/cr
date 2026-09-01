@@ -8,7 +8,23 @@ edition = "2021"
 # `.github/workflows/ci.yml` builds and tests on exactly this version so the
 # number cannot drift without CI noticing.
 rust-version = "1.89"
+description = "A local-first database made from Markdown files with typed YAML front matter, a tamper-evident audit log, a CLI, a REST API, and server-rendered views"
+repository = "https://github.com/AnandChowdhary/cr"
 license = "MIT"
+readme = "README.md"
+keywords = ["markdown", "database", "local-first", "audit-log", "cli"]
+categories = [
+  "command-line-utilities",
+  "database",
+  "filesystem",
+  "web-programming::http-server",
+]
+
+# Keep the published tarball to source and prose. The screenshots are ~300 KiB of
+# already-compressed JPEG (roughly 80% of the crate) and crates.io rewrites the
+# README's relative image links to `repository`, so they still render there.
+# CI configuration is meaningless to a downstream consumer.
+exclude = ["/docs/screenshots/", "/.github/"]
 
 [dependencies]
 anyhow = "1.0"
