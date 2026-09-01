@@ -8,11 +8,11 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    Assignment, Database, SortDirection,
     database::validate_component,
-    error::{invalid, is_already_exists, is_missing, DomainError},
+    error::{DomainError, invalid, is_already_exists, is_missing},
     paths,
     value::parse_path,
-    Assignment, Database, SortDirection,
 };
 
 /// Where saved view definitions live beneath the database root.
@@ -533,132 +533,152 @@ mod tests {
         let temporary = tempdir().unwrap();
         let database = Database::init(temporary.path().join("database")).unwrap();
 
-        assert!(database
-            .create_view("api", None, "deals", vec![], vec![], 50)
-            .unwrap_err()
-            .to_string()
-            .contains("reserved"));
-        assert!(database
-            .create_view("audit", None, "deals", vec![], vec![], 50)
-            .unwrap_err()
-            .to_string()
-            .contains("reserved"));
-        assert!(database
-            .create_view("bad", None, "deals", vec!["status".into()], vec![], 50)
-            .unwrap_err()
-            .to_string()
-            .contains("invalid filter"));
-        assert!(database
-            .create_view(
-                "bad",
-                None,
-                "deals",
-                vec![],
-                vec!["owner..email".into()],
-                50
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("invalid column"));
-        assert!(database
-            .create_view_with_options(
-                "bad-sort",
-                None,
-                "deals",
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                50,
-                ViewLayout::Table,
-                None,
-                Some("owner..email".into()),
-                SortDirection::Asc,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("invalid sort_by"));
-        assert!(database
-            .create_view_with_options(
-                "missing-sort",
-                None,
-                "deals",
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                50,
-                ViewLayout::Table,
-                None,
-                None,
-                SortDirection::Desc,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("requires sort_by"));
-        assert!(database
-            .create_view_with_options(
-                "empty-group",
-                None,
-                "deals",
-                vec![],
-                vec![],
-                vec![ViewFilterGroup {
-                    match_mode: ViewPredicateMatch::All,
-                    expressions: vec![],
-                }],
-                vec![],
-                50,
-                ViewLayout::Table,
-                None,
-                None,
-                SortDirection::Asc,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("cannot be empty"));
-        assert!(database
-            .create_view_with_layout(
-                "missing-group",
-                None,
-                "deals",
-                vec![],
-                vec![],
-                50,
-                ViewLayout::Kanban,
-                None,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("requires group_by"));
-        assert!(database
-            .create_view_with_layout(
-                "table-group",
-                None,
-                "deals",
-                vec![],
-                vec![],
-                50,
-                ViewLayout::Table,
-                Some("stage".into()),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("only valid for the kanban layout"));
-        assert!(database
-            .create_view_with_layout(
-                "bad-group",
-                None,
-                "deals",
-                vec![],
-                vec![],
-                50,
-                ViewLayout::Kanban,
-                Some("owner..team".into()),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("invalid group_by"));
+        assert!(
+            database
+                .create_view("api", None, "deals", vec![], vec![], 50)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+        assert!(
+            database
+                .create_view("audit", None, "deals", vec![], vec![], 50)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+        assert!(
+            database
+                .create_view("bad", None, "deals", vec!["status".into()], vec![], 50)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid filter")
+        );
+        assert!(
+            database
+                .create_view(
+                    "bad",
+                    None,
+                    "deals",
+                    vec![],
+                    vec!["owner..email".into()],
+                    50
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("invalid column")
+        );
+        assert!(
+            database
+                .create_view_with_options(
+                    "bad-sort",
+                    None,
+                    "deals",
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                    50,
+                    ViewLayout::Table,
+                    None,
+                    Some("owner..email".into()),
+                    SortDirection::Asc,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("invalid sort_by")
+        );
+        assert!(
+            database
+                .create_view_with_options(
+                    "missing-sort",
+                    None,
+                    "deals",
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                    50,
+                    ViewLayout::Table,
+                    None,
+                    None,
+                    SortDirection::Desc,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("requires sort_by")
+        );
+        assert!(
+            database
+                .create_view_with_options(
+                    "empty-group",
+                    None,
+                    "deals",
+                    vec![],
+                    vec![],
+                    vec![ViewFilterGroup {
+                        match_mode: ViewPredicateMatch::All,
+                        expressions: vec![],
+                    }],
+                    vec![],
+                    50,
+                    ViewLayout::Table,
+                    None,
+                    None,
+                    SortDirection::Asc,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be empty")
+        );
+        assert!(
+            database
+                .create_view_with_layout(
+                    "missing-group",
+                    None,
+                    "deals",
+                    vec![],
+                    vec![],
+                    50,
+                    ViewLayout::Kanban,
+                    None,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("requires group_by")
+        );
+        assert!(
+            database
+                .create_view_with_layout(
+                    "table-group",
+                    None,
+                    "deals",
+                    vec![],
+                    vec![],
+                    50,
+                    ViewLayout::Table,
+                    Some("stage".into()),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("only valid for the kanban layout")
+        );
+        assert!(
+            database
+                .create_view_with_layout(
+                    "bad-group",
+                    None,
+                    "deals",
+                    vec![],
+                    vec![],
+                    50,
+                    ViewLayout::Kanban,
+                    Some("owner..team".into()),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("invalid group_by")
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ mod common;
 
 use std::{fs, process::Command};
 
-use common::{run_failure, run_success, TestDatabase};
+use common::{TestDatabase, run_failure, run_success};
 use serde_json::Value;
 
 fn json_output(database: &TestDatabase, arguments: &[&str]) -> Value {
@@ -28,8 +28,10 @@ fn direct_edit_stays_dirty_until_an_explicit_attributed_save() {
         run_success(database.command().arg("status")),
         "M candidates/jane\n"
     );
-    assert!(run_failure(database.command().args(["audit", "verify"]))
-        .contains("does not match its latest audited state"));
+    assert!(
+        run_failure(database.command().args(["audit", "verify"]))
+            .contains("does not match its latest audited state")
+    );
 
     let saved = run_success(database.command().args([
         "--actor",
@@ -214,8 +216,10 @@ fn selective_save_leaves_other_changes_dirty_and_rejects_invalid_selections() {
         run_success(database.command().arg("status")),
         "M items/two\n"
     );
-    assert!(run_failure(database.command().args(["save", "items/one"]))
-        .contains("has no unsaved changes"));
+    assert!(
+        run_failure(database.command().args(["save", "items/one"]))
+            .contains("has no unsaved changes")
+    );
     assert!(run_failure(database.command().arg("save")).contains("provide at least one"));
     assert!(
         run_failure(database.command().args(["save", "invalid"])).contains("must be COLLECTION/ID")
@@ -270,8 +274,10 @@ fn malformed_files_are_visible_but_cannot_be_saved_or_partially_trusted() {
     )
     .unwrap();
     assert!(run_failure(database.command().arg("status")).contains("audit event hash mismatch"));
-    assert!(run_failure(database.command().args(["save", "--all"]))
-        .contains("audit event hash mismatch"));
+    assert!(
+        run_failure(database.command().args(["save", "--all"]))
+            .contains("audit event hash mismatch")
+    );
 }
 
 #[test]

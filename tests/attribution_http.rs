@@ -7,16 +7,16 @@
 //! `detected_from` field, and that the delegate is queryable afterwards.
 
 use axum::{
-    body::Body,
-    http::{header, HeaderMap, Method, Request, StatusCode},
     Router,
+    body::Body,
+    http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use cr::{
-    server::{openapi_document, router, ServerConfig},
     Attribution, Database,
+    server::{ServerConfig, openapi_document, router},
 };
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -160,10 +160,12 @@ async fn a_request_cannot_claim_how_cr_came_to_believe_it() {
     assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
     let error = response.json();
     assert_eq!(error["error"]["code"], "validation_failed");
-    assert!(error["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("detected_from"));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("detected_from")
+    );
     assert!(response.headers.contains_key("x-request-id"));
 }
 
@@ -206,10 +208,12 @@ async fn invalid_attribution_headers_are_rejected_without_internal_detail() {
     .await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
     assert_eq!(response.json()["error"]["code"], "invalid_intent");
-    assert!(response.json()["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("visible ASCII"));
+    assert!(
+        response.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("visible ASCII")
+    );
 
     // The escaped form is accepted and round-trips through the journal.
     let accepted = request(
@@ -371,9 +375,11 @@ async fn the_html_history_names_the_agent_rather_than_only_the_human() {
     let filtered = request(&app, Method::GET, "/audit?agent=claude-code", None, &[]).await;
     assert!(filtered.text().contains("acme-renewal"));
     let missing = request(&app, Method::GET, "/audit?agent=cursor-agent", None, &[]).await;
-    assert!(missing
-        .text()
-        .contains("No audit events match this filter."));
+    assert!(
+        missing
+            .text()
+            .contains("No audit events match this filter.")
+    );
 }
 
 /// `preview=true` computes the change set and writes nothing, and the digest it
@@ -439,10 +445,12 @@ async fn a_previewed_change_set_is_computed_without_writing_and_can_then_be_appr
     .await;
     assert_eq!(refused.status, StatusCode::CONFLICT);
     assert_eq!(refused.json()["error"]["code"], "approval_mismatch");
-    assert!(refused.json()["error"]["message"]
-        .as_str()
-        .expect("a message")
-        .contains("does not match the approved change set"));
+    assert!(
+        refused.json()["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("does not match the approved change set")
+    );
 
     let applied = request(
         &app,
@@ -504,10 +512,12 @@ fn the_openapi_document_describes_the_attribution_contract() {
         agent["properties"]["detected_from"]["enum"],
         json!(["environment", "flag", "header", "config"])
     );
-    assert!(agent["properties"]["detected_from"]["description"]
-        .as_str()
-        .unwrap()
-        .contains("No value means verified"));
+    assert!(
+        agent["properties"]["detected_from"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("No value means verified")
+    );
     assert!(
         document["components"]["schemas"]["AuditAuthorization"]["properties"]["approved_changes"]
             ["description"]

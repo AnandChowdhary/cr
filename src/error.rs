@@ -130,7 +130,7 @@ fn io_kind_matches(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{approval_mismatch, conflict, invalid, is_already_exists, is_missing, DomainError};
+    use super::{DomainError, approval_mismatch, conflict, invalid, is_already_exists, is_missing};
     use anyhow::anyhow;
 
     #[test]

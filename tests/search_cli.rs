@@ -2,7 +2,7 @@ mod common;
 
 use std::{fs, process::Command};
 
-use common::{binary, run_failure, run_success, TestDatabase};
+use common::{TestDatabase, binary, run_failure, run_success};
 use serde_json::Value;
 
 #[test]
@@ -154,12 +154,14 @@ fn search_supports_literal_regex_case_and_target_scopes() {
     let literal = run_success(database.command().args(["search", "[VIP]", "--body"]));
     assert_eq!(literal.trim(), "records/companies/acme-vip.md");
 
-    assert!(run_success(
-        database
-            .command()
-            .args(["search", "BODY_ONLY", "--front-matter"])
-    )
-    .is_empty());
+    assert!(
+        run_success(
+            database
+                .command()
+                .args(["search", "BODY_ONLY", "--front-matter"])
+        )
+        .is_empty()
+    );
     assert!(run_success(database.command().args(["search", "FRONT_ONLY", "--body"])).is_empty());
 
     let path = run_success(database.command().args(["search", "acme-vip.md", "--path"]));
@@ -240,13 +242,15 @@ fn unsaved_direct_edits_are_immediately_searchable_without_being_accepted() {
         std::os::unix::fs::symlink(&external, database.root.join("records/external-link")).unwrap();
         // Naming the linked collection is refused rather than silently
         // answered from outside the database.
-        assert!(run_failure(database.command().args([
-            "search",
-            "outside",
-            "--collection",
-            "external-link"
-        ]))
-        .contains("symbolic link"));
+        assert!(
+            run_failure(database.command().args([
+                "search",
+                "outside",
+                "--collection",
+                "external-link"
+            ]))
+            .contains("symbolic link")
+        );
         assert!(
             run_failure(database.command().args(["list", "external-link"]))
                 .contains("symbolic link")

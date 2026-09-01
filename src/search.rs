@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use regex::{Regex, RegexBuilder};
 
-use crate::{error::DomainError, value::parse_path, Record};
+use crate::{Record, error::DomainError, value::parse_path};
 
 /// The part of a Markdown record searched by [`SearchQuery`].
 #[derive(Clone, Debug)]
@@ -125,17 +125,21 @@ mod tests {
 
         let case_sensitive =
             SearchQuery::new("amsterdam", SearchTarget::Document, false, false).unwrap();
-        assert!(!case_sensitive
-            .matches(&record, "city: Amsterdam\n")
-            .unwrap());
+        assert!(
+            !case_sensitive
+                .matches(&record, "city: Amsterdam\n")
+                .unwrap()
+        );
     }
 
     #[test]
     fn invalid_regular_expressions_are_rejected() {
         let error = SearchQuery::new("[", SearchTarget::Document, true, false).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("invalid search regular expression"));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid search regular expression")
+        );
 
         let error = SearchQuery::new("anything", SearchTarget::Field("a..b".into()), false, false)
             .unwrap_err();

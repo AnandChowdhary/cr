@@ -3,7 +3,7 @@ use std::{cmp::Ordering, fmt, str::FromStr};
 use anyhow::{Context, Result};
 use yaml_serde::{Mapping, Value};
 
-use crate::error::{invalid, DomainError};
+use crate::error::{DomainError, invalid};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Assignment {
@@ -350,7 +350,7 @@ fn set_path(attributes: &mut Mapping, path: &[String], value: Value) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_yaml_values, parse_path, remove_path, Assignment, FilterExpression, FilterOperator,
+        Assignment, FilterExpression, FilterOperator, compare_yaml_values, parse_path, remove_path,
     };
     use std::{cmp::Ordering, str::FromStr};
     use yaml_serde::{Mapping, Value};
@@ -430,15 +430,21 @@ mod tests {
             .apply(&mut attributes)
             .unwrap();
 
-        assert!(Assignment::from_str("metrics.score=42")
-            .unwrap()
-            .matches(&attributes));
-        assert!(!Assignment::from_str("metrics.score=\"42\"")
-            .unwrap()
-            .matches(&attributes));
-        assert!(!Assignment::from_str("metrics.missing=42")
-            .unwrap()
-            .matches(&attributes));
+        assert!(
+            Assignment::from_str("metrics.score=42")
+                .unwrap()
+                .matches(&attributes)
+        );
+        assert!(
+            !Assignment::from_str("metrics.score=\"42\"")
+                .unwrap()
+                .matches(&attributes)
+        );
+        assert!(
+            !Assignment::from_str("metrics.missing=42")
+                .unwrap()
+                .matches(&attributes)
+        );
     }
 
     #[test]
@@ -453,21 +459,31 @@ mod tests {
             .apply(&mut attributes)
             .unwrap();
 
-        assert!(FilterExpression::from_str("value>10000")
-            .unwrap()
-            .matches(&attributes));
-        assert!(FilterExpression::from_str("value<=12000")
-            .unwrap()
-            .matches(&attributes));
-        assert!(!FilterExpression::from_str("value>12000")
-            .unwrap()
-            .matches(&attributes));
-        assert!(FilterExpression::from_str("expected_close<2028-01-01")
-            .unwrap()
-            .matches(&attributes));
-        assert!(!FilterExpression::from_str("value>\"10000\"")
-            .unwrap()
-            .matches(&attributes));
+        assert!(
+            FilterExpression::from_str("value>10000")
+                .unwrap()
+                .matches(&attributes)
+        );
+        assert!(
+            FilterExpression::from_str("value<=12000")
+                .unwrap()
+                .matches(&attributes)
+        );
+        assert!(
+            !FilterExpression::from_str("value>12000")
+                .unwrap()
+                .matches(&attributes)
+        );
+        assert!(
+            FilterExpression::from_str("expected_close<2028-01-01")
+                .unwrap()
+                .matches(&attributes)
+        );
+        assert!(
+            !FilterExpression::from_str("value>\"10000\"")
+                .unwrap()
+                .matches(&attributes)
+        );
     }
 
     #[test]
@@ -503,12 +519,16 @@ mod tests {
                 "filter did not match: {expression}"
             );
         }
-        assert!(!FilterExpression::from_str("owner!=Maya")
-            .unwrap()
-            .matches(&attributes));
-        assert!(!FilterExpression::from_str("tags not-contains enterprise")
-            .unwrap()
-            .matches(&attributes));
+        assert!(
+            !FilterExpression::from_str("owner!=Maya")
+                .unwrap()
+                .matches(&attributes)
+        );
+        assert!(
+            !FilterExpression::from_str("tags not-contains enterprise")
+                .unwrap()
+                .matches(&attributes)
+        );
     }
 
     #[test]

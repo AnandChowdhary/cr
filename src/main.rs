@@ -1,11 +1,11 @@
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
-    sort_records_by_field, AgentEvidence, Assignment, AttributionOverrides, AuditFilter, Database,
-    FilterExpression, Record, SearchQuery, SearchTarget, SortDirection, SyncAttribution,
-    ViewLayout,
+    AgentEvidence, Assignment, AttributionOverrides, AuditFilter, Database, FilterExpression,
+    Record, SearchQuery, SearchTarget, SortDirection, SyncAttribution, ViewLayout,
+    sort_records_by_field,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -1167,11 +1167,7 @@ fn print_preview(preview: &cr::ChangePreview, json: bool) -> Result<()> {
 
 /// Name the whole document rather than printing an empty JSON Pointer.
 fn change_path(path: &str) -> &str {
-    if path.is_empty() {
-        "(record)"
-    } else {
-        path
-    }
+    if path.is_empty() { "(record)" } else { path }
 }
 
 fn compact(value: &serde_json::Value) -> Result<String> {

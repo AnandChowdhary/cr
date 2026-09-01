@@ -30,9 +30,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
-use crate::error::{is_missing, DomainError};
+use crate::error::{DomainError, is_missing};
 
 /// Names of files this module writes before publishing them under their final
 /// name. The prefix keeps them out of every extension-filtered listing.
@@ -107,7 +107,7 @@ pub(crate) fn create_directory_all(root: &Path, relative: &Path, label: &str) ->
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => {
-                        return Err(anyhow!(error).context(format!("could not create {label}")))
+                        return Err(anyhow!(error).context(format!("could not create {label}")));
                     }
                 }
                 directory
@@ -290,7 +290,7 @@ pub(crate) fn remove_file(root: &Path, relative: &Path, label: &str) -> Result<(
             return Err(located(
                 refuse_entry(label, kind),
                 &directory.path().join(name),
-            ))
+            ));
         }
         Err(error) => return Err(anyhow!(error).context(format!("could not inspect {label}"))),
     }
@@ -784,8 +784,8 @@ mod portable {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_directory_all, list_directory, open_directory, read_to_string,
-        read_to_string_optional, remove_file, write_new, write_replace, EntryKind,
+        EntryKind, create_directory_all, list_directory, open_directory, read_to_string,
+        read_to_string_optional, remove_file, write_new, write_replace,
     };
     use crate::error::DomainError;
     use std::path::Path;
@@ -869,8 +869,8 @@ mod tests {
     #[cfg(unix)]
     mod symlinks {
         use super::super::{
-            create_directory_all, entry_kind, open_directory, read_to_string, remove_file,
-            write_new, write_replace, EntryKind,
+            EntryKind, create_directory_all, entry_kind, open_directory, read_to_string,
+            remove_file, write_new, write_replace,
         };
         use super::classification;
         use std::{os::unix::fs::symlink, path::Path};

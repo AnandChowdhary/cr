@@ -2,7 +2,7 @@ mod common;
 
 use std::{fs, process::Command};
 
-use common::{binary, run_failure, run_success, TestDatabase};
+use common::{TestDatabase, binary, run_failure, run_success};
 use serde_json::Value;
 
 #[test]
@@ -45,10 +45,12 @@ fn raw_field_body_only_update_and_parent_discovery_work() {
     );
     let fetched: Value = serde_json::from_str(&fetched).unwrap();
     assert_eq!(fetched["attributes"]["stage"], "screening");
-    assert!(fetched["body"]
-        .as_str()
-        .unwrap()
-        .contains("Replacement notes"));
+    assert!(
+        fetched["body"]
+            .as_str()
+            .unwrap()
+            .contains("Replacement notes")
+    );
 
     let nested = database.root.join("records/candidates/nested");
     fs::create_dir_all(&nested).unwrap();
@@ -155,10 +157,12 @@ fn configured_records_directory_is_honored() {
     .unwrap();
 
     run_success(database.command().args(["create", "companies", "acme"]));
-    assert!(database
-        .root
-        .join("content/data/companies/acme.md")
-        .exists());
+    assert!(
+        database
+            .root
+            .join("content/data/companies/acme.md")
+            .exists()
+    );
     assert_eq!(
         run_success(database.command().args(["list", "companies"])).trim(),
         "content/data/companies/acme.md"

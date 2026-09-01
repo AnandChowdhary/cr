@@ -10,7 +10,7 @@ mod common;
 
 use std::{fs, path::Path};
 
-use common::{command_for, run_failure, run_success, TestDatabase};
+use common::{TestDatabase, command_for, run_failure, run_success};
 use serde_json::Value;
 
 /// Everything `cr` may have written for a database, as one comparable value.

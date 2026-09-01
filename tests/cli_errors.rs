@@ -2,7 +2,7 @@ mod common;
 
 use std::fs;
 
-use common::{run_failure, run_success, TestDatabase};
+use common::{TestDatabase, run_failure, run_success};
 
 #[test]
 fn duplicate_create_never_overwrites_the_existing_record() {

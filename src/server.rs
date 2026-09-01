@@ -4,34 +4,34 @@ use std::{
     net::SocketAddr,
     str::FromStr,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::{
+    Json, Router,
     body::Body,
-    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, RawForm, RawQuery, State},
-    http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
+    extract::{DefaultBodyLimit, Path, RawForm, RawQuery, State, rejection::JsonRejection},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
-use maud::{html, Markup, PreEscaped, DOCTYPE};
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{json, Map, Value as JsonValue};
+use maud::{DOCTYPE, Markup, PreEscaped, html};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Map, Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
-    audit::AuditChange, sort_records_by_field, AgentEvidence, Assignment, Attribution,
-    AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
-    AuditIntentPart, AuditSource, CollectionModel, Database, DomainError, FilterExpression,
-    FilterOperator, Record, SearchQuery, SearchTarget, SortDirection, ViewDefinition,
-    ViewFilterGroup, ViewLayout, ViewPredicateMatch,
+    AgentEvidence, Assignment, Attribution, AttributionOverrides, AuditAgent, AuditAuthorization,
+    AuditEntry, AuditFilter, AuditIntent, AuditIntentPart, AuditSource, CollectionModel, Database,
+    DomainError, FilterExpression, FilterOperator, Record, SearchQuery, SearchTarget,
+    SortDirection, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
+    audit::AuditChange, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -2285,10 +2285,10 @@ fn ok_or_preview(schema: &str, preview: &str) -> JsonValue {
 
 fn created(schema: &str) -> JsonValue {
     let mut responses = ok(schema);
-    if let Some(object) = responses.as_object_mut() {
-        if let Some(success) = object.remove("200") {
-            object.insert("201".into(), success);
-        }
+    if let Some(object) = responses.as_object_mut()
+        && let Some(success) = object.remove("200")
+    {
+        object.insert("201".into(), success);
     }
     responses
 }
@@ -4770,7 +4770,7 @@ fn parse_document_form(raw: &[u8]) -> ApiResult<HtmlDocumentForm> {
             return Err(ApiError::bad_request(
                 "invalid_form",
                 format!("unsupported form mode '{other}'"),
-            ))
+            ));
         }
         None => false,
     };
@@ -4851,13 +4851,13 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
 
     let mut attributes = parse_front_matter(&form.additional_attributes)?;
     for key in attributes.keys() {
-        if let YamlValue::String(key) = key {
-            if properties.contains_key(key) {
-                return Err(ApiError::bad_request(
-                    "invalid_form",
-                    format!("declared attribute '{key}' cannot be overridden in additional YAML"),
-                ));
-            }
+        if let YamlValue::String(key) = key
+            && properties.contains_key(key)
+        {
+            return Err(ApiError::bad_request(
+                "invalid_form",
+                format!("declared attribute '{key}' cannot be overridden in additional YAML"),
+            ));
         }
     }
     if !schema_allows_additional_attributes(schema) && !attributes.is_empty() {
@@ -5367,7 +5367,9 @@ mod tests {
     /// A leaky diagnostic chain of the shape the domain layer actually
     /// produces, used to prove that none of it reaches a caller.
     fn leaky_cause() -> anyhow::Error {
-        anyhow!("could not read record /private/db/records/people/ada.md: No such file or directory (os error 2)")
+        anyhow!(
+            "could not read record /private/db/records/people/ada.md: No such file or directory (os error 2)"
+        )
     }
 
     #[test]
