@@ -1,5 +1,6 @@
 mod attribution;
 mod audit;
+mod check;
 mod database;
 mod error;
 mod frontmatter;
@@ -18,6 +19,9 @@ pub use attribution::{
 pub use audit::{
     AuditAction, AuditChange, AuditEntry, AuditFilter, AuditHead, AuditSource, AuditVerification,
     ChangePreview,
+};
+pub use check::{
+    CheckReport, CheckScope, CheckSummary, Finding, FindingKind, Severity, parse_threshold,
 };
 pub use database::{
     CollectionModel, Database, Record, SortDirection, WorkingChange, WorkingChangeKind,

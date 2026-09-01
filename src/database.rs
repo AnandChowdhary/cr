@@ -13,6 +13,7 @@ use crate::{
     Assignment, AuditAction, AuditEntry, AuditHead, AuditSource, AuditVerification, SearchQuery,
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     audit::{AuditFilter, AuditLog, AuditMutation, ChangePreview, ReconciledMutation, record_hash},
+    check::{CheckReport, CheckScope},
     error::{DomainError, conflict, invalid, is_already_exists, is_missing},
     frontmatter::Document,
     paths,
@@ -23,7 +24,7 @@ use crate::{
 
 const CONFIG_PATH: &str = ".cr/config.yaml";
 const DATABASE_DIRECTORY: &str = ".cr";
-const SCHEMA_DIRECTORY: &str = ".cr/schemas";
+pub(crate) const SCHEMA_DIRECTORY: &str = ".cr/schemas";
 const CURRENT_FORMAT_VERSION: u32 = 1;
 
 /// How the database directory itself is named to a caller.
@@ -360,6 +361,19 @@ impl Database {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The configured records directory, relative to the root.
+    pub(crate) fn records_dir(&self) -> &Path {
+        &self.config.data_dir
+    }
+
+    /// Report every integrity problem in the database without changing it.
+    ///
+    /// The whole implementation lives in [`crate::check`]; this is the seam
+    /// that gives it the root, the records directory, and the audit log.
+    pub fn check(&self, scope: &CheckScope) -> Result<CheckReport> {
+        crate::check::run(self, scope)
     }
 
     pub fn actor(&self) -> &str {
@@ -1377,7 +1391,7 @@ impl Database {
         Ok(collections)
     }
 
-    fn audit(&self) -> AuditLog<'_> {
+    pub(crate) fn audit(&self) -> AuditLog<'_> {
         AuditLog::new(
             &self.root,
             &self.config.data_dir,

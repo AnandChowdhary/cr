@@ -28,10 +28,10 @@ use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
     AgentEvidence, Assignment, Attribution, AttributionOverrides, AuditAgent, AuditAuthorization,
-    AuditEntry, AuditFilter, AuditIntent, AuditIntentPart, AuditSource, CollectionModel, Database,
-    DomainError, FilterExpression, FilterOperator, Record, SearchQuery, SearchTarget,
-    SortDirection, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
-    audit::AuditChange, sort_records_by_field,
+    AuditEntry, AuditFilter, AuditIntent, AuditIntentPart, AuditSource, CheckScope, CheckSummary,
+    CollectionModel, Database, DomainError, FilterExpression, FilterOperator, Finding, Record,
+    SearchQuery, SearchTarget, SortDirection, ViewDefinition, ViewFilterGroup, ViewLayout,
+    ViewPredicateMatch, audit::AuditChange, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -184,6 +184,15 @@ struct PreviewQuery {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+/// Scope and window for an integrity report.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckQuery {
+    collection: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
 }
@@ -851,6 +860,7 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
                 )
                 .route("/search", get(search_records))
                 .route("/status", get(status))
+                .route("/check", get(check))
                 .route("/save", post(save))
                 .route("/audit/log", get(audit_log))
                 .route("/audit/head", get(audit_head))
@@ -1684,6 +1694,46 @@ async fn status(
     Ok(Json(paginate(changes, bounds)))
 }
 
+/// A page of findings with the counts the page was drawn from.
+///
+/// The summary is deliberately not paginated away: a caller that reads only the
+/// first page still has to be able to tell a clean database from a broken one,
+/// and `data.is_empty()` on page three does not mean that.
+#[derive(Debug, Serialize)]
+struct CheckResponse {
+    #[serde(flatten)]
+    page: Page<Finding>,
+    summary: CheckSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collection: Option<String>,
+}
+
+/// Report integrity problems without changing anything.
+///
+/// A successful run always answers `200`, including when it found problems:
+/// the findings are the resource, and a database being broken is not an HTTP
+/// error. Callers decide from `summary.errors`, which is what the CLI's exit
+/// status is computed from too.
+async fn check(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<CheckResponse>> {
+    let query: CheckQuery = parse_query(raw)?;
+    let bounds = page_bounds(query.limit, query.offset, state.max_page_size)?;
+    let report = run_database(&state, &headers, move |database| {
+        database.check(&CheckScope {
+            collection: query.collection,
+        })
+    })
+    .await?;
+    Ok(Json(CheckResponse {
+        page: paginate(report.findings, bounds),
+        summary: report.summary,
+        collection: report.collection,
+    }))
+}
+
 async fn save(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2005,6 +2055,46 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "pagination": { "$ref": "#/components/schemas/Pagination" }
             }
         },
+        "CheckFinding": {
+            "type": "object",
+            "required": ["severity", "kind", "message"],
+            "description": "One integrity problem. Records are named by collection and ID and never by filesystem path.",
+            "properties": {
+                "severity": { "enum": ["error", "warning"], "description": "warning marks a divergence cr save can still reconcile, which cr status also reports." },
+                "kind": { "enum": [
+                    "dangling_link", "malformed_relation", "schema_violation", "unusable_schema",
+                    "invalid_record_name", "unreadable_record", "unaudited_record", "missing_record",
+                    "record_content_mismatch", "audit_chain_broken", "approval_mismatch",
+                    "interrupted_sync_run"
+                ] },
+                "collection": { "type": "string" },
+                "id": { "type": "string" },
+                "field": { "type": "string", "description": "Dotted front matter path, where the finding is about one field." },
+                "target": { "type": "string", "description": "The collection/id a dangling relation pointed at." },
+                "message": { "type": "string" }
+            }
+        },
+        "CheckSummary": {
+            "type": "object",
+            "required": ["collections", "records", "audited_records", "errors", "warnings"],
+            "properties": {
+                "collections": { "type": "integer", "minimum": 0 },
+                "records": { "type": "integer", "minimum": 0 },
+                "audited_records": { "type": "integer", "minimum": 0 },
+                "errors": { "type": "integer", "minimum": 0 },
+                "warnings": { "type": "integer", "minimum": 0 }
+            }
+        },
+        "CheckReport": {
+            "type": "object", "required": ["data", "pagination", "summary"],
+            "description": "Findings are paginated; the summary always covers the whole run.",
+            "properties": {
+                "data": { "type": "array", "items": { "$ref": "#/components/schemas/CheckFinding" } },
+                "pagination": { "$ref": "#/components/schemas/Pagination" },
+                "summary": { "$ref": "#/components/schemas/CheckSummary" },
+                "collection": { "type": "string" }
+            }
+        },
         "SaveRequest": {
             "type": "object", "additionalProperties": false,
             "properties": {
@@ -2244,6 +2334,11 @@ fn openapi_paths() -> JsonValue {
             ], "responses": ok("#/components/schemas/RecordPage") }
         },
         "/api/v1/status": { "get": { "operationId": "getStatus", "parameters": page_parameters, "responses": ok("#/components/schemas/WorkingChangePage") } },
+        "/api/v1/check": { "get": { "operationId": "getCheckReport", "description": "Report every integrity problem in the database. Read-only, and 200 even when problems were found.", "parameters": [
+            { "name": "collection", "in": "query", "description": "Check one collection instead of the whole database.", "schema": { "type": "string" } },
+            { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+            { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } }
+        ], "responses": ok("#/components/schemas/CheckReport") } },
         "/api/v1/save": { "post": { "operationId": "saveDirectEdits", "parameters": mutation_parameters(Vec::new()), "requestBody": json_body("#/components/schemas/SaveRequest"), "responses": ok_or_preview("#/components/schemas/AuditEntries", "#/components/schemas/ChangePreviews") } },
         "/api/v1/audit/log": { "get": { "operationId": "getAuditLog", "parameters": [
             { "name": "agent", "in": "query", "description": "Only events whose acting agent, or any delegate in its chain, carries this identifier.", "schema": { "type": "string" } },
