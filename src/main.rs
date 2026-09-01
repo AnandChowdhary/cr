@@ -1,10 +1,11 @@
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
-    sort_records_by_field, Assignment, Database, FilterExpression, Record, SearchQuery,
-    SearchTarget, SortDirection, ViewLayout,
+    sort_records_by_field, AgentEvidence, Assignment, AttributionOverrides, AuditFilter, Database,
+    FilterExpression, Record, SearchQuery, SearchTarget, SortDirection, SyncAttribution,
+    ViewLayout,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -21,6 +22,105 @@ impl From<Record> for ListedRecord {
             path: record.path,
             front_matter: record.attributes,
         }
+    }
+}
+
+/// Attribution recorded beside `--actor` when software acts for a human.
+///
+/// `--actor` stays the responsible human. These options say which software
+/// carried the change out, how much of a human decision stood behind it, and
+/// what was asked. Every value is a claim the calling process makes about
+/// itself: `cr` records it, never verifies it, and never lets it affect what an
+/// operation is allowed to do. `CR_AGENT`, `CR_AUTHORIZATION`, and `CR_INTENT`
+/// supply the same three values to every command, and `CR_AGENT=none` declares
+/// that no agent was involved.
+#[derive(Clone, Debug, Default, Args)]
+struct AttributionArgs {
+    /// Software acting for the actor: 'none', an identifier such as claude-code, or a JSON object.
+    #[arg(long, value_name = "AGENT")]
+    agent: Option<String>,
+
+    /// Release of the acting software.
+    #[arg(long, value_name = "VERSION")]
+    agent_version: Option<String>,
+
+    /// Model that did the reasoning. Never detected from the environment, only declared.
+    #[arg(long, value_name = "MODEL")]
+    agent_model: Option<String>,
+
+    /// Agent conversation identifier.
+    #[arg(long, value_name = "SESSION")]
+    agent_session: Option<String>,
+
+    /// Agent turn or prompt identifier inside the session.
+    #[arg(long, value_name = "TURN")]
+    agent_turn: Option<String>,
+
+    /// Approval mode: direct, interactive, delegated, autonomous, or unknown. Also accepts a JSON object.
+    #[arg(long, value_name = "MODE")]
+    authorization: Option<String>,
+
+    /// Raw vendor grant string, recorded verbatim beside the approval mode.
+    #[arg(long, value_name = "GRANT")]
+    grant: Option<String>,
+
+    /// Who approved the change, when that is known separately from the actor.
+    #[arg(long, value_name = "IDENTITY")]
+    approved_by: Option<String>,
+
+    /// When the change was approved, as an RFC 3339 timestamp.
+    #[arg(long, value_name = "TIMESTAMP")]
+    approved_at: Option<String>,
+
+    /// JSON intent object carrying a request, a rationale, or both.
+    #[arg(long, value_name = "JSON")]
+    intent: Option<String>,
+
+    /// What the human asked for, attributed to the human.
+    #[arg(long, value_name = "TEXT")]
+    intent_request: Option<String>,
+
+    /// What the agent believed this write was doing, attributed to the agent.
+    #[arg(long, value_name = "TEXT")]
+    intent_rationale: Option<String>,
+}
+
+impl AttributionArgs {
+    fn overrides(&self) -> AttributionOverrides<'_> {
+        AttributionOverrides {
+            agent: self.agent.as_deref(),
+            agent_version: self.agent_version.as_deref(),
+            agent_model: self.agent_model.as_deref(),
+            agent_session: self.agent_session.as_deref(),
+            agent_turn: self.agent_turn.as_deref(),
+            authorization: self.authorization.as_deref(),
+            grant: self.grant.as_deref(),
+            approved_by: self.approved_by.as_deref(),
+            approved_at: self.approved_at.as_deref(),
+            intent: self.intent.as_deref(),
+            intent_request: self.intent_request.as_deref(),
+            intent_rationale: self.intent_rationale.as_deref(),
+        }
+    }
+
+    /// Apply these declarations on top of whatever the environment detected.
+    fn apply(&self, database: Database) -> Result<Database> {
+        let mut attribution = database.attribution().clone();
+        attribution.apply(&self.overrides(), AgentEvidence::Flag)?;
+        Ok(database.with_attribution(attribution))
+    }
+}
+
+/// Apply attribution and an optional audit message to one command's database.
+fn attributed(
+    database: Database,
+    attribution: &AttributionArgs,
+    message: Option<&str>,
+) -> Result<Database> {
+    let database = attribution.apply(database)?;
+    match message {
+        Some(message) => database.with_audit_message(message),
+        None => Ok(database),
     }
 }
 
@@ -63,6 +163,13 @@ enum Command {
         /// Set the Markdown body.
         #[arg(long, default_value = "")]
         body: String,
+
+        /// Explain why this record is being created.
+        #[arg(short = 'm', long, value_name = "MESSAGE")]
+        message: Option<String>,
+
+        #[command(flatten)]
+        attribution: AttributionArgs,
     },
 
     /// Fetch a record.
@@ -197,6 +304,13 @@ enum Command {
         /// Replace the Markdown body. If omitted, the existing body is preserved.
         #[arg(long)]
         body: Option<String>,
+
+        /// Explain why this record is being updated.
+        #[arg(short = 'm', long, value_name = "MESSAGE")]
+        message: Option<String>,
+
+        #[command(flatten)]
+        attribution: AttributionArgs,
     },
 
     /// Add a named relation from one record to another.
@@ -206,6 +320,13 @@ enum Command {
         relation: String,
         target_collection: String,
         target_id: String,
+
+        /// Explain why this relation is being added.
+        #[arg(short = 'm', long, value_name = "MESSAGE")]
+        message: Option<String>,
+
+        #[command(flatten)]
+        attribution: AttributionArgs,
     },
 
     /// Show direct Markdown changes not yet recorded in the audit journal.
@@ -232,12 +353,18 @@ enum Command {
         /// Return the committed audit events as JSON.
         #[arg(long)]
         json: bool,
+
+        #[command(flatten)]
+        attribution: AttributionArgs,
     },
 
-    /// Print the identity that will be used for audit events.
+    /// Print the attribution that will be recorded in audit events.
     Identity {
         #[arg(long)]
         json: bool,
+
+        #[command(flatten)]
+        attribution: AttributionArgs,
     },
 
     /// Delete a record while retaining its previous state in the audit log.
@@ -248,6 +375,13 @@ enum Command {
         /// Confirm the destructive operation.
         #[arg(long, required = true)]
         yes: bool,
+
+        /// Explain why this record is being deleted.
+        #[arg(short = 'm', long, value_name = "MESSAGE")]
+        message: Option<String>,
+
+        #[command(flatten)]
+        attribution: AttributionArgs,
     },
 
     /// Inspect and verify the tamper-evident audit journal.
@@ -371,6 +505,10 @@ enum SyncCommand {
         #[arg(long)]
         actor: Option<String>,
 
+        /// Software recorded as acting for that identity: an identifier or a JSON agent object.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+
         /// Program and arguments. Use -- before the program.
         #[arg(
             required = true,
@@ -416,6 +554,14 @@ enum AuditCommand {
     Log {
         collection: Option<String>,
         id: Option<String>,
+
+        /// Only events whose acting agent, or any delegate behind it, carries this identifier.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+
+        /// Only events whose acting agent, or any delegate behind it, carries this session.
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
 
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
@@ -471,7 +617,10 @@ fn run() -> Result<()> {
             id,
             assignments,
             body,
+            message,
+            attribution,
         } => {
+            let database = attributed(database, &attribution, message.as_deref())?;
             let record = database.create(&collection, &id, &assignments, &body)?;
             println!("{}", record.reference());
         }
@@ -652,6 +801,7 @@ fn run() -> Result<()> {
                 max_output_bytes,
                 max_operations,
                 actor,
+                agent,
                 command,
             } => {
                 let sync = database.create_sync(
@@ -660,7 +810,7 @@ fn run() -> Result<()> {
                     timeout_seconds,
                     max_output_bytes,
                     max_operations,
-                    actor,
+                    SyncAttribution { actor, agent },
                 )?;
                 println!("{}", sync.name);
             }
@@ -720,10 +870,13 @@ fn run() -> Result<()> {
             id,
             assignments,
             body,
+            message,
+            attribution,
         } => {
             if assignments.is_empty() && body.is_none() {
                 bail!("provide at least one --set or --body value");
             }
+            let database = attributed(database, &attribution, message.as_deref())?;
             let record = database.update(&collection, &id, &assignments, body.as_deref())?;
             println!("{}", record.reference());
         }
@@ -733,7 +886,10 @@ fn run() -> Result<()> {
             relation,
             target_collection,
             target_id,
+            message,
+            attribution,
         } => {
+            let database = attributed(database, &attribution, message.as_deref())?;
             let record =
                 database.link(&collection, &id, &relation, &target_collection, &target_id)?;
             println!("{}", record.reference());
@@ -755,7 +911,9 @@ fn run() -> Result<()> {
             all,
             message,
             json,
+            attribution,
         } => {
+            let database = attribution.apply(database)?;
             let entries = database.save(&records, all, message.as_deref())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&entries)?);
@@ -772,23 +930,35 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Command::Identity { json } => {
+        Command::Identity {
+            json,
+            attribution: declared,
+        } => {
+            let database = declared.apply(database)?;
+            let attribution = database.attribution();
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "actor": database.actor()
+                        "actor": database.actor(),
+                        "agent": attribution.agent,
+                        "authorization": attribution.authorization,
+                        "intent": attribution.intent,
                     }))?
                 );
             } else {
                 println!("{}", database.actor());
+                print_attribution(attribution);
             }
         }
         Command::Delete {
             collection,
             id,
             yes: _,
+            message,
+            attribution,
         } => {
+            let database = attributed(database, &attribution, message.as_deref())?;
             let record = database.delete(&collection, &id)?;
             println!("{}", record.reference());
         }
@@ -800,24 +970,41 @@ fn run() -> Result<()> {
             AuditCommand::Log {
                 collection,
                 id,
+                agent,
+                session,
                 limit,
                 json,
             } => {
                 if limit == 0 {
                     bail!("audit log limit must be greater than zero");
                 }
-                let entries = database.audit_recent(limit, collection.as_deref(), id.as_deref())?;
+                let entries = database.audit_recent(
+                    limit,
+                    AuditFilter {
+                        collection: collection.as_deref(),
+                        id: id.as_deref(),
+                        agent: agent.as_deref(),
+                        session: session.as_deref(),
+                    },
+                )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&entries)?);
                 } else {
                     for entry in entries {
+                        let agent = entry
+                            .payload
+                            .agent
+                            .as_ref()
+                            .map(|agent| format!(" agent={}", agent.id))
+                            .unwrap_or_default();
                         println!(
-                            "{} {} {} {} {}",
+                            "{} {} {} {} {}{}",
                             entry.payload.sequence,
                             entry.payload.timestamp,
                             entry.payload.action,
                             entry.payload.record.reference(),
-                            entry.hash
+                            entry.hash,
+                            agent
                         );
                     }
                 }
@@ -847,6 +1034,63 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Print the agent, authorization, and intent an event would carry.
+///
+/// Prints nothing when there is nothing to say, so a human at the keyboard sees
+/// exactly the single identity line `cr identity` has always printed.
+fn print_attribution(attribution: &cr::Attribution) {
+    if let Some(agent) = &attribution.agent {
+        let mut line = format!("agent: {}", agent.id);
+        if let Some(version) = &agent.version {
+            line.push_str(&format!(" {version}"));
+        }
+        if let Some(model) = &agent.model {
+            line.push_str(&format!(" model={model}"));
+        }
+        if let Some(session) = &agent.session {
+            line.push_str(&format!(" session={session}"));
+        }
+        if let Some(turn) = &agent.turn {
+            line.push_str(&format!(" turn={turn}"));
+        }
+        for delegate in agent.via.iter().flatten() {
+            line.push_str(&format!(" via={}", delegate.id));
+        }
+        line.push_str(&format!(
+            " (asserted, detected from {})",
+            agent.detected_from.label()
+        ));
+        println!("{line}");
+    }
+    if let Some(authorization) = &attribution.authorization {
+        let mut line = format!("authorization: {}", authorization.mode.label());
+        if let Some(grant) = &authorization.grant {
+            line.push_str(&format!(" grant={grant}"));
+        }
+        if let Some(approved_by) = &authorization.approved_by {
+            line.push_str(&format!(" approved_by={approved_by}"));
+        }
+        if let Some(at) = &authorization.at {
+            line.push_str(&format!(" at={at}"));
+        }
+        println!("{line}");
+    }
+    if let Some(intent) = &attribution.intent {
+        for (label, part) in [
+            ("request", intent.request.as_ref()),
+            ("rationale", intent.rationale.as_ref()),
+        ] {
+            let Some(part) = part else { continue };
+            let body = match (&part.text, &part.digest) {
+                (Some(text), _) => text.replace('\n', " "),
+                (None, Some(digest)) => format!("not retained; digest {digest}"),
+                (None, None) => String::new(),
+            };
+            println!("intent {label} ({}): {body}", part.author.label());
+        }
+    }
 }
 
 fn print_records(records: Vec<Record>, json: bool) -> Result<()> {

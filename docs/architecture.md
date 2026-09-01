@@ -103,7 +103,7 @@ Refusals are classified `DomainError::Conflict`, so they reach a caller as `409`
 
 Each stored line is a small JSON wrapper containing a SHA-256 hash and an exact JSON payload. The payload contains:
 
-- format version, global sequence, UTC timestamp, actor, source, optional message, and action;
+- format version, global sequence, UTC timestamp, actor, source, optional agent/authorization/intent attribution, optional message, and action;
 - collection and record ID;
 - JSON Pointer-like field changes with distinguishable absent and `null` values;
 - SHA-256 hashes of the complete record bytes before and after the mutation;
@@ -112,6 +112,18 @@ Each stored line is a small JSON wrapper containing a SHA-256 hash and an exact 
 Create and baseline events store the complete after-state. Delete events store the complete before-state. Updates and links recursively diff objects while treating arrays and scalar values as replaceable units. Version 2 changes use explicit `add`, `remove`, and `replace` operations, so an absent value remains distinguishable from a present `null`. The reader accepts and safely converts version 1 change objects while retaining their original hashed bytes.
 
 Verification replays these operations independently for each record. Every event's `before_hash` must equal that record's prior audited hash, every change's before-value must equal the replayed semantic state, and record presence must agree with `after_hash`. This replay makes the prior document available even after somebody directly edits or deletes its Markdown file.
+
+### Agent attribution
+
+`actor` is the responsible human and keeps that meaning in every event ever written. When software acts on that human's behalf, three optional objects are recorded beside it rather than replacing it: `agent` (which software, at which version and model, in which session and turn, with a `via` delegation chain for sub-agents), `authorization` (a normalized `mode` plus the raw vendor `grant` and any separately-known approver and time), and `intent` (the human's `request` and the agent's `rationale`, each tagged with an `author`). The polarity — human primary, agent qualifier — follows every system designed specifically for agents acting for humans, and is forced here anyway: reassigning a field's meaning partway through an append-only log is the one thing such a log must never do.
+
+Both halves of the intent are stored because they answer different questions. The request is evidence about the human and the rationale is evidence about the agent; a misinterpretation is invisible if only the rationale is kept, because the summary is written by the party whose interpretation is in question, and a misattribution is invisible if only the request is kept, because one instruction typically causes many writes. Each event is self-contained: the text lives in the event rather than behind a session pointer, because a session identifier is a foreign key into a store with a different owner and a shorter lifetime, and a pointer to a deleted transcript looks like traceability without being it. The session and turn identifiers are kept as well, as secondary correlation keys that cost nothing when the transcript is gone.
+
+`agent.detected_from` records how `cr` came to believe an agent was involved — `environment` for a documented variable, `flag` for `--agent` or `CR_AGENT`, `header` for `X-CR-Agent`, `config` for a sync definition — and **none of its values means verified**. Detection probes only variables their vendors document for this purpose (`CLAUDECODE`, `CURSOR_AGENT`) and records only what it observed; an explicit declaration always outranks a sniffed environment, and enriching an observed agent with declared details downgrades its evidence to the declaring source rather than overstating what was seen. Callers can supply the fields but never `detected_from` itself: the stored types accept unknown fields so a newer writer cannot break an older reader, while the separate input types reject them.
+
+Adding these fields does not change `AUDIT_VERSION`. Every one is `Option` with `skip_serializing_if`, so an event with no attribution serializes to exactly the bytes it did before, and verification hashes stored bytes rather than a reserialization, so existing chains verify to identical head hashes. A bump would have been the harmful choice: `parse_line` rejects any version outside the supported range, so one newer event would make an older `cr` hard-fail an entire chain, and a metadata addition must never be able to make `audit verify` fail. The cost, accepted deliberately, is that an older binary silently omits these fields when it displays an event. For the same reason the payload must never gain a non-optional field, a `HashMap`, or a `#[serde(flatten)]`, and the four attribution enums cannot grow a variant without the same care as a version bump, since an unknown variant fails deserialization and therefore the whole chain.
+
+`audit log` filters by `--agent` and `--session`, matching the acting agent or any delegate in its chain, over CLI, REST, and the HTML timeline. Recording a delegate that cannot be queried answers none of the questions the record exists for.
 
 Segments rotate on configurable event-count and byte-size bounds. Appending atomically rewrites only the active bounded segment; verification and history reads stream segments and never require the complete journal in memory. `audit log` reads newest segments backward until its requested limit is satisfied.
 
@@ -170,6 +182,10 @@ The hash chain detects modified payloads, missing or reordered middle events, se
 
 Actor values are assertions supplied by the process, not authenticated principals. Resolution prefers the explicit CLI override and `CR_*` environment, then Git author environment/configuration, then common email and OS-user fallbacks. Signed events or trusted operating-system identity integration would be required to authenticate them.
 
+Agent, authorization, and intent are assertions on exactly the same footing, and the schema says so rather than implying otherwise through field names. `cr` is an ordinary local process with no attestation authority, so it cannot establish that an agent is what it claims, that the human actually asked, or that a rationale is honest or complete; `CR_AGENT=none` suppresses detection and produces an event indistinguishable from a human's. None of it may ever gate an authorization decision, and the delegation chain is informational only. What the design does achieve is a conventional, cheap, structured slot, so that in the ordinary honest case the record stops making a false statement, and in every case the absence of attribution becomes information rather than silence. A locally checkable property — a digest of a change set the human previewed, recomputed by `audit verify` — is the intended next step and is tracked in `TODO.md`.
+
+The journal contains historical values and deletion tombstones, and intent text adds volume to that permanence rather than a new class of risk. Text is bounded per field and per event, and exceeding the bound is an explicit error rather than a truncation. An intent part can alternatively carry a digest and reference instead of inline text, so a deployment that must be able to delete intent later can adopt content-addressed storage without a schema change.
+
 The journal contains historical values and deletion tombstones. Encryption, redaction rules, retention, and access control are deployment concerns and must be designed before storing regulated or highly sensitive data.
 
 ## Query and indexing strategy
@@ -196,7 +212,7 @@ Failures carry a typed `DomainError` classification attached to the `anyhow` cha
 
 Every request receives a correlation ID, returned as `X-Request-Id` and inside the error envelope. Before a response is rendered, the server writes the complete chain to standard error under that ID together with the method, path, status, and code; unexpected failures replace their message with a fixed generic one. Expected client errors keep their actionable wording. This holds the line that internal detail is a server-side artifact: the log is authoritative for diagnosis and the response is authoritative for what a caller may know.
 
-The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentication for HTML views, the OpenAPI document, and all `/api/v1` routes; `/health` remains public. `X-CR-Actor` is an audit attribution override with the same assertion-only trust boundary as CLI actor values. The server does not implement TLS, user accounts, authorization policies, or rate limiting; network deployments must supply those controls at a trusted reverse proxy or service boundary.
+The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentication for HTML views, the OpenAPI document, and all `/api/v1` routes; `/health` remains public. `X-CR-Actor` is an audit attribution override with the same assertion-only trust boundary as CLI actor values, and `X-CR-Agent`, `X-CR-Authorization`, and `X-CR-Intent` extend that boundary unchanged to the three attribution objects. Each accepts the same compact or JSON form as its command-line option and is recorded as `detected_from: header`; because HTTP header values are visible ASCII, non-ASCII intent text must arrive as JSON escapes, and a header that is not decodable is refused with a message that names the header and nothing internal. `GET /api/v1/identity` returns the complete attribution a request would record, which is how a client checks its wiring without writing anything. The server does not implement TLS, user accounts, authorization policies, or rate limiting; network deployments must supply those controls at a trusted reverse proxy or service boundary.
 
 ## Views and server-rendered HTML
 
@@ -227,6 +243,7 @@ Mutating forms include a cryptographically random token generated when the serve
 ## Integrity boundaries
 
 - Collection names and IDs are single path components, preventing path traversal. `data_dir` must be a relative path of plain components.
+- Actor, agent, authorization, and intent values are asserted by the caller, are bounded in length, and never influence validation, locking, or permission. They are recorded evidence, not credentials.
 - No directory between the root and a target may be a symbolic link. That covers `data_dir`, its intermediate directories, each collection directory, `.cr/`, and the audit, schema, view, and sync directories beneath it. A configured directory replaced by a link is refused rather than followed.
 - Markdown record paths must be regular files. Single-record CRUD, status, save, and audit verification reject symlinks and other special file types rather than trusting them by content hash; ordinary collection, schema, view, and sync listings continue to ignore non-file entries, and every name they do yield is reopened safely before it is read.
 - Creation never overwrites an existing record.

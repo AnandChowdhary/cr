@@ -29,8 +29,28 @@ pub fn binary() -> &'static str {
 
 pub fn command_for(database: &Path) -> Command {
     let mut command = Command::new(binary());
+    clear_attribution_environment(&mut command);
     command.arg("--database").arg(database);
     command
+}
+
+/// Remove every variable `cr` uses to detect or declare an acting agent.
+///
+/// Without this, running the suite inside a coding agent would produce
+/// different audit events than running it in CI, and tests that assert what is
+/// *not* recorded would depend on where they were run. Tests that care about
+/// attribution set these variables back explicitly.
+pub fn clear_attribution_environment(command: &mut Command) {
+    for variable in [
+        "CR_AGENT",
+        "CR_AUTHORIZATION",
+        "CR_INTENT",
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+        "CURSOR_AGENT",
+    ] {
+        command.env_remove(variable);
+    }
 }
 
 pub fn run_success(command: &mut Command) -> String {

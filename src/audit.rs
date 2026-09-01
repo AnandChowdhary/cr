@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
+    attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     database::{record_label, validate_component, RECORDS_LABEL},
     error::conflict,
     frontmatter::Document,
@@ -164,6 +165,21 @@ pub struct AuditPayload {
     pub actor: String,
     #[serde(default)]
     pub source: AuditSource,
+    /// The software that carried the change out on the actor's behalf.
+    ///
+    /// Absent for a human at the keyboard, which is why it and its two
+    /// siblings are `Option` with `skip_serializing_if`: an event with no
+    /// attribution serializes to exactly the bytes it did before these fields
+    /// existed, so no audit version bump is needed and every existing journal
+    /// keeps verifying. See `src/attribution.rs` for the byte-stability rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AuditAgent>,
+    /// How much of a human decision stood behind the change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<AuditAuthorization>,
+    /// What was asked, and what the agent thought it was doing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<AuditIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub action: AuditAction,
@@ -179,6 +195,70 @@ pub struct AuditEntry {
     pub hash: String,
     #[serde(flatten)]
     pub payload: AuditPayload,
+}
+
+/// Which audit events a history read should return.
+///
+/// The agent and session predicates exist because "show me everything this
+/// agent did" is the first question anyone asks of delegated attribution, and
+/// recording the delegate without being able to query it answers none of it.
+/// Both match the acting agent or any delegate in its `via` chain.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AuditFilter<'a> {
+    /// Only events for this collection.
+    pub collection: Option<&'a str>,
+    /// Only events for this record ID within `collection`.
+    pub id: Option<&'a str>,
+    /// Only events whose agent chain contains this agent identifier.
+    pub agent: Option<&'a str>,
+    /// Only events whose agent chain contains this session identifier.
+    pub session: Option<&'a str>,
+}
+
+impl<'a> AuditFilter<'a> {
+    /// Every event, unfiltered.
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// Every event for one record.
+    pub fn record(collection: &'a str, id: &'a str) -> Self {
+        Self {
+            collection: Some(collection),
+            id: Some(id),
+            ..Self::default()
+        }
+    }
+
+    /// True when `payload` satisfies every configured predicate.
+    fn matches(&self, payload: &AuditPayload) -> bool {
+        if self
+            .collection
+            .is_some_and(|value| payload.record.collection != value)
+            || self.id.is_some_and(|value| payload.record.id != value)
+        {
+            return false;
+        }
+        if let Some(agent) = self.agent {
+            if !payload
+                .agent
+                .as_ref()
+                .is_some_and(|value| value.declares_id(agent))
+            {
+                return false;
+            }
+        }
+        if let Some(session) = self.session {
+            if !payload
+                .agent
+                .as_ref()
+                .is_some_and(|value| value.declares_session(session))
+            {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -231,6 +311,7 @@ pub(crate) struct AuditLog<'a> {
     segment_max_events: usize,
     segment_max_bytes: u64,
     actor: &'a str,
+    attribution: &'a Attribution,
 }
 
 pub(crate) struct AuditMutation<'a> {
@@ -285,6 +366,7 @@ impl<'a> AuditLog<'a> {
         segment_max_events: usize,
         segment_max_bytes: u64,
         actor: &'a str,
+        attribution: &'a Attribution,
     ) -> Self {
         Self {
             root,
@@ -292,6 +374,7 @@ impl<'a> AuditLog<'a> {
             segment_max_events,
             segment_max_bytes,
             actor,
+            attribution,
         }
     }
 
@@ -385,6 +468,9 @@ impl<'a> AuditLog<'a> {
                 .context("could not format audit timestamp")?,
             actor: self.actor.to_owned(),
             source: mutation.source,
+            agent: self.attribution.agent.clone(),
+            authorization: self.attribution.authorization.clone(),
+            intent: self.attribution.intent.clone(),
             message: mutation.message.map(str::to_owned),
             action: mutation.action,
             record: AuditRecord {
@@ -569,12 +655,7 @@ impl<'a> AuditLog<'a> {
         bail!("pending audit mutation cannot be recovered because the record matches neither state")
     }
 
-    pub fn recent(
-        &self,
-        limit: usize,
-        collection: Option<&str>,
-        id: Option<&str>,
-    ) -> Result<Vec<AuditEntry>> {
+    pub fn recent(&self, limit: usize, filter: AuditFilter<'_>) -> Result<Vec<AuditEntry>> {
         self.verify_chain(|_| Ok(()))?;
         let mut result = Vec::new();
         let paths = self.segment_paths()?;
@@ -583,10 +664,7 @@ impl<'a> AuditLog<'a> {
             let mut entries = self.read_segment(&path)?;
             entries.reverse();
             for stored in entries {
-                let record = &stored.entry.payload.record;
-                if collection.is_some_and(|value| record.collection != value)
-                    || id.is_some_and(|value| record.id != value)
-                {
+                if !filter.matches(&stored.entry.payload) {
                     continue;
                 }
                 result.push(stored.entry);
@@ -1242,10 +1320,220 @@ fn digest(domain: &[u8], contents: &[u8]) -> String {
 mod tests {
     use super::{
         apply_changes, diff_documents, event_hash, parse_line, record_hash, stored_line,
-        AuditAction, AuditChange, AuditLog, AuditMutation, AuditSource, PendingMutation,
-        PreparedEntry, ReconciledMutation, PENDING_PATH,
+        AuditAction, AuditChange, AuditFilter, AuditLog, AuditMutation, AuditPayload, AuditRecord,
+        AuditSource, PendingMutation, PreparedEntry, ReconciledMutation, PENDING_PATH,
     };
-    use crate::{frontmatter::Document, paths};
+    use crate::{
+        attribution::{
+            AgentEvidence, Attribution, AuditAgent, AuditAuthorization, AuditIntent,
+            AuditIntentPart, AuthorizationMode, IntentAuthor,
+        },
+        frontmatter::Document,
+        paths,
+    };
+
+    /// One audit event written by `cr` at `0ca95fb`, before `agent`,
+    /// `authorization`, and `intent` existed, copied verbatim out of
+    /// `tests/fixtures/legacy-journal`.
+    const LEGACY_PAYLOAD: &str = r#"{"version":2,"sequence":3,"timestamp":"2026-09-01T10:06:28.583165677Z","actor":"Ada Lovelace <ada@example.com>","source":"cli","action":"update","record":{"collection":"deals","id":"acme-renewal"},"changes":[{"operation":"replace","path":"/attributes/stage","before":"negotiation","after":"closed"},{"operation":"replace","path":"/attributes/status","before":"open","after":"closed-won"}],"before_hash":"sha256:bff41b4063a1c3174a78757ba233661b8e009f20023193b68d9024d39f48f7fe","after_hash":"sha256:6ae98ae2e84c09ef640b8c8c69c0a316a1b7c945274b4eb85d47eb3061519c8d","previous_hash":"sha256:df5581e0fabd9d6a1a96a3d863680dbead1e5a9efa18e6b62ece155390d41858"}"#;
+
+    /// The hash that same `cr` wrote beside those bytes.
+    const LEGACY_HASH: &str =
+        "sha256:859fd73ce851c6098b4b186a67cb38ab54f855624c591cd3902e0c8633f0f8a3";
+
+    fn attributed_payload() -> AuditPayload {
+        AuditPayload {
+            version: 2,
+            sequence: 2,
+            timestamp: "2026-09-01T09:18:34.451476644Z".to_owned(),
+            actor: "Ada Lovelace <ada@example.com>".to_owned(),
+            source: AuditSource::Cli,
+            agent: Some(AuditAgent {
+                id: "claude-code".to_owned(),
+                version: Some("2.1.237".to_owned()),
+                model: Some("claude-opus-4-5".to_owned()),
+                session: Some("6d1baa69".to_owned()),
+                turn: Some("prompt_01HXZ".to_owned()),
+                detected_from: AgentEvidence::Environment,
+                via: Some(vec![AuditAgent {
+                    id: "claude-code-parent".to_owned(),
+                    version: None,
+                    model: None,
+                    session: Some("parent-session".to_owned()),
+                    turn: None,
+                    detected_from: AgentEvidence::Flag,
+                    via: None,
+                }]),
+            }),
+            authorization: Some(AuditAuthorization {
+                mode: AuthorizationMode::Delegated,
+                grant: Some("acceptEdits".to_owned()),
+                approved_by: Some("Ada Lovelace <ada@example.com>".to_owned()),
+                at: Some("2026-09-01T09:17:55Z".to_owned()),
+                approved_changes: None,
+            }),
+            intent: Some(AuditIntent {
+                request: Some(AuditIntentPart {
+                    author: IntentAuthor::Human,
+                    text: Some("update this deal to closed-won".to_owned()),
+                    digest: None,
+                    reference: None,
+                    at: Some("2026-09-01T09:17:41Z".to_owned()),
+                }),
+                rationale: Some(AuditIntentPart {
+                    author: IntentAuthor::Agent,
+                    text: Some("set status to closed-won and stage to closed".to_owned()),
+                    digest: None,
+                    reference: None,
+                    at: None,
+                }),
+            }),
+            message: None,
+            action: AuditAction::Update,
+            record: AuditRecord {
+                collection: "deals".to_owned(),
+                id: "acme-renewal".to_owned(),
+            },
+            changes: vec![AuditChange::Replace {
+                path: "/attributes/status".to_owned(),
+                before: json!("open"),
+                after: json!("closed-won"),
+            }],
+            before_hash: Some("sha256:70af0060".to_owned()),
+            after_hash: Some("sha256:3c583cd6".to_owned()),
+            previous_hash: Some("sha256:be4bd677".to_owned()),
+        }
+    }
+
+    /// The whole compatibility argument, asserted against bytes this code did
+    /// not produce.
+    ///
+    /// A payload written before `agent`, `authorization`, and `intent` existed
+    /// must deserialize into the current struct with all three absent, and must
+    /// serialize back to exactly the bytes on disk, under exactly the hash that
+    /// was stored beside them. A round trip through the current serializer alone
+    /// would agree with itself no matter what changed, so the expected value is
+    /// a literal taken from a journal an older `cr` wrote.
+    #[test]
+    fn a_pre_change_payload_reserializes_to_identical_bytes_and_the_same_hash() {
+        let payload: AuditPayload = serde_json::from_str(LEGACY_PAYLOAD).unwrap();
+        assert!(payload.agent.is_none());
+        assert!(payload.authorization.is_none());
+        assert!(payload.intent.is_none());
+        let reserialized = serde_json::to_string(&payload).unwrap();
+        assert_eq!(reserialized, LEGACY_PAYLOAD);
+        assert_eq!(event_hash(reserialized.as_bytes()), LEGACY_HASH);
+    }
+
+    /// Absent attribution must add no bytes at all, so a human-authored event
+    /// written today is indistinguishable from one written before this change.
+    #[test]
+    fn absent_attribution_serializes_to_no_bytes() {
+        let mut payload: AuditPayload = serde_json::from_str(LEGACY_PAYLOAD).unwrap();
+        payload.sequence = 99;
+        let without = serde_json::to_string(&payload).unwrap();
+        assert!(!without.contains("agent"));
+        assert!(!without.contains("authorization"));
+        assert!(!without.contains("intent"));
+        assert!(!without.contains("null,\"action\""));
+    }
+
+    /// A stored event that carries every new field must survive a read and a
+    /// rewrite unchanged, so nothing in the schema depends on map ordering.
+    #[test]
+    fn an_attributed_payload_round_trips_byte_for_byte() {
+        let payload = attributed_payload();
+        let first = serde_json::to_string(&payload).unwrap();
+        let parsed: AuditPayload = serde_json::from_str(&first).unwrap();
+        let second = serde_json::to_string(&parsed).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(event_hash(first.as_bytes()), event_hash(second.as_bytes()));
+        assert_eq!(parsed, payload);
+        assert_eq!(parsed.version, 2);
+        assert!(first.contains(r#""detected_from":"environment""#));
+        assert!(first.contains(r#""mode":"delegated""#));
+        assert!(first.contains(r#""author":"human""#));
+    }
+
+    /// A journal that carries the new fields must verify, and it must verify by
+    /// hashing the bytes as stored rather than anything reserialized.
+    #[test]
+    fn a_stored_attributed_event_verifies_from_its_own_bytes() {
+        let payload = serde_json::to_string(&attributed_payload()).unwrap();
+        let line = stored_line(&event_hash(payload.as_bytes()), &payload).unwrap();
+        let stored = parse_line(line.trim_end().as_bytes()).unwrap();
+        let agent = stored.entry.payload.agent.as_ref().unwrap();
+        assert_eq!(agent.id, "claude-code");
+        assert_eq!(agent.detected_from, AgentEvidence::Environment);
+        assert_eq!(agent.via.as_ref().unwrap()[0].id, "claude-code-parent");
+        assert_eq!(
+            stored.entry.payload.authorization.as_ref().unwrap().mode,
+            AuthorizationMode::Delegated
+        );
+        assert!(stored
+            .entry
+            .payload
+            .intent
+            .as_ref()
+            .unwrap()
+            .rationale
+            .is_some());
+    }
+
+    /// An event written by a newer `cr` that added another optional sibling must
+    /// still verify here. Verification hashes what is on disk, and the payload
+    /// deliberately does not deny unknown fields, so an addition can never make
+    /// `audit verify` fail for a reader that has not caught up.
+    #[test]
+    fn an_unknown_future_field_does_not_break_verification() {
+        let payload = LEGACY_PAYLOAD.replacen(
+            r#""source":"cli","#,
+            r#""source":"cli","principal":{"id":"token-7","authenticated":true},"#,
+            1,
+        );
+        let hash = event_hash(payload.as_bytes());
+        let line = stored_line(&hash, &payload).unwrap();
+        let stored = parse_line(line.trim_end().as_bytes()).unwrap();
+        assert_eq!(stored.entry.hash, hash);
+        assert_eq!(stored.entry.payload.sequence, 3);
+    }
+
+    /// The delegate has to be queryable, including through a chain, or
+    /// recording it answers nothing.
+    #[test]
+    fn history_filters_match_the_acting_agent_and_its_chain() {
+        let payload = attributed_payload();
+        let plain = serde_json::from_str::<AuditPayload>(LEGACY_PAYLOAD).unwrap();
+
+        assert!(AuditFilter::all().matches(&payload));
+        assert!(AuditFilter {
+            agent: Some("claude-code"),
+            ..AuditFilter::all()
+        }
+        .matches(&payload));
+        assert!(AuditFilter {
+            agent: Some("claude-code-parent"),
+            ..AuditFilter::all()
+        }
+        .matches(&payload));
+        assert!(AuditFilter {
+            session: Some("parent-session"),
+            ..AuditFilter::all()
+        }
+        .matches(&payload));
+        assert!(!AuditFilter {
+            agent: Some("cursor-agent"),
+            ..AuditFilter::all()
+        }
+        .matches(&payload));
+        assert!(!AuditFilter {
+            agent: Some("claude-code"),
+            ..AuditFilter::all()
+        }
+        .matches(&plain));
+        assert!(AuditFilter::record("deals", "acme-renewal").matches(&payload));
+        assert!(!AuditFilter::record("people", "ada").matches(&payload));
+    }
     use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
     use yaml_serde::Mapping;
@@ -1355,7 +1643,15 @@ mod tests {
     #[test]
     fn accepting_a_direct_edit_rechecks_the_current_file_hash() {
         let root = tempfile::tempdir().unwrap();
-        let audit = AuditLog::new(root.path(), Path::new("records"), 10, 1024 * 1024, "tester");
+        let attribution = Attribution::default();
+        let audit = AuditLog::new(
+            root.path(),
+            Path::new("records"),
+            10,
+            1024 * 1024,
+            "tester",
+            &attribution,
+        );
         let _lock = audit.lock().unwrap();
         let original = Document {
             attributes: Mapping::new(),
@@ -1412,12 +1708,14 @@ mod tests {
     #[test]
     fn pending_mutations_recover_committed_state_and_discard_unapplied_state() {
         let committed_root = tempfile::tempdir().unwrap();
+        let attribution = Attribution::default();
         let committed = AuditLog::new(
             committed_root.path(),
             Path::new("records"),
             2,
             1024 * 1024,
             "tester",
+            &attribution,
         );
         committed.ensure_layout().unwrap();
         let _lock = committed.lock().unwrap();
@@ -1461,6 +1759,7 @@ mod tests {
             2,
             1024 * 1024,
             "tester",
+            &attribution,
         );
         aborted.ensure_layout().unwrap();
         let _lock = aborted.lock().unwrap();
