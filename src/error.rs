@@ -35,6 +35,21 @@ pub enum DomainError {
     /// corrupt". Sharing a code with every other conflict would bury exactly
     /// the distinction the digest exists to make.
     ApprovalMismatch(String),
+    /// The journal does not agree with the audit anchor kept beside it.
+    ///
+    /// Its own variant for the same reason as [`Self::ApprovalMismatch`]. "The
+    /// chain is internally consistent but it is not the chain your anchor
+    /// attests to" is a different finding from "the chain is damaged", and an
+    /// auditor who cannot tell them apart cannot act on either: the first
+    /// points at rewritten history, the second at a broken file. Sharing a code
+    /// with every other conflict would bury exactly that distinction.
+    ///
+    /// It also covers an anchor that cannot be interpreted at all — unreadable
+    /// bytes or a format version this build does not know — because in every
+    /// one of those cases the honest report is the same: agreement could not be
+    /// established. It never means "the anchor is merely behind", which is a
+    /// success with a notice rather than a failure.
+    AnchorMismatch(String),
 }
 
 impl DomainError {
@@ -52,6 +67,7 @@ impl DomainError {
             Self::Conflict(_) => "conflict",
             Self::Invalid(_) => "validation_failed",
             Self::ApprovalMismatch(_) => "approval_mismatch",
+            Self::AnchorMismatch(_) => "anchor_mismatch",
         }
     }
 
@@ -62,7 +78,8 @@ impl DomainError {
             | Self::AlreadyExists(message)
             | Self::Conflict(message)
             | Self::Invalid(message)
-            | Self::ApprovalMismatch(message) => message,
+            | Self::ApprovalMismatch(message)
+            | Self::AnchorMismatch(message) => message,
         }
     }
 
@@ -158,6 +175,11 @@ pub(crate) fn approval_mismatch(message: impl Display) -> anyhow::Error {
     anyhow::Error::new(DomainError::ApprovalMismatch(message.to_string()))
 }
 
+/// Build an audit-anchor disagreement for `bail!`-style returns.
+pub(crate) fn anchor_mismatch(message: impl Display) -> anyhow::Error {
+    anyhow::Error::new(DomainError::AnchorMismatch(message.to_string()))
+}
+
 /// True when `error` was caused by a missing filesystem entry.
 pub(crate) fn is_missing(error: &anyhow::Error) -> bool {
     io_kind_matches(error, std::io::ErrorKind::NotFound)
@@ -178,7 +200,10 @@ fn io_kind_matches(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DomainError, approval_mismatch, conflict, invalid, is_already_exists, is_missing};
+    use super::{
+        DomainError, anchor_mismatch, approval_mismatch, conflict, invalid, is_already_exists,
+        is_missing,
+    };
     use anyhow::anyhow;
 
     #[test]
@@ -217,6 +242,10 @@ mod tests {
         assert_eq!(
             DomainError::of(&invalid("bad field")).map(DomainError::code),
             Some("validation_failed")
+        );
+        assert_eq!(
+            DomainError::of(&anchor_mismatch("anchor is not the head")).map(DomainError::code),
+            Some("anchor_mismatch")
         );
     }
 

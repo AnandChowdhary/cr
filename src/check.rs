@@ -34,8 +34,8 @@
 //!
 //! Everything else here — dangling links, malformed relation values, schema
 //! drift, unusable schemas, invalid record names, chain damage, approval
-//! mismatches, and a sync run that stopped halfway — is invisible to `status`
-//! entirely. The sync one is the sharpest case: an interrupted run leaves a
+//! mismatches, an audit anchor that disagrees with or lags the journal, and a
+//! sync run that stopped halfway — is invisible to `status` entirely. The sync one is the sharpest case: an interrupted run leaves a
 //! committed prefix that genuinely agrees with the journal, so `status` reports
 //! clean and `audit verify` passes, and until now the only way to find it was
 //! to already suspect the sync by name.
@@ -58,7 +58,7 @@ use serde::Serialize;
 use yaml_serde::{Mapping, Value};
 
 use crate::{
-    audit::record_hash,
+    audit::{AnchorStatus, record_hash},
     database::{
         CollectionEntry, Database, collection_directory_name, collection_entry, validate_component,
     },
@@ -125,6 +125,12 @@ pub enum FindingKind {
     ApprovalMismatch,
     /// A sync run stopped partway and has not been completed.
     InterruptedSyncRun,
+    /// The audit anchor does not agree with the journal it sits beside.
+    AuditAnchorMismatch,
+    /// The audit anchor attests to an earlier event than the current head.
+    AuditAnchorBehind,
+    /// The journal has events and no audit anchor attests to its head.
+    AuditAnchorMissing,
 }
 
 impl FindingKind {
@@ -143,6 +149,9 @@ impl FindingKind {
             Self::AuditChainBroken => "audit_chain_broken",
             Self::ApprovalMismatch => "approval_mismatch",
             Self::InterruptedSyncRun => "interrupted_sync_run",
+            Self::AuditAnchorMismatch => "audit_anchor_mismatch",
+            Self::AuditAnchorBehind => "audit_anchor_behind",
+            Self::AuditAnchorMissing => "audit_anchor_missing",
         }
     }
 
@@ -388,6 +397,7 @@ pub(crate) fn run(database: &Database, scope: &CheckScope) -> Result<CheckReport
     // Database-wide, and therefore reported under `--collection` too: a
     // half-applied import is not a property of one collection.
     report_interrupted_syncs(database, &mut findings)?;
+    report_anchor(&audit, &mut findings);
 
     findings.sort_by(|left, right| {
         right
@@ -990,6 +1000,51 @@ fn unknown_collection(
             "collection '{collection}' does not exist"
         )))
     })
+}
+
+/// Report how the audit anchor stands against the journal.
+///
+/// Three separable findings rather than one, because they call for three
+/// different responses. A mismatch is an [`Severity::Error`]: the journal is
+/// not the one the anchor attests to, and the anchor's committed history is the
+/// place to find out which side moved. A lagging anchor and a missing anchor
+/// are [`Severity::Warning`]s: nothing has been altered, the guarantee is
+/// merely thinner than it should be, and `cr audit anchor --write` restores it.
+///
+/// Deliberately silent when the chain itself could not be replayed: that
+/// failure is not an anchor mismatch, so it falls through to no finding and the
+/// journal's own [`FindingKind::AuditChainBroken`] stands alone. Stacking an
+/// anchor complaint on top of a broken journal would send an operator after the
+/// wrong thing.
+fn report_anchor(audit: &crate::audit::AuditLog<'_>, findings: &mut Vec<Finding>) {
+    let finding = match audit.anchor_report() {
+        Ok(report) => match report.status {
+            AnchorStatus::Empty | AnchorStatus::Matched { .. } | AnchorStatus::Overridden => return,
+            AnchorStatus::Absent => Finding::database(
+                FindingKind::AuditAnchorMissing,
+                Severity::Warning,
+                "the journal has events and no audit anchor attests to its head; run 'cr audit anchor --write' and commit the result",
+            ),
+            AnchorStatus::Behind { sequence, head } => Finding::database(
+                FindingKind::AuditAnchorBehind,
+                Severity::Warning,
+                format!(
+                    "the audit anchor attests to sequence {sequence} and the journal is at {head}; the journal still agrees with the anchor, so this is a lagging anchor rather than altered history"
+                ),
+            ),
+        },
+        Err(error) => match DomainError::of(&error) {
+            Some(DomainError::AnchorMismatch(message)) => Finding::database(
+                FindingKind::AuditAnchorMismatch,
+                Severity::Error,
+                message.clone(),
+            ),
+            // The chain replayed a moment ago, so anything else here is an
+            // environment failure rather than a finding about the database.
+            _ => return,
+        },
+    };
+    findings.push(finding);
 }
 
 /// A database-wide finding for a journal that could not be replayed.

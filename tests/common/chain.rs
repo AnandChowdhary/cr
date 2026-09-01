@@ -142,3 +142,51 @@ pub fn assert_chain_is_well_formed(root: &Path) -> Option<String> {
     }
     previous
 }
+
+/// The anchor `cr` maintains at the database root.
+pub const ANCHOR_PATH: &str = ".cr-audit-head.json";
+
+/// Read the stored anchor, or `None` when the database has none.
+pub fn read_anchor(root: &Path) -> Option<Value> {
+    let contents = fs::read_to_string(root.join(ANCHOR_PATH)).ok()?;
+    assert!(
+        contents.ends_with('\n'),
+        "the anchor must be newline-terminated so a Git diff is clean"
+    );
+    Some(serde_json::from_str(&contents).expect("the anchor is valid JSON"))
+}
+
+/// Overwrite the anchor with `contents` exactly.
+pub fn write_anchor(root: &Path, contents: &str) {
+    fs::write(root.join(ANCHOR_PATH), contents).expect("the anchor is writable");
+}
+
+/// Delete the anchor.
+pub fn remove_anchor(root: &Path) {
+    fs::remove_file(root.join(ANCHOR_PATH)).expect("the anchor exists");
+}
+
+/// Rewrite the anchor so that it agrees with whatever the journal now says.
+///
+/// This is the forger's second move, and it costs them nothing: the anchor is a
+/// plain file at the database root, so anybody who can rewrite `.cr/audit/` can
+/// rewrite this in the same pass. Tests that document what the anchor does
+/// *not* buy call this; tests that document what it does catch do not.
+///
+/// Derived from the stored journal here rather than by asking `cr`, so a test
+/// that says "the anchor was rewritten to match" is checked against the format
+/// rather than against the implementation agreeing with itself.
+pub fn reanchor(root: &Path) {
+    let events = read_chain(root);
+    let head = events.last().expect("the journal has at least one event");
+    let anchor = serde_json::json!({
+        "version": 1,
+        "sequence": head.sequence(),
+        "hash": head.hash,
+        "timestamp": head.parsed["timestamp"],
+    });
+    write_anchor(
+        root,
+        &format!("{}\n", serde_json::to_string_pretty(&anchor).unwrap()),
+    );
+}

@@ -4,6 +4,8 @@ This is a ready-to-use `cr` database with sample companies, contacts, deals, rel
 
 It intentionally has no `.cr/config.yaml`: the standard `records/` directory and audit segment limits come from built-in defaults. Add a config only when this database needs an override.
 
+It does carry `.cr-audit-head.json`, the audit anchor, checked in exactly the way a real database should carry it. `cr --database examples/crm audit verify` checks the journal against it without being asked. Mutating this database through the HTML forms below rewrites the anchor, so it will show up in `git status` alongside the records that changed — which is the whole point of it.
+
 From the repository root, start it with:
 
 ```sh
