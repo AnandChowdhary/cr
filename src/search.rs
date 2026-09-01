@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use regex::{Regex, RegexBuilder};
 
-use crate::{value::parse_path, Record};
+use crate::{error::DomainError, value::parse_path, Record};
 
 /// The part of a Markdown record searched by [`SearchQuery`].
 #[derive(Clone, Debug)]
@@ -43,7 +43,9 @@ impl SearchQuery {
         let matcher = RegexBuilder::new(&expression)
             .case_insensitive(ignore_case)
             .build()
-            .with_context(|| format!("invalid search regular expression '{pattern}'"))?;
+            .with_context(|| {
+                DomainError::Invalid(format!("invalid search regular expression '{pattern}'"))
+            })?;
         Ok(Self { matcher, target })
     }
 

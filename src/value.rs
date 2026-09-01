@@ -1,7 +1,9 @@
 use std::{cmp::Ordering, fmt, str::FromStr};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use yaml_serde::{Mapping, Value};
+
+use crate::error::{invalid, DomainError};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Assignment {
@@ -78,7 +80,9 @@ impl FilterExpression {
             Some(parse_filter_value(raw_value)?)
         } else {
             if !raw_value.trim().is_empty() {
-                bail!("operator '{operator}' does not accept a value");
+                return Err(invalid(format!(
+                    "operator '{operator}' does not accept a value"
+                )));
             }
             None
         };
@@ -187,9 +191,10 @@ impl FromStr for FilterExpression {
             .iter()
             .filter_map(|(token, operator)| input.find(token).map(|position| (position, *token, *operator)))
             .min_by_key(|(position, token, _)| (*position, std::cmp::Reverse(token.len())))
-            .context(
-                "expected a filter expression such as value>=10000, name contains Acme, or owner is-empty",
-            )?;
+            .context(DomainError::Invalid(
+                "expected a filter expression such as value>=10000, name contains Acme, or owner is-empty"
+                    .to_owned(),
+            ))?;
         let path = input[..position].trim();
         let raw_value = input[position + token.len()..].trim();
         Self::new(path, operator, raw_value)
@@ -200,8 +205,9 @@ fn parse_filter_value(raw_value: &str) -> Result<Value> {
     if raw_value.is_empty() {
         Ok(Value::String(String::new()))
     } else {
-        yaml_serde::from_str(raw_value)
-            .with_context(|| format!("'{raw_value}' is not a valid YAML value"))
+        yaml_serde::from_str(raw_value).with_context(|| {
+            DomainError::Invalid(format!("'{raw_value}' is not a valid YAML value"))
+        })
     }
 }
 
@@ -264,9 +270,9 @@ impl FromStr for Assignment {
     type Err = anyhow::Error;
 
     fn from_str(input: &str) -> Result<Self> {
-        let (key, raw_value) = input
-            .split_once('=')
-            .context("expected KEY=YAML (for example, stage=interview)")?;
+        let (key, raw_value) = input.split_once('=').context(DomainError::Invalid(
+            "expected KEY=YAML (for example, stage=interview)".to_owned(),
+        ))?;
         let path = parse_path(key)?;
         let value = parse_filter_value(raw_value)?;
 
@@ -276,12 +282,14 @@ impl FromStr for Assignment {
 
 pub(crate) fn parse_path(input: &str) -> Result<Vec<String>> {
     if input.is_empty() {
-        bail!("field path cannot be empty");
+        return Err(invalid("field path cannot be empty"));
     }
 
     let path: Vec<_> = input.split('.').map(str::to_owned).collect();
     if path.iter().any(|part| part.is_empty()) {
-        bail!("field path '{input}' contains an empty segment");
+        return Err(invalid(format!(
+            "field path '{input}' contains an empty segment"
+        )));
     }
     Ok(path)
 }
@@ -315,9 +323,9 @@ pub(crate) fn remove_path(attributes: &mut Mapping, path: &[String]) -> bool {
 }
 
 fn set_path(attributes: &mut Mapping, path: &[String], value: Value) -> Result<()> {
-    let (first, rest) = path
-        .split_first()
-        .context("field path must contain at least one segment")?;
+    let (first, rest) = path.split_first().context(DomainError::Invalid(
+        "field path must contain at least one segment".to_owned(),
+    ))?;
     let key = Value::String(first.clone());
 
     if rest.is_empty() {
@@ -331,7 +339,9 @@ fn set_path(attributes: &mut Mapping, path: &[String], value: Value) -> Result<(
 
     let child = attributes.get_mut(&key).expect("field was just inserted");
     let Value::Mapping(mapping) = child else {
-        bail!("cannot set a nested field below non-object field '{first}'");
+        return Err(invalid(format!(
+            "cannot set a nested field below non-object field '{first}'"
+        )));
     };
 
     set_path(mapping, rest, value)

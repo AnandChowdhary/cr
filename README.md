@@ -1120,10 +1120,38 @@ Errors use a stable JSON envelope and appropriate HTTP status such as `400`, `40
 {
   "error": {
     "code": "validation_failed",
-    "message": "record does not match schema for collection 'deals'"
+    "message": "record does not match schema for collection 'deals'",
+    "request_id": "3f1c9a70b52d4e18"
   }
 }
 ```
+
+`message` is written for the caller and never contains a filesystem path, an
+operating-system error, or other server-internal context. A missing record
+names itself by collection and ID:
+
+```json
+{
+  "error": {
+    "code": "not_found",
+    "message": "record deals/nope does not exist",
+    "request_id": "9b40e2c1d7a35f66"
+  }
+}
+```
+
+An unexpected failure returns `500` with a fixed generic message. Every
+response, including successful ones, carries an `X-Request-Id` header that
+matches `error.request_id`, and every error writes one line to the server's
+standard error containing the request ID, method, path, status, code, and the
+complete diagnostic chain:
+
+```text
+cr error request_id=9b40e2c1d7a35f66 status=404 code=not_found method=GET path=/api/v1/collections/deals/records/nope detail="record deals/nope does not exist: could not read record /srv/crm/records/deals/nope.md: No such file or directory (os error 2)"
+```
+
+Server-rendered HTML error pages apply the same rules and display the request
+ID so it can be quoted in a report.
 
 ## Useful command summary
 

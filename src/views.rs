@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     database::{validate_component, write_new},
+    error::{invalid, is_already_exists, DomainError},
     value::parse_path,
     Assignment, Database, SortDirection,
 };
@@ -154,7 +155,7 @@ impl Database {
         validate_component(collection, "collection")?;
         let title = title.unwrap_or(name).trim();
         if title.is_empty() {
-            bail!("view title cannot be empty");
+            return Err(invalid("view title cannot be empty"));
         }
 
         let stored = StoredViewDefinition {
@@ -176,7 +177,14 @@ impl Database {
         let path = self.view_path(name);
         let serialized = yaml_serde::to_string(&stored).context("could not serialize view")?;
         write_new(&path, serialized.as_bytes())
-            .with_context(|| format!("could not create view '{name}'"))?;
+            .with_context(|| format!("could not create view '{name}'"))
+            .map_err(|error| {
+                if is_already_exists(&error) {
+                    error.context(DomainError::view_exists(name))
+                } else {
+                    error
+                }
+            })?;
         Ok(to_public(name, stored, true))
     }
 
@@ -194,7 +202,7 @@ impl Database {
         {
             return Ok(automatic_view(name));
         }
-        bail!("view '{name}' does not exist")
+        Err(DomainError::view_not_found(name).into())
     }
 
     pub fn views(&self) -> Result<Vec<ViewDefinition>> {
@@ -254,14 +262,14 @@ impl Database {
         validate_view_name(name)?;
         let path = self.view_path(name);
         let metadata =
-            fs::symlink_metadata(&path).with_context(|| format!("view '{name}' does not exist"))?;
+            fs::symlink_metadata(&path).with_context(|| DomainError::view_not_found(name))?;
         if !metadata.file_type().is_file() {
             bail!("view path {} must be a regular file", path.display());
         }
         let serialized =
             fs::read_to_string(&path).with_context(|| format!("could not read view '{name}'"))?;
         let stored: StoredViewDefinition = yaml_serde::from_str(&serialized)
-            .with_context(|| format!("view '{name}' is not valid YAML"))?;
+            .with_context(|| DomainError::Invalid(format!("view '{name}' is not valid YAML")))?;
         validate_stored(name, &stored)?;
         Ok(to_public(name, stored, true))
     }
@@ -274,83 +282,106 @@ impl Database {
 fn validate_view_name(name: &str) -> Result<()> {
     validate_component(name, "view")?;
     if RESERVED_VIEW_NAMES.contains(&name) {
-        bail!("view name '{name}' is reserved by the HTTP server");
+        return Err(invalid(format!(
+            "view name '{name}' is reserved by the HTTP server"
+        )));
     }
     Ok(())
 }
 
 fn validate_stored(name: &str, view: &StoredViewDefinition) -> Result<()> {
     if view.version != VIEW_FORMAT_VERSION {
-        bail!(
-            "view '{name}' uses unsupported format version {} (expected {})",
-            view.version,
-            VIEW_FORMAT_VERSION
-        );
+        return Err(invalid(format!(
+            "view '{name}' uses unsupported format version {} (expected {VIEW_FORMAT_VERSION})",
+            view.version
+        )));
     }
     if view.title.trim().is_empty() {
-        bail!("view '{name}' title cannot be empty");
+        return Err(invalid(format!("view '{name}' title cannot be empty")));
     }
     validate_component(&view.collection, "collection")?;
     if !(1..=MAX_VIEW_PAGE_SIZE).contains(&view.page_size) {
-        bail!("view '{name}' page_size must be between 1 and {MAX_VIEW_PAGE_SIZE}");
+        return Err(invalid(format!(
+            "view '{name}' page_size must be between 1 and {MAX_VIEW_PAGE_SIZE}"
+        )));
     }
     for filter in &view.filters {
-        Assignment::from_str(filter)
-            .with_context(|| format!("view '{name}' has invalid filter '{filter}'"))?;
+        Assignment::from_str(filter).with_context(|| {
+            DomainError::Invalid(format!("view '{name}' has invalid filter '{filter}'"))
+        })?;
     }
     for expression in &view.where_expr {
-        crate::FilterExpression::from_str(expression)
-            .with_context(|| format!("view '{name}' has invalid where_expr '{expression}'"))?;
+        crate::FilterExpression::from_str(expression).with_context(|| {
+            DomainError::Invalid(format!(
+                "view '{name}' has invalid where_expr '{expression}'"
+            ))
+        })?;
     }
     if view.filter_groups.len() > MAX_VIEW_FILTER_GROUPS {
-        bail!("view '{name}' can contain at most {MAX_VIEW_FILTER_GROUPS} filter groups");
+        return Err(invalid(format!(
+            "view '{name}' can contain at most {MAX_VIEW_FILTER_GROUPS} filter groups"
+        )));
     }
     for (index, group) in view.filter_groups.iter().enumerate() {
         if group.expressions.is_empty() {
-            bail!("view '{name}' filter group {} cannot be empty", index + 1);
+            return Err(invalid(format!(
+                "view '{name}' filter group {} cannot be empty",
+                index + 1
+            )));
         }
         if group.expressions.len() > MAX_VIEW_GROUP_EXPRESSIONS {
-            bail!(
+            return Err(invalid(format!(
                 "view '{name}' filter group {} can contain at most {MAX_VIEW_GROUP_EXPRESSIONS} expressions",
                 index + 1
-            );
+            )));
         }
         for expression in &group.expressions {
             crate::FilterExpression::from_str(expression).with_context(|| {
-                format!(
+                DomainError::Invalid(format!(
                     "view '{name}' filter group {} has invalid expression '{expression}'",
                     index + 1
-                )
+                ))
             })?;
         }
     }
     for column in &view.columns {
-        parse_path(column)
-            .with_context(|| format!("view '{name}' has invalid column '{column}'"))?;
+        parse_path(column).with_context(|| {
+            DomainError::Invalid(format!("view '{name}' has invalid column '{column}'"))
+        })?;
     }
     match (view.sort_by.as_deref(), view.sort_direction) {
         (None, SortDirection::Desc) => {
-            bail!("view '{name}' sort_direction requires sort_by")
+            return Err(invalid(format!(
+                "view '{name}' sort_direction requires sort_by"
+            )));
         }
         (Some(field), _) if field.trim().is_empty() => {
-            bail!("view '{name}' sort_by cannot be empty")
+            return Err(invalid(format!("view '{name}' sort_by cannot be empty")));
         }
         (Some(field), _) if !matches!(field, "$id" | "$collection" | "$path") => {
-            parse_path(field)
-                .with_context(|| format!("view '{name}' has invalid sort_by field '{field}'"))?;
+            parse_path(field).with_context(|| {
+                DomainError::Invalid(format!("view '{name}' has invalid sort_by field '{field}'"))
+            })?;
         }
         _ => {}
     }
     match (view.layout, view.group_by.as_deref()) {
         (ViewLayout::Table, Some(_)) => {
-            bail!("view '{name}' group_by is only valid for the kanban layout")
+            return Err(invalid(format!(
+                "view '{name}' group_by is only valid for the kanban layout"
+            )));
         }
         (ViewLayout::Kanban, None) => {
-            bail!("view '{name}' using the kanban layout requires group_by")
+            return Err(invalid(format!(
+                "view '{name}' using the kanban layout requires group_by"
+            )));
         }
         (ViewLayout::Kanban, Some(field)) => {
-            parse_path(field)
-                .with_context(|| format!("view '{name}' has invalid group_by field '{field}'"))?;
+            parse_path(field).with_context(|| {
+                DomainError::Invalid(format!(
+                    "view '{name}' has invalid group_by field '{field}'"
+                ))
+            })?;
         }
         (ViewLayout::Table, None) => {}
     }

@@ -3,14 +3,17 @@ use std::{
     io::Write,
     net::SocketAddr,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     body::Body,
     extract::{rejection::JsonRejection, DefaultBodyLimit, Path, RawForm, RawQuery, State},
-    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -25,8 +28,8 @@ use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
     audit::AuditChange, sort_records_by_field, Assignment, AuditEntry, AuditSource,
-    CollectionModel, Database, FilterExpression, FilterOperator, Record, SearchQuery, SearchTarget,
-    SortDirection, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
+    CollectionModel, Database, DomainError, FilterExpression, FilterOperator, Record, SearchQuery,
+    SearchTarget, SortDirection, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -36,6 +39,11 @@ const MAX_PAGE_OFFSET: usize = 1_000_000;
 const MAX_VIEW_FILTERS: usize = 20;
 const MAX_VIEW_COLUMNS: usize = 50;
 const ACTOR_HEADER: &str = "x-cr-actor";
+const REQUEST_ID_HEADER: &str = "x-request-id";
+/// The only message an unexpected failure may reveal. Everything else about it
+/// stays in the server log, correlated by request ID.
+const INTERNAL_MESSAGE: &str =
+    "the server could not complete this request; quote the request ID when reporting it";
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -582,11 +590,26 @@ struct IdentityResponse {
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
+/// A failure on its way back to a caller.
+///
+/// `message` is the only text a caller ever sees, so every construction site
+/// keeps it free of filesystem paths, operating-system errors, and other
+/// internal context. `detail` carries the complete `anyhow` chain, which is
+/// written to the server log and never serialized into a response.
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    detail: Option<anyhow::Error>,
+}
+
+/// An error after logging and redaction, shared by the JSON and HTML renderers.
+struct PublicError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    request_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -598,6 +621,7 @@ struct ErrorEnvelope {
 struct ErrorDetail {
     code: &'static str,
     message: String,
+    request_id: String,
 }
 
 impl ApiError {
@@ -606,6 +630,7 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -621,53 +646,76 @@ impl ApiError {
         )
     }
 
-    fn from_database(error: anyhow::Error) -> Self {
-        let message = format!("{error:#}");
-        let lower = message.to_lowercase();
-        if lower.contains("already exists") || lower.contains("file exists") {
-            Self::new(StatusCode::CONFLICT, "already_exists", message)
-        } else if lower.contains("does not exist")
-            || lower.contains("no such file or directory")
-            || lower.contains("has no audit history")
-        {
-            Self::new(StatusCode::NOT_FOUND, "not_found", message)
-        } else if lower.contains("unsaved")
-            || lower.contains("audited hash")
-            || lower.contains("differs from")
-            || lower.contains("concurrent")
-        {
-            Self::new(StatusCode::CONFLICT, "conflict", message)
-        } else if lower.contains("schema")
-            || lower.contains("expected")
-            || lower.contains("must ")
-            || lower.contains("cannot ")
-            || lower.contains("provide ")
-            || lower.contains("field '")
-            || lower.contains("field path")
-            || lower.contains("path component")
-            || lower.contains("regular expression")
-        {
-            Self::unprocessable(message)
+    /// Report a failure that no caller can act on, keeping its diagnostics.
+    fn internal(error: anyhow::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
+            message: INTERNAL_MESSAGE.to_owned(),
+            detail: Some(error),
+        }
+    }
+
+    /// Classify a failure from the domain layer by its typed [`DomainError`],
+    /// falling back to an unexpected-failure response when it carries none.
+    fn from_domain(error: anyhow::Error) -> Self {
+        let Some(domain) = DomainError::of(&error) else {
+            return Self::internal(error);
+        };
+        let status = match domain {
+            DomainError::NotFound(_) => StatusCode::NOT_FOUND,
+            DomainError::AlreadyExists(_) | DomainError::Conflict(_) => StatusCode::CONFLICT,
+            DomainError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        };
+        let code = domain.code();
+        let message = domain.message().to_owned();
+        Self {
+            status,
+            code,
+            message,
+            detail: Some(error),
+        }
+    }
+
+    /// Write complete diagnostics to the server log and reduce the error to the
+    /// part a caller may see.
+    fn publish(self) -> PublicError {
+        let request_id = current_request_id();
+        let detail = self
+            .detail
+            .as_ref()
+            .map_or_else(|| self.message.clone(), |error| format!("{error:#}"));
+        log_error(self.status, self.code, &request_id, &detail);
+        let message = if self.status.is_server_error() {
+            INTERNAL_MESSAGE.to_owned()
         } else {
-            Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+            self.message
+        };
+        PublicError {
+            status: self.status,
+            code: self.code,
+            message,
+            request_id,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = self.status;
+        let unauthorized = self.status == StatusCode::UNAUTHORIZED;
+        let error = self.publish();
         let mut response = (
-            status,
+            error.status,
             Json(ErrorEnvelope {
                 error: ErrorDetail {
-                    code: self.code,
-                    message: self.message,
+                    code: error.code,
+                    message: error.message,
+                    request_id: error.request_id,
                 },
             }),
         )
             .into_response();
-        if status == StatusCode::UNAUTHORIZED {
+        if unauthorized {
             response.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
                 HeaderValue::from_static("Bearer realm=\"cr\""),
@@ -675,6 +723,37 @@ impl IntoResponse for ApiError {
         }
         response
     }
+}
+
+/// Per-request correlation data, published for the duration of the handler so
+/// that error reporting can name the request without threading it everywhere.
+#[derive(Clone, Debug)]
+struct RequestContext {
+    id: Arc<str>,
+    method: Method,
+    path: Arc<str>,
+}
+
+tokio::task_local! {
+    static REQUEST_CONTEXT: RequestContext;
+}
+
+/// The current request's correlation ID, or a fresh one outside a request.
+fn current_request_id() -> String {
+    REQUEST_CONTEXT
+        .try_with(|context| context.id.to_string())
+        .unwrap_or_else(|_| random_id())
+}
+
+/// Record the complete diagnostic chain, which never leaves the server.
+fn log_error(status: StatusCode, code: &str, request_id: &str, detail: &str) {
+    let (method, path) = REQUEST_CONTEXT
+        .try_with(|context| (context.method.to_string(), context.path.to_string()))
+        .unwrap_or_else(|_| ("-".to_owned(), "-".to_owned()));
+    eprintln!(
+        "cr error request_id={request_id} status={} code={code} method={method} path={path} detail={detail:?}",
+        status.as_u16()
+    );
 }
 
 pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
@@ -749,6 +828,7 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
+        .layer(middleware::from_fn(request_context))
         .with_state(state))
 }
 
@@ -776,6 +856,25 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Give every request a correlation ID, publish it to the handlers beneath
+/// this layer, and return it so an operator can find the matching log line.
+async fn request_context(request: Request<Body>, next: Next) -> Response {
+    let id = random_id();
+    let header = HeaderValue::from_str(&id).ok();
+    let context = RequestContext {
+        id: Arc::from(id),
+        method: request.method().clone(),
+        path: Arc::from(request.uri().path()),
+    };
+    let mut response = REQUEST_CONTEXT.scope(context, next.run(request)).await;
+    if let Some(header) = header {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(REQUEST_ID_HEADER), header);
+    }
+    response
 }
 
 async fn authorize(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
@@ -1005,7 +1104,9 @@ async fn save_view_form(
                                 .then(|| source.group_by.clone())
                                 .flatten()
                         })
-                        .context("Kanban layout must provide group_by")?,
+                        .context(DomainError::Invalid(
+                            "Kanban layout must provide group_by".to_owned(),
+                        ))?,
                 ),
             };
             database.create_view_with_options(
@@ -1176,20 +1277,27 @@ async fn move_kanban_card(
         run_database(&state, &headers, move |database| {
             let view = database.view(&requested_view)?;
             if view.layout != ViewLayout::Kanban {
-                bail!(
+                return Err(DomainError::Invalid(format!(
                     "cannot move a card through view '{}' because it does not use the kanban layout",
                     view.name
-                );
+                ))
+                .into());
             }
             let group_by = view
                 .group_by
                 .as_deref()
-                .context("kanban view is missing group_by")?;
+                .context(DomainError::Invalid(
+                    "kanban view is missing group_by".to_owned(),
+                ))?;
             let record = database.get(&view.collection, &id)?;
             match target {
                 KanbanTarget::Value { value } => {
                     let target_value: YamlValue = yaml_serde::from_str(&value)
-                        .with_context(|| format!("kanban target '{value}' is not valid YAML"))?;
+                        .with_context(|| {
+                            DomainError::Invalid(format!(
+                                "kanban target '{value}' is not valid YAML"
+                            ))
+                        })?;
                     if record.field(group_by)? == Some(&target_value) {
                         return Ok(record);
                     }
@@ -1326,8 +1434,10 @@ async fn get_field(
         let value = record
             .field(&field)?
             .cloned()
-            .with_context(|| format!("field '{field}' does not exist"))?;
-        serde_json::to_value(value).context("field cannot be represented as JSON")
+            .with_context(|| DomainError::NotFound(format!("field '{field}' does not exist")))?;
+        serde_json::to_value(value).context(DomainError::Invalid(
+            "field cannot be represented as JSON".to_owned(),
+        ))
     })
     .await?;
     Ok(Json(json!({ "value": value })))
@@ -1437,7 +1547,7 @@ async fn search_records(
         parameters.regex,
         parameters.ignore_case,
     )
-    .map_err(ApiError::from_database)?;
+    .map_err(ApiError::from_domain)?;
     let collection = parameters.collection;
     let records = run_database(&state, &headers, move |database| {
         let mut records = database.search(collection.as_deref(), &filters, &query)?;
@@ -1759,10 +1869,14 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
             "properties": {
                 "error": {
                     "type": "object",
-                    "required": ["code", "message"],
+                    "required": ["code", "message", "request_id"],
                     "properties": {
                         "code": { "type": "string" },
-                        "message": { "type": "string" }
+                        "message": { "type": "string" },
+                        "request_id": {
+                            "type": "string",
+                            "description": "Correlates this response with the server log entry that holds complete diagnostics"
+                        }
                     }
                 }
             }
@@ -4077,7 +4191,7 @@ fn view_filter_expressions(query: &ViewQuery) -> ApiResult<Vec<FilterExpression>
                     .unwrap_or_default();
                 Some(
                     FilterExpression::new(field, operator.into(), value)
-                        .map_err(ApiError::from_database),
+                        .map_err(ApiError::from_domain),
                 )
             }
         })
@@ -4110,7 +4224,7 @@ fn save_view_filter_group(form: &HtmlSaveViewForm) -> ApiResult<Option<ViewFilte
         } else {
             format!("{}{}", field.trim(), operator.expression_token())
         };
-        FilterExpression::from_str(&expression).map_err(ApiError::from_database)?;
+        FilterExpression::from_str(&expression).map_err(ApiError::from_domain)?;
         expressions.push(expression);
     }
 
@@ -4140,7 +4254,7 @@ fn sort_view_records(records: &mut [Record], query: &ViewQuery) -> ApiResult<()>
         return Ok(());
     };
     sort_records_by_field(records, field, query.sort_direction.into())
-        .map_err(ApiError::from_database)
+        .map_err(ApiError::from_domain)
 }
 
 fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset: usize) -> String {
@@ -4531,8 +4645,24 @@ fn verify_csrf(state: &AppState, provided: &str) -> ApiResult<()> {
 fn random_token() -> Result<String> {
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes)
-        .map_err(|error| anyhow::anyhow!("could not generate form security token: {error}"))?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+        .map_err(|error| anyhow!("could not generate form security token: {error}"))?;
+    Ok(hexadecimal(&bytes))
+}
+
+/// A short correlation ID. Unlike a security token this may never fail, so a
+/// process-wide counter covers the rare case where the system source does not
+/// answer; diagnostics still correlate within one server run.
+fn random_id() -> String {
+    let mut bytes = [0_u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        static FALLBACK: AtomicU64 = AtomicU64::new(0);
+        bytes = FALLBACK.fetch_add(1, Ordering::Relaxed).to_be_bytes();
+    }
+    hexadecimal(&bytes)
+}
+
+fn hexadecimal(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn see_other(location: &str) -> ApiResult<Response> {
@@ -4549,6 +4679,7 @@ fn html_result(result: ApiResult<Markup>) -> Response {
 }
 
 fn html_error(error: ApiError) -> Response {
+    let error = error.publish();
     let status = error.status;
     let markup = page_layout(
         "Error",
@@ -4557,6 +4688,7 @@ fn html_error(error: ApiError) -> Response {
                 p class="text-sm font-semibold uppercase tracking-wide text-red-600" { (status.as_u16()) " " (status.canonical_reason().unwrap_or("Error")) }
                 h1 class="mt-2 text-2xl font-bold text-slate-950" { "Request could not be completed" }
                 p class="mt-3 text-sm text-slate-700" { (error.message) }
+                p class="mt-3 text-xs text-slate-500" { "Request ID " (error.request_id) }
                 a href="/" class="mt-6 inline-flex rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Back to views" }
             }
         },
@@ -4596,7 +4728,7 @@ fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database
     let actor = actor
         .to_str()
         .map_err(|_| ApiError::bad_request("invalid_actor", "X-CR-Actor must be valid UTF-8"))?;
-    database.with_actor(actor).map_err(ApiError::from_database)
+    database.with_actor(actor).map_err(ApiError::from_domain)
 }
 
 async fn run_database<T, F>(state: &AppState, headers: &HeaderMap, operation: F) -> ApiResult<T>
@@ -4607,14 +4739,8 @@ where
     let database = request_database(state, headers)?;
     tokio::task::spawn_blocking(move || operation(&database))
         .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                format!("database task failed: {error}"),
-            )
-        })?
-        .map_err(ApiError::from_database)
+        .map_err(|error| ApiError::internal(anyhow!(error).context("database task failed")))?
+        .map_err(ApiError::from_domain)
 }
 
 fn json_payload<T>(payload: std::result::Result<Json<T>, JsonRejection>) -> ApiResult<Json<T>> {
@@ -4639,14 +4765,14 @@ fn parse_query<T: DeserializeOwned>(raw: Option<String>) -> ApiResult<T> {
 fn parse_filters(filters: Vec<String>) -> ApiResult<Vec<Assignment>> {
     filters
         .into_iter()
-        .map(|filter| filter.parse().map_err(ApiError::from_database))
+        .map(|filter| filter.parse().map_err(ApiError::from_domain))
         .collect()
 }
 
 fn parse_filter_expressions(expressions: Vec<String>) -> ApiResult<Vec<FilterExpression>> {
     expressions
         .into_iter()
-        .map(|expression| expression.parse().map_err(ApiError::from_database))
+        .map(|expression| expression.parse().map_err(ApiError::from_domain))
         .collect()
 }
 
@@ -4795,4 +4921,69 @@ fn collection_component_name(collection: &str) -> String {
         .take(40)
         .collect();
     format!("Collection_{readable}_{suffix}_FrontMatter")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApiError, INTERNAL_MESSAGE};
+    use crate::DomainError;
+    use anyhow::anyhow;
+    use axum::http::StatusCode;
+
+    /// A leaky diagnostic chain of the shape the domain layer actually
+    /// produces, used to prove that none of it reaches a caller.
+    fn leaky_cause() -> anyhow::Error {
+        anyhow!("could not read record /private/db/records/people/ada.md: No such file or directory (os error 2)")
+    }
+
+    #[test]
+    fn every_domain_classification_maps_to_a_stable_status_and_code() {
+        let cases = [
+            (
+                DomainError::NotFound("record people/ada does not exist".to_owned()),
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            (
+                DomainError::AlreadyExists("record people/ada already exists".to_owned()),
+                StatusCode::CONFLICT,
+                "already_exists",
+            ),
+            (
+                DomainError::Conflict("record people/ada has unsaved changes".to_owned()),
+                StatusCode::CONFLICT,
+                "conflict",
+            ),
+            (
+                DomainError::Invalid("field path cannot be empty".to_owned()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_failed",
+            ),
+        ];
+
+        for (domain, status, code) in cases {
+            let expected = domain.message().to_owned();
+            let error = ApiError::from_domain(leaky_cause().context(domain));
+            assert_eq!(error.status, status);
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, expected);
+
+            let published = error.publish();
+            assert_eq!(published.message, expected);
+            assert!(!published.request_id.is_empty());
+        }
+    }
+
+    #[test]
+    fn unclassified_failures_become_redacted_internal_errors() {
+        let error = ApiError::from_domain(leaky_cause());
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code, "internal_error");
+
+        let published = error.publish();
+        assert_eq!(published.message, INTERNAL_MESSAGE);
+        assert!(!published.request_id.is_empty());
+        assert!(!published.message.contains("/private/db"));
+        assert!(!published.message.contains("os error"));
+    }
 }

@@ -18,11 +18,11 @@ Priorities:
 
 ## Current shortcuts and technical debt
 
-- [ ] **P0 — Replace string-based HTTP error classification with typed domain errors.**
-  `server.rs` currently maps `anyhow` messages to HTTP status codes using text matching. Introduce stable error variants shared by CLI and HTTP, preserve error chains for logs, and test every public status/code mapping.
+- [x] **P0 — Replace string-based HTTP error classification with typed domain errors.**
+  A shared `DomainError` classification travels inside the `anyhow` chain, so the CLI still prints complete chains while `server.rs` selects each status and code by typed downcast instead of message text. Every public status/code mapping is covered by unit and HTTP tests.
 
-- [ ] **P0 — Redact internal error details in HTTP 500 responses.**
-  Unexpected errors can currently expose filesystem paths and internal context. Return a request ID and safe public message while retaining complete diagnostics in server logs.
+- [x] **P0 — Redact internal error details in HTTP responses.**
+  Every request carries a correlation ID returned as `X-Request-Id` and in the error envelope. Unexpected failures return a fixed generic message; expected client errors keep actionable wording that names records, views, and fields rather than filesystem paths or operating-system errors. JSON and HTML responses share the rules, and the complete chain reaches the server log under the request ID.
 
 - [ ] **P0 — Harden every parent path against symlink escapes.**
   Final record files and explicitly listed collection directories are checked, but a replaced `data_dir` or an intermediate configured directory could still be a symlink. Resolve or open path components safely beneath the database root for every read and mutation.
@@ -58,7 +58,7 @@ Priorities:
   Graceful shutdown currently waits for Ctrl-C. Add Unix `SIGTERM` handling, document shutdown behavior, and test that in-flight mutations either complete safely or recover on restart.
 
 - [ ] **P2 — Add structured server observability.**
-  Add request IDs, structured access logs, latency/error metrics, and safe audit-operation fields without logging bearer tokens or sensitive record contents.
+  Request IDs and a structured error log line now exist. Add structured access logs for successful requests, latency/error metrics, a real logging framework with levels instead of `eprintln!`, and safe audit-operation fields without logging bearer tokens or sensitive record contents.
 
 - [ ] **P3 — Add opt-in CORS configuration.**
   The API intentionally sends no permissive CORS headers. Add an explicit origin allowlist for browser clients without weakening the local-only default.
@@ -86,6 +86,15 @@ Priorities:
 
 - [ ] **P2 — Define large-board Kanban loading and ordering.**
   Kanban lanes group the current bounded result page so the server never loads an unbounded collection. Define cursor-based incremental loading or an explicit board-size policy for pipelines larger than the configured page limit, plus optional card sorting within lanes.
+
+- [ ] **P1 — Classify the remaining CLI-only failures.**
+  `sync.rs`, `Database::init`, and `Database::discover` still return unclassified failures because only the CLI reaches them. They would surface as `500`/`internal_error` if a future route exposed them; give them typed classifications when that happens or as a routine cleanup.
+
+- [ ] **P2 — Enforce response redaction structurally rather than by construction.**
+  Safe public messages are guaranteed by writing them at the failure site and covered by tests that reject the database root and operating-system text. Nothing in the type system prevents a future caller from putting a path into `ApiError::message`. Consider a newtype for public messages, or a final scrub against the database root before a response is written.
+
+- [ ] **P3 — Reach or remove the unreachable `invalid_location` error.**
+  `see_other` and the create-record `Location` header return `400`/`invalid_location` when a header value cannot be built. Percent-encoding makes that unreachable today, so the mapping has no test. Either construct the header infallibly or find a case that exercises it.
 
 ## Query and result capabilities
 
@@ -238,7 +247,7 @@ Priorities:
 - [x] Typed equality filters, dotted field paths, and compact list results.
 - [x] Literal/regex search across paths, front matter, fields, bodies, and collections.
 - [x] REST API covering current database, search, direct-edit, relation, and audit operations.
-- [x] Bounded HTTP pagination, bearer-token option, request actor attribution, and structured errors.
+- [x] Bounded HTTP pagination, bearer-token option, request actor attribution, and typed, redacted, request-correlated errors.
 - [x] Live OpenAPI 3.1 collection-schema components.
 - [x] Automatic collection tables and saved server-rendered HTML views with CSRF-protected audited forms.
 - [x] Per-record and global server-rendered audit history with filtering, pagination, attribution, and expandable field diffs.

@@ -1,6 +1,7 @@
 mod common;
 
 use std::{
+    fs::File,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     process::{Child, Command, Stdio},
@@ -172,4 +173,84 @@ fn http_request(
         .parse()
         .unwrap();
     (status, body.to_owned())
+}
+
+/// The response a caller sees and the diagnostics an operator needs are two
+/// different things, joined only by the request ID.
+#[test]
+fn error_responses_are_redacted_while_the_server_log_keeps_the_full_chain() {
+    let temporary = tempfile::tempdir().unwrap();
+    let database = temporary.path().join("network-errors");
+    run_success(Command::new(binary()).args(["init"]).arg(&database));
+
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+
+    let log_path = temporary.path().join("serve.log");
+    let child = Command::new(binary())
+        .args(["--database"])
+        .arg(&database)
+        .args(["serve", "--bind", &address.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(File::create(&log_path).unwrap()))
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard(child);
+    wait_until_ready(&mut server.0, address);
+
+    let (status, body) = http_request(
+        address,
+        "GET",
+        "/api/v1/collections/deals/records/nope",
+        &[],
+        None,
+    );
+    assert_eq!(status, 404, "{body}");
+    let payload: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["error"]["code"], "not_found");
+    assert_eq!(
+        payload["error"]["message"],
+        "record deals/nope does not exist"
+    );
+    let request_id = payload["error"]["request_id"].as_str().unwrap().to_owned();
+    assert!(!request_id.is_empty());
+
+    // Nothing about the filesystem or the operating system reaches the caller.
+    assert!(!body.contains("records/deals/nope.md"), "{body}");
+    assert!(!body.contains("os error"), "{body}");
+    assert!(!body.contains(database.to_str().unwrap()), "{body}");
+
+    // All of it reaches the log, under the request ID the caller was given.
+    let log = read_until(&log_path, &request_id);
+    let line = log
+        .lines()
+        .find(|line| line.contains(&request_id))
+        .unwrap_or_else(|| panic!("no log line for request {request_id}:\n{log}"));
+    assert!(line.contains("status=404"), "{line}");
+    assert!(line.contains("code=not_found"), "{line}");
+    assert!(
+        line.contains("path=/api/v1/collections/deals/records/nope"),
+        "{line}"
+    );
+    assert!(line.contains("could not read record"), "{line}");
+    assert!(line.contains("records/deals/nope.md"), "{line}");
+    assert!(line.contains("os error"), "{line}");
+}
+
+/// Read `path` until it contains `needle`, because the child process flushes
+/// its log independently of the request that produced it.
+fn read_until(path: &std::path::Path, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let contents = std::fs::read_to_string(path).unwrap_or_default();
+        if contents.contains(needle) {
+            return contents;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "log never mentioned {needle}:\n{contents}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
