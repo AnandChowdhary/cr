@@ -25,6 +25,10 @@ impl TestDatabase {
     pub fn command(&self) -> Command {
         command_for(&self.root)
     }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 }
 
 pub fn binary() -> &'static str {

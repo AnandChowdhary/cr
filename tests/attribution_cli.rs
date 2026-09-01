@@ -578,6 +578,66 @@ fn identity_reports_the_complete_attribution_that_would_be_recorded() {
     assert!(empty["intent"].is_null());
 }
 
+#[test]
+fn a_blank_agent_session_is_absent_and_does_not_block_a_write() {
+    let database = TestDatabase::new("blank-agent-session");
+    run_success(database.command().args([
+        "--actor",
+        "Harness <harness@example.com>",
+        "create",
+        "jobs",
+        "nightly",
+        "--set",
+        "status=complete",
+        "--agent",
+        "host-bookkeeping",
+        "--agent-session",
+        "",
+    ]));
+
+    let entries: Value = serde_json::from_str(&run_success(database.command().args([
+        "--actor",
+        "Harness <harness@example.com>",
+        "audit",
+        "log",
+        "jobs",
+        "nightly",
+        "--json",
+    ])))
+    .expect("audit log is JSON");
+    assert_eq!(entries[0]["agent"]["id"], "host-bookkeeping");
+    assert!(entries[0]["agent"].get("session").is_none());
+
+    let mut inherited = database.command();
+    inherited.env(
+        "CR_AGENT",
+        r#"{"id":"host-bookkeeping","session":"inherited-session"}"#,
+    );
+    run_success(inherited.args([
+        "--actor",
+        "Harness <harness@example.com>",
+        "create",
+        "jobs",
+        "scheduled",
+        "--set",
+        "status=complete",
+        "--agent-session",
+        "",
+    ]));
+    let scheduled: Value = serde_json::from_str(&run_success(database.command().args([
+        "--actor",
+        "Harness <harness@example.com>",
+        "audit",
+        "log",
+        "jobs",
+        "scheduled",
+        "--json",
+    ])))
+    .expect("audit log is JSON");
+    assert_eq!(scheduled[0]["agent"]["id"], "host-bookkeeping");
+    assert!(scheduled[0]["agent"].get("session").is_none());
+}
+
 /// Invalid attribution is refused before anything is written, with wording that
 /// names the field and never a path or an operating-system error.
 #[test]

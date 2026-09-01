@@ -15,7 +15,8 @@ use crate::{
     AuditVerification, SearchQuery,
     access::{
         AccessAction, AccessDecision, AccessIdentity, Resource as AccessResource, Role,
-        USERS_COLLECTION, User, UserKind, UserStatus, display_name, principal_id, users_schema,
+        USERS_COLLECTION, User, UserEnsureOutcome, UserKind, UserStatus, UserUpdate, display_name,
+        principal_id, users_schema,
     },
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     audit::{AuditFilter, AuditLog, AuditMutation, ChangePreview, ReconciledMutation, record_hash},
@@ -482,6 +483,84 @@ impl Database {
         Ok(database)
     }
 
+    /// Evaluate a delegated CLI command as another registered principal after
+    /// proving the launching owner's policy still matches its audited state.
+    ///
+    /// The server perspective console validates its owner at startup and calls
+    /// [`Self::impersonate`] for each request. A standalone CLI invocation has
+    /// no such long-lived boundary, so it must pin the policy at delegation
+    /// time or a manually edited access-manager record could promote itself
+    /// just long enough to select an owner perspective.
+    pub fn impersonate_verified(&self, principal: &str) -> Result<Self> {
+        if !self.access_enabled()? {
+            return Err(conflict("access control is not initialized"));
+        }
+        let canonical = principal_id(principal)?;
+        if canonical != principal {
+            return Err(invalid(format!(
+                "principal '{principal}' is not canonical; use '{canonical}'"
+            )));
+        }
+
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let states = audit.record_states()?;
+
+        // Validate and authorize the operator before looking up the target.
+        // This keeps missing and drifted target identities private from callers
+        // who are not allowed to delegate in the first place.
+        let operator_path = self.record_path(USERS_COLLECTION, &self.principal)?;
+        let operator_raw = self.read_record(USERS_COLLECTION, &self.principal, &operator_path)?;
+        AuditLog::assert_current_in(
+            &states,
+            USERS_COLLECTION,
+            &self.principal,
+            operator_raw.as_bytes(),
+        )?;
+        let operator_document = parse_record(USERS_COLLECTION, &self.principal, &operator_raw)?;
+        let operator = User::from_attributes(&operator_document.attributes)?;
+        let operator_hash = record_hash(operator_raw.as_bytes());
+        let owner = operator.decision(
+            &self.principal,
+            &self.actor,
+            AccessAction::ManageAccess,
+            &AccessResource::Database,
+            &operator_hash,
+        );
+        if !owner.is_some_and(|decision| decision.role == Role::Owner) {
+            return Err(forbidden(format!(
+                "principal '{}' must be an owner of database",
+                self.principal
+            )));
+        }
+
+        if principal == self.principal {
+            let mut database = self.clone();
+            database.impersonated_by = None;
+            return Ok(database);
+        }
+
+        let target_path = self.record_path(USERS_COLLECTION, principal)?;
+        let target_raw = self.read_record(USERS_COLLECTION, principal, &target_path)?;
+        AuditLog::assert_current_in(&states, USERS_COLLECTION, principal, target_raw.as_bytes())?;
+        let target_document = parse_record(USERS_COLLECTION, principal, &target_raw)?;
+        let target = User::from_attributes(&target_document.attributes)?;
+
+        let mut database = self.clone();
+        database.impersonated_by = Some(AccessIdentity {
+            principal: self.principal.clone(),
+            display: self.actor.clone(),
+        });
+        database.principal = principal.to_owned();
+        database.actor = format!(
+            "{} <{}>",
+            target.name,
+            target.email.as_deref().unwrap_or(principal)
+        );
+        Ok(database)
+    }
+
     /// The agent, authorization, and intent that will be recorded beside
     /// `actor` on every event this database appends.
     pub fn attribution(&self) -> &Attribution {
@@ -653,8 +732,40 @@ impl Database {
         Ok(Some((user, record_hash(raw.as_bytes()))))
     }
 
+    /// Pin one security-sensitive operation to the current principal's
+    /// audited policy before any permission from the working file is trusted.
+    ///
+    /// This is intentionally done once at the mutation boundary instead of in
+    /// `authorize`: list/search may authorize thousands of records, and
+    /// replaying the audit chain for every one would make them quadratic.
+    fn assert_current_principal_policy(&self, audit: &AuditLog<'_>) -> Result<()> {
+        if !self.access_enabled()? {
+            return Ok(());
+        }
+        self.assert_current_user_policy(audit, &self.principal)
+    }
+
+    fn assert_current_user_policy(&self, audit: &AuditLog<'_>, principal: &str) -> Result<()> {
+        let path = self.record_path(USERS_COLLECTION, principal)?;
+        let raw = self.read_record(USERS_COLLECTION, principal, &path)?;
+        audit.assert_current(USERS_COLLECTION, principal, raw.as_bytes())
+    }
+
     /// Bootstrap RBAC by creating the current principal as database owner.
     pub fn initialize_access(&self, name: Option<&str>, email: Option<&str>) -> Result<Record> {
+        self.initialize_access_with_kind(name, email, UserKind::Human)
+    }
+
+    /// Bootstrap RBAC with an explicitly typed owner principal.
+    ///
+    /// The original two-argument API remains a human-defaulting wrapper for
+    /// compatibility; unattended deployments can select `Service` here.
+    pub fn initialize_access_with_kind(
+        &self,
+        name: Option<&str>,
+        email: Option<&str>,
+        kind: UserKind,
+    ) -> Result<Record> {
         if self.access_enabled()? {
             return Err(conflict("access control is already initialized"));
         }
@@ -672,8 +783,9 @@ impl Database {
             email: email
                 .map(str::to_owned)
                 .or_else(|| self.principal.contains('@').then(|| self.principal.clone())),
-            kind: UserKind::Human,
+            kind,
             status: UserStatus::Active,
+            profile: Mapping::new(),
             access: vec![crate::AccessGrant {
                 resource: AccessResource::Database,
                 role: Role::Owner,
@@ -698,6 +810,23 @@ impl Database {
         email: Option<&str>,
         kind: UserKind,
     ) -> Result<Record> {
+        self.add_user_with_profile(id, name, email, kind, Mapping::new())
+    }
+
+    /// Register a principal with application-owned namespaced metadata.
+    pub fn add_user_with_profile(
+        &self,
+        id: &str,
+        name: &str,
+        email: Option<&str>,
+        kind: UserKind,
+        profile: Mapping,
+    ) -> Result<Record> {
+        if !self.access_enabled()? {
+            return Err(conflict(
+                "access control is not initialized; run 'cr access init' first",
+            ));
+        }
         validate_component(id, "user")?;
         let canonical = principal_id(id)?;
         if canonical != id {
@@ -710,6 +839,7 @@ impl Database {
             email: email.map(str::to_owned),
             kind,
             status: UserStatus::Active,
+            profile,
             access: Vec::new(),
         };
         self.run_create(
@@ -724,6 +854,254 @@ impl Database {
             )),
         )?
         .record()
+    }
+
+    /// Declaratively ensure a principal's non-access definition.
+    ///
+    /// Existing grants are deliberately ignored: access remains managed by
+    /// `grant_access`/`revoke_access`. Every requested identity/profile field
+    /// must match, however, so bootstrap code cannot silently accept drift.
+    /// The absence check and create are performed under the audit lock, making
+    /// concurrent daemon starts converge on one creation and one no-op.
+    pub fn ensure_user(
+        &self,
+        id: &str,
+        name: &str,
+        email: Option<&str>,
+        kind: UserKind,
+        profile: Mapping,
+    ) -> Result<UserEnsureOutcome> {
+        if !self.access_enabled()? {
+            return Err(conflict(
+                "access control is not initialized; run 'cr access init' first",
+            ));
+        }
+        validate_component(id, "user")?;
+        let canonical = principal_id(id)?;
+        if canonical != id {
+            return Err(invalid(format!(
+                "user ID '{id}' is not canonical; use '{canonical}'"
+            )));
+        }
+        let requested = User {
+            name: name.to_owned(),
+            email: email.map(str::to_owned),
+            kind,
+            status: UserStatus::Active,
+            profile,
+            access: Vec::new(),
+        };
+        let attributes = requested.attributes()?;
+        let requested = User::from_attributes(&attributes)?;
+        self.validate(USERS_COLLECTION, &attributes)?;
+
+        let path = self.record_path(USERS_COLLECTION, id)?;
+        let label = record_label(USERS_COLLECTION, id);
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        self.assert_current_principal_policy(&audit)?;
+        let decision = self.authorize(AccessAction::ManageAccess, &AccessResource::Database)?;
+
+        if paths::entry_kind(&self.root, &path, &label)?.is_some() {
+            let raw = self.read_record(USERS_COLLECTION, id, &path)?;
+            audit.assert_current(USERS_COLLECTION, id, raw.as_bytes())?;
+            let document = parse_record(USERS_COLLECTION, id, &raw)?;
+            let existing = User::from_attributes(&document.attributes)?;
+            if existing.name == requested.name
+                && existing.email == requested.email
+                && existing.kind == requested.kind
+                && existing.status == requested.status
+                && existing.profile == requested.profile
+            {
+                return Ok(UserEnsureOutcome::Unchanged);
+            }
+            return Err(conflict(format!(
+                "user '{id}' exists but does not match the requested definition"
+            )));
+        }
+
+        let document = Document {
+            attributes,
+            body: String::new(),
+        };
+        let rendered = document.render()?;
+        let event = audit.prepare(AuditMutation {
+            action: AuditAction::Create,
+            collection: USERS_COLLECTION,
+            id,
+            before_document: None,
+            after_document: Some(&document),
+            before_bytes: None,
+            after_bytes: Some(rendered.as_bytes()),
+            source: self.source.clone(),
+            message: self.audit_message.as_deref(),
+            access: decision.as_ref(),
+        })?;
+        audit.commit(event, &path, || {
+            paths::write_new(&self.root, &path, rendered.as_bytes(), &label).map_err(|error| {
+                if is_already_exists(&error) {
+                    error.context(DomainError::record_exists(USERS_COLLECTION, id))
+                } else {
+                    error
+                }
+            })
+        })?;
+        Ok(UserEnsureOutcome::Created)
+    }
+
+    /// Update the non-access portion of a registered principal.
+    ///
+    /// Privileged users require a database owner to edit, and disabling the
+    /// final active database owner is refused. The stable user ID is never
+    /// renamed when `email` changes.
+    pub fn update_user(&self, id: &str, update: UserUpdate) -> Result<Record> {
+        if update.is_empty() {
+            return Err(invalid("user update must change at least one field"));
+        }
+        validate_component(id, "user")?;
+        let canonical = principal_id(id)?;
+        if canonical != id {
+            return Err(invalid(format!(
+                "user ID '{id}' is not canonical; use '{canonical}'"
+            )));
+        }
+
+        let path = self.record_path(USERS_COLLECTION, id)?;
+        let label = record_label(USERS_COLLECTION, id);
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        self.assert_current_principal_policy(&audit)?;
+        let ordinary_decision =
+            self.authorize(AccessAction::ManageAccess, &AccessResource::Database)?;
+
+        let before_raw = self.read_record(USERS_COLLECTION, id, &path)?;
+        audit.assert_current(USERS_COLLECTION, id, before_raw.as_bytes())?;
+        let before = parse_record(USERS_COLLECTION, id, &before_raw)?;
+        let before_user = User::from_attributes(&before.attributes)?;
+        let decision = if before_user.has_privileged_grant() {
+            self.authorize_owner(&AccessResource::Database)?
+        } else {
+            ordinary_decision
+        };
+
+        let mut after_user = before_user.clone();
+        update.apply(&mut after_user)?;
+        after_user.validate()?;
+        if before_user.status == UserStatus::Active
+            && before_user.is_database_owner()
+            && after_user.status != UserStatus::Active
+            && !self.has_database_owner_other_than(id)?
+        {
+            return Err(conflict("cannot disable the final database owner"));
+        }
+        if after_user == before_user {
+            return Err(conflict(format!(
+                "user '{id}' already has the requested values"
+            )));
+        }
+
+        let after = Document {
+            attributes: after_user.attributes()?,
+            body: before.body.clone(),
+        };
+        self.validate(USERS_COLLECTION, &after.attributes)?;
+        let rendered = after.render()?;
+        let event = audit.prepare(AuditMutation {
+            action: AuditAction::Update,
+            collection: USERS_COLLECTION,
+            id,
+            before_document: Some(&before),
+            after_document: Some(&after),
+            before_bytes: Some(before_raw.as_bytes()),
+            after_bytes: Some(rendered.as_bytes()),
+            source: self.source.clone(),
+            message: self.audit_message.as_deref(),
+            access: decision.as_ref(),
+        })?;
+        audit.commit(event, &path, || {
+            paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
+        })?;
+        Ok(record_from_document(USERS_COLLECTION, id, path, after))
+    }
+
+    /// Restore a manually drifted user file to the exact latest audited bytes.
+    ///
+    /// Authorization is evaluated from the replayed journal, never from the
+    /// potentially edited current policy. No audit event is appended because
+    /// this operation changes no audited state; it only rematerializes it.
+    pub fn restore_user(&self, id: &str) -> Result<Record> {
+        validate_component(id, "user")?;
+        let canonical = principal_id(id)?;
+        if canonical != id {
+            return Err(invalid(format!(
+                "user ID '{id}' is not canonical; use '{canonical}'"
+            )));
+        }
+
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let states = audit.record_states()?;
+        let principal_state = states
+            .get(&(USERS_COLLECTION.to_owned(), self.principal.clone()))
+            .and_then(|state| state.document.as_ref().zip(state.hash.as_deref()))
+            .ok_or_else(|| {
+                forbidden(format!(
+                    "principal '{}' has no active audited user policy",
+                    self.principal
+                ))
+            })?;
+        let principal_document = Document::from_audit_value(principal_state.0)?;
+        let principal_user = User::from_attributes(&principal_document.attributes)?;
+        principal_user
+            .decision(
+                &self.principal,
+                &self.actor,
+                AccessAction::ManageAccess,
+                &AccessResource::Database,
+                principal_state.1,
+            )
+            .filter(|decision| decision.role == Role::Owner)
+            .ok_or_else(|| {
+                forbidden(format!(
+                    "principal '{}' must be an owner of database",
+                    self.principal
+                ))
+            })?;
+
+        let state = states
+            .get(&(USERS_COLLECTION.to_owned(), id.to_owned()))
+            .and_then(|state| state.document.as_ref().zip(state.hash.as_deref()))
+            .ok_or_else(|| DomainError::record_not_found(USERS_COLLECTION, id))?;
+        let audited_document = Document::from_audit_value(state.0)?;
+        let audited_user = User::from_attributes(&audited_document.attributes)?;
+        // Re-serialize through the fixed User schema. Audit JSON orders object
+        // fields independently of the YAML struct, while managed user records
+        // have always used the struct's canonical field order.
+        let document = Document {
+            attributes: audited_user.attributes()?,
+            body: audited_document.body,
+        };
+        let rendered = document.render()?;
+        if record_hash(rendered.as_bytes()) != state.1 {
+            return Err(conflict(format!(
+                "record users/{id} cannot be reconstructed byte-for-byte from its audit history"
+            )));
+        }
+
+        let path = self.record_path(USERS_COLLECTION, id)?;
+        let label = record_label(USERS_COLLECTION, id);
+        match paths::entry_kind(&self.root, &path, &label)? {
+            Some(_) => paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)?,
+            None => paths::write_new(&self.root, &path, rendered.as_bytes(), &label)?,
+        }
+        let restored = self.read_record(USERS_COLLECTION, id, &path)?;
+        if record_hash(restored.as_bytes()) != state.1 {
+            bail!("restoring record users/{id} did not reproduce its audited state");
+        }
+        Ok(record_from_document(USERS_COLLECTION, id, path, document))
     }
 
     /// Read one registered user. Everyone may inspect their own effective
@@ -844,13 +1222,31 @@ impl Database {
     }
 
     fn has_database_owner_other_than(&self, excluded: &str) -> Result<bool> {
-        for id in self.user_ids_unchecked()? {
-            if id == excluded {
+        let states = self.audit().record_states()?;
+        for ((collection, id), state) in states {
+            if collection != USERS_COLLECTION || id == excluded {
                 continue;
             }
-            if self.user_unchecked_optional(&id)?.is_some_and(|(user, _)| {
-                user.status == UserStatus::Active && user.is_database_owner()
-            }) {
+            let Some((document, expected_hash)) =
+                state.document.as_ref().zip(state.hash.as_deref())
+            else {
+                continue;
+            };
+            let document = Document::from_audit_value(document)?;
+            let user = User::from_attributes(&document.attributes)?;
+            if user.status != UserStatus::Active || !user.is_database_owner() {
+                continue;
+            }
+            let path = self.record_path(USERS_COLLECTION, &id)?;
+            let Some(raw) = paths::read_to_string_optional(
+                &self.root,
+                &path,
+                &record_label(USERS_COLLECTION, &id),
+            )?
+            else {
+                continue;
+            };
+            if record_hash(raw.as_bytes()) == expected_hash {
                 return Ok(true);
             }
         }
@@ -955,6 +1351,12 @@ impl Database {
             return Err(conflict(
                 "access control was initialized by another process; retry as a registered principal",
             ));
+        }
+        if access
+            .as_ref()
+            .is_some_and(|request| request.action == AccessAction::ManageAccess)
+        {
+            self.assert_current_principal_policy(&audit)?;
         }
         let decision = access
             .as_ref()
@@ -1358,6 +1760,9 @@ impl Database {
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
         }
+        if access.action == AccessAction::ManageAccess {
+            self.assert_current_principal_policy(&audit)?;
+        }
         let decision = if access.owner_only {
             self.authorize_owner(&access.resource)?
         } else {
@@ -1739,6 +2144,7 @@ impl Database {
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         match (filter.collection, filter.id) {
+            (Some(USERS_COLLECTION), Some(id)) if id == self.principal => {}
             (Some(USERS_COLLECTION), _) => {
                 self.authorize(AccessAction::ReadAccess, &AccessResource::Database)?;
             }
@@ -1755,7 +2161,44 @@ impl Database {
                 )?;
             }
             (None, None) => {
-                self.authorize_owner(&AccessResource::Database)?;
+                if self.owner_access_allowed(&AccessResource::Database)? {
+                    return audit.recent(limit, filter);
+                }
+                let Some((user, policy_hash)) = self.user_unchecked_optional(&self.principal)?
+                else {
+                    return Err(forbidden(format!(
+                        "principal '{}' is not registered in the users collection",
+                        self.principal
+                    )));
+                };
+                return audit.recent_where(limit, filter, |entry| {
+                    if entry.payload.record.collection == USERS_COLLECTION {
+                        if entry.payload.record.id == self.principal {
+                            return Ok(true);
+                        }
+                        return Ok(user
+                            .decision(
+                                &self.principal,
+                                &self.actor,
+                                AccessAction::ReadAccess,
+                                &AccessResource::Database,
+                                &policy_hash,
+                            )
+                            .is_some());
+                    }
+                    Ok(user
+                        .decision(
+                            &self.principal,
+                            &self.actor,
+                            AccessAction::ReadAudit,
+                            &AccessResource::record(
+                                &entry.payload.record.collection,
+                                &entry.payload.record.id,
+                            ),
+                            &policy_hash,
+                        )
+                        .is_some())
+                });
             }
             (None, Some(_)) => unreachable!(),
         }

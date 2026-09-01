@@ -860,7 +860,7 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         );
     }
     if access_controlled {
-        database.impersonate(database.principal())?;
+        database.impersonate_verified(database.principal())?;
     }
     if config.max_page_size == 0 {
         bail!("maximum page size must be greater than zero");
@@ -1032,7 +1032,7 @@ async fn switch_perspective(State(state): State<AppState>, RawForm(raw): RawForm
         let principal = form.principal.trim().to_owned();
         let database = state.database.clone();
         let principal_for_check = principal.clone();
-        tokio::task::spawn_blocking(move || database.impersonate(&principal_for_check))
+        tokio::task::spawn_blocking(move || database.impersonate_verified(&principal_for_check))
             .await
             .map_err(|error| ApiError::internal(anyhow!(error).context("database task failed")))?
             .map_err(ApiError::from_domain)?;
@@ -5534,7 +5534,7 @@ fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database
         let principal =
             perspective_principal(headers)?.unwrap_or_else(|| database.principal().to_owned());
         database = database
-            .impersonate(&principal)
+            .impersonate_verified(&principal)
             .map_err(ApiError::from_domain)?;
     }
     let agent = attribution_header(headers, AGENT_HEADER, "X-CR-Agent", "invalid_agent")?;
@@ -5618,7 +5618,7 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
             .ok_or_else(|| DomainError::record_not_found("users", &selected))?;
         let selected_name = selected_user.name.clone();
         let selected_status = selected_user.status;
-        let selected_database = database.impersonate(&selected)?;
+        let selected_database = database.impersonate_verified(&selected)?;
         let can_view_global_audit =
             selected_database.owner_access_allowed(&AccessResource::Database)?;
         let users = users

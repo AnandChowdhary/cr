@@ -12,7 +12,8 @@ pub struct Assignment {
 }
 
 impl Assignment {
-    pub(crate) fn apply(&self, attributes: &mut Mapping) -> Result<()> {
+    /// Apply this dotted-path assignment to a YAML mapping.
+    pub fn apply(&self, attributes: &mut Mapping) -> Result<()> {
         set_path(attributes, &self.path, self.value.clone())
     }
 
