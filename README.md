@@ -1249,10 +1249,23 @@ CRM and ATS records often contain personal or confidential information. Apply ap
 
 ## Development
 
+`cr` requires Rust 1.89 or newer, declared as `rust-version` in `Cargo.toml`.
+
+Continuous integration runs these exact commands on Linux and macOS, so running them locally reproduces the pipeline:
+
 ```sh
-cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --all-targets
+cargo test --locked
 ```
 
 See [`docs/architecture.md`](docs/architecture.md) for the storage protocol and integrity boundaries. [`TODO.md`](TODO.md) is the canonical list of shortcuts, technical debt, and planned capabilities; update it in the same commit as future feature work.
+
+## Security
+
+Report vulnerabilities privately as described in [`SECURITY.md`](SECURITY.md) rather than in a public issue.
+
+## License
+
+Released under the [MIT License](LICENSE).
