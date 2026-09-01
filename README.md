@@ -254,6 +254,114 @@ over is an error, not a silent truncation.
 `-m/--message` also now works on `create`, `update`, `link`, and `delete`, not
 only `save`. It keeps its existing meaning: a short note about the change.
 
+### Approve a change set before it is written
+
+Everything above is asserted. This is the one thing `cr` checks.
+
+`--preview` computes the change set a mutation would record and prints a digest
+over it, without writing anything — no record change, no audit event, no pending
+mutation, and the lock released on the way out:
+
+```sh
+$ cr update deals acme-renewal --set status=closed-won --set stage=closed --preview
+update deals/acme-renewal
+replace /attributes/stage "negotiation" -> "closed"
+replace /attributes/status "open" -> "closed-won"
+digest sha256:47d8473f1c3fa8c044954674c2a97cb0eb9667eeaad7b80d691535c08277c78d
+```
+
+Read it, then pass the digest back to perform the write:
+
+```sh
+cr update deals acme-renewal --set status=closed-won --set stage=closed \
+  --authorization interactive --approved-by 'Anand Chowdhary <anand@example.com>' \
+  --approved-changes sha256:47d8473f1c3fa8c044954674c2a97cb0eb9667eeaad7b80d691535c08277c78d
+```
+
+`cr` recomputes the digest from the change set it is about to record and refuses
+the write if they differ:
+
+```
+$ cr update deals acme-renewal --set status=lost \
+    --authorization interactive --approved-changes sha256:47d8473f…
+error: record deals/acme-renewal does not match the approved change set:
+sha256:47d8473f… was approved, but this change set is sha256:149d63eb…
+```
+
+The digest is stored in `authorization.approved_changes`, and `cr audit verify`
+recomputes it from the event's own `changes`:
+
+```
+$ cr audit verify
+error: audit event 2 for record deals/acme-renewal records an approved change set
+that is not the one it applied: sha256:47d8473f… was approved, but its changes
+hash to sha256:b92149ba…
+```
+
+That is a different finding from a broken chain, and it has its own error and its
+own HTTP code (`409 approval_mismatch`), because "the change that was applied is
+not the change that was approved" and "the journal was tampered with" call for
+different responses.
+
+`--preview --json` prints the same thing as a JSON object with `changes`,
+`before_hash`, `after_hash`, and `digest`, which is the form a wrapper reads.
+
+Over HTTP, `preview` is a query parameter because it decides whether the request
+writes, and the digest is a header because it is a precondition on one:
+
+```sh
+curl -X PATCH 'http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal?preview=true' \
+  -H 'Content-Type: application/json' -d '{"front_matter":{"status":"closed-won"}}'
+
+curl -X PATCH 'http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal' \
+  -H 'Content-Type: application/json' \
+  -H 'X-CR-Authorization: interactive' \
+  -H 'X-CR-Approved-Changes: sha256:…' \
+  -d '{"front_matter":{"status":"closed-won"}}'
+```
+
+`--preview` works on `create`, `update`, `link`, `delete`, and `save`, and
+`preview=true` on `POST`/`PATCH`/`DELETE` records, `POST` links, and `POST
+/api/v1/save`. `cr delete --preview` does not need `--yes`, because it deletes
+nothing.
+
+#### What the digest proves, and what it does not
+
+**It proves**: the change set recorded in the event is the one the digest
+commits to. Nothing else in the event, and nothing about the record's other
+fields, is covered — the digest is over `changes` and only `changes`.
+
+**It does not prove that a human saw the preview.** An agent can compute a
+digest and pass it to itself. What the digest gives an auditor is a value they
+can compare against an approval recorded somewhere else — a ticket, a message, a
+commit — and it is worth exactly as much as that independent record.
+
+**It does not prove the journal is honest.** Anyone who can rewrite the chain can
+rewrite the digest with it. `audit verify` catches a change set that was altered
+without updating the approval beside it; it is a consistency check inside one
+event, not a second signature over it.
+
+**It is not enforced when it is absent.** A mutation with no
+`--approved-changes` is written unchecked, exactly as before. Its absence is
+information, not a failure.
+
+**The preview-to-apply gap is real, and closing it is what the digest is for.**
+State does change in between. If it changes in a way that alters the change set —
+including a change to the `before` value of any field being written — the digest
+no longer matches and the write is refused. If it changes some *other* field, the
+change set is unaffected and the write proceeds: you approved a change, not a
+resulting document. The separate `before_hash` guard is not enough on its own for
+this, because a competing `cr update` moves the record *and* the audited state
+together and so passes it; the digest is what actually notices.
+
+**One digest approves one record.** `cr save --preview` prints a digest per
+record, and `--approved-changes` on `save` requires exactly one
+`COLLECTION/ID` — approving a multi-record save needs a per-record mapping and
+waits on the bulk-mutation design in `TODO.md`.
+
+`sync` runs carry no approved digest. An adapter has no human in the loop by
+construction, so a digest there would only be a machine approving itself.
+
 ### Find what an agent did
 
 ```sh
@@ -295,6 +403,12 @@ to exactly the same head hash, and an older `cr` still verifies a journal that
 contains them — it simply does not display them. That last point matters in a
 shared repository: an older binary shows an agent-written event with no sign that
 anything was omitted.
+
+The same holds for the *values* of `detected_from`, `mode`, and `author`. If a
+later `cr` adds one, this one reads it, prints it verbatim, and rewrites it
+unchanged, so the event keeps its hash and the journal keeps verifying. `cr`
+still refuses to *record* a value it does not know, so an approval mode in a
+journal always means what this table says it means.
 
 Intent text is stored inline and is therefore **permanent**, like every other
 value in the journal.
@@ -1136,6 +1250,10 @@ recorded with `detected_from: header`. HTTP header values are visible ASCII, so
 non-ASCII intent text must use JSON `\uXXXX` escapes. `GET /api/v1/identity`
 returns the complete attribution a request would record.
 
+`X-CR-Approved-Changes` is the fifth header and the only one that can refuse a
+request: it carries the digest from a `preview=true` response, and a mutation
+whose change set hashes differently is rejected with `409 approval_mismatch`.
+
 ### CRUD requests
 
 Fetch one record:
@@ -1333,6 +1451,7 @@ cr init PATH
 cr identity [--json] [ATTRIBUTION]
 
 cr create COLLECTION ID [--set KEY=YAML]... [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
+                        [--preview [--json]]
 cr get COLLECTION ID [--json | --field KEY]
 cr list COLLECTION [--where KEY=YAML]... [--where-expr EXPRESSION]...
                    [--sort FIELD [--desc]] [--json]
@@ -1341,9 +1460,11 @@ cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]...
                   [--front-matter | --field KEY | --body | --path]
                   [--ignore-case] [--regex]
 cr update COLLECTION ID [--set KEY=YAML]... [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
+                        [--preview [--json]]
 cr link SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
-              [-m MESSAGE] [ATTRIBUTION]
+              [-m MESSAGE] [ATTRIBUTION] [--preview [--json]]
 cr delete COLLECTION ID --yes [-m MESSAGE] [ATTRIBUTION]
+cr delete COLLECTION ID --preview [--json]
 cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N]
 
 cr view create NAME --collection COLLECTION [--where KEY=YAML]... [--column FIELD]...
@@ -1359,8 +1480,8 @@ cr sync run NAME [--json]
 cr sync state NAME
 
 cr status [--json]
-cr save COLLECTION/ID... [--message TEXT] [--json] [ATTRIBUTION]
-cr save --all [--message TEXT] [--json] [ATTRIBUTION]
+cr save COLLECTION/ID... [--message TEXT] [--json] [--preview] [ATTRIBUTION]
+cr save --all [--message TEXT] [--json] [--preview] [ATTRIBUTION]
 
 cr audit log [COLLECTION] [ID] [--agent AGENT] [--session SESSION] [--limit N] [--json]
 cr audit verify [--expected-head HASH]
@@ -1371,6 +1492,7 @@ ATTRIBUTION = [--agent AGENT] [--agent-version V] [--agent-model MODEL]
               [--agent-session SESSION] [--agent-turn TURN]
               [--authorization MODE] [--grant GRANT]
               [--approved-by IDENTITY] [--approved-at TIMESTAMP]
+              [--approved-changes SHA256]
               [--intent JSON] [--intent-request TEXT] [--intent-rationale TEXT]
 ```
 

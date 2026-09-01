@@ -26,6 +26,15 @@ pub enum DomainError {
     Conflict(String),
     /// The request is well formed but is not valid for this database.
     Invalid(String),
+    /// A change set does not match the digest that was approved for it.
+    ///
+    /// Deliberately its own variant rather than a [`Self::Conflict`]. It is the
+    /// one integrity finding in `cr` that is not about the journal being
+    /// damaged, and an auditor has to be able to tell "the change that was
+    /// applied is not the change that was approved" apart from "the chain is
+    /// corrupt". Sharing a code with every other conflict would bury exactly
+    /// the distinction the digest exists to make.
+    ApprovalMismatch(String),
 }
 
 impl DomainError {
@@ -42,6 +51,7 @@ impl DomainError {
             Self::AlreadyExists(_) => "already_exists",
             Self::Conflict(_) => "conflict",
             Self::Invalid(_) => "validation_failed",
+            Self::ApprovalMismatch(_) => "approval_mismatch",
         }
     }
 
@@ -51,7 +61,8 @@ impl DomainError {
             Self::NotFound(message)
             | Self::AlreadyExists(message)
             | Self::Conflict(message)
-            | Self::Invalid(message) => message,
+            | Self::Invalid(message)
+            | Self::ApprovalMismatch(message) => message,
         }
     }
 
@@ -94,6 +105,11 @@ pub(crate) fn conflict(message: impl Display) -> anyhow::Error {
     anyhow::Error::new(DomainError::Conflict(message.to_string()))
 }
 
+/// Build an approved-change-digest mismatch for `bail!`-style returns.
+pub(crate) fn approval_mismatch(message: impl Display) -> anyhow::Error {
+    anyhow::Error::new(DomainError::ApprovalMismatch(message.to_string()))
+}
+
 /// True when `error` was caused by a missing filesystem entry.
 pub(crate) fn is_missing(error: &anyhow::Error) -> bool {
     io_kind_matches(error, std::io::ErrorKind::NotFound)
@@ -114,7 +130,7 @@ fn io_kind_matches(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{conflict, invalid, is_already_exists, is_missing, DomainError};
+    use super::{approval_mismatch, conflict, invalid, is_already_exists, is_missing, DomainError};
     use anyhow::anyhow;
 
     #[test]
@@ -146,6 +162,10 @@ mod tests {
             "view 'board' already exists"
         );
         assert_eq!(conflict("stale").to_string(), "stale");
+        assert_eq!(
+            DomainError::of(&approval_mismatch("not approved")).map(DomainError::code),
+            Some("approval_mismatch")
+        );
         assert_eq!(
             DomainError::of(&invalid("bad field")).map(DomainError::code),
             Some("validation_failed")

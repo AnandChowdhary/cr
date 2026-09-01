@@ -14,7 +14,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::{
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     database::{record_label, validate_component, RECORDS_LABEL},
-    error::conflict,
+    error::{approval_mismatch, conflict},
     frontmatter::Document,
     paths::{self, EntryKind},
 };
@@ -32,6 +32,11 @@ const AUDIT_VERSION: u32 = 2;
 const MIN_AUDIT_VERSION: u32 = 1;
 const EVENT_HASH_DOMAIN: &[u8] = b"cr:audit:event:v1\0";
 const RECORD_HASH_DOMAIN: &[u8] = b"cr:record:v1\0";
+/// Domain separator for the previewed-change digest.
+///
+/// Distinct from the event and record domains so a change-set digest can never
+/// be mistaken for, or substituted with, either of the other two hashes.
+const CHANGE_SET_HASH_DOMAIN: &[u8] = b"cr:audit:changes:v1\0";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -274,6 +279,33 @@ pub struct AuditVerification {
     pub head: AuditHead,
 }
 
+/// A change set computed without writing it, and the digest that commits to it.
+///
+/// The digest is over the exact bytes the `changes` array will occupy in the
+/// audit payload. Passing it back as `--approved-changes` binds the write to
+/// this change set: `cr` refuses to apply anything whose change set hashes
+/// differently, and `audit verify` recomputes it from the stored event.
+///
+/// What the digest does not carry: any evidence that a human ever looked at
+/// this. It commits to a change set, and to nothing about who saw it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ChangePreview {
+    /// Always `true`. Present so a client cannot mistake this for a write that
+    /// happened, if a proxy dropped the preview parameter on the way in.
+    pub preview: bool,
+    pub action: AuditAction,
+    pub record: AuditRecord,
+    /// The change set exactly as the audit event would record it.
+    pub changes: Vec<AuditChange>,
+    /// The record's current audited state, or absent when it does not exist.
+    pub before_hash: Option<String>,
+    /// The state the mutation would produce, or absent for a deletion.
+    pub after_hash: Option<String>,
+    /// `sha256:` over the canonical bytes of `changes`. Pass to
+    /// `--approved-changes` or `X-CR-Approved-Changes`.
+    pub digest: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct PendingMutation {
     target: PathBuf,
@@ -287,6 +319,23 @@ pub(crate) struct PreparedEntry {
     hash: String,
     payload: String,
     parsed: AuditPayload,
+    /// Digest of this event's change set, computed from the bytes above.
+    change_digest: String,
+}
+
+impl PreparedEntry {
+    /// Describe this event as a preview, discarding it rather than writing it.
+    pub fn into_preview(self) -> ChangePreview {
+        ChangePreview {
+            preview: true,
+            action: self.parsed.action,
+            record: self.parsed.record,
+            changes: self.parsed.changes,
+            before_hash: self.parsed.before_hash,
+            after_hash: self.parsed.after_hash,
+            digest: self.change_digest,
+        }
+    }
 }
 
 struct StoredEntry {
@@ -484,12 +533,26 @@ impl<'a> AuditLog<'a> {
         };
         let serialized =
             serde_json::to_string(&payload).context("could not serialize audit event")?;
+        let change_digest = change_set_hash(&serialized)?;
+        if let Some(approved) = payload
+            .authorization
+            .as_ref()
+            .and_then(|authorization| authorization.approved_changes.as_deref())
+        {
+            if approved != change_digest {
+                return Err(approval_mismatch(format!(
+                    "record {}/{} does not match the approved change set: {approved} was approved, but this change set is {change_digest}",
+                    payload.record.collection, payload.record.id
+                )));
+            }
+        }
         let hash = event_hash(serialized.as_bytes());
 
         Ok(PreparedEntry {
             hash,
             payload: serialized,
             parsed: payload,
+            change_digest,
         })
     }
 
@@ -638,10 +701,12 @@ impl<'a> AuditLog<'a> {
         }
 
         if current_hash == pending.after_hash {
+            let change_digest = change_set_hash(&pending.payload)?;
             self.append(&PreparedEntry {
                 hash: pending.hash,
                 payload: pending.payload,
                 parsed: payload,
+                change_digest,
             })?;
             self.clear_pending()?;
             return Ok(());
@@ -656,7 +721,7 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn recent(&self, limit: usize, filter: AuditFilter<'_>) -> Result<Vec<AuditEntry>> {
-        self.verify_chain(|_| Ok(()))?;
+        self.verify_chain(|_, _| Ok(()))?;
         let mut result = Vec::new();
         let paths = self.segment_paths()?;
 
@@ -678,7 +743,7 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn head(&self) -> Result<AuditHead> {
-        let state = self.verify_chain(|_| Ok(()))?;
+        let state = self.verify_chain(|_, _| Ok(()))?;
         Ok(AuditHead {
             sequence: state.entries,
             hash: state.head_hash,
@@ -686,7 +751,7 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn verify(&self, expected_head: Option<&str>) -> Result<AuditVerification> {
-        let (latest, state) = self.states()?;
+        let (latest, state) = self.states(true)?;
 
         if let Some(expected) = expected_head {
             if state.head_hash.as_deref() != Some(expected) {
@@ -713,12 +778,21 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn record_states(&self) -> Result<AuditedRecordStates> {
-        self.states().map(|(states, _)| states)
+        self.states(false).map(|(states, _)| states)
     }
 
-    fn states(&self) -> Result<(AuditedRecordStates, ChainState)> {
+    /// Replay the chain into per-record state.
+    ///
+    /// `check_approvals` recomputes each event's previewed-change digest from
+    /// its stored `changes`. Only `verify` asks for that. Reading history must
+    /// not fail on it: an auditor who has just been told that a change set does
+    /// not match its approval needs `audit log` to still show them the event.
+    fn states(&self, check_approvals: bool) -> Result<(AuditedRecordStates, ChainState)> {
         let mut latest = AuditedRecordStates::new();
-        let chain = self.verify_chain(|entry| {
+        let chain = self.verify_chain(|entry, payload| {
+            if check_approvals {
+                verify_approved_changes(entry, payload)?;
+            }
             let key = (
                 entry.payload.record.collection.clone(),
                 entry.payload.record.id.clone(),
@@ -835,9 +909,11 @@ impl<'a> AuditLog<'a> {
         }))
     }
 
+    /// Walk every segment, checking sequence continuity and the hash chain, and
+    /// hand each entry with its exact stored payload bytes to `visitor`.
     fn verify_chain<F>(&self, mut visitor: F) -> Result<ChainState>
     where
-        F: FnMut(&AuditEntry) -> Result<()>,
+        F: FnMut(&AuditEntry, &str) -> Result<()>,
     {
         let paths = self.segment_paths()?;
         let mut expected_sequence = 1;
@@ -869,7 +945,7 @@ impl<'a> AuditLog<'a> {
                 if stored.entry.payload.previous_hash != previous_hash {
                     bail!("audit hash chain is broken at sequence {expected_sequence}");
                 }
-                visitor(&stored.entry)?;
+                visitor(&stored.entry, &stored.payload)?;
                 previous_hash = Some(stored.entry.hash);
                 expected_sequence += 1;
                 segment_entries += 1;
@@ -892,7 +968,7 @@ impl<'a> AuditLog<'a> {
         id: &str,
     ) -> Result<(Option<Option<String>>, ChainState)> {
         let mut state = None;
-        let chain = self.verify_chain(|entry| {
+        let chain = self.verify_chain(|entry, _| {
             if entry.payload.record.collection == collection && entry.payload.record.id == id {
                 state = Some(entry.payload.after_hash.clone());
             }
@@ -1118,6 +1194,58 @@ fn missing_audit_history(collection: &str, id: &str, action: &str) -> anyhow::Er
 }
 
 /// The stored record no longer matches the state the audit log recorded.
+/// The digest of the change set carried by a serialized audit payload.
+///
+/// The canonical form is deliberately not a re-serialization. It is the exact
+/// byte range the `changes` array occupies inside the payload, read back out
+/// with `RawValue`, which is the same discipline the event hash already
+/// follows: hash what is stored, never what a later parse happens to produce.
+///
+/// Preview and apply hash a payload this process just serialized; `audit
+/// verify` hashes the payload as it sits on disk. All three go through here, so
+/// there is exactly one definition of what was approved.
+pub(crate) fn change_set_hash(payload: &str) -> Result<String> {
+    let parsed: PayloadChanges<'_> = serde_json::from_str(payload)
+        .context("audit payload does not carry a readable change set")?;
+    Ok(digest(
+        CHANGE_SET_HASH_DOMAIN,
+        parsed.changes.get().as_bytes(),
+    ))
+}
+
+/// Just enough of a payload to borrow its `changes` bytes unchanged.
+#[derive(Deserialize)]
+struct PayloadChanges<'a> {
+    #[serde(borrow)]
+    changes: &'a RawValue,
+}
+
+/// Recompute one event's previewed-change digest from its stored change set.
+///
+/// A mismatch is a different finding from a broken chain, and says so. The
+/// chain being intact means nobody edited the journal after the fact; this
+/// failing means the event itself records that a human approved one change set
+/// while a different one was written.
+fn verify_approved_changes(entry: &AuditEntry, payload: &str) -> Result<()> {
+    let Some(approved) = entry
+        .payload
+        .authorization
+        .as_ref()
+        .and_then(|authorization| authorization.approved_changes.as_deref())
+    else {
+        return Ok(());
+    };
+    let actual = change_set_hash(payload)?;
+    if approved == actual {
+        return Ok(());
+    }
+    Err(approval_mismatch(format!(
+        "audit event {} for record {} records an approved change set that is not the one it applied: {approved} was approved, but its changes hash to {actual}",
+        entry.payload.sequence,
+        entry.payload.record.reference()
+    )))
+}
+
 fn stale_audit_state(collection: &str, id: &str) -> anyhow::Error {
     conflict(format!(
         "record {collection}/{id} does not match its latest audited state; run 'cr audit verify'"
@@ -1319,9 +1447,10 @@ fn digest(domain: &[u8], contents: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_changes, diff_documents, event_hash, parse_line, record_hash, stored_line,
-        AuditAction, AuditChange, AuditFilter, AuditLog, AuditMutation, AuditPayload, AuditRecord,
-        AuditSource, PendingMutation, PreparedEntry, ReconciledMutation, PENDING_PATH,
+        apply_changes, change_set_hash, diff_documents, digest, event_hash, parse_line,
+        record_hash, stored_line, AuditAction, AuditChange, AuditFilter, AuditLog, AuditMutation,
+        AuditPayload, AuditRecord, AuditSource, PendingMutation, PreparedEntry, ReconciledMutation,
+        CHANGE_SET_HASH_DOMAIN, PENDING_PATH,
     };
     use crate::{
         attribution::{
@@ -1340,6 +1469,17 @@ mod tests {
     /// The hash that same `cr` wrote beside those bytes.
     const LEGACY_HASH: &str =
         "sha256:859fd73ce851c6098b4b186a67cb38ab54f855624c591cd3902e0c8633f0f8a3";
+
+    /// One audit event from `tests/fixtures/future-journal`, copied verbatim.
+    ///
+    /// It names an `AgentEvidence`, an `AuthorizationMode`, and an
+    /// `IntentAuthor` that this build has never heard of, standing in for a
+    /// journal written by a later `cr` that grew a value.
+    const FUTURE_PAYLOAD: &str = r#"{"version":2,"sequence":3,"timestamp":"2026-09-01T10:06:28.583165677Z","actor":"Ada Lovelace <ada@example.com>","source":"cli","agent":{"id":"future-agent","session":"s-1","detected_from":"attestation"},"authorization":{"mode":"escalated","grant":"planMode"},"intent":{"request":{"author":"operator","text":"close the renewal"}},"action":"update","record":{"collection":"deals","id":"acme-renewal"},"changes":[{"operation":"replace","path":"/attributes/stage","before":"negotiation","after":"closed"},{"operation":"replace","path":"/attributes/status","before":"open","after":"closed-won"}],"before_hash":"sha256:bff41b4063a1c3174a78757ba233661b8e009f20023193b68d9024d39f48f7fe","after_hash":"sha256:6ae98ae2e84c09ef640b8c8c69c0a316a1b7c945274b4eb85d47eb3061519c8d","previous_hash":"sha256:df5581e0fabd9d6a1a96a3d863680dbead1e5a9efa18e6b62ece155390d41858"}"#;
+
+    /// The hash stored beside those bytes in the fixture.
+    const FUTURE_HASH: &str =
+        "sha256:e34dfe8559e82230cc466d143f547b75f4de3b1aa4eb8a75b3c5ebb7e2dc28a0";
 
     fn attributed_payload() -> AuditPayload {
         AuditPayload {
@@ -1480,6 +1620,57 @@ mod tests {
             .is_some());
     }
 
+    /// An attribution value this build does not know must survive a read and a
+    /// rewrite byte for byte, under the hash that was stored beside it.
+    ///
+    /// This is the whole point of the tolerant reader. A closed enum rejects the
+    /// label, and a payload that fails to deserialize fails the entire chain —
+    /// exactly the hard failure that not bumping the audit version exists to
+    /// prevent. A tolerant reader that *normalized* the unknown label to a
+    /// default would be worse still: the read would succeed and the rewrite
+    /// would silently change the bytes the hash covers. Neither is acceptable,
+    /// so the assertion here is byte equality against a literal, not a round
+    /// trip that would agree with itself.
+    #[test]
+    fn an_unknown_attribution_value_round_trips_byte_for_byte() {
+        let payload: AuditPayload = serde_json::from_str(FUTURE_PAYLOAD).unwrap();
+        let agent = payload.agent.as_ref().unwrap();
+        let authorization = payload.authorization.as_ref().unwrap();
+        let author = &payload
+            .intent
+            .as_ref()
+            .unwrap()
+            .request
+            .as_ref()
+            .unwrap()
+            .author;
+
+        assert_eq!(
+            agent.detected_from,
+            AgentEvidence::Other("attestation".to_owned())
+        );
+        assert_eq!(
+            authorization.mode,
+            AuthorizationMode::Other("escalated".to_owned())
+        );
+        assert_eq!(*author, IntentAuthor::Other("operator".to_owned()));
+        assert!(!agent.detected_from.is_known());
+        assert!(!authorization.mode.is_known());
+        assert!(!author.is_known());
+        assert_eq!(agent.detected_from.label(), "attestation");
+        assert_eq!(authorization.mode.label(), "escalated");
+        assert_eq!(author.label(), "operator");
+
+        let reserialized = serde_json::to_string(&payload).unwrap();
+        assert_eq!(reserialized, FUTURE_PAYLOAD);
+        assert_eq!(event_hash(reserialized.as_bytes()), FUTURE_HASH);
+
+        let line = stored_line(FUTURE_HASH, FUTURE_PAYLOAD).unwrap();
+        let stored = parse_line(line.trim_end().as_bytes()).unwrap();
+        assert_eq!(stored.entry.hash, FUTURE_HASH);
+        assert_eq!(stored.payload, FUTURE_PAYLOAD);
+    }
+
     /// An event written by a newer `cr` that added another optional sibling must
     /// still verify here. Verification hashes what is on disk, and the payload
     /// deliberately does not deny unknown fields, so an addition can never make
@@ -1537,6 +1728,61 @@ mod tests {
     use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
     use yaml_serde::Mapping;
+
+    /// The canonical form of a change set is the exact byte range it occupies
+    /// inside the stored payload, and nothing else.
+    ///
+    /// The digest a preview prints comes from a payload this process serialized;
+    /// the digest `audit verify` recomputes comes from a payload read off disk.
+    /// They agree because both are the same substring, which is why this asserts
+    /// against a hand-written slice rather than round-tripping the same value
+    /// through the same serializer twice.
+    #[test]
+    fn a_change_set_digest_covers_the_stored_change_bytes_and_only_those() {
+        let payload = attributed_payload();
+        let serialized = serde_json::to_string(&payload).unwrap();
+        let changes = r#"[{"operation":"replace","path":"/attributes/status","before":"open","after":"closed-won"}]"#;
+        assert!(serialized.contains(&format!(r#""changes":{changes},"#)));
+        assert_eq!(
+            change_set_hash(&serialized).unwrap(),
+            digest(CHANGE_SET_HASH_DOMAIN, changes.as_bytes())
+        );
+
+        // Everything outside `changes` is deliberately not covered: the digest
+        // answers "was this the change set", not "was this the same event".
+        let mut moved = payload.clone();
+        moved.sequence = 41;
+        moved.timestamp = "2027-01-01T00:00:00Z".to_owned();
+        moved.actor = "Someone Else <else@example.com>".to_owned();
+        let moved = serde_json::to_string(&moved).unwrap();
+        assert_ne!(moved, serialized);
+        assert_eq!(
+            change_set_hash(&moved).unwrap(),
+            change_set_hash(&serialized).unwrap()
+        );
+
+        // Any difference inside the change set does change it.
+        let mut different = payload;
+        different.changes = vec![AuditChange::Replace {
+            path: "/attributes/status".to_owned(),
+            before: json!("open"),
+            after: json!("lost"),
+        }];
+        assert_ne!(
+            change_set_hash(&serde_json::to_string(&different).unwrap()).unwrap(),
+            change_set_hash(&serialized).unwrap()
+        );
+
+        // And the domain separator keeps it out of the other two hash spaces.
+        assert_ne!(
+            digest(CHANGE_SET_HASH_DOMAIN, changes.as_bytes()),
+            event_hash(changes.as_bytes())
+        );
+        assert_ne!(
+            digest(CHANGE_SET_HASH_DOMAIN, changes.as_bytes()),
+            record_hash(changes.as_bytes())
+        );
+    }
 
     #[test]
     fn event_hashes_are_domain_separated_and_stable() {

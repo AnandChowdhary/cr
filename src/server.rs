@@ -46,6 +46,14 @@ const ACTOR_HEADER: &str = "x-cr-actor";
 const AGENT_HEADER: &str = "x-cr-agent";
 const AUTHORIZATION_ATTRIBUTION_HEADER: &str = "x-cr-authorization";
 const INTENT_HEADER: &str = "x-cr-intent";
+/// The digest of a change set a caller previewed and approved.
+///
+/// A precondition as well as a recorded value: a mutation whose change set
+/// hashes differently is refused. Like `If-Match`, and unlike the attribution
+/// headers beside it, omitting it is not neutral — it is the difference between
+/// a checked write and an unchecked one, which is why the event records
+/// whether it was present.
+const APPROVED_CHANGES_HEADER: &str = "x-cr-approved-changes";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 /// The only message an unexpected failure may reveal. Everything else about it
 /// stays in the server log, correlated by request ID.
@@ -158,6 +166,19 @@ struct Pagination {
     has_more: bool,
     next_offset: Option<usize>,
     previous_offset: Option<usize>,
+}
+
+/// Whether a mutating request should compute its change set instead of writing.
+///
+/// This lives in the request target rather than a header on purpose. It changes
+/// what the request *does*, so it belongs in the URI, and a header is the one
+/// part of a request an intermediary may rewrite. `deny_unknown_fields` makes a
+/// misspelled parameter a rejection rather than an unintended write.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewQuery {
+    #[serde(default)]
+    preview: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -678,7 +699,9 @@ impl ApiError {
         };
         let status = match domain {
             DomainError::NotFound(_) => StatusCode::NOT_FOUND,
-            DomainError::AlreadyExists(_) | DomainError::Conflict(_) => StatusCode::CONFLICT,
+            DomainError::AlreadyExists(_)
+            | DomainError::Conflict(_)
+            | DomainError::ApprovalMismatch(_) => StatusCode::CONFLICT,
             DomainError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
         };
         let code = domain.code();
@@ -1477,9 +1500,23 @@ async fn create_record(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(collection): Path<String>,
+    RawQuery(raw): RawQuery,
     payload: std::result::Result<Json<CreateRecordRequest>, JsonRejection>,
 ) -> ApiResult<Response> {
+    let query: PreviewQuery = parse_query(raw)?;
     let Json(payload) = json_payload(payload)?;
+    if query.preview {
+        let preview = run_database(&state, &headers, move |database| {
+            database.preview_create_record(
+                &collection,
+                &payload.id,
+                payload.front_matter,
+                &payload.markdown,
+            )
+        })
+        .await?;
+        return Ok(Json(preview).into_response());
+    }
     let id = payload.id.clone();
     let location = format!(
         "/api/v1/collections/{}/records/{}",
@@ -1508,9 +1545,24 @@ async fn patch_record(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((collection, id)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
     payload: std::result::Result<Json<PatchRecordRequest>, JsonRejection>,
-) -> ApiResult<Json<ApiRecord>> {
+) -> ApiResult<Response> {
+    let query: PreviewQuery = parse_query(raw)?;
     let Json(payload) = json_payload(payload)?;
+    if query.preview {
+        let preview = run_database(&state, &headers, move |database| {
+            database.preview_patch(
+                &collection,
+                &id,
+                &payload.front_matter,
+                &payload.remove,
+                payload.markdown.as_deref(),
+            )
+        })
+        .await?;
+        return Ok(Json(preview).into_response());
+    }
     let record = run_database(&state, &headers, move |database| {
         database.patch(
             &collection,
@@ -1521,14 +1573,23 @@ async fn patch_record(
         )
     })
     .await?;
-    Ok(Json(record.try_into()?))
+    Ok(Json(ApiRecord::try_from(record)?).into_response())
 }
 
 async fn delete_record(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((collection, id)): Path<(String, String)>,
-) -> ApiResult<Json<DeleteResponse>> {
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Response> {
+    let query: PreviewQuery = parse_query(raw)?;
+    if query.preview {
+        let preview = run_database(&state, &headers, move |database| {
+            database.preview_delete(&collection, &id)
+        })
+        .await?;
+        return Ok(Json(preview).into_response());
+    }
     let record = run_database(&state, &headers, move |database| {
         database.delete(&collection, &id)
     })
@@ -1536,16 +1597,32 @@ async fn delete_record(
     Ok(Json(DeleteResponse {
         deleted: true,
         record: record.try_into()?,
-    }))
+    })
+    .into_response())
 }
 
 async fn link_record(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((collection, id)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
     payload: std::result::Result<Json<LinkRequest>, JsonRejection>,
-) -> ApiResult<Json<ApiRecord>> {
+) -> ApiResult<Response> {
+    let query: PreviewQuery = parse_query(raw)?;
     let Json(payload) = json_payload(payload)?;
+    if query.preview {
+        let preview = run_database(&state, &headers, move |database| {
+            database.preview_link(
+                &collection,
+                &id,
+                &payload.relation,
+                &payload.target_collection,
+                &payload.target_id,
+            )
+        })
+        .await?;
+        return Ok(Json(preview).into_response());
+    }
     let record = run_database(&state, &headers, move |database| {
         database.link(
             &collection,
@@ -1556,7 +1633,7 @@ async fn link_record(
         )
     })
     .await?;
-    Ok(Json(record.try_into()?))
+    Ok(Json(ApiRecord::try_from(record)?).into_response())
 }
 
 async fn search_records(
@@ -1610,14 +1687,23 @@ async fn status(
 async fn save(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     payload: std::result::Result<Json<SaveRequest>, JsonRejection>,
-) -> ApiResult<Json<Vec<crate::AuditEntry>>> {
+) -> ApiResult<Response> {
+    let query: PreviewQuery = parse_query(raw)?;
     let Json(payload) = json_payload(payload)?;
+    if query.preview {
+        let previews = run_database(&state, &headers, move |database| {
+            database.preview_save(&payload.records, payload.all, payload.message.as_deref())
+        })
+        .await?;
+        return Ok(Json(previews).into_response());
+    }
     let entries = run_database(&state, &headers, move |database| {
         database.save(&payload.records, payload.all, payload.message.as_deref())
     })
     .await?;
-    Ok(Json(entries))
+    Ok(Json(entries).into_response())
 }
 
 async fn audit_log(
@@ -1723,8 +1809,13 @@ pub fn openapi_document(database: &Database, token_enabled: bool) -> Result<Json
     Ok(document)
 }
 
+/// The static OpenAPI component schemas.
+///
+/// Split across two `json!` invocations only because one literal of this size
+/// exceeds the macro recursion limit; the halves are concatenated and the
+/// division carries no meaning.
 fn base_openapi_schemas() -> Map<String, JsonValue> {
-    serde_json::from_value(json!({
+    let mut schemas: Map<String, JsonValue> = serde_json::from_value(json!({
         "FrontMatter": { "type": "object", "additionalProperties": true },
         "RecordSummary": {
             "type": "object",
@@ -1821,7 +1912,7 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "grant": { "type": "string" },
                 "approved_by": { "type": "string" },
                 "at": { "type": "string", "format": "date-time" },
-                "approved_changes": { "type": "string", "description": "Reserved for a previewed-change digest that cr does not yet verify. Callers cannot supply it." }
+                "approved_changes": { "type": "string", "description": "Digest of the change set that was previewed and approved. cr refuses a mutation whose change set hashes differently, and audit verify recomputes it from the stored changes. It commits to what was applied, not to who saw it." }
             }
         },
         "AuditIntentPart": {
@@ -1867,6 +1958,26 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "target_collection": { "type": "string" },
                 "target_id": { "type": "string" }
             }
+        },
+    }))
+    .expect("static OpenAPI schemas are objects");
+    let rest: Map<String, JsonValue> = serde_json::from_value(json!({
+        "ChangePreview": {
+            "type": "object",
+            "required": ["preview", "action", "record", "changes", "digest"],
+            "description": "A change set computed without writing it. Returned by any mutating operation with preview=true. `preview` is always true, so a client can tell a preview from a write even if the query parameter was lost in transit.",
+            "properties": {
+                "preview": { "const": true },
+                "action": { "enum": ["baseline", "create", "update", "link", "delete"] },
+                "record": { "type": "object" },
+                "changes": { "type": "array", "items": { "type": "object" } },
+                "before_hash": { "type": ["string", "null"] },
+                "after_hash": { "type": ["string", "null"] },
+                "digest": { "type": "string", "description": "sha256 over the canonical bytes of changes. Send back as X-CR-Approved-Changes." }
+            }
+        },
+        "ChangePreviews": {
+            "type": "array", "items": { "$ref": "#/components/schemas/ChangePreview" }
         },
         "DeleteResponse": {
             "type": "object", "required": ["deleted", "record"],
@@ -1969,7 +2080,9 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
             }
         }
     }))
-    .expect("static OpenAPI schemas are objects")
+    .expect("static OpenAPI schemas are objects");
+    schemas.extend(rest);
+    schemas
 }
 
 fn openapi_paths() -> JsonValue {
@@ -2003,8 +2116,27 @@ fn openapi_paths() -> JsonValue {
             "schema": { "type": "string" },
             "description": "JSON intent object with a request, a rationale, or both. Header values are visible ASCII, so other characters must use JSON \\u escapes."
         }),
+        json!({
+            "name": "X-CR-Approved-Changes",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "description": "Digest printed by a preview=true request. The mutation is refused with 409 approval_mismatch unless its change set hashes to exactly this, and the digest is recorded in authorization.approved_changes. Requires X-CR-Authorization to name an approval mode."
+        }),
     ];
+    let preview = json!({
+        "name": "preview",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "boolean", "default": false },
+        "description": "Compute the change set and its digest without writing anything, and return a ChangePreview with 200 instead of performing the mutation."
+    });
+    let attribution_parameters = |mut path: Vec<JsonValue>| {
+        path.extend(attribution_headers.iter().cloned());
+        JsonValue::Array(path)
+    };
     let mutation_parameters = |mut path: Vec<JsonValue>| {
+        path.push(preview.clone());
         path.extend(attribution_headers.iter().cloned());
         JsonValue::Array(path)
     };
@@ -2054,7 +2186,7 @@ fn openapi_paths() -> JsonValue {
             }
         },
         "/api/v1/identity": {
-            "get": { "operationId": "getIdentity", "parameters": mutation_parameters(Vec::new()), "responses": ok("#/components/schemas/Identity") }
+            "get": { "operationId": "getIdentity", "parameters": attribution_parameters(Vec::new()), "responses": ok("#/components/schemas/Identity") }
         },
         "/api/v1/collections": {
             "get": { "operationId": "listCollections", "parameters": page_parameters.clone(), "responses": ok("#/components/schemas/CollectionPage") }
@@ -2074,7 +2206,7 @@ fn openapi_paths() -> JsonValue {
             "post": {
                 "operationId": "createRecord", "parameters": mutation_parameters(vec![collection.clone()]),
                 "requestBody": json_body("#/components/schemas/CreateRecordRequest"),
-                "responses": created("#/components/schemas/Record")
+                "responses": created_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview")
             }
         },
         "/api/v1/collections/{collection}/records/{id}": {
@@ -2082,9 +2214,9 @@ fn openapi_paths() -> JsonValue {
             "patch": {
                 "operationId": "patchRecord", "parameters": mutation_parameters(vec![collection.clone(), id.clone()]),
                 "requestBody": json_body("#/components/schemas/PatchRecordRequest"),
-                "responses": ok("#/components/schemas/Record")
+                "responses": ok_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview")
             },
-            "delete": { "operationId": "deleteRecord", "parameters": mutation_parameters(vec![collection.clone(), id.clone()]), "responses": ok("#/components/schemas/DeleteResponse") }
+            "delete": { "operationId": "deleteRecord", "parameters": mutation_parameters(vec![collection.clone(), id.clone()]), "responses": ok_or_preview("#/components/schemas/DeleteResponse", "#/components/schemas/ChangePreview") }
         },
         "/api/v1/collections/{collection}/records/{id}/document": {
             "get": { "operationId": "getRecordDocument", "parameters": [collection.clone(), id.clone()], "responses": { "200": { "description": "Exact Markdown document", "content": { "text/markdown": { "schema": { "type": "string" } } } }, "404": error_response() } }
@@ -2093,7 +2225,7 @@ fn openapi_paths() -> JsonValue {
             "get": { "operationId": "getRecordField", "parameters": [collection.clone(), id.clone(), json!({ "name": "field", "in": "path", "required": true, "schema": { "type": "string" } })], "responses": ok("#/components/schemas/FieldResponse") }
         },
         "/api/v1/collections/{collection}/records/{id}/links": {
-            "post": { "operationId": "linkRecord", "parameters": mutation_parameters(vec![collection, id]), "requestBody": json_body("#/components/schemas/LinkRequest"), "responses": ok("#/components/schemas/Record") }
+            "post": { "operationId": "linkRecord", "parameters": mutation_parameters(vec![collection, id]), "requestBody": json_body("#/components/schemas/LinkRequest"), "responses": ok_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview") }
         },
         "/api/v1/search": {
             "get": { "operationId": "searchRecords", "parameters": [
@@ -2112,7 +2244,7 @@ fn openapi_paths() -> JsonValue {
             ], "responses": ok("#/components/schemas/RecordPage") }
         },
         "/api/v1/status": { "get": { "operationId": "getStatus", "parameters": page_parameters, "responses": ok("#/components/schemas/WorkingChangePage") } },
-        "/api/v1/save": { "post": { "operationId": "saveDirectEdits", "parameters": mutation_parameters(Vec::new()), "requestBody": json_body("#/components/schemas/SaveRequest"), "responses": ok("#/components/schemas/AuditEntries") } },
+        "/api/v1/save": { "post": { "operationId": "saveDirectEdits", "parameters": mutation_parameters(Vec::new()), "requestBody": json_body("#/components/schemas/SaveRequest"), "responses": ok_or_preview("#/components/schemas/AuditEntries", "#/components/schemas/ChangePreviews") } },
         "/api/v1/audit/log": { "get": { "operationId": "getAuditLog", "parameters": [
             { "name": "agent", "in": "query", "description": "Only events whose acting agent, or any delegate in its chain, carries this identifier.", "schema": { "type": "string" } },
             { "name": "session", "in": "query", "description": "Only events whose acting agent, or any delegate in its chain, carries this session identifier.", "schema": { "type": "string" } },
@@ -2137,6 +2269,20 @@ fn ok(schema: &str) -> JsonValue {
     })
 }
 
+/// Success responses for a mutating operation that also answers `preview=true`.
+///
+/// The preview response is a different shape from the write response, so both
+/// are described rather than pretending one schema covers the operation.
+fn ok_or_preview(schema: &str, preview: &str) -> JsonValue {
+    let mut responses = ok(schema);
+    responses["200"]["content"]["application/json"]["schema"] = json!({
+        "oneOf": [{ "$ref": schema }, { "$ref": preview }]
+    });
+    responses["200"]["description"] =
+        JsonValue::String("Success, or the computed change set when preview=true".to_owned());
+    responses
+}
+
 fn created(schema: &str) -> JsonValue {
     let mut responses = ok(schema);
     if let Some(object) = responses.as_object_mut() {
@@ -2144,6 +2290,16 @@ fn created(schema: &str) -> JsonValue {
             object.insert("201".into(), success);
         }
     }
+    responses
+}
+
+/// A creation that answers `preview=true` with `200` and a change set.
+fn created_or_preview(schema: &str, preview: &str) -> JsonValue {
+    let mut responses = created(schema);
+    responses["200"] = json!({
+        "description": "The computed change set, returned when preview=true",
+        "content": { "application/json": { "schema": { "$ref": preview } } }
+    });
     responses
 }
 
@@ -2331,6 +2487,10 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
                                         @if let Some(grant) = &authorization.grant { " · grant " (grant) }
                                         @if let Some(approved_by) = &authorization.approved_by { " · approved by " (approved_by) }
                                         @if let Some(at) = &authorization.at { " · " (at) }
+                                        @if let Some(approved) = &authorization.approved_changes {
+                                            " · approved change set "
+                                            span class="cr-data" title=(approved) { (short_hash(approved)) }
+                                        }
                                     }
                                 }
                                 @if let Some(intent) = &entry.payload.intent {
@@ -4953,7 +5113,14 @@ fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database
         "invalid_authorization",
     )?;
     let intent = attribution_header(headers, INTENT_HEADER, "X-CR-Intent", "invalid_intent")?;
-    if agent.is_none() && authorization.is_none() && intent.is_none() {
+    let approved_changes = attribution_header(
+        headers,
+        APPROVED_CHANGES_HEADER,
+        "X-CR-Approved-Changes",
+        "invalid_approved_changes",
+    )?;
+    if agent.is_none() && authorization.is_none() && intent.is_none() && approved_changes.is_none()
+    {
         return Ok(database);
     }
     let mut attribution = database.attribution().clone();
@@ -4963,6 +5130,7 @@ fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database
                 agent,
                 authorization,
                 intent,
+                approved_changes,
                 ..AttributionOverrides::default()
             },
             AgentEvidence::Header,

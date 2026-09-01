@@ -20,10 +20,12 @@
 //!   these fields existed, so old journals keep verifying and no audit version
 //!   bump is needed.
 //! - **Reading is permissive and writing is strict.** The stored types below
-//!   ignore unknown fields, so a journal written by a newer `cr` still verifies
-//!   under an older one. The separate `*Spec` input types reject unknown fields,
-//!   so a caller cannot smuggle in a value `cr` is supposed to determine —
-//!   `detected_from` above all.
+//!   ignore unknown fields, and the three enums below accept a label they do
+//!   not know rather than failing, so a journal written by a newer `cr` still
+//!   verifies under an older one. The separate `*Spec` input types reject
+//!   unknown fields and unknown enum labels, so a caller cannot smuggle in a
+//!   value `cr` is supposed to determine — `detected_from` above all — or
+//!   record a value this build cannot name.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -67,38 +69,122 @@ struct AgentProbe {
     session_variable: Option<&'static str>,
 }
 
-/// How `cr` came to believe that an agent was involved.
+/// Define one of the attribution enums stored inside the hashed audit payload.
 ///
-/// None of these values means the claim was verified. They rank the strength of
-/// the assertion only: an explicit declaration outranks a sniffed environment
-/// because somebody chose to make it.
+/// The three enums this generates live inside a payload whose exact stored
+/// bytes are the hash input, and whose format version is deliberately not
+/// bumped when metadata is added (see `docs/architecture.md`). A closed enum
+/// would make adding a value a chain-breaking event: an older `cr` that cannot
+/// deserialize the label fails the payload, and a payload that fails to
+/// deserialize fails the whole journal — the exact hard failure the
+/// no-version-bump decision exists to prevent.
 ///
-/// Adding a variant is a compatibility event, not a metadata addition: an older
-/// `cr` cannot deserialize a variant it does not know, and an audit payload that
-/// fails to deserialize fails the whole chain. Treat a new variant with the same
-/// care as an audit version bump.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentEvidence {
-    /// Observed in the process environment through a documented variable.
-    Environment,
-    /// Declared by a command-line flag or a `CR_*` environment variable.
-    Flag,
-    /// Declared by an `X-CR-*` request header.
-    Header,
-    /// Declared by stored configuration, such as a sync definition.
-    Config,
+/// So the generated type carries an `Other` variant that **preserves the label
+/// verbatim**. Reading is permissive: an unknown label parses. Writing is
+/// strict: only [`parse_known`](Self::parse_known) turns caller input into a
+/// value, and it rejects anything this build cannot name, so `Other` is
+/// reachable from stored bytes and from nothing else.
+///
+/// Serialization writes the preserved label back unchanged, so a payload
+/// carrying an unknown value round-trips byte for byte and keeps its hash. A
+/// tolerant reader that normalized unknown labels — to a default, or to a
+/// marker string — would silently rewrite the bytes and destroy the very
+/// property it was added to protect.
+macro_rules! stored_label_enum {
+    (
+        $(#[$enum_meta:meta])*
+        $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident => $label:literal,
+            )+
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )+
+            /// A label this build does not know, preserved exactly as stored.
+            ///
+            /// Produced only by reading a journal written by a newer `cr`.
+            /// Rendered verbatim and serialized verbatim, so the event's bytes
+            /// and hash survive a read and a rewrite unchanged.
+            Other(String),
+        }
+
+        impl $name {
+            /// The stored label for this value.
+            ///
+            /// Stable, lowercase, and for `Other` exactly the bytes that were
+            /// read. Safe for output and rendering: it is a bounded label from
+            /// the journal, not free text.
+            pub fn label(&self) -> &str {
+                match self {
+                    $(Self::$variant => $label,)+
+                    Self::Other(label) => label,
+                }
+            }
+
+            /// True when this build does not know what this value means.
+            pub fn is_known(&self) -> bool {
+                !matches!(self, Self::Other(_))
+            }
+
+            /// Parse a label this build knows, rejecting every other value.
+            ///
+            /// This is the writing half of the rule. Every caller-supplied
+            /// value goes through here, so `cr` never records a label it
+            /// cannot name.
+            pub fn parse_known(label: &str) -> Option<Self> {
+                match label {
+                    $($label => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(self.label())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let label = String::deserialize(deserializer)?;
+                Ok(Self::parse_known(&label).unwrap_or(Self::Other(label)))
+            }
+        }
+    };
 }
 
-impl AgentEvidence {
-    /// A stable lowercase label for output and rendering.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Environment => "environment",
-            Self::Flag => "flag",
-            Self::Header => "header",
-            Self::Config => "config",
-        }
+stored_label_enum! {
+    /// How `cr` came to believe that an agent was involved.
+    ///
+    /// None of these values means the claim was verified. They rank the strength
+    /// of the assertion only: an explicit declaration outranks a sniffed
+    /// environment because somebody chose to make it.
+    ///
+    /// `cr` determines this itself, so no caller can supply it and the `Other`
+    /// variant is reachable only by reading a journal a newer `cr` wrote.
+    AgentEvidence {
+        /// Observed in the process environment through a documented variable.
+        Environment => "environment",
+        /// Declared by a command-line flag or a `CR_*` environment variable.
+        Flag => "flag",
+        /// Declared by an `X-CR-*` request header.
+        Header => "header",
+        /// Declared by stored configuration, such as a sync definition.
+        Config => "config",
     }
 }
 
@@ -153,36 +239,28 @@ impl AuditAgent {
     }
 }
 
-/// How much of a human decision stood behind one change.
-///
-/// Ordered by decreasing human proximity. The question an auditor actually asks
-/// is "did a person see *this* change before it happened", and only `direct`
-/// and `interactive` answer yes.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthorizationMode {
-    /// A human ran the command. No agent involved.
-    Direct,
-    /// A human was present and approved this specific invocation.
-    Interactive,
-    /// A human instructed the task; this write was covered by a standing grant.
-    Delegated,
-    /// No human in the session: scheduled, headless, or unattended.
-    Autonomous,
-    /// The approval path could not be determined.
-    Unknown,
-}
-
-impl AuthorizationMode {
-    /// A stable lowercase label for output and rendering.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Direct => "direct",
-            Self::Interactive => "interactive",
-            Self::Delegated => "delegated",
-            Self::Autonomous => "autonomous",
-            Self::Unknown => "unknown",
-        }
+stored_label_enum! {
+    /// How much of a human decision stood behind one change.
+    ///
+    /// Ordered by decreasing human proximity. The question an auditor actually
+    /// asks is "did a person see *this* change before it happened", and only
+    /// `direct` and `interactive` answer yes.
+    ///
+    /// Note that `Unknown` and `Other` are different answers. `unknown` is a
+    /// value a writer chose: it says the approval path could not be determined.
+    /// `Other` says a writer named an approval path this build has never heard
+    /// of, and the reader must not guess how much human was behind it.
+    AuthorizationMode {
+        /// A human ran the command. No agent involved.
+        Direct => "direct",
+        /// A human was present and approved this specific invocation.
+        Interactive => "interactive",
+        /// A human instructed the task; this write was covered by a standing grant.
+        Delegated => "delegated",
+        /// No human in the session: scheduled, headless, or unattended.
+        Autonomous => "autonomous",
+        /// The approval path could not be determined.
+        Unknown => "unknown",
     }
 }
 
@@ -200,37 +278,27 @@ pub struct AuditAuthorization {
     /// When the approval was given, as an RFC 3339 timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
-    /// Digest of a change set a human previewed and approved.
+    /// Digest of the change set that was previewed and approved.
     ///
-    /// Reserved. The preview command that produces this digest, and the
-    /// verification that recomputes it from the stored `changes`, are a
-    /// separate change. The field is defined here so adopting them later needs
-    /// no migration; nothing writes it today and no caller may supply it,
-    /// because a digest nobody checks would look like proof and be none.
+    /// The one field in this module that is checked rather than believed. `cr`
+    /// refuses to apply a mutation whose change set hashes differently, and
+    /// `audit verify` recomputes the digest from the event's stored `changes`.
+    ///
+    /// It commits to *what* was applied, not to *who saw it*. That a human read
+    /// the preview is asserted, exactly like everything else here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_changes: Option<String>,
 }
 
-/// Who a piece of recorded intent is attributed to.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IntentAuthor {
-    /// Attributed to the responsible human. `cr` did not witness them type it.
-    Human,
-    /// The agent's own account of itself. Self-serving evidence by construction.
-    Agent,
-    /// Generated by tooling rather than by either party.
-    System,
-}
-
-impl IntentAuthor {
-    /// A stable lowercase label for output and rendering.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Human => "human",
-            Self::Agent => "agent",
-            Self::System => "system",
-        }
+stored_label_enum! {
+    /// Who a piece of recorded intent is attributed to.
+    IntentAuthor {
+        /// Attributed to the responsible human. `cr` did not witness them type it.
+        Human => "human",
+        /// The agent's own account of itself. Self-serving evidence by construction.
+        Agent => "agent",
+        /// Generated by tooling rather than by either party.
+        System => "system",
     }
 }
 
@@ -310,6 +378,8 @@ pub struct AttributionOverrides<'a> {
     pub approved_by: Option<&'a str>,
     /// When the change was approved.
     pub approved_at: Option<&'a str>,
+    /// `sha256:` digest of the change set that was previewed and approved.
+    pub approved_changes: Option<&'a str>,
     /// A JSON intent object.
     pub intent: Option<&'a str>,
     /// The instruction, attributed to the human.
@@ -330,6 +400,7 @@ impl<'a> AttributionOverrides<'a> {
             && self.grant.is_none()
             && self.approved_by.is_none()
             && self.approved_at.is_none()
+            && self.approved_changes.is_none()
             && self.intent.is_none()
             && self.intent_request.is_none()
             && self.intent_rationale.is_none()
@@ -390,7 +461,7 @@ impl Attribution {
         evidence: AgentEvidence,
     ) -> Result<()> {
         if let Some(spec) = overrides.agent {
-            self.agent = parse_agent(spec, evidence)?;
+            self.agent = parse_agent(spec, evidence.clone())?;
         }
         let details = [
             ("agent version", overrides.agent_version),
@@ -434,6 +505,7 @@ impl Attribution {
             ("authorization grant", overrides.grant),
             ("approving identity", overrides.approved_by),
             ("approval timestamp", overrides.approved_at),
+            ("approved change set", overrides.approved_changes),
         ];
         if details.iter().all(|(_, value)| value.is_none()) {
             return Ok(());
@@ -455,6 +527,9 @@ impl Attribution {
         }
         if let Some(value) = overrides.approved_at {
             authorization.at = Some(timestamp(value, "approval timestamp")?);
+        }
+        if let Some(value) = overrides.approved_changes {
+            authorization.approved_changes = Some(digest(value, "approved change set")?);
         }
         Ok(())
     }
@@ -550,7 +625,7 @@ pub fn parse_agent(spec: &str, evidence: AgentEvidence) -> Result<Option<AuditAg
     }
     let parsed: AgentSpec = serde_json::from_str(spec)
         .map_err(|error| invalid(format!("agent is not a valid agent object: {error}")))?;
-    parsed.into_agent(evidence, 1).map(Some)
+    parsed.into_agent(&evidence, 1).map(Some)
 }
 
 /// A declared authorization: a bare mode or a JSON object.
@@ -560,26 +635,13 @@ pub fn parse_authorization(spec: &str) -> Result<AuditAuthorization> {
         return Err(invalid("authorization cannot be empty"));
     }
     if !spec.starts_with('{') {
-        let mode = serde_json::from_value::<AuthorizationMode>(serde_json::Value::String(
-            spec.to_owned(),
-        ))
-        .map_err(|_| {
-            invalid(format!(
-                "authorization mode '{spec}' must be direct, interactive, delegated, autonomous, or unknown"
-            ))
-        })?;
         return Ok(AuditAuthorization {
-            mode,
+            mode: authorization_mode(spec)?,
             grant: None,
             approved_by: None,
             at: None,
             approved_changes: None,
         });
-    }
-    if spec.contains("\"approved_changes\"") {
-        return Err(invalid(
-            "authorization approved_changes is reserved for a previewed-change digest that cr does not yet verify, and cannot be supplied",
-        ));
     }
     let parsed: AuthorizationSpec = serde_json::from_str(spec).map_err(|error| {
         invalid(format!(
@@ -587,12 +649,36 @@ pub fn parse_authorization(spec: &str) -> Result<AuditAuthorization> {
         ))
     })?;
     Ok(AuditAuthorization {
-        mode: parsed.mode,
+        mode: authorization_mode(&parsed.mode)?,
         grant: optional_identifier(parsed.grant.as_deref(), "authorization grant")?,
         approved_by: optional_identifier(parsed.approved_by.as_deref(), "approving identity")?,
         at: optional_timestamp(parsed.at.as_deref(), "approval timestamp")?,
-        approved_changes: None,
+        approved_changes: parsed
+            .approved_changes
+            .as_deref()
+            .map(|value| digest(value, "approved change set"))
+            .transpose()?,
     })
+}
+
+/// Accept only an approval mode this build knows.
+///
+/// The stored type tolerates an unknown label so a journal a newer `cr` wrote
+/// still verifies. Input does not: recording a mode `cr` cannot name would put
+/// a value into a permanent record that no reader — including this one — can
+/// interpret.
+fn authorization_mode(label: &str) -> Result<AuthorizationMode> {
+    AuthorizationMode::parse_known(label).ok_or_else(|| {
+        invalid(format!(
+            "authorization mode '{label}' must be direct, interactive, delegated, autonomous, or unknown"
+        ))
+    })
+}
+
+/// Accept only an intent author this build knows. See [`authorization_mode`].
+fn intent_author(label: &str, field: &str) -> Result<IntentAuthor> {
+    IntentAuthor::parse_known(label)
+        .ok_or_else(|| invalid(format!("{field} author must be human, agent, or system")))
 }
 
 /// A declared intent object.
@@ -665,7 +751,7 @@ struct AgentSpec {
 }
 
 impl AgentSpec {
-    fn into_agent(self, evidence: AgentEvidence, depth: usize) -> Result<AuditAgent> {
+    fn into_agent(self, evidence: &AgentEvidence, depth: usize) -> Result<AuditAgent> {
         if depth > MAX_DELEGATION_DEPTH {
             return Err(invalid(format!(
                 "agent delegation chain is longer than {MAX_DELEGATION_DEPTH} agents"
@@ -682,7 +768,7 @@ impl AgentSpec {
             model: optional_identifier(self.model.as_deref(), "agent model")?,
             session: optional_identifier(self.session.as_deref(), "agent session")?,
             turn: optional_identifier(self.turn.as_deref(), "agent turn")?,
-            detected_from: evidence,
+            detected_from: evidence.clone(),
             via: (!via.is_empty()).then_some(via),
         })
     }
@@ -692,10 +778,12 @@ impl AgentSpec {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthorizationSpec {
-    mode: AuthorizationMode,
+    /// Validated against the labels this build knows, never stored verbatim.
+    mode: String,
     grant: Option<String>,
     approved_by: Option<String>,
     at: Option<String>,
+    approved_changes: Option<String>,
 }
 
 /// The strict input shape for a declared intent.
@@ -710,7 +798,8 @@ struct IntentSpec {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IntentPartSpec {
-    author: Option<IntentAuthor>,
+    /// Validated against the labels this build knows, never stored verbatim.
+    author: Option<String>,
     text: Option<String>,
     digest: Option<String>,
     #[serde(rename = "ref")]
@@ -721,7 +810,12 @@ struct IntentPartSpec {
 impl IntentPartSpec {
     fn into_part(self, default_author: IntentAuthor, field: &str) -> Result<AuditIntentPart> {
         let part = AuditIntentPart {
-            author: self.author.unwrap_or(default_author),
+            author: self
+                .author
+                .as_deref()
+                .map(|label| intent_author(label, field))
+                .transpose()?
+                .unwrap_or(default_author),
             text: self
                 .text
                 .as_deref()
@@ -1004,11 +1098,37 @@ mod tests {
         assert!(message(&error).contains("must be direct, interactive"));
     }
 
+    /// The approved-change digest is shaped input like any other: `cr` checks
+    /// it before recording it, so a malformed digest fails at the flag rather
+    /// than becoming a permanent value that can never match anything.
     #[test]
-    fn an_unverified_approved_change_digest_cannot_be_supplied() {
+    fn an_approved_change_digest_must_be_a_sha256_digest() {
         let error = parse_authorization(r#"{"mode":"delegated","approved_changes":"sha256:abc"}"#)
             .unwrap_err();
-        assert!(message(&error).contains("reserved"));
+        assert!(message(&error).contains("64 lowercase hexadecimal"));
+
+        let accepted = parse_authorization(
+            r#"{"mode":"interactive","approved_changes":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            accepted.approved_changes.as_deref(),
+            Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+
+        let mut attribution = Attribution::default();
+        let orphan = attribution
+            .apply(
+                &AttributionOverrides {
+                    approved_changes: Some(
+                        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    ),
+                    ..overrides()
+                },
+                AgentEvidence::Flag,
+            )
+            .unwrap_err();
+        assert!(message(&orphan).contains("without an authorization mode"));
     }
 
     #[test]
@@ -1074,6 +1194,48 @@ mod tests {
             assert!(!message.contains('/'), "{message}");
             assert!(!message.contains("os error"), "{message}");
         }
+    }
+
+    /// Reading tolerates a value this build does not know; writing does not.
+    ///
+    /// The stored types have to accept an unknown label, because refusing it
+    /// would fail the payload and therefore the whole hash chain. Caller input
+    /// has to refuse it, because recording a label `cr` cannot name would put a
+    /// value nobody can interpret into a permanent record — and would let a
+    /// caller invent an approval mode that looks stronger than it is.
+    #[test]
+    fn an_unknown_label_is_read_verbatim_but_never_accepted_from_a_caller() {
+        let mode: AuthorizationMode = serde_json::from_str(r#""escalated""#).unwrap();
+        assert_eq!(mode, AuthorizationMode::Other("escalated".to_owned()));
+        assert_eq!(mode.label(), "escalated");
+        assert!(!mode.is_known());
+        assert_eq!(serde_json::to_string(&mode).unwrap(), r#""escalated""#);
+
+        let evidence: AgentEvidence = serde_json::from_str(r#""attestation""#).unwrap();
+        assert_eq!(evidence, AgentEvidence::Other("attestation".to_owned()));
+        assert_eq!(
+            serde_json::to_string(&evidence).unwrap(),
+            r#""attestation""#
+        );
+
+        let author: IntentAuthor = serde_json::from_str(r#""operator""#).unwrap();
+        assert_eq!(author, IntentAuthor::Other("operator".to_owned()));
+        assert_eq!(serde_json::to_string(&author).unwrap(), r#""operator""#);
+
+        assert!(AuthorizationMode::parse_known("escalated").is_none());
+        assert_eq!(
+            AuthorizationMode::parse_known("delegated"),
+            Some(AuthorizationMode::Delegated)
+        );
+        assert!(AuthorizationMode::Delegated.is_known());
+
+        let bare = parse_authorization("escalated").unwrap_err();
+        assert!(message(&bare).contains("must be direct, interactive"));
+        let object = parse_authorization(r#"{"mode":"escalated"}"#).unwrap_err();
+        assert!(message(&object).contains("must be direct, interactive"));
+        let author =
+            parse_intent(r#"{"request":{"author":"operator","text":"hello"}}"#).unwrap_err();
+        assert!(message(&author).contains("author must be human, agent, or system"));
     }
 
     #[test]
