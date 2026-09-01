@@ -1,7 +1,11 @@
 #![allow(dead_code)]
 
+pub mod chain;
+pub mod fault;
+
 use std::{path::Path, process::Command};
 
+#[derive(Debug)]
 pub struct TestDatabase {
     pub root: std::path::PathBuf,
     _temporary: tempfile::TempDir,
