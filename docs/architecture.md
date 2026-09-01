@@ -186,7 +186,13 @@ That check is the part of the preview-to-apply gap the digest actually closes. S
 
 One digest approves one record. `cr save --preview` prints a digest per record, and an approved digest on `save` requires exactly one named record rather than being checked against one of several independent change sets; multi-record approval needs a per-record mapping and waits on the bulk-mutation design. Sync runs carry no approved digest, because an adapter has no human in the loop by construction.
 
-`audit log` filters by `--agent` and `--session`, matching the acting agent or any delegate in its chain, over CLI, REST, and the HTML timeline. Recording a delegate that cannot be queried answers none of the questions the record exists for.
+`audit log` filters by `--by-agent` and `--by-session` (`--agent` and
+`--session` remain compatibility aliases), matching the acting agent or any
+delegate in its chain over CLI, REST, and the HTML timeline. An explicitly
+blank session or turn is normalized to absence, including when it clears a
+value inherited from `CR_AGENT`; host bookkeeping that belongs to no
+conversation therefore does not need a synthetic session. Recording a delegate
+that cannot be queried answers none of the questions the record exists for.
 
 Segments rotate on configurable event-count and byte-size bounds. Appending atomically rewrites only the active bounded segment; verification and history reads stream segments and never require the complete journal in memory. `audit log` reads newest segments backward until its requested limit is satisfied.
 
@@ -227,7 +233,12 @@ directory is deliberately not enough, so a bootstrap interrupted before the
 record write leaves the database open and retryable.
 
 `users` is a reserved collection with a built-in JSON Schema. A user record
-contains `name`, optional `email`, `kind`, `status`, and direct `access` grants.
+contains `name`, optional `email`, `kind`, `status`, an application-owned open
+`profile` mapping, and direct `access` grants. Keeping extensibility below one
+namespace preserves the closed policy schema: future CR-owned fields cannot
+collide with arbitrary application keys, and applications can choose whether a
+principal record also serves as their person record. A person who can never act
+still has no reason to be placed in this policy collection.
 Each grant pairs one of `viewer`, `editor`, `access_manager`, or `owner` with a
 resource string: `database`, `collection:<name>`, or
 `record:<collection>/<id>`. Database grants inherit through the resource tree,
@@ -241,7 +252,13 @@ That makes a policy version an ordinary audited user-record version rather than
 a second configuration history. Generic record mutations cannot target
 `users`; `cr user` and `cr access` preserve the fixed schema, prevent an access
 manager from minting ownership or another access manager, and prevent removal
-of the final active database owner. Each allowed data mutation stores an
+of the final active database owner. Bootstrap accepts an explicit human or
+service kind. User add/ensure/update operations apply profile assignments and
+identity changes inside the same audit lock as the write; update cannot change
+access grants, and ensure is a create-or-exact-match operation rather than a
+read-then-create race. An owner-only restore reconstructs the exact latest
+audited user bytes after a direct edit, without appending a fictional policy
+change. Each allowed data mutation stores an
 optional access decision beside the event: principal, display identity,
 action, target resource, effective role, grant scope, and the exact hash of the
 user record evaluated. Legacy and bootstrap events omit the object and retain
@@ -250,7 +267,10 @@ their original bytes.
 Authorization happens inside `Database`. Mutations evaluate under the audit
 lock before preparing the event; list and search filter records by `read`; a
 specific history read requires `read_audit`; and database-wide status, check,
-head, anchor, verification, and baseline operations require ownership. The
+head, anchor, verification, and baseline operations require ownership. A global
+history read is different: owners receive every event, while other principals
+receive only events for records they may currently audit plus their own user
+history. Filtering happens before the requested limit. The
 principal is the normalized policy identity derived from the actor (an email
 inside `Name <email>` when present), so actor and principal remain one
 user-facing identity. Once RBAC is enabled, an explicit actor with a different
@@ -258,16 +278,21 @@ principal is rejected.
 
 This is an honest local boundary, not authenticated multi-user isolation. The
 process still supplies its actor environment and anyone with backing-file
-access can bypass CR. `cr serve` supports RBAC as a loopback-only owner
-perspective console: the launching principal must own the database, and a
-CSRF-protected switcher stores one selected registered principal in an
-HTTP-only, same-site session cookie. Every HTML and REST request clones the
-owner's database handle and explicitly impersonates that selection before it
-reaches `Database`. The effective actor and principal become the selected user;
-an allowed event's access decision additionally stores the launching owner as
-`impersonated_by`. Non-bypassable multi-user enforcement still requires a
-managed daemon or server that owns the Markdown directory and authenticates
-each client.
+access can bypass CR. The global `--as PRINCIPAL` option gives a trusted owner
+process an explicit delegation path for a single CLI command. It calls the
+same verified delegation boundary as the server: the audit chain is replayed
+once, the launching policy is checked and authorized before the target is even
+looked up, and both materialized policy files must match that replay.
+Permissions are evaluated for the selected registered user, while an allowed event's access decision
+stores the launching owner under `impersonated_by`. `cr serve` exposes that
+boundary through its loopback-only owner perspective console: a CSRF-protected
+switcher stores one selected principal in an HTTP-only, same-site session
+cookie, and every HTML and REST request clones the owner's database handle and
+impersonates that selection before it reaches `Database`. `--as` cannot launch
+the long-lived server, so its original operator can never be lost at that
+boundary. Non-bypassable
+multi-user enforcement still requires a managed daemon or server that owns the
+Markdown directory and authenticates each client.
 
 `audit verify` validates the chain and reconciles every latest record hash, including deleted-record absence and manually added untracked files. `audit baseline` explicitly introduces legacy records into the chain. It cannot silently baseline a record that already has history.
 
@@ -371,14 +396,28 @@ The REST API uses generic collection and record routes. List, search, status, an
 
 The OpenAPI 3.1 document is produced on demand at `/openapi.json`. OpenAPI 3.1 uses the Draft 2020-12 JSON Schema model, allowing collection schemas to be embedded without translating them into Rust types. The document includes generic transport schemas plus one live component per `.cr/schemas/<collection>.json`; `x-cr-collection-schemas` preserves the mapping when collection names are not safe or unique component identifiers.
 
-Failures carry a typed `DomainError` classification attached to the `anyhow` chain rather than being recovered from message text. The domain layer names the four meanings a caller can act on—not found, already exists, conflicting durable or audited state, and invalid input—and writes the caller-facing wording at the point of failure, so it names records, views, collections, and fields instead of paths. The HTTP layer maps each classification to exactly one status and code (`404`/`not_found`, `409`/`already_exists`, `409`/`conflict`, `422`/`validation_failed`) and treats an unclassified failure as `500`/`internal_error`. Because the classification is a value inside the chain, the CLI keeps printing the complete chain while the server returns only the classified message. Transport-level problems the domain layer never sees—authentication, routing, body decoding, and body limits—keep their own codes.
+Failures carry a typed `DomainError` classification attached to the `anyhow`
+chain rather than being recovered from message text. The domain layer names the
+meanings a caller can act on—not found, already exists, forbidden, conflicting
+durable or audited state, invalid input, approval mismatch, and anchor
+mismatch—and writes the caller-facing wording at the point of failure, so it
+names records, views, collections, and fields instead of paths. The HTTP layer
+maps each classification to one status and code and treats an unclassified
+failure as `500`/`internal_error`. By default the CLI keeps printing the
+complete chain; global `--json-errors` instead emits the same stable domain code
+and authored message in a JSON envelope, uses `usage_error` for command-line
+parsing failures, and reserves `internal_error` for unclassified failures.
+Transport-level problems the domain layer never sees—authentication, routing,
+body decoding, and body limits—keep their own codes.
 
 Every request receives a correlation ID, returned as `X-Request-Id` and inside the error envelope. Before a response is rendered, the server writes the complete chain to standard error under that ID together with the method, path, status, and code; unexpected failures replace their message with a fixed generic one. Expected client errors keep their actionable wording. This holds the line that internal detail is a server-side artifact: the log is authoritative for diagnosis and the response is authoritative for what a caller may know.
 
 The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentication for HTML views, the OpenAPI document, and all `/api/v1` routes; `/health` remains public. `X-CR-Actor` is an audit attribution override with the same assertion-only trust boundary as CLI actor values, and `X-CR-Agent`, `X-CR-Authorization`, and `X-CR-Intent` extend that boundary unchanged to the three attribution objects. Each accepts the same compact or JSON form as its command-line option and is recorded as `detected_from: header`; because HTTP header values are visible ASCII, non-ASCII intent text must arrive as JSON escapes, and a header that is not decodable is refused with a message that names the header and nothing internal. `GET /api/v1/identity` returns the effective actor, principal, optional impersonating owner, and attribution a request would record, which is how a client checks its wiring without writing anything.
 
 For RBAC, router construction proves the launching principal is a database
-owner and rejects a non-loopback bind before opening a listener. The single
+owner against its audited policy and rejects a non-loopback bind before opening
+a listener. Every selected perspective is also checked against the same
+verified delegation boundary before a request uses it. The single
 bearer token is not treated as a principal registry. Instead, the local owner
 console enumerates the live fixed-schema user records and switches perspective
 through a CSRF-protected POST. The resulting HTTP-only, same-site cookie is a

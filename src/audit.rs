@@ -727,9 +727,20 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn assert_current(&self, collection: &str, id: &str, contents: &[u8]) -> Result<()> {
+        let states = self.record_states()?;
+        Self::assert_current_in(&states, collection, id, contents)
+    }
+
+    /// Compare one materialized record with an already replayed journal state.
+    pub(crate) fn assert_current_in(
+        states: &AuditedRecordStates,
+        collection: &str,
+        id: &str,
+        contents: &[u8],
+    ) -> Result<()> {
         let actual = Some(record_hash(contents));
-        match self.record_state(collection, id)?.0 {
-            Some(expected) if expected == actual => Ok(()),
+        match states.get(&(collection.to_owned(), id.to_owned())) {
+            Some(state) if state.hash == actual => Ok(()),
             None => Err(missing_audit_history(collection, id, "using")),
             Some(_) => Err(stale_audit_state(collection, id)),
         }
@@ -887,6 +898,22 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn recent(&self, limit: usize, filter: AuditFilter<'_>) -> Result<Vec<AuditEntry>> {
+        self.recent_where(limit, filter, |_| Ok(true))
+    }
+
+    /// Return recent events that satisfy both the caller's filter and a
+    /// visibility predicate.
+    ///
+    /// Applying `visible` while walking newest-first is important for callers
+    /// that enforce record-level access: `limit` must count visible events,
+    /// rather than truncating the journal before inaccessible events are
+    /// removed.
+    pub(crate) fn recent_where(
+        &self,
+        limit: usize,
+        filter: AuditFilter<'_>,
+        mut visible: impl FnMut(&AuditEntry) -> Result<bool>,
+    ) -> Result<Vec<AuditEntry>> {
         self.verify_chain(|_, _| Ok(()))?;
         let mut result = Vec::new();
         let paths = self.segment_paths()?;
@@ -896,6 +923,9 @@ impl<'a> AuditLog<'a> {
             entries.reverse();
             for stored in entries {
                 if !filter.matches(&stored.entry.payload) {
+                    continue;
+                }
+                if !visible(&stored.entry)? {
                     continue;
                 }
                 result.push(stored.entry);

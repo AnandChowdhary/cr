@@ -5,7 +5,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
     AccessAction, AccessResource, AgentEvidence, Assignment, AttributionOverrides, AuditFilter,
     CheckReport, CheckScope, Database, FilterExpression, Record, Role, SearchQuery, SearchTarget,
-    SortDirection, SyncAttribution, UserKind, ViewLayout, parse_threshold, sort_records_by_field,
+    SortDirection, SyncAttribution, UserEnsureOutcome, UserKind, UserStatus, UserUpdate,
+    ViewLayout, parse_threshold, sort_records_by_field,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -140,9 +141,17 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     database: Option<PathBuf>,
 
+    /// Emit command failures as a machine-readable JSON error envelope.
+    #[arg(long, global = true)]
+    json_errors: bool,
+
     /// Identity recorded in audit events. Overrides CR/Git identity discovery.
     #[arg(long, global = true, value_name = "IDENTITY")]
     actor: Option<String>,
+
+    /// Evaluate this command as a registered principal. Requires database ownership.
+    #[arg(long = "as", global = true, value_name = "PRINCIPAL")]
+    as_principal: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -479,9 +488,82 @@ enum UserCommand {
         #[arg(long)]
         email: Option<String>,
 
+        /// Principal kind. Defaults to human.
+        #[arg(long, value_enum, conflicts_with = "service")]
+        kind: Option<UserKindArg>,
+
         /// Register an unattended service instead of a person.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "kind")]
         service: bool,
+
+        /// Set an application-owned profile field using KEY=YAML.
+        #[arg(short = 's', long = "set", value_name = "KEY=YAML")]
+        profile: Vec<Assignment>,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Declaratively create a principal or verify its definition is unchanged.
+    Ensure {
+        id: String,
+
+        #[arg(long)]
+        name: String,
+
+        #[arg(long)]
+        email: Option<String>,
+
+        #[arg(long, value_enum, conflicts_with = "service")]
+        kind: Option<UserKindArg>,
+
+        #[arg(long, conflicts_with = "kind")]
+        service: bool,
+
+        /// Set an application-owned profile field using KEY=YAML.
+        #[arg(short = 's', long = "set", value_name = "KEY=YAML")]
+        profile: Vec<Assignment>,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Update identity fields or application-owned profile data without changing access grants.
+    Update {
+        id: String,
+
+        #[arg(long)]
+        name: Option<String>,
+
+        #[arg(long, conflicts_with = "clear_email")]
+        email: Option<String>,
+
+        #[arg(long, conflicts_with = "email")]
+        clear_email: bool,
+
+        #[arg(long, value_enum, conflicts_with = "service")]
+        kind: Option<UserKindArg>,
+
+        #[arg(long, conflicts_with = "kind")]
+        service: bool,
+
+        #[arg(long, value_enum)]
+        status: Option<UserStatusArg>,
+
+        /// Set an application-owned profile field using KEY=YAML.
+        #[arg(short = 's', long = "set", value_name = "KEY=YAML")]
+        profile: Vec<Assignment>,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Restore a manually edited user file to its exact latest audited state.
+    Restore {
+        id: String,
+
+        #[arg(long)]
+        json: bool,
     },
 
     /// List registered principals. Requires database access management.
@@ -508,6 +590,14 @@ enum AccessCommand {
 
         #[arg(long)]
         email: Option<String>,
+
+        /// Kind of the first database owner. Defaults to human.
+        #[arg(long, value_enum, conflicts_with = "service")]
+        kind: Option<UserKindArg>,
+
+        /// Initialize an unattended service as the first database owner.
+        #[arg(long, conflicts_with = "kind")]
+        service: bool,
     },
 
     /// Show whether the current principal may perform an action.
@@ -531,6 +621,36 @@ enum AccessCommand {
         user: String,
         resource: AccessResource,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum UserKindArg {
+    Human,
+    Service,
+}
+
+impl From<UserKindArg> for UserKind {
+    fn from(value: UserKindArg) -> Self {
+        match value {
+            UserKindArg::Human => Self::Human,
+            UserKindArg::Service => Self::Service,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum UserStatusArg {
+    Active,
+    Disabled,
+}
+
+impl From<UserStatusArg> for UserStatus {
+    fn from(value: UserStatusArg) -> Self {
+        match value {
+            UserStatusArg::Active => Self::Active,
+            UserStatusArg::Disabled => Self::Disabled,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -710,11 +830,11 @@ enum AuditCommand {
         id: Option<String>,
 
         /// Only events whose acting agent, or any delegate behind it, carries this identifier.
-        #[arg(long, value_name = "AGENT")]
+        #[arg(long = "by-agent", visible_alias = "agent", value_name = "AGENT")]
         agent: Option<String>,
 
         /// Only events whose acting agent, or any delegate behind it, carries this session.
-        #[arg(long, value_name = "SESSION")]
+        #[arg(long = "by-session", visible_alias = "session", value_name = "SESSION")]
         session: Option<String>,
 
         #[arg(short = 'n', long, default_value_t = 20)]
@@ -763,19 +883,72 @@ enum AuditCommand {
 const FOUND_PROBLEMS: u8 = 2;
 
 fn main() -> ExitCode {
-    match run() {
+    let requested_json_errors = std::env::args_os().any(|argument| argument == "--json-errors");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                let code = error.exit_code();
+                let _ = error.print();
+                return ExitCode::from(code as u8);
+            }
+            if requested_json_errors {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "error": {
+                            "code": "usage_error",
+                            "message": error.to_string().trim(),
+                        }
+                    })
+                );
+            } else {
+                let _ = error.print();
+            }
+            return ExitCode::from(error.exit_code() as u8);
+        }
+    };
+    let json_errors = cli.json_errors;
+    match run(cli) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("error: {error:#}");
+            print_command_error(&error, json_errors);
             ExitCode::FAILURE
         }
     }
 }
 
-fn run() -> Result<ExitCode> {
-    let cli = Cli::parse();
+fn print_command_error(error: &anyhow::Error, json: bool) {
+    if json {
+        let (code, message) = cr::DomainError::of(error).map_or_else(
+            || ("internal_error", format!("{error:#}")),
+            |domain| (domain.code(), domain.message().to_owned()),
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "error": {
+                    "code": code,
+                    "message": message,
+                }
+            })
+        );
+    } else {
+        eprintln!("error: {error:#}");
+    }
+}
 
+fn run(cli: Cli) -> Result<ExitCode> {
+    if cli.as_principal.is_some() && matches!(&cli.command, Command::Serve { .. }) {
+        bail!("--as cannot be used to launch the long-lived server");
+    }
     if let Command::Init { path } = cli.command {
+        if cli.as_principal.is_some() {
+            bail!("--as cannot be used while initializing a database");
+        }
         let path = cli.database.unwrap_or(path);
         let database = Database::init(path)?;
         println!("Initialized database at {}", database.root().display());
@@ -785,6 +958,10 @@ fn run() -> Result<ExitCode> {
     let database = Database::discover(cli.database.as_deref())?;
     let database = match cli.actor {
         Some(actor) => database.with_actor(actor)?,
+        None => database,
+    };
+    let database = match cli.as_principal {
+        Some(principal) => database.impersonate_verified(&principal)?,
         None => database,
     };
 
@@ -1073,19 +1250,89 @@ fn run() -> Result<ExitCode> {
                 id,
                 name,
                 email,
+                kind,
                 service,
+                profile,
+                json,
             } => {
-                let record = database.add_user(
+                let record = database.add_user_with_profile(
                     &id,
                     &name,
                     email.as_deref(),
-                    if service {
-                        UserKind::Service
-                    } else {
-                        UserKind::Human
+                    selected_user_kind(kind, service),
+                    profile_from_assignments(&profile)?,
+                )?;
+                print_user_record(&record, json)?;
+            }
+            UserCommand::Ensure {
+                id,
+                name,
+                email,
+                kind,
+                service,
+                profile,
+                json,
+            } => {
+                let outcome = database.ensure_user(
+                    &id,
+                    &name,
+                    email.as_deref(),
+                    selected_user_kind(kind, service),
+                    profile_from_assignments(&profile)?,
+                )?;
+                let created = outcome == UserEnsureOutcome::Created;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "id": id,
+                            "created": created,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "users/{id} {}",
+                        if created { "created" } else { "unchanged" }
+                    );
+                }
+            }
+            UserCommand::Update {
+                id,
+                name,
+                email,
+                clear_email,
+                kind,
+                service,
+                status,
+                profile,
+                json,
+            } => {
+                let kind = if service {
+                    Some(UserKind::Service)
+                } else {
+                    kind.map(Into::into)
+                };
+                let email = if clear_email {
+                    Some(None)
+                } else {
+                    email.map(Some)
+                };
+                let record = database.update_user(
+                    &id,
+                    UserUpdate {
+                        name,
+                        email,
+                        kind,
+                        status: status.map(Into::into),
+                        profile_assignments: profile,
+                        ..UserUpdate::default()
                     },
                 )?;
-                println!("{}", record.reference());
+                print_user_record(&record, json)?;
+            }
+            UserCommand::Restore { id, json } => {
+                let record = database.restore_user(&id)?;
+                print_user_record(&record, json)?;
             }
             UserCommand::List { json } => {
                 let users = database.users()?;
@@ -1117,8 +1364,17 @@ fn run() -> Result<ExitCode> {
             }
         },
         Command::Access { command } => match command {
-            AccessCommand::Init { name, email } => {
-                let record = database.initialize_access(name.as_deref(), email.as_deref())?;
+            AccessCommand::Init {
+                name,
+                email,
+                kind,
+                service,
+            } => {
+                let record = database.initialize_access_with_kind(
+                    name.as_deref(),
+                    email.as_deref(),
+                    selected_user_kind(kind, service),
+                )?;
                 println!(
                     "Initialized access control with {} as database owner",
                     record.id
@@ -1285,19 +1541,29 @@ fn run() -> Result<ExitCode> {
             let database = declared.apply(database)?;
             let attribution = database.attribution();
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "actor": database.actor(),
-                        "principal": database.principal(),
-                        "access_control": database.access_enabled()?,
-                        "agent": attribution.agent,
-                        "authorization": attribution.authorization,
-                        "intent": attribution.intent,
-                    }))?
-                );
+                let mut identity = serde_json::json!({
+                    "actor": database.actor(),
+                    "principal": database.principal(),
+                    "access_control": database.access_enabled()?,
+                    "agent": attribution.agent,
+                    "authorization": attribution.authorization,
+                    "intent": attribution.intent,
+                });
+                if let Some(impersonated_by) = database.impersonated_by() {
+                    identity
+                        .as_object_mut()
+                        .expect("identity is a JSON object")
+                        .insert(
+                            "impersonated_by".to_owned(),
+                            serde_json::to_value(impersonated_by)?,
+                        );
+                }
+                println!("{}", serde_json::to_string_pretty(&identity)?);
             } else {
                 println!("{}", database.actor());
+                if let Some(impersonated_by) = database.impersonated_by() {
+                    println!("impersonated by: {}", impersonated_by.display);
+                }
                 print_attribution(attribution);
             }
         }
@@ -1550,6 +1816,31 @@ fn change_path(path: &str) -> &str {
 
 fn compact(value: &serde_json::Value) -> Result<String> {
     Ok(serde_json::to_string(value)?)
+}
+
+fn selected_user_kind(kind: Option<UserKindArg>, service: bool) -> UserKind {
+    if service {
+        UserKind::Service
+    } else {
+        kind.map(Into::into).unwrap_or(UserKind::Human)
+    }
+}
+
+fn profile_from_assignments(assignments: &[Assignment]) -> Result<Mapping> {
+    let mut profile = Mapping::new();
+    for assignment in assignments {
+        assignment.apply(&mut profile)?;
+    }
+    Ok(profile)
+}
+
+fn print_user_record(record: &Record, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(record)?);
+    } else {
+        println!("{}", record.reference());
+    }
+    Ok(())
 }
 
 /// Print the agent, authorization, and intent an event would carry.

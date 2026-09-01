@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value as JsonValue, json};
 use yaml_serde::{Mapping, Value};
 
-use crate::error::invalid;
+use crate::{error::invalid, value::Assignment};
 
 /// The collection CR reserves for authenticated principals and their grants.
 pub const USERS_COLLECTION: &str = "users";
@@ -30,6 +30,14 @@ pub struct User {
     pub kind: UserKind,
     #[serde(default)]
     pub status: UserStatus,
+    /// Application-owned metadata about this principal.
+    ///
+    /// CR deliberately keeps extensibility below one namespace so future
+    /// access-control fields can be added without colliding with application
+    /// data. This does not turn `users` into a public people collection: user
+    /// visibility remains governed by the access-management rules.
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub profile: Mapping,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<AccessGrant>,
 }
@@ -46,7 +54,20 @@ impl User {
     /// Serialize a user into record front matter.
     pub fn attributes(&self) -> Result<Mapping> {
         self.validate()?;
-        match yaml_serde::to_value(self)
+        // Canonicalize application metadata through JSON before serializing.
+        // Audit replay stores documents as JSON, so deterministic key order is
+        // what makes an exact policy file recoverable from that journal later.
+        let mut canonical = self.clone();
+        canonical.profile =
+            serde_json::from_value(serde_json::to_value(&self.profile).map_err(|error| {
+                invalid(format!("user profile is not JSON-compatible: {error}"))
+            })?)
+            .map_err(|error| {
+                invalid(format!(
+                    "user profile cannot be represented as YAML: {error}"
+                ))
+            })?;
+        match yaml_serde::to_value(&canonical)
             .map_err(|error| invalid(format!("user cannot be represented as YAML: {error}")))?
         {
             Value::Mapping(attributes) => Ok(attributes),
@@ -156,6 +177,71 @@ impl User {
             .iter()
             .any(|grant| grant.resource == Resource::Database && grant.role == Role::Owner)
     }
+
+    /// Whether this policy contains a role that only an owner may administer.
+    pub(crate) fn has_privileged_grant(&self) -> bool {
+        self.access
+            .iter()
+            .any(|grant| matches!(grant.role, Role::Owner | Role::AccessManager))
+    }
+}
+
+/// The mutable, non-access portion of a user record.
+///
+/// `access` is intentionally absent. Grants continue to move exclusively
+/// through `grant_access` and `revoke_access`, so an application-profile edit
+/// cannot become a privilege escalation.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UserUpdate {
+    pub name: Option<String>,
+    /// `None` leaves email unchanged; `Some(None)` clears it.
+    pub email: Option<Option<String>>,
+    pub kind: Option<UserKind>,
+    pub status: Option<UserStatus>,
+    /// Replace the complete application-owned profile mapping.
+    pub profile: Option<Mapping>,
+    /// Apply dotted-path changes inside the application-owned profile.
+    pub profile_assignments: Vec<Assignment>,
+}
+
+impl UserUpdate {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.email.is_none()
+            && self.kind.is_none()
+            && self.status.is_none()
+            && self.profile.is_none()
+            && self.profile_assignments.is_empty()
+    }
+
+    pub(crate) fn apply(self, user: &mut User) -> Result<()> {
+        if let Some(name) = self.name {
+            user.name = name;
+        }
+        if let Some(email) = self.email {
+            user.email = email;
+        }
+        if let Some(kind) = self.kind {
+            user.kind = kind;
+        }
+        if let Some(status) = self.status {
+            user.status = status;
+        }
+        if let Some(profile) = self.profile {
+            user.profile = profile;
+        }
+        for assignment in self.profile_assignments {
+            assignment.apply(&mut user.profile)?;
+        }
+        Ok(())
+    }
+}
+
+/// The result of declaratively ensuring a principal exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserEnsureOutcome {
+    Created,
+    Unchanged,
 }
 
 /// Whether a principal is a person or unattended software.
@@ -509,6 +595,10 @@ pub fn users_schema() -> JsonValue {
             "email": { "type": "string", "format": "email" },
             "kind": { "enum": ["human", "service"] },
             "status": { "enum": ["active", "disabled"] },
+            "profile": {
+                "type": "object",
+                "additionalProperties": true
+            },
             "access": {
                 "type": "array",
                 "items": {
@@ -550,6 +640,7 @@ mod tests {
             email: Some("ada@example.com".into()),
             kind: UserKind::Human,
             status: UserStatus::Active,
+            profile: Default::default(),
             access,
         }
     }

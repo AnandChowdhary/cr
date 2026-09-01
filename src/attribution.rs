@@ -463,13 +463,23 @@ impl Attribution {
         if let Some(spec) = overrides.agent {
             self.agent = parse_agent(spec, evidence.clone())?;
         }
+        // Session and turn are optional correlation keys. Harnesses commonly
+        // build one argv shape for conversational and host-owned work, leaving
+        // these values blank when no conversation exists. Treating that blank
+        // value exactly like an absent environment variable keeps the write
+        // path usable without inventing a meaningless identifier.
+        let agent_session = non_empty(overrides.agent_session);
+        let agent_turn = non_empty(overrides.agent_turn);
         let details = [
             ("agent version", overrides.agent_version),
             ("agent model", overrides.agent_model),
-            ("agent session", overrides.agent_session),
-            ("agent turn", overrides.agent_turn),
+            ("agent session", agent_session),
+            ("agent turn", agent_turn),
         ];
-        if details.iter().all(|(_, value)| value.is_none()) {
+        let clears_correlation = self.agent.is_some()
+            && ((overrides.agent_session.is_some() && agent_session.is_none())
+                || (overrides.agent_turn.is_some() && agent_turn.is_none()));
+        if details.iter().all(|(_, value)| value.is_none()) && !clears_correlation {
             return Ok(());
         }
         let Some(agent) = self.agent.as_mut() else {
@@ -487,11 +497,12 @@ impl Attribution {
         if let Some(value) = overrides.agent_model {
             agent.model = Some(identifier(value, "agent model")?);
         }
-        if let Some(value) = overrides.agent_session {
-            agent.session = Some(identifier(value, "agent session")?);
+        if overrides.agent_session.is_some() {
+            agent.session =
+                optional_correlation_identifier(overrides.agent_session, "agent session")?;
         }
-        if let Some(value) = overrides.agent_turn {
-            agent.turn = Some(identifier(value, "agent turn")?);
+        if overrides.agent_turn.is_some() {
+            agent.turn = optional_correlation_identifier(overrides.agent_turn, "agent turn")?;
         }
         agent.detected_from = evidence;
         Ok(())
@@ -766,8 +777,8 @@ impl AgentSpec {
             id: identifier(&self.id, "agent")?,
             version: optional_identifier(self.version.as_deref(), "agent version")?,
             model: optional_identifier(self.model.as_deref(), "agent model")?,
-            session: optional_identifier(self.session.as_deref(), "agent session")?,
-            turn: optional_identifier(self.turn.as_deref(), "agent turn")?,
+            session: optional_correlation_identifier(self.session.as_deref(), "agent session")?,
+            turn: optional_correlation_identifier(self.turn.as_deref(), "agent turn")?,
             detected_from: evidence.clone(),
             via: (!via.is_empty()).then_some(via),
         })
@@ -869,6 +880,16 @@ fn identifier(value: &str, field: &str) -> Result<String> {
 
 fn optional_identifier(value: Option<&str>, field: &str) -> Result<Option<String>> {
     value.map(|value| identifier(value, field)).transpose()
+}
+
+fn optional_correlation_identifier(value: Option<&str>, field: &str) -> Result<Option<String>> {
+    non_empty(value)
+        .map(|value| identifier(value, field))
+        .transpose()
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 /// Validate bounded intent prose. Line breaks are allowed; other control
@@ -1057,6 +1078,57 @@ mod tests {
             )
             .unwrap_err();
         assert!(message(&error).contains("without an agent identity"));
+    }
+
+    #[test]
+    fn blank_optional_correlation_keys_are_absent() {
+        let mut attribution = Attribution::default();
+        attribution
+            .apply(
+                &AttributionOverrides {
+                    agent_session: Some(""),
+                    agent_turn: Some("   "),
+                    ..overrides()
+                },
+                AgentEvidence::Flag,
+            )
+            .unwrap();
+        assert!(attribution.agent.is_none());
+
+        let agent = parse_agent(
+            r#"{"id":"host-bookkeeping","session":"","turn":"   "}"#,
+            AgentEvidence::Header,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(agent.session.is_none());
+        assert!(agent.turn.is_none());
+
+        let mut detected = Attribution {
+            agent: Some(AuditAgent {
+                id: "host-bookkeeping".to_owned(),
+                version: None,
+                model: None,
+                session: Some("inherited-session".to_owned()),
+                turn: Some("inherited-turn".to_owned()),
+                detected_from: AgentEvidence::Environment,
+                via: None,
+            }),
+            ..Attribution::default()
+        };
+        detected
+            .apply(
+                &AttributionOverrides {
+                    agent_session: Some(""),
+                    agent_turn: Some("  "),
+                    ..overrides()
+                },
+                AgentEvidence::Flag,
+            )
+            .unwrap();
+        let detected = detected.agent.unwrap();
+        assert!(detected.session.is_none());
+        assert!(detected.turn.is_none());
     }
 
     #[test]

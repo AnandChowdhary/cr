@@ -164,18 +164,45 @@ export CR_EMAIL='jane@example.com'
 cr access init
 ```
 
+For an unattended deployment, initialize the first owner as software instead:
+
+```sh
+cr access init --service --name Harness --email harness@example.com
+```
+
+`--kind human|service` is the explicit form; `--service` is the convenient
+service shorthand.
+
 The first user becomes the database owner. Its record is ordinary readable
 Markdown at `records/users/jane@example.com.md`, but its schema and mutation
 surface are owned by CR: generic `create`, `update`, `save`, and `delete`
 commands cannot change `users`. Use the dedicated commands instead:
 
 ```sh
-cr user add maria@example.com --name Maria --email maria@example.com
+cr user add maria@example.com --name Maria --email maria@example.com --set role=CEO
+cr user ensure nightly@example.com --name Nightly --service --set queue=default
+cr user update maria@example.com --name 'Maria Garcia' --set team=leadership
 cr access grant maria@example.com editor collection:deals
 cr access grant maria@example.com viewer record:deals/sensitive-renewal
 cr access check update record:deals/acme-renewal
 cr access revoke maria@example.com record:deals/sensitive-renewal
 ```
+
+`name`, `email`, `kind`, `status`, and `access` remain CR-owned and validated.
+Application identity data belongs under the open `profile` namespace; each
+`--set` applies a dotted path within that namespace. This is enough for many
+integrations to use `users` as their principal and people registry without
+adding a parallel table, while applications that also model people who can
+never act may still keep those records separately.
+
+`user ensure` is the declarative, race-safe bootstrap command: it creates a
+missing principal, exits successfully without writing another event when the
+complete definition already matches, and returns a `conflict` if the existing
+definition differs. `user update` changes identity and profile fields under the
+audit lock while preserving access grants and the stable ID. If somebody edits
+a managed user Markdown file directly, `user restore ID` reproduces its exact
+latest audited state so `audit verify` can become clean again. Only an audited
+database owner may restore policy files.
 
 Resources are written as `database`, `collection:NAME`, or
 `record:COLLECTION/ID`. Database grants inherit into every collection and
@@ -197,10 +224,22 @@ effective role, grant scope, and hash of the user policy that allowed it.
 
 The principal and audit actor are normally one user-facing identity. Once RBAC
 is enabled, `--actor` may repeat that principal but cannot impersonate another
-one. The deliberate exception is the local `cr serve` perspective console: an
-owner can select any registered user in the top-right switcher, after which
-HTML and REST requests are evaluated as that user. An allowed mutation records
-the selected actor and principal plus an `impersonated_by` owner identity.
+one. A trusted process launched as a database owner can explicitly delegate a
+command to a registered principal instead:
+
+```sh
+cr --as maria@example.com update deals acme-renewal --set stage=won
+```
+
+The command is authorized as Maria, not as the owner. An allowed mutation
+records Maria as its actor and principal plus the launching owner under
+`access.impersonated_by`. The local `cr serve` perspective console uses this
+same boundary when an owner selects a registered user in the top-right
+switcher, so its HTML and REST requests are evaluated as that user too. Both
+the launching owner's policy and the target policy must match their latest
+audited versions before delegation is accepted. `--as` is rejected for
+`serve`: one delegated command must not silently become a long-lived identity
+boundary.
 
 The local identity is still an assertion supplied by the process, so this is
 strong CR gating, not a sandbox: somebody who can read or edit the backing
@@ -422,13 +461,14 @@ construction, so a digest there would only be a machine approving itself.
 ### Find what an agent did
 
 ```sh
-cr audit log --agent claude-code
-cr audit log --session 6d1baa69-f114-490c-ae19-4be99c2bd744
+cr audit log --by-agent claude-code
+cr audit log --by-session 6d1baa69-f114-490c-ae19-4be99c2bd744
 ```
 
 Both match the acting agent or any delegate in its `via` chain, so a sub-agent's
 writes are still findable under the agent that spawned it. The same filters exist
 at `GET /api/v1/audit/log?agent=…&session=…` and on the `/audit` page.
+The older `--agent` and `--session` spellings remain aliases for compatibility.
 
 Preview what would be recorded without writing anything:
 
@@ -451,6 +491,11 @@ export CR_AGENT='{"id":"claude-code-subagent","session":"child",
 
 `CR_AGENT`, `CR_AUTHORIZATION`, and `CR_INTENT` apply to every command, so an
 agent harness can set them once for a whole session.
+
+An explicitly empty `--agent-session`, `--agent-turn`, or corresponding JSON
+value means that correlation key is absent. This lets host-level bookkeeping
+clear a session inherited through `CR_AGENT` instead of failing or attaching a
+write to the wrong conversation.
 
 ### Compatibility
 
@@ -937,6 +982,11 @@ Show recent events for the entire database:
 cr audit log
 cr audit log --limit 100 --json
 ```
+
+With RBAC enabled, owners see the complete global stream. Other principals see
+only events for records whose audit history they may currently read, plus their
+own user-policy history; visibility is applied before `--limit`. This makes an
+editor's `audit log` useful without granting database-wide access management.
 
 Show history for one record:
 
@@ -1682,7 +1732,15 @@ ID so it can be quoted in a report.
 
 ## Useful command summary
 
+Global `--as PRINCIPAL` delegates one command from an audited database owner.
+Global `--json-errors` writes failures to stderr as
+`{"error":{"code":"...","message":"..."}}`; command-line syntax failures use
+`usage_error`, classified domain failures retain their stable code, and an
+unclassified failure uses `internal_error`.
+
 ```text
+cr [--database PATH] [--actor IDENTITY] [--as PRINCIPAL] [--json-errors] COMMAND
+
 cr init PATH
 cr identity [--json] [ATTRIBUTION]
 
@@ -1703,6 +1761,22 @@ cr delete COLLECTION ID --yes [-m MESSAGE] [ATTRIBUTION]
 cr delete COLLECTION ID --preview [--json]
 cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N]
 
+cr access init [--name NAME] [--email EMAIL] [--kind human|service | --service]
+cr access check ACTION RESOURCE [--json]
+cr access grant USER ROLE RESOURCE
+cr access revoke USER RESOURCE
+
+cr user add ID --name NAME [--email EMAIL] [--kind human|service | --service]
+            [--set KEY=YAML]... [--json]
+cr user ensure ID --name NAME [--email EMAIL] [--kind human|service | --service]
+               [--set KEY=YAML]... [--json]
+cr user update ID [--name NAME] [--email EMAIL | --clear-email]
+               [--kind human|service | --service] [--status active|disabled]
+               [--set KEY=YAML]... [--json]
+cr user restore ID [--json]
+cr user list [--json]
+cr user show [ID] [--json]
+
 cr view create NAME --collection COLLECTION [--where KEY=YAML]... [--column FIELD]...
                     [--layout table|kanban] [--group-by FIELD]
                     [--sort-by FIELD] [--sort-direction asc|desc] [--page-size N]
@@ -1721,7 +1795,7 @@ cr check [--collection COLLECTION] [--json] [--fail-on error|warning|never]
 cr save COLLECTION/ID... [--message TEXT] [--json] [--preview] [ATTRIBUTION]
 cr save --all [--message TEXT] [--json] [--preview] [ATTRIBUTION]
 
-cr audit log [COLLECTION] [ID] [--agent AGENT] [--session SESSION] [--limit N] [--json]
+cr audit log [COLLECTION] [ID] [--by-agent AGENT] [--by-session SESSION] [--limit N] [--json]
 cr audit verify [--expected-head HASH]
 cr audit head [--json]
 cr audit anchor [--write] [--json]
