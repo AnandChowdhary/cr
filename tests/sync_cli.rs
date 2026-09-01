@@ -652,7 +652,21 @@ fn a_killed_run_leaves_a_ledger_that_completes_the_remaining_records() {
         json_output(&database, &["sync", "state", "bulk"])["cursor"],
         "done"
     );
-    assert_eq!(fs::read_dir(&records).unwrap().count(), total);
+    // Only records: a process killed between staging a file and linking it
+    // into place leaves a `.cr-tmp-*` file behind, which every reader ignores.
+    // See `tests/audit_fault_injection.rs`.
+    assert_eq!(
+        fs::read_dir(&records)
+            .unwrap()
+            .filter(|entry| entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".md"))
+            .count(),
+        total
+    );
     assert_eq!(run_success(database.command().arg("status")), "Clean\n");
     run_success(database.command().args(["audit", "verify"]));
 }

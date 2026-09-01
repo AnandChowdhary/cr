@@ -986,7 +986,14 @@ impl<'a> AuditLog<'a> {
     }
 
     fn verify_records(&self, latest: &HashMap<(String, String), Option<String>>) -> Result<()> {
-        for ((collection, id), expected_hash) in latest {
+        // Sorted, because verification reports the *first* record that
+        // disagrees with the chain and stops. Iterating the map directly made
+        // that choice depend on hash order, so an auditor running `audit
+        // verify` twice on a database with two divergent records could be told
+        // about a different one each time.
+        let mut audited: Vec<_> = latest.iter().collect();
+        audited.sort_unstable_by_key(|(record, _)| *record);
+        for ((collection, id), expected_hash) in audited {
             validate_component(collection, "collection")?;
             validate_component(id, "id")?;
             let path = self.records_dir.join(collection).join(format!("{id}.md"));
