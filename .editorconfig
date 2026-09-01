@@ -1,0 +1,19 @@
+# rustfmt already governs *.rs. This exists for everything it does not touch —
+# workflows, JSON Schemas, Markdown, TOML, and the example records — so those
+# files do not drift between editors.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 2
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.rs]
+indent_size = 4
+
+[*.md]
+# Markdown gives meaning to two trailing spaces (a hard line break).
+trim_trailing_whitespace = false
