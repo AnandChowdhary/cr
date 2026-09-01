@@ -71,6 +71,9 @@ database-root/
 │   └── sync/
 │       ├── locks/
 │       │   └── notion-meetings.lock
+│       ├── runs/
+│       │   ├── notion-meetings.json
+│       │   └── notion-meetings.jsonl
 │       └── state/
 │           └── notion-meetings.json
 └── records/
@@ -87,7 +90,7 @@ database-root/
 - Relations live under `relations.<name>` as lists of `{ collection, id }` references. `cr link` verifies the target exists and is idempotent.
 - A collection schema is optional and validates only its front matter.
 - A saved view is an optional versioned query/display definition. Collections also receive automatic views without a file.
-- A saved sync is an optional versioned command definition. Its mutable JSON checkpoint and advisory lock are stored separately from configuration.
+- A saved sync is an optional versioned command definition. Its mutable JSON checkpoint and advisory lock are stored separately from configuration, as is the ledger of a run that has started applying records and not yet finished.
 
 ### Path resolution
 
@@ -188,7 +191,19 @@ The complete bounded output is parsed before application. Unknown fields, malfor
 
 Application uses the same `Database` mutation methods as the CLI and HTTP server with `source: sync` and `message: sync:<name> run:<random-id>`. A separate application lock serializes the post-process verification and application phases across different sync names. The audit head must still equal the head observed before the command started, preventing a clean concurrent CLI or API commit from being overwritten by stale adapter output. Exact upsert matches and missing deletes are counted as unchanged without creating audit noise. The checkpoint must also match its initial value and is atomically replaced only after record operations succeed. A nonzero adapter exit or any preflight failure applies neither records nor state.
 
-This is not yet a multi-record transaction. After preflight, individual record changes use the existing one-record write-ahead audit protocol; a durable failure during the application loop can commit a prefix while leaving the checkpoint unchanged. Retrying is safe for deterministic upserts and deletes. Remote side effects occur outside the database transaction entirely and must use provider idempotency controls.
+### Interrupted runs
+
+This is not a multi-record transaction, and it deliberately does not pretend to be one. After preflight, individual record changes use the existing one-record write-ahead audit protocol, so a durable failure during the application loop still commits a prefix. The property the design does hold is narrower and honest: **a run cannot leave committed work and the recorded checkpoint disagreeing without that being durably recorded, reportable, and completable.**
+
+Rollback is not available and is not attempted. The journal is append-only, so unwinding a prefix would mean deleting events, and forward-only compensation — appending inverse mutations — would replace one true history with a longer, more confusing one for no gain over simply finishing the run. Advancing the checkpoint per record is not available either: the protocol's checkpoint is a single opaque adapter value emitted once at the end, and `cr` cannot invent an intermediate cursor an adapter never described.
+
+What is available is making the run itself durable. After preflight and the head comparison, and before the first mutation, `cr` writes `.cr/sync/runs/<name>.jsonl` — the adapter's exact validated stream — and then `.cr/sync/runs/<name>.json`, a ledger naming the run, its start time, its operation count, a domain-separated digest of that stream, the audit head it started from, and the checkpoints it began with and owes. The stream is written first, so a ledger on disk always has its operations beside it. Both are removed only after the checkpoint has been committed, ledger first, so an interruption while tidying up can only leave a stream that claims nothing about committed work and is discarded by the next run.
+
+A ledger on disk is therefore the single fact that separates "a run finished" from "a run stopped somewhere in the middle". `cr sync run` refuses to start while one is present, which is what stops a stale checkpoint from being silently replayed. `cr sync recover <name>` completes the run by replaying the recorded stream, which is sound rather than merely convenient: `cr-jsonl-v1` guarantees each target appears at most once, an upsert carries the complete record, and deleting a missing record is a no-op, so a replay commits exactly the operations the interrupted run never reached and appends no event for the rest. The events it appends carry the interrupted run's own ID, so the journal shows one run rather than two.
+
+Progress is never counted into the ledger as the run proceeds. `cr sync recover --check` reads it back out of the audit chain by counting events after the ledger's recorded head that carry this run's message, so the report cannot claim work the journal does not hold. The same pass identifies records changed after the run stopped by anything other than that run: recovery refuses if any of them is a record the run still has to write, and proceeds if they are unrelated. It also refuses when the recorded stream no longer matches the digest in its ledger, when the chain was rewritten beneath it, or when the checkpoint moved for some other reason.
+
+Two limits remain. If the original failure is still present, recovery reproduces it and leaves the ledger in place; that is a truthful stuck state, not a repaired one, and it needs a person. And remote side effects an adapter performed occur outside the database entirely, so a replay can re-drive them: an adapter that also writes to a remote service must use that service's idempotency controls.
 
 Adapters are trusted local executables, not a sandbox. They inherit the caller's environment—including secrets—and operating-system access to files, processes, network services, and external APIs. Limits constrain runtime, protocol output, and message count, but not CPU, memory, network traffic, stderr volume, or platform-specific child behavior. The scheduler and service account remain part of the deployment security boundary.
 
@@ -267,6 +282,7 @@ Mutating forms include a cryptographically random token generated when the serve
 - Links validate that their target exists and matches its latest audited content hash. Manual deletion can still produce a dangling reference after the link is created; a future `cr check` command should scan links and delete policies.
 - A database-wide filesystem lock serializes audited mutations, and a pending-operation journal recovers single-record crash windows. There are no multi-record transactions.
 - Per-sync filesystem locks reject overlapping runs of one adapter. Different syncs may fetch concurrently, but a separate application lock plus the initial audit-head comparison rejects stale output if another sync or ordinary mutation committed first. The audit lock still serializes individual record mutations during a run.
+- A run that stops partway through leaves a durable ledger under `.cr/sync/runs/`, so committed work and a lagging checkpoint can never disagree unnoticed. The next run refuses until the interrupted one is completed by `cr sync recover`, which replays the recorded stream forward and never deletes an audit event.
 - YAML comments and hand-chosen front matter formatting are not preserved after a CLI mutation; the Markdown body is preserved exactly. A syntax-preserving YAML editor could replace serialization later without changing the command model.
 
 ## Roadmap

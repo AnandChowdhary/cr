@@ -197,7 +197,9 @@ Priorities:
 ## HTTP and integrations
 
 - [ ] **P1 — Bulk mutation endpoints and multi-record transactions.**
-  Define atomicity, validation, audit grouping, crash recovery, maximum batch sizes, and partial-failure behavior before exposing bulk create/update/delete. Sync runs currently preflight their complete bounded stream but commit sequential single-record mutations, so a durable application failure can leave a committed prefix and unchanged checkpoint.
+  Define atomicity, validation, audit grouping, crash recovery, maximum batch sizes, and partial-failure behavior before exposing bulk create/update/delete. Deliberately still open: nothing here is a multi-record transaction.
+  The sync half of it is closed to the strongest property available without one. Sync runs still preflight their bounded stream and commit sequential single-record mutations, so a durable application failure still commits a prefix — but it can no longer do so silently. A run ledger and the run's exact validated stream become durable under `.cr/sync/runs/` before the first mutation and are removed only once the checkpoint agrees with the committed work, so an interrupted run is a fact on disk rather than an inference. `cr sync run` refuses to start over one, and `cr sync recover <name>` completes it by replaying the recorded stream forward — sound because the protocol stream is idempotent by construction — under the interrupted run's own ID; `--check` reports it while reading committed progress back out of the audit chain rather than keeping a second copy. Rollback is not attempted and is not wanted: the journal is append-only, and appending inverse mutations would trade a true history for a longer one that gains nothing over finishing the run. Per-record checkpoint advancement is impossible by protocol, because the adapter emits one opaque cursor at the end.
+  What remains for this entry: genuine all-or-nothing application across several records, which needs a staging-and-publish design for record files plus an audit protocol that can commit a group of events as one unit; bulk create/update/delete over HTTP and the CLI built on that; and per-record approval mapping so `--approved-changes` can cover a multi-record `save`. Recovery of a run whose original failure persists remains a truthful stuck state that needs a person, and a replay can re-drive an adapter's remote side effects, which is the neighbouring "remote-effect idempotency" entry.
 
 - [ ] **P1 — Define sync ownership, pruning, and remote-effect idempotency.**
   Version 1 only deletes records when an adapter emits an explicit target. Add optional source ownership metadata and safe prune previews without treating absence from a partial page as deletion. Define retry/idempotency guidance or primitives for adapters that also perform irreversible remote effects.
@@ -233,6 +235,7 @@ Priorities:
 
 - [ ] **P2 — Repair and recovery tooling.**
   Add read-only diagnosis and explicit repair flows for interrupted operations, corrupted active segments, and record/audit divergence. Never silently rewrite evidence.
+  `cr sync recover --check` and `cr sync recover` are the first pair of this shape, scoped to one interrupted sync run. Generalizing means surfacing an interrupted run in whatever whole-database diagnosis command lands, so an operator who does not already suspect a wedged sync still finds it, and doing the same for the other interrupted operations listed above.
 
 - [ ] **P2 — Operating-system audit integration guidance.**
   Document and optionally integrate controls for deployments that must observe every write attempt rather than only accepted net file state.
