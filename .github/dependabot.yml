@@ -1,0 +1,39 @@
+version: 2
+
+updates:
+  # Keep the Rust dependency graph current. Grouped so a quiet week produces one
+  # PR rather than a dozen, which keeps `cargo audit` and review load manageable.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Workflow actions are pinned to commit SHAs, which means they never pick up
+  # upstream fixes on their own. Dependabot understands the `# vX.Y.Z` trailer
+  # and bumps both the SHA and the comment, so this is what keeps the pins from
+  # silently rotting.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

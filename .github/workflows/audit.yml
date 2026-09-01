@@ -1,0 +1,57 @@
+name: Security audit
+
+# Dependency advisories are deliberately NOT part of the CI gate on every PR.
+# A new RustSec advisory can land at any time without this repository changing,
+# and that must not turn an unrelated documentation PR red. Instead this runs:
+#   - weekly, so newly published advisories surface on their own schedule;
+#   - on pushes/PRs that actually touch the dependency graph;
+#   - on demand.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/audit.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/audit.yml
+  schedule:
+    # Mondays at 06:17 UTC. Off the hour to avoid GitHub's cron stampede.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Installs a prebuilt cargo-audit binary instead of compiling it (~2 min).
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+        with:
+          tool: cargo-audit
+
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
