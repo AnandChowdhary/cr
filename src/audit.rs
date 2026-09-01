@@ -13,6 +13,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     database::{sync_parent, validate_component, write_new, write_replace},
+    error::conflict,
     frontmatter::Document,
 };
 
@@ -308,29 +309,21 @@ impl<'a> AuditLog<'a> {
         let (audited_state, chain) = self.record_state(mutation.collection, mutation.id)?;
         if mutation.action == AuditAction::Baseline {
             if audited_state.is_some() {
-                bail!(
+                return Err(conflict(format!(
                     "record {}/{} already has audit history",
-                    mutation.collection,
-                    mutation.id
-                );
+                    mutation.collection, mutation.id
+                )));
             }
             if mutation.before_bytes.is_some() || mutation.after_bytes.is_none() {
                 bail!("a baseline event must capture an existing record as new audit state");
             }
         } else {
+            let (collection, id) = (mutation.collection, mutation.id);
             match audited_state {
                 None if before_hash.is_none() => {}
                 Some(expected) if expected == before_hash => {}
-                None => bail!(
-                    "record {}/{} has no audit history; run 'cr audit baseline' before mutating it",
-                    mutation.collection,
-                    mutation.id
-                ),
-                Some(_) => bail!(
-                    "record {}/{} does not match its latest audited state; run 'cr audit verify'",
-                    mutation.collection,
-                    mutation.id
-                ),
+                None => return Err(missing_audit_history(collection, id, "mutating")),
+                Some(_) => return Err(stale_audit_state(collection, id)),
             }
         }
 
@@ -353,11 +346,10 @@ impl<'a> AuditLog<'a> {
         let before_hash = mutation.before_hash.map(str::to_owned);
         let expected_state = mutation.had_history.then_some(before_hash.clone());
         if audited_state != expected_state {
-            bail!(
+            return Err(conflict(format!(
                 "record {}/{} changed since status was calculated",
-                mutation.collection,
-                mutation.id
-            );
+                mutation.collection, mutation.id
+            )));
         }
         self.prepare_payload(PayloadMutation {
             action: mutation.action,
@@ -416,12 +408,8 @@ impl<'a> AuditLog<'a> {
         let actual = Some(record_hash(contents));
         match self.record_state(collection, id)?.0 {
             Some(expected) if expected == actual => Ok(()),
-            None => bail!(
-                "record {collection}/{id} has no audit history; run 'cr audit baseline' before using it"
-            ),
-            Some(_) => bail!(
-                "record {collection}/{id} does not match its latest audited state; run 'cr audit verify'"
-            ),
+            None => Err(missing_audit_history(collection, id, "using")),
+            Some(_) => Err(stale_audit_state(collection, id)),
         }
     }
 
@@ -486,11 +474,10 @@ impl<'a> AuditLog<'a> {
         }
         let current_hash = file_hash_optional(&self.root.join(target))?;
         if current_hash != entry.parsed.after_hash {
-            bail!(
+            return Err(conflict(format!(
                 "record {}/{} changed while it was being saved",
-                entry.parsed.record.collection,
-                entry.parsed.record.id
-            );
+                entry.parsed.record.collection, entry.parsed.record.id
+            )));
         }
         let result = AuditEntry {
             hash: entry.hash.clone(),
@@ -608,10 +595,10 @@ impl<'a> AuditLog<'a> {
 
         if let Some(expected) = expected_head {
             if state.head_hash.as_deref() != Some(expected) {
-                bail!(
+                return Err(conflict(format!(
                     "audit head does not match expected checkpoint (actual: {})",
                     state.head_hash.as_deref().unwrap_or("none")
-                );
+                )));
             }
         }
 
@@ -839,7 +826,9 @@ impl<'a> AuditLog<'a> {
                 .join(format!("{id}.md"));
             let actual_hash = file_hash_optional(&path)?;
             if &actual_hash != expected_hash {
-                bail!("record {collection}/{id} does not match its latest audited state");
+                return Err(conflict(format!(
+                    "record {collection}/{id} does not match its latest audited state"
+                )));
             }
         }
 
@@ -873,7 +862,9 @@ impl<'a> AuditLog<'a> {
                     .context("record filename is not valid UTF-8")?
                     .to_owned();
                 if !latest.contains_key(&(collection_name.clone(), id.clone())) {
-                    bail!("record {collection_name}/{id} has no audit history");
+                    return Err(conflict(format!(
+                        "record {collection_name}/{id} has no audit history"
+                    )));
                 }
             }
         }
@@ -1029,6 +1020,20 @@ fn segment_start(path: &Path) -> Result<u64> {
         bail!("invalid audit segment filename {}", path.display());
     }
     stem.parse().context("invalid audit segment sequence")
+}
+
+/// A record that has never been audited cannot take part in `action`.
+fn missing_audit_history(collection: &str, id: &str, action: &str) -> anyhow::Error {
+    conflict(format!(
+        "record {collection}/{id} has no audit history; run 'cr audit baseline' before {action} it"
+    ))
+}
+
+/// The stored record no longer matches the state the audit log recorded.
+fn stale_audit_state(collection: &str, id: &str) -> anyhow::Error {
+    conflict(format!(
+        "record {collection}/{id} does not match its latest audited state; run 'cr audit verify'"
+    ))
 }
 
 fn validate_relative_target(path: &Path) -> Result<()> {

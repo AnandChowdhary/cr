@@ -1,5 +1,6 @@
 mod audit;
 mod database;
+mod error;
 mod frontmatter;
 mod search;
 pub mod server;
@@ -12,6 +13,7 @@ pub use database::{
     sort_records_by_field, CollectionModel, Database, Record, SortDirection, WorkingChange,
     WorkingChangeKind,
 };
+pub use error::DomainError;
 pub use search::{SearchQuery, SearchTarget};
 pub use sync::{SyncDefinition, SyncRunSummary};
 pub use value::{compare_yaml_values, Assignment, FilterExpression, FilterOperator};

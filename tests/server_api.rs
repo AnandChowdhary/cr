@@ -726,3 +726,221 @@ fn assert_local_schema_references_resolve(root: &Value, value: &Value) {
         _ => {}
     }
 }
+
+/// One request that must produce one public status and error code: a label for
+/// assertion messages, the expected status and code, then the method, URI,
+/// body, and headers that produce it.
+type ErrorCase = (
+    &'static str,
+    StatusCode,
+    &'static str,
+    Method,
+    String,
+    Option<String>,
+    Vec<(&'static str, &'static str)>,
+);
+
+/// Every public error code the JSON API can return, with the status it must
+/// carry and a request that produces it.
+#[tokio::test]
+async fn every_public_error_mapping_is_typed_redacted_and_correlated() {
+    let (_temporary, database) = test_database("server-errors");
+    let root = database.root().display().to_string();
+    database.create("deals", "alpha", &[], "Alpha\n").unwrap();
+    // A directory where a record file belongs is an internal fault, not
+    // something a caller can correct.
+    fs::create_dir(database.root().join("records/deals/broken.md")).unwrap();
+    // Editing a record outside the audited path makes the next mutation stale.
+    database.create("deals", "stale", &[], "Stale\n").unwrap();
+    fs::write(
+        database.root().join("records/deals/stale.md"),
+        "---\nstatus: edited\n---\n",
+    )
+    .unwrap();
+
+    let app = router(
+        database,
+        ServerConfig {
+            api_token: Some("secret".into()),
+            max_body_bytes: 256,
+            ..ServerConfig::default()
+        },
+    )
+    .unwrap();
+    let authorization = ("authorization", "Bearer secret");
+
+    let cases: Vec<ErrorCase> = vec![
+        (
+            "unauthorized",
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            Method::GET,
+            "/api/v1/collections".to_owned(),
+            None,
+            vec![],
+        ),
+        (
+            "route_not_found",
+            StatusCode::NOT_FOUND,
+            "route_not_found",
+            Method::GET,
+            "/api/v1/nowhere".to_owned(),
+            None,
+            vec![authorization],
+        ),
+        (
+            "method_not_allowed",
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            Method::DELETE,
+            "/api/v1/collections".to_owned(),
+            None,
+            vec![authorization],
+        ),
+        (
+            "missing record",
+            StatusCode::NOT_FOUND,
+            "not_found",
+            Method::GET,
+            "/api/v1/collections/deals/records/nope".to_owned(),
+            None,
+            vec![authorization],
+        ),
+        (
+            "missing field",
+            StatusCode::NOT_FOUND,
+            "not_found",
+            Method::GET,
+            "/api/v1/collections/deals/records/alpha/fields/nope".to_owned(),
+            None,
+            vec![authorization],
+        ),
+        (
+            "duplicate record",
+            StatusCode::CONFLICT,
+            "already_exists",
+            Method::POST,
+            "/api/v1/collections/deals/records".to_owned(),
+            Some(json!({ "id": "alpha" }).to_string()),
+            vec![authorization],
+        ),
+        (
+            "record edited outside the audit log",
+            StatusCode::CONFLICT,
+            "conflict",
+            Method::PATCH,
+            "/api/v1/collections/deals/records/stale".to_owned(),
+            Some(json!({ "front_matter": { "status": "won" } }).to_string()),
+            vec![authorization],
+        ),
+        (
+            "invalid expression",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_failed",
+            Method::GET,
+            "/api/v1/collections/deals/records?where_expr=score".to_owned(),
+            None,
+            vec![authorization],
+        ),
+        (
+            "malformed JSON body",
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+            Method::POST,
+            "/api/v1/collections/deals/records".to_owned(),
+            Some("{".to_owned()),
+            vec![authorization],
+        ),
+        (
+            "malformed query string",
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            Method::GET,
+            "/api/v1/collections/deals/records?limit=many".to_owned(),
+            None,
+            vec![authorization],
+        ),
+        (
+            "non-UTF-8 actor",
+            StatusCode::BAD_REQUEST,
+            "invalid_actor",
+            Method::GET,
+            "/api/v1/identity".to_owned(),
+            None,
+            vec![authorization, ("x-cr-actor", "caf\u{e9}")],
+        ),
+        (
+            "oversized body",
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            Method::POST,
+            "/api/v1/collections/deals/records".to_owned(),
+            Some(json!({ "id": "big", "markdown": "x".repeat(512) }).to_string()),
+            vec![authorization],
+        ),
+        (
+            "record file replaced by a directory",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            Method::GET,
+            "/api/v1/collections/deals/records/broken".to_owned(),
+            None,
+            vec![authorization],
+        ),
+    ];
+
+    for (label, status, code, method, uri, body, headers) in cases {
+        let response = request(&app, method, &uri, body.as_deref(), &headers).await;
+        assert_eq!(response.status, status, "{label}: {}", response.text());
+        let payload = response.json();
+        assert_eq!(payload["error"]["code"], code, "{label}");
+
+        let message = payload["error"]["message"].as_str().unwrap();
+        assert!(!message.is_empty(), "{label} has no message");
+        assert!(!message.contains(&root), "{label} leaked the database root");
+        assert!(!message.contains("os error"), "{label} leaked an OS error");
+        assert!(
+            !response.text().contains(&root),
+            "{label} leaked the database root"
+        );
+
+        let request_id = payload["error"]["request_id"].as_str().unwrap();
+        assert!(!request_id.is_empty(), "{label} has no request ID");
+        assert_eq!(
+            response.headers.get("x-request-id").unwrap(),
+            request_id,
+            "{label} header and body request IDs differ"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unexpected_failures_reveal_only_a_generic_message_and_a_request_id() {
+    let (_temporary, database) = test_database("server-internal");
+    let root = database.root().display().to_string();
+    fs::create_dir(database.root().join("records")).ok();
+    fs::create_dir_all(database.root().join("records/deals/broken.md")).unwrap();
+    let app = router(database, ServerConfig::default()).unwrap();
+
+    let response = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/records/broken",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let payload = response.json();
+    assert_eq!(payload["error"]["code"], "internal_error");
+    let message = payload["error"]["message"].as_str().unwrap();
+    assert!(message.contains("request ID"), "{message}");
+    assert!(!message.contains(&root));
+    assert!(!message.contains("must be a regular file"));
+    assert!(!payload["error"]["request_id"].as_str().unwrap().is_empty());
+
+    // Successful responses carry the same correlation ID for access logs.
+    let health = request(&app, Method::GET, "/health", None, &[]).await;
+    assert_eq!(health.status, StatusCode::OK);
+    assert!(health.headers.contains_key("x-request-id"));
+}

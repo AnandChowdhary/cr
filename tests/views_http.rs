@@ -1369,3 +1369,57 @@ async fn view_routes_respect_api_authentication_and_return_html_errors() {
         .text()
         .contains("one matching filter_operator"));
 }
+
+/// Server-rendered error pages are redacted exactly like the JSON API, and
+/// carry the same request ID so a reader can quote it.
+#[tokio::test]
+async fn html_error_pages_are_redacted_and_carry_a_request_id() {
+    let (_temporary, database) = test_database("views-errors");
+    let root = database.root().display().to_string();
+    database.create("deals", "alpha", &[], "Alpha\n").unwrap();
+    fs::create_dir(database.root().join("records/deals/broken.md")).unwrap();
+    let app = router(database, ServerConfig::default()).unwrap();
+
+    let cases = [
+        (
+            "/missing-view",
+            StatusCode::NOT_FOUND,
+            "view 'missing-view'",
+        ),
+        (
+            "/deals/records/nope",
+            StatusCode::NOT_FOUND,
+            "record deals/nope does not exist",
+        ),
+        (
+            "/deals/records/broken",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quote the request ID",
+        ),
+    ];
+
+    for (uri, status, expected) in cases {
+        let response = request(&app, Method::GET, uri, None, &[]).await;
+        assert_eq!(response.status, status, "{uri}");
+        let text = response.text();
+        assert!(text.contains("Request could not be completed"), "{uri}");
+        assert!(text.contains(expected), "{uri}: {text}");
+        assert!(!text.contains(&root), "{uri} leaked the database root");
+        assert!(!text.contains("os error"), "{uri} leaked an OS error");
+        assert!(
+            !text.contains("must be a regular file"),
+            "{uri} leaked internal context"
+        );
+
+        let request_id = response
+            .headers
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            text.contains(&format!("Request ID {request_id}")),
+            "{uri} did not show its request ID"
+        );
+    }
+}

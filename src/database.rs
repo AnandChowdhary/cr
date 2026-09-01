@@ -13,6 +13,7 @@ use yaml_serde::{Mapping, Value};
 
 use crate::{
     audit::{record_hash, AuditLog, AuditMutation, ReconciledMutation},
+    error::{conflict, invalid, is_already_exists, is_missing, DomainError},
     frontmatter::Document,
     value::{compare_yaml_values, get_path, parse_path, remove_path},
     Assignment, AuditAction, AuditEntry, AuditHead, AuditSource, AuditVerification, SearchQuery,
@@ -143,7 +144,7 @@ pub fn sort_records_by_field(
 ) -> Result<()> {
     let field = field.trim();
     if field.is_empty() {
-        bail!("sort field cannot be empty");
+        return Err(invalid("sort field cannot be empty"));
     }
     if !matches!(field, "$id" | "$collection" | "$path") {
         parse_path(field)?;
@@ -294,7 +295,7 @@ impl Database {
     pub fn with_actor(mut self, actor: impl Into<String>) -> Result<Self> {
         let actor = actor.into();
         if actor.trim().is_empty() {
-            bail!("audit actor cannot be empty");
+            return Err(invalid("audit actor cannot be empty"));
         }
         self.actor = actor;
         Ok(self)
@@ -308,7 +309,7 @@ impl Database {
     pub fn with_audit_message(mut self, message: impl Into<String>) -> Result<Self> {
         let message = message.into();
         if message.trim().is_empty() {
-            bail!("audit message cannot be empty");
+            return Err(invalid("audit message cannot be empty"));
         }
         self.audit_message = Some(message);
         Ok(self)
@@ -338,7 +339,7 @@ impl Database {
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         if path.exists() {
-            bail!("record {collection}/{id} already exists");
+            return Err(DomainError::record_exists(collection, id).into());
         }
         let document = Document {
             attributes,
@@ -357,13 +358,21 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
         })?;
-        audit.commit(event, &path, || write_new(&path, rendered.as_bytes()))?;
+        audit.commit(event, &path, || {
+            write_new(&path, rendered.as_bytes()).map_err(|error| {
+                if is_already_exists(&error) {
+                    error.context(DomainError::record_exists(collection, id))
+                } else {
+                    error
+                }
+            })
+        })?;
         self.record_from_document(collection, id, path, document)
     }
 
     pub fn get(&self, collection: &str, id: &str) -> Result<Record> {
         let path = self.record_path(collection, id)?;
-        let document = self.read_document(&path)?;
+        let document = self.read_document(collection, id, &path)?;
         self.record_from_document(collection, id, path, document)
     }
 
@@ -380,7 +389,7 @@ impl Database {
 
     pub fn read_raw(&self, collection: &str, id: &str) -> Result<String> {
         let path = self.record_path(collection, id)?;
-        read_regular_string(&path)
+        read_record(collection, id, &path)
     }
 
     pub fn list(&self, collection: &str, filters: &[Assignment]) -> Result<Vec<Record>> {
@@ -429,7 +438,7 @@ impl Database {
             })
             .map(|result: Result<(String, PathBuf)>| {
                 let (id, path) = result?;
-                let document = self.read_document(&path)?;
+                let document = self.read_document(collection, &id, &path)?;
                 self.record_from_document(collection, &id, path, document)
             })
             .filter(|record| {
@@ -507,10 +516,17 @@ impl Database {
             validate_component(&name, "collection")?;
             let serialized = fs::read_to_string(entry.path())
                 .with_context(|| format!("could not read schema for collection '{name}'"))?;
-            let schema: serde_json::Value = serde_json::from_str(&serialized)
-                .with_context(|| format!("schema for collection '{name}' is not valid JSON"))?;
-            jsonschema::meta::validate(&schema)
-                .map_err(|error| anyhow!("invalid JSON Schema for collection '{name}': {error}"))?;
+            let schema: serde_json::Value =
+                serde_json::from_str(&serialized).with_context(|| {
+                    DomainError::Invalid(format!(
+                        "schema for collection '{name}' is not valid JSON"
+                    ))
+                })?;
+            jsonschema::meta::validate(&schema).map_err(|error| {
+                anyhow!("{error}").context(DomainError::Invalid(format!(
+                    "invalid JSON Schema for collection '{name}'"
+                )))
+            })?;
             models.insert(name, Some(schema));
         }
 
@@ -550,7 +566,7 @@ impl Database {
         body: Option<&str>,
     ) -> Result<Record> {
         if attributes.is_empty() && remove.is_empty() && body.is_none() {
-            bail!("patch must change front matter or Markdown");
+            return Err(invalid("patch must change front matter or Markdown"));
         }
         let remove = remove
             .iter()
@@ -560,7 +576,7 @@ impl Database {
             merge_mapping(&mut document.attributes, attributes);
             for (raw, path) in &remove {
                 if !remove_path(&mut document.attributes, path) {
-                    bail!("field '{raw}' does not exist");
+                    return Err(invalid(format!("field '{raw}' does not exist")));
                 }
             }
             if let Some(body) = body {
@@ -598,9 +614,8 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        let before_raw = read_regular_string(&path)?;
-        let before = Document::parse(&before_raw)
-            .with_context(|| format!("could not parse {}", path.display()))?;
+        let before_raw = read_record(collection, id, &path)?;
+        let before = parse_record(collection, id, &before_raw)?;
         let mut document = before.clone();
         mutate(&mut document)?;
         self.validate(collection, &document.attributes)?;
@@ -633,18 +648,17 @@ impl Database {
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         let target_path = self.record_path(target_collection, target_id)?;
-        let target_raw = read_regular_string(&target_path).with_context(|| {
-            format!("relation target {target_collection}/{target_id} does not exist")
+        let target_raw = read_regular_string(&target_path).map_err(|error| {
+            error.context(DomainError::NotFound(format!(
+                "relation target {target_collection}/{target_id} does not exist"
+            )))
         })?;
-        Document::parse(&target_raw).with_context(|| {
-            format!("could not parse relation target {}", target_path.display())
-        })?;
+        parse_record(target_collection, target_id, &target_raw)?;
         audit.assert_current(target_collection, target_id, target_raw.as_bytes())?;
 
         let path = self.record_path(collection, id)?;
-        let before_raw = read_regular_string(&path)?;
-        let before = Document::parse(&before_raw)
-            .with_context(|| format!("could not parse {}", path.display()))?;
+        let before_raw = read_record(collection, id, &path)?;
+        let before = parse_record(collection, id, &before_raw)?;
         let mut document = before.clone();
         let relations = mapping_field(&mut document.attributes, "relations")?;
         let targets = sequence_field(relations, relation)?;
@@ -676,9 +690,8 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        let before_raw = read_regular_string(&path)?;
-        let document = Document::parse(&before_raw)
-            .with_context(|| format!("could not parse {}", path.display()))?;
+        let before_raw = read_record(collection, id, &path)?;
+        let document = parse_record(collection, id, &before_raw)?;
         let event = audit.prepare(AuditMutation {
             action: AuditAction::Delete,
             collection,
@@ -713,13 +726,13 @@ impl Database {
         message: Option<&str>,
     ) -> Result<Vec<AuditEntry>> {
         if all && !references.is_empty() {
-            bail!("--all cannot be combined with record references");
+            return Err(invalid("--all cannot be combined with record references"));
         }
         if !all && references.is_empty() {
-            bail!("provide at least one COLLECTION/ID or use --all");
+            return Err(invalid("provide at least one COLLECTION/ID or use --all"));
         }
         if message.is_some_and(|value| value.trim().is_empty()) {
-            bail!("save message cannot be empty");
+            return Err(invalid("save message cannot be empty"));
         }
 
         let selected = references
@@ -739,11 +752,10 @@ impl Database {
         if !all {
             for reference in &selected {
                 if !available.contains_key(reference) {
-                    bail!(
+                    return Err(conflict(format!(
                         "record {}/{} has no unsaved changes",
-                        reference.0,
-                        reference.1
-                    );
+                        reference.0, reference.1
+                    )));
                 }
             }
         }
@@ -765,14 +777,13 @@ impl Database {
             let after_raw = match change.status {
                 WorkingChangeKind::Deleted => None,
                 WorkingChangeKind::Added | WorkingChangeKind::Modified => {
-                    Some(read_regular_string(&path)?)
+                    Some(read_record(&change.collection, &change.id, &path)?)
                 }
             };
             let after = after_raw
                 .as_deref()
-                .map(Document::parse)
-                .transpose()
-                .with_context(|| format!("could not parse {}", path.display()))?;
+                .map(|raw| parse_record(&change.collection, &change.id, raw))
+                .transpose()?;
             if let Some(document) = &after {
                 self.validate(&change.collection, &document.attributes)?;
             }
@@ -809,7 +820,7 @@ impl Database {
         id: Option<&str>,
     ) -> Result<Vec<AuditEntry>> {
         if id.is_some() && collection.is_none() {
-            bail!("an audit record ID requires a collection");
+            return Err(invalid("an audit record ID requires a collection"));
         }
         if let Some(collection) = collection {
             validate_component(collection, "collection")?;
@@ -847,9 +858,8 @@ impl Database {
             if audit.has_history(&collection, &id)? {
                 continue;
             }
-            let raw = read_regular_string(&path)?;
-            let document = Document::parse(&raw)
-                .with_context(|| format!("could not parse {}", path.display()))?;
+            let raw = read_record(&collection, &id, &path)?;
+            let document = parse_record(&collection, &id, &raw)?;
             let event = audit.prepare(AuditMutation {
                 action: AuditAction::Baseline,
                 collection: &collection,
@@ -934,9 +944,9 @@ impl Database {
             .join(format!("{id}.md")))
     }
 
-    fn read_document(&self, path: &Path) -> Result<Document> {
-        let input = read_regular_string(path)?;
-        Document::parse(&input).with_context(|| format!("could not parse {}", path.display()))
+    fn read_document(&self, collection: &str, id: &str, path: &Path) -> Result<Document> {
+        let input = read_record(collection, id, path)?;
+        parse_record(collection, id, &input)
     }
 
     fn record_from_document(
@@ -968,18 +978,27 @@ impl Database {
             return Ok(());
         }
 
+        let unusable = || {
+            DomainError::Invalid(format!(
+                "collection '{collection}' has an unusable JSON Schema"
+            ))
+        };
         let serialized = fs::read_to_string(&schema_path)
             .with_context(|| format!("could not read schema {}", schema_path.display()))?;
         let schema: serde_json::Value = serde_json::from_str(&serialized)
-            .with_context(|| format!("{} is not valid JSON", schema_path.display()))?;
+            .with_context(|| format!("{} is not valid JSON", schema_path.display()))
+            .with_context(unusable)?;
         jsonschema::meta::validate(&schema)
-            .map_err(|error| anyhow!("invalid JSON Schema {}: {error}", schema_path.display()))?;
-        let validator = jsonschema::validator_for(&schema).map_err(|error| {
-            anyhow!(
-                "could not compile schema {}: {error}",
-                schema_path.display()
-            )
-        })?;
+            .map_err(|error| anyhow!("invalid JSON Schema {}: {error}", schema_path.display()))
+            .with_context(unusable)?;
+        let validator = jsonschema::validator_for(&schema)
+            .map_err(|error| {
+                anyhow!(
+                    "could not compile schema {}: {error}",
+                    schema_path.display()
+                )
+            })
+            .with_context(unusable)?;
         let instance = serde_json::to_value(attributes)
             .context("front matter cannot be represented as JSON for schema validation")?;
         let errors: Vec<_> = validator
@@ -988,10 +1007,10 @@ impl Database {
             .collect();
 
         if !errors.is_empty() {
-            bail!(
+            return Err(invalid(format!(
                 "record does not match schema for collection '{collection}':\n{}",
                 errors.join("\n")
-            );
+            )));
         }
 
         Ok(())
@@ -1133,11 +1152,15 @@ fn git_identity(root: &Path) -> Option<String> {
 }
 
 fn parse_reference(reference: &str) -> Result<(String, String)> {
-    let (collection, id) = reference
-        .split_once('/')
-        .with_context(|| format!("record reference '{reference}' must be COLLECTION/ID"))?;
+    let (collection, id) = reference.split_once('/').with_context(|| {
+        DomainError::Invalid(format!(
+            "record reference '{reference}' must be COLLECTION/ID"
+        ))
+    })?;
     if id.contains('/') {
-        bail!("record reference '{reference}' must contain exactly one '/'");
+        return Err(invalid(format!(
+            "record reference '{reference}' must contain exactly one '/'"
+        )));
     }
     validate_component(collection, "collection")?;
     validate_component(id, "id")?;
@@ -1169,7 +1192,9 @@ fn mapping_field<'a>(attributes: &'a mut Mapping, field: &str) -> Result<&'a mut
     }
     match attributes.get_mut(&key) {
         Some(Value::Mapping(mapping)) => Ok(mapping),
-        _ => bail!("field '{field}' must be an object to store relations"),
+        _ => Err(invalid(format!(
+            "field '{field}' must be an object to store relations"
+        ))),
     }
 }
 
@@ -1180,7 +1205,7 @@ fn sequence_field<'a>(mapping: &'a mut Mapping, field: &str) -> Result<&'a mut V
     }
     match mapping.get_mut(&key) {
         Some(Value::Sequence(sequence)) => Ok(sequence),
-        _ => bail!("relation '{field}' must be a list"),
+        _ => Err(invalid(format!("relation '{field}' must be a list"))),
     }
 }
 
@@ -1205,12 +1230,34 @@ fn read_regular_string(path: &Path) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("could not read record {}", path.display()))
 }
 
+/// Read a record's exact bytes, classifying a missing file as a typed
+/// not-found failure so callers never inspect the operating-system message.
+fn read_record(collection: &str, id: &str, path: &Path) -> Result<String> {
+    read_regular_string(path).map_err(|error| {
+        if is_missing(&error) {
+            error.context(DomainError::record_not_found(collection, id))
+        } else {
+            error
+        }
+    })
+}
+
+/// Parse a stored record, naming it by collection and ID rather than by path.
+fn parse_record(collection: &str, id: &str, raw: &str) -> Result<Document> {
+    Document::parse(raw)
+        .with_context(|| DomainError::Invalid(format!("could not parse record {collection}/{id}")))
+}
+
 pub(crate) fn validate_component(value: &str, label: &str) -> Result<()> {
     if value.is_empty() || value == "." || value == ".." {
-        bail!("{label} must be a non-empty path component");
+        return Err(invalid(format!(
+            "{label} must be a non-empty path component"
+        )));
     }
     if value.contains('/') || value.contains('\\') || value.contains('\0') {
-        bail!("{label} '{value}' cannot contain path separators");
+        return Err(invalid(format!(
+            "{label} '{value}' cannot contain path separators"
+        )));
     }
     Ok(())
 }
@@ -1242,9 +1289,9 @@ pub(crate) fn write_new(path: &Path, contents: &[u8]) -> Result<()> {
         .as_file()
         .sync_all()
         .with_context(|| format!("could not sync temporary file for {}", path.display()))?;
-    temporary
-        .persist_noclobber(path)
-        .map_err(|error| anyhow!("could not create {}: {}", path.display(), error.error))?;
+    temporary.persist_noclobber(path).map_err(|error| {
+        anyhow!(error.error).context(format!("could not create {}", path.display()))
+    })?;
     sync_parent(parent)?;
     Ok(())
 }
@@ -1269,9 +1316,9 @@ pub(crate) fn write_replace(path: &Path, contents: &[u8]) -> Result<()> {
         .as_file()
         .sync_all()
         .with_context(|| format!("could not sync temporary file for {}", path.display()))?;
-    temporary
-        .persist(path)
-        .map_err(|error| anyhow!("could not replace {}: {}", path.display(), error.error))?;
+    temporary.persist(path).map_err(|error| {
+        anyhow!(error.error).context(format!("could not replace {}", path.display()))
+    })?;
     sync_parent(parent)?;
     Ok(())
 }
