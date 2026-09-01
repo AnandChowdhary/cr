@@ -134,3 +134,52 @@ fn optional_json_schema_rejects_invalid_updates_without_changing_the_file() {
     assert!(stderr.contains("does not match schema"));
     assert_eq!(fs::read_to_string(record_path).unwrap(), before);
 }
+
+/// `jsonschema` 0.52 moved `idn-hostname` and `idn-email` behind an `idna`
+/// Cargo feature that `default-features = false` switches off, and an unknown
+/// format is *accepted*, not rejected. That failure mode is silent: the schema
+/// still compiles and every record still validates, so nothing else in this
+/// suite would notice the assertion disappearing. Draft-07 is the interesting
+/// dialect because `format` asserts there by default; under 2020-12, which every
+/// other schema in this repository declares, `format` is only an annotation.
+#[test]
+fn draft_07_schemas_still_assert_internationalized_formats() {
+    let temporary = tempfile::tempdir().unwrap();
+    let database = temporary.path().join("hosts");
+    run_success(
+        Command::new(env!("CARGO_BIN_EXE_cr"))
+            .arg("init")
+            .arg(&database),
+    );
+
+    let schema = r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["host"],
+  "properties": {
+    "host": { "type": "string", "format": "idn-hostname" }
+  }
+}"#;
+    fs::write(database.join(".cr/schemas/servers.json"), schema).unwrap();
+
+    let stderr = run_failure(command_for(&database).args([
+        "create",
+        "servers",
+        "broken",
+        "--set",
+        "host=-1bad-.example",
+    ]));
+    assert!(
+        stderr.contains("does not match schema"),
+        "an invalid internationalized hostname must be refused, got: {stderr}"
+    );
+    assert!(!database.join("records/servers/broken.md").exists());
+
+    run_success(command_for(&database).args([
+        "create",
+        "servers",
+        "good",
+        "--set",
+        "host=münchen.example",
+    ]));
+}
