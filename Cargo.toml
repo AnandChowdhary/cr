@@ -1,7 +1,10 @@
 [package]
 name = "cr"
 version = "0.1.0"
-edition = "2021"
+# Edition 2024 needs Rust 1.85, and the let-chains it enables (`src/audit.rs`,
+# `src/server.rs`, `tests/server_api.rs`) need 1.88. Both sit under the floor
+# below, so neither is what sets it.
+edition = "2024"
 # `src/audit.rs` and `src/sync.rs` use `File::lock`/`File::try_lock` (the std
 # `file_lock` feature), stabilised in Rust 1.89. Nothing in `Cargo.lock` needs a
 # newer compiler, so 1.89 is the true floor. The `msrv` job in

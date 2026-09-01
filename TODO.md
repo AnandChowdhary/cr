@@ -111,6 +111,11 @@ Priorities:
 - [ ] **P3 — Reach or remove the unreachable `invalid_location` error.**
   `see_other` and the create-record `Location` header return `400`/`invalid_location` when a header value cannot be built. Percent-encoding makes that unreachable today, so the mapping has no test. Either construct the header infallibly or find a case that exercises it.
 
+- [x] **P2 — Move the crate to edition 2024.**
+  `edition = "2024"`, with `rust-version` left at 1.89: edition 2024 needs 1.85 and the let-chains it enables need 1.88, so neither sets the floor. `cargo fix --edition` found nothing to change, and neither did any migration lint named individually (`if_let_rescope`, `tail_expr_drop_order`, `impl_trait_overcaptures`, `static_mut_refs`, `unsafe_attr_outside_unsafe`, `missing_unsafe_on_extern`, `keyword_idents_2024`, `rust_2024_prelude_collisions`, and the rest of `rust_2024_compatibility`), across lib, binary, and every integration test. The tree had nothing for them to catch: no `unsafe fn`, no `extern` block, no `static mut`, no `gen` identifier, no `macro_rules!` taking an `expr` fragment, and the one RPIT signature (`database::update_with`) already writes the `+ 'a` bound that edition 2024 would otherwise change the meaning of.
+  The two silent traps do not apply either. Every audit and sync lock is a named `File` local (`let _lock = audit.lock()?`), never a temporary in an `if let` scrutinee, so `if let` rescoping cannot shorten one; and no tail expression builds a temporary with a significant `Drop` beside such a local, so tail-expression drop order cannot reorder one.
+  What the migration did cost is real but mechanical: rustfmt's 2024 style edition reordered imports and rewrapped call chains across 30 files, adding a trailing `;` to six `return Err(...)` match arms, and let-chain stabilisation made `clippy::collapsible_if` fire on seven nested `if let`s, which are now `&&` chains. Comparing the non-whitespace character multiset of every touched file before and after shows exactly those two changes and nothing else.
+
 ## Query and result capabilities
 
 - [x] **P1 — Comparison expressions.**

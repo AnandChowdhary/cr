@@ -2,7 +2,7 @@ mod common;
 
 use std::fs;
 
-use common::{run_failure, run_success, TestDatabase};
+use common::{TestDatabase, run_failure, run_success};
 use serde_json::Value;
 
 fn audit_json(database: &TestDatabase, arguments: &[&str]) -> Value {

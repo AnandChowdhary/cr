@@ -2,7 +2,7 @@ mod common;
 
 use std::fs;
 
-use common::{run_failure, run_success, TestDatabase};
+use common::{TestDatabase, run_failure, run_success};
 use serde_json::Value;
 
 fn json_output(database: &TestDatabase, arguments: &[&str]) -> Value {
@@ -84,10 +84,12 @@ fn cli_crud_reads_are_audit_neutral_and_mutations_form_one_history() {
         run_failure(database.command().args(["get", "candidates", "jane"]))
             .contains("could not read record")
     );
-    assert!(json_output(&database, &["list", "candidates", "--json"])
-        .as_array()
-        .unwrap()
-        .is_empty());
+    assert!(
+        json_output(&database, &["list", "candidates", "--json"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let after_delete = audit_head(&database);
     assert_eq!(after_delete["sequence"], 3);
 
@@ -99,11 +101,13 @@ fn cli_crud_reads_are_audit_neutral_and_mutations_form_one_history() {
     assert_eq!(entries[1]["actor"], "recruiter@example.com");
     assert_eq!(entries[2]["action"], "create");
     assert_eq!(entries[2]["actor"], "creator@example.com");
-    assert!(entries
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|entry| entry["source"] == "cli"));
+    assert!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["source"] == "cli")
+    );
     run_success(database.command().args(["audit", "verify"]));
 }
 
@@ -166,8 +170,10 @@ fn manual_markdown_crud_is_readable_while_dirty_and_fully_auditable_after_save()
         .len(),
         1
     );
-    assert!(run_failure(database.command().args(["audit", "verify"]))
-        .contains("does not match its latest audited state"));
+    assert!(
+        run_failure(database.command().args(["audit", "verify"]))
+            .contains("does not match its latest audited state")
+    );
     assert_eq!(audit_head(&database)["sequence"], 1);
     run_success(database.command().args([
         "--actor",
@@ -187,10 +193,12 @@ fn manual_markdown_crud_is_readable_while_dirty_and_fully_auditable_after_save()
         run_failure(database.command().args(["get", "candidates", "jane"]))
             .contains("could not read record")
     );
-    assert!(json_output(&database, &["list", "candidates", "--json"])
-        .as_array()
-        .unwrap()
-        .is_empty());
+    assert!(
+        json_output(&database, &["list", "candidates", "--json"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(audit_head(&database)["sequence"], 2);
     run_success(database.command().args([
         "--actor",
@@ -209,11 +217,13 @@ fn manual_markdown_crud_is_readable_while_dirty_and_fully_auditable_after_save()
     assert_eq!(entries[1]["message"], "Update in editor");
     assert_eq!(entries[2]["action"], "create");
     assert_eq!(entries[2]["message"], "Create in editor");
-    assert!(entries
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|entry| entry["source"] == "filesystem"));
+    assert!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["source"] == "filesystem")
+    );
 
     let head = audit_head(&database);
     run_success(database.command().args([

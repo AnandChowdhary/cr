@@ -1,16 +1,16 @@
 use std::fs;
 
 use axum::{
-    body::Body,
-    http::{header, HeaderMap, Method, Request, StatusCode},
     Router,
+    body::Body,
+    http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use cr::{
-    server::{router, ServerConfig},
     Database,
+    server::{ServerConfig, router},
 };
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -312,9 +312,11 @@ async fn rest_crud_search_relations_audit_and_pagination_share_database_semantic
         "text/markdown; charset=utf-8"
     );
     assert!(document.text().starts_with("---\n"));
-    assert!(document
-        .text()
-        .ends_with("Updated notes: follow up tomorrow."));
+    assert!(
+        document
+            .text()
+            .ends_with("Updated notes: follow up tomorrow.")
+    );
 
     let searched = request(
         &app,
@@ -461,12 +463,14 @@ async fn direct_edits_status_save_and_baseline_are_available_over_http() {
     assert_eq!(saved.json()[0]["source"], "filesystem");
     assert_eq!(saved.json()[0]["actor"], "editor@example.com");
     assert_eq!(saved.json()[0]["message"], "Reviewed direct edit");
-    assert!(request(&app, Method::GET, "/api/v1/status", None, &[])
-        .await
-        .json()["data"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+    assert!(
+        request(&app, Method::GET, "/api/v1/status", None, &[])
+            .await
+            .json()["data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 
     let (_legacy_temporary, legacy_database) = test_database("server-baseline");
     fs::create_dir_all(legacy_database.root().join("records/companies")).unwrap();
@@ -601,9 +605,11 @@ async fn openapi_authentication_and_http_errors_are_structured() {
             .contains(&json!("sync"))
     );
     assert_eq!(openapi["security"][0]["bearerAuth"], json!([]));
-    assert!(openapi["paths"]
-        .get("/api/v1/collections/{collection}/records")
-        .is_some());
+    assert!(
+        openapi["paths"]
+            .get("/api/v1/collections/{collection}/records")
+            .is_some()
+    );
     for path in ["/api/v1/collections/{collection}/records", "/api/v1/search"] {
         let parameters = openapi["paths"][path]["get"]["parameters"]
             .as_array()
@@ -706,13 +712,13 @@ async fn openapi_authentication_and_http_errors_are_structured() {
 fn assert_local_schema_references_resolve(root: &Value, value: &Value) {
     match value {
         Value::Object(object) => {
-            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
-                if let Some(component) = reference.strip_prefix("#/components/schemas/") {
-                    assert!(
-                        root["components"]["schemas"].get(component).is_some(),
-                        "unresolved OpenAPI schema reference: {reference}"
-                    );
-                }
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str)
+                && let Some(component) = reference.strip_prefix("#/components/schemas/")
+            {
+                assert!(
+                    root["components"]["schemas"].get(component).is_some(),
+                    "unresolved OpenAPI schema reference: {reference}"
+                );
             }
             for value in object.values() {
                 assert_local_schema_references_resolve(root, value);

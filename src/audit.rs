@@ -5,15 +5,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
-use serde_json::{value::RawValue, Value};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde_json::{Value, value::RawValue};
 use sha2::{Digest, Sha256};
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
-    database::{record_label, validate_component, RECORDS_LABEL},
+    database::{RECORDS_LABEL, record_label, validate_component},
     error::{approval_mismatch, conflict},
     frontmatter::Document,
     paths::{self, EntryKind},
@@ -124,7 +124,7 @@ impl<'de> Deserialize<'de> for AuditChange {
             Some(Value::String(operation)) => {
                 return Err(D::Error::custom(format!(
                     "unsupported audit change operation '{operation}'"
-                )))
+                )));
             }
             Some(_) => return Err(D::Error::custom("audit change operation must be a string")),
             None => match (fields.remove("before"), fields.remove("after")) {
@@ -138,7 +138,7 @@ impl<'de> Deserialize<'de> for AuditChange {
                 (None, None) => {
                     return Err(D::Error::custom(
                         "legacy audit change must contain before or after",
-                    ))
+                    ));
                 }
             },
         };
@@ -244,23 +244,21 @@ impl<'a> AuditFilter<'a> {
         {
             return false;
         }
-        if let Some(agent) = self.agent {
-            if !payload
+        if let Some(agent) = self.agent
+            && !payload
                 .agent
                 .as_ref()
                 .is_some_and(|value| value.declares_id(agent))
-            {
-                return false;
-            }
+        {
+            return false;
         }
-        if let Some(session) = self.session {
-            if !payload
+        if let Some(session) = self.session
+            && !payload
                 .agent
                 .as_ref()
                 .is_some_and(|value| value.declares_session(session))
-            {
-                return false;
-            }
+        {
+            return false;
         }
         true
     }
@@ -538,13 +536,12 @@ impl<'a> AuditLog<'a> {
             .authorization
             .as_ref()
             .and_then(|authorization| authorization.approved_changes.as_deref())
+            && approved != change_digest
         {
-            if approved != change_digest {
-                return Err(approval_mismatch(format!(
-                    "record {}/{} does not match the approved change set: {approved} was approved, but this change set is {change_digest}",
-                    payload.record.collection, payload.record.id
-                )));
-            }
+            return Err(approval_mismatch(format!(
+                "record {}/{} does not match the approved change set: {approved} was approved, but this change set is {change_digest}",
+                payload.record.collection, payload.record.id
+            )));
         }
         let hash = event_hash(serialized.as_bytes());
 
@@ -753,13 +750,13 @@ impl<'a> AuditLog<'a> {
     pub fn verify(&self, expected_head: Option<&str>) -> Result<AuditVerification> {
         let (latest, state) = self.states(true)?;
 
-        if let Some(expected) = expected_head {
-            if state.head_hash.as_deref() != Some(expected) {
-                return Err(conflict(format!(
-                    "audit head does not match expected checkpoint (actual: {})",
-                    state.head_hash.as_deref().unwrap_or("none")
-                )));
-            }
+        if let Some(expected) = expected_head
+            && state.head_hash.as_deref() != Some(expected)
+        {
+            return Err(conflict(format!(
+                "audit head does not match expected checkpoint (actual: {})",
+                state.head_hash.as_deref().unwrap_or("none")
+            )));
         }
 
         let latest_hashes = latest
@@ -1447,10 +1444,10 @@ fn digest(domain: &[u8], contents: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_changes, change_set_hash, diff_documents, digest, event_hash, parse_line,
-        record_hash, stored_line, AuditAction, AuditChange, AuditFilter, AuditLog, AuditMutation,
-        AuditPayload, AuditRecord, AuditSource, PendingMutation, PreparedEntry, ReconciledMutation,
-        CHANGE_SET_HASH_DOMAIN, PENDING_PATH,
+        AuditAction, AuditChange, AuditFilter, AuditLog, AuditMutation, AuditPayload, AuditRecord,
+        AuditSource, CHANGE_SET_HASH_DOMAIN, PENDING_PATH, PendingMutation, PreparedEntry,
+        ReconciledMutation, apply_changes, change_set_hash, diff_documents, digest, event_hash,
+        parse_line, record_hash, stored_line,
     };
     use crate::{
         attribution::{
@@ -1610,14 +1607,16 @@ mod tests {
             stored.entry.payload.authorization.as_ref().unwrap().mode,
             AuthorizationMode::Delegated
         );
-        assert!(stored
-            .entry
-            .payload
-            .intent
-            .as_ref()
-            .unwrap()
-            .rationale
-            .is_some());
+        assert!(
+            stored
+                .entry
+                .payload
+                .intent
+                .as_ref()
+                .unwrap()
+                .rationale
+                .is_some()
+        );
     }
 
     /// An attribution value this build does not know must survive a read and a
@@ -1697,35 +1696,45 @@ mod tests {
         let plain = serde_json::from_str::<AuditPayload>(LEGACY_PAYLOAD).unwrap();
 
         assert!(AuditFilter::all().matches(&payload));
-        assert!(AuditFilter {
-            agent: Some("claude-code"),
-            ..AuditFilter::all()
-        }
-        .matches(&payload));
-        assert!(AuditFilter {
-            agent: Some("claude-code-parent"),
-            ..AuditFilter::all()
-        }
-        .matches(&payload));
-        assert!(AuditFilter {
-            session: Some("parent-session"),
-            ..AuditFilter::all()
-        }
-        .matches(&payload));
-        assert!(!AuditFilter {
-            agent: Some("cursor-agent"),
-            ..AuditFilter::all()
-        }
-        .matches(&payload));
-        assert!(!AuditFilter {
-            agent: Some("claude-code"),
-            ..AuditFilter::all()
-        }
-        .matches(&plain));
+        assert!(
+            AuditFilter {
+                agent: Some("claude-code"),
+                ..AuditFilter::all()
+            }
+            .matches(&payload)
+        );
+        assert!(
+            AuditFilter {
+                agent: Some("claude-code-parent"),
+                ..AuditFilter::all()
+            }
+            .matches(&payload)
+        );
+        assert!(
+            AuditFilter {
+                session: Some("parent-session"),
+                ..AuditFilter::all()
+            }
+            .matches(&payload)
+        );
+        assert!(
+            !AuditFilter {
+                agent: Some("cursor-agent"),
+                ..AuditFilter::all()
+            }
+            .matches(&payload)
+        );
+        assert!(
+            !AuditFilter {
+                agent: Some("claude-code"),
+                ..AuditFilter::all()
+            }
+            .matches(&plain)
+        );
         assert!(AuditFilter::record("deals", "acme-renewal").matches(&payload));
         assert!(!AuditFilter::record("people", "ada").matches(&payload));
     }
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
     use yaml_serde::Mapping;
 
@@ -1945,9 +1954,11 @@ mod tests {
             .unwrap();
         std::fs::write(root.path().join(target), "---\n---\nChanged again\n").unwrap();
         let error = audit.accept(event, target).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("changed while it was being saved"));
+        assert!(
+            error
+                .to_string()
+                .contains("changed while it was being saved")
+        );
         assert_eq!(audit.head().unwrap().sequence, 1);
     }
 

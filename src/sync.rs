@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 #[cfg(unix)]
@@ -17,10 +17,10 @@ use tempfile::NamedTempFile;
 use yaml_serde::Mapping;
 
 use crate::{
+    AuditSource, Database,
     database::validate_component,
     error::is_missing,
     paths::{self, EntryKind},
-    AuditSource, Database,
 };
 
 /// Where sync definitions, checkpoints, and locks live beneath the root.
@@ -625,19 +625,23 @@ mod tests {
             "{\"type\":\"delete\",\"collection\":\"notes\",\"id\":\"one\"}\n",
             "{\"type\":\"delete\",\"collection\":\"notes\",\"id\":\"one\"}\n"
         );
-        assert!(parse_messages("test", duplicate, 10)
-            .unwrap_err()
-            .to_string()
-            .contains("multiple operations"));
+        assert!(
+            parse_messages("test", duplicate, 10)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple operations")
+        );
 
         let after_checkpoint = concat!(
             "{\"type\":\"checkpoint\",\"state\":{\"cursor\":1}}\n",
             "{\"type\":\"delete\",\"collection\":\"notes\",\"id\":\"one\"}\n"
         );
-        assert!(parse_messages("test", after_checkpoint, 10)
-            .unwrap_err()
-            .to_string()
-            .contains("final message"));
+        assert!(
+            parse_messages("test", after_checkpoint, 10)
+                .unwrap_err()
+                .to_string()
+                .contains("final message")
+        );
     }
 
     #[test]

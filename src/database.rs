@@ -5,20 +5,20 @@ use std::{
     process::Command,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use yaml_serde::{Mapping, Value};
 
 use crate::{
+    Assignment, AuditAction, AuditEntry, AuditHead, AuditSource, AuditVerification, SearchQuery,
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
-    audit::{record_hash, AuditFilter, AuditLog, AuditMutation, ChangePreview, ReconciledMutation},
-    error::{conflict, invalid, is_already_exists, is_missing, DomainError},
+    audit::{AuditFilter, AuditLog, AuditMutation, ChangePreview, ReconciledMutation, record_hash},
+    error::{DomainError, conflict, invalid, is_already_exists, is_missing},
     frontmatter::Document,
     paths,
     sync::{SYNC_DEFINITION_DIRECTORY, SYNC_LOCK_DIRECTORY, SYNC_STATE_DIRECTORY},
     value::{compare_yaml_values, get_path, parse_path, remove_path},
     views::VIEW_DIRECTORY,
-    Assignment, AuditAction, AuditEntry, AuditHead, AuditSource, AuditVerification, SearchQuery,
 };
 
 const CONFIG_PATH: &str = ".cr/config.yaml";

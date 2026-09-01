@@ -1,13 +1,13 @@
 use std::{fs, str::FromStr};
 
 use axum::{
-    body::Body,
-    http::{header, HeaderMap, Method, Request, StatusCode},
     Router,
+    body::Body,
+    http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use cr::{
-    server::{router, ServerConfig},
     Assignment, AuditAction, AuditFilter, AuditSource, Database, ViewLayout, ViewPredicateMatch,
+    server::{ServerConfig, router},
 };
 use http_body_util::BodyExt;
 use tempfile::TempDir;
@@ -133,18 +133,22 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
 
     let automatic = request(&app, Method::GET, "/deals", None, &[]).await;
     assert_eq!(automatic.status, StatusCode::OK);
-    assert!(automatic
-        .text()
-        .contains("https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"));
+    assert!(
+        automatic
+            .text()
+            .contains("https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4")
+    );
     assert!(automatic.text().contains("alpha"));
     assert!(automatic.text().contains("beta"));
     assert!(automatic.text().contains("href=\"/deals/records/alpha\""));
     assert!(automatic.text().contains("data-filter-builder=\"true\""));
     assert!(automatic.text().contains("data-view-search=\"true\""));
     assert!(automatic.text().contains("aria-label=\"Submit search\""));
-    assert!(automatic
-        .text()
-        .contains("data-filter-disclosure=\"true\" data-active-filters=\"0\""));
+    assert!(
+        automatic
+            .text()
+            .contains("data-filter-disclosure=\"true\" data-active-filters=\"0\"")
+    );
     assert!(automatic.text().contains("data-filter-panel=\"true\""));
     let search_position = automatic.text().find("data-view-search=\"true\"").unwrap();
     let filter_position = automatic
@@ -161,21 +165,29 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(automatic.text().contains("aria-label=\"Sort by\""));
     assert!(automatic.text().contains("aria-label=\"Sort direction\""));
     assert!(automatic.text().contains("aria-label=\"Visible columns\""));
-    assert!(automatic
-        .text()
-        .contains("name=\"columns\" value=\"custom\""));
-    assert!(automatic
-        .text()
-        .contains("name=\"column\" value=\"name\" checked"));
+    assert!(
+        automatic
+            .text()
+            .contains("name=\"columns\" value=\"custom\"")
+    );
+    assert!(
+        automatic
+            .text()
+            .contains("name=\"column\" value=\"name\" checked")
+    );
     assert!(automatic.text().contains("Missing values stay last"));
     assert!(automatic.text().contains("Sort by Value ascending"));
     assert!(automatic.text().contains("md:grid-cols-2 xl:grid-cols-12"));
-    assert!(automatic
-        .text()
-        .contains("md:col-span-2 xl:col-span-1 xl:justify-self-end"));
-    assert!(automatic
-        .text()
-        .contains("&lt;script&gt;alert('x')&lt;/script&gt;"));
+    assert!(
+        automatic
+            .text()
+            .contains("md:col-span-2 xl:col-span-1 xl:justify-self-end")
+    );
+    assert!(
+        automatic
+            .text()
+            .contains("&lt;script&gt;alert('x')&lt;/script&gt;")
+    );
     assert!(!automatic.text().contains("<script>alert('x')</script>"));
     assert!(!automatic.text().to_lowercase().contains("react"));
     assert_eq!(automatic.headers[header::CACHE_CONTROL], "no-store");
@@ -269,9 +281,11 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     let browser_pipeline_page = request(&app, Method::GET, "/browser-pipeline", None, &[]).await;
     assert_eq!(browser_pipeline_page.status, StatusCode::OK);
     assert!(browser_pipeline_page.text().contains("Kanban grouped by"));
-    assert!(browser_pipeline_page
-        .text()
-        .contains("data-kanban-board=\"true\""));
+    assert!(
+        browser_pipeline_page
+            .text()
+            .contains("data-kanban-board=\"true\"")
+    );
 
     let missing_group = request(
         &app,
@@ -288,9 +302,11 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     )
     .await;
     assert_eq!(missing_group.status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(missing_group
-        .text()
-        .contains("Kanban layout must provide group_by"));
+    assert!(
+        missing_group
+            .text()
+            .contains("Kanban layout must provide group_by")
+    );
 
     let preset_page = request(&app, Method::GET, "/sales-focus", None, &[]).await;
     assert_eq!(preset_page.status, StatusCode::OK);
@@ -382,9 +398,11 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     .await;
     assert!(sorted_page.text().contains("/deals/records/beta"));
     assert!(!sorted_page.text().contains("/deals/records/alpha"));
-    assert!(sorted_page
-        .text()
-        .contains("sort_field=value&amp;sort_direction=asc&amp;limit=1&amp;offset=1"));
+    assert!(
+        sorted_page
+            .text()
+            .contains("sort_field=value&amp;sort_direction=asc&amp;limit=1&amp;offset=1")
+    );
 
     let invalid_sort = request(
         &app,
@@ -413,15 +431,19 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(projected.text().contains(
         "sort_field=name&amp;sort_direction=asc&amp;columns=custom&amp;column=name&amp;column=value"
     ));
-    assert!(projected
-        .text()
-        .contains("columns=custom&amp;column=name&amp;column=value&amp;limit=1&amp;offset=1"));
+    assert!(
+        projected
+            .text()
+            .contains("columns=custom&amp;column=name&amp;column=value&amp;limit=1&amp;offset=1")
+    );
 
     let empty_projection = request(&app, Method::GET, "/deals?columns=custom", None, &[]).await;
     assert_eq!(empty_projection.status, StatusCode::BAD_REQUEST);
-    assert!(empty_projection
-        .text()
-        .contains("select at least one visible column"));
+    assert!(
+        empty_projection
+            .text()
+            .contains("select at least one visible column")
+    );
 
     let unknown_projection = request(
         &app,
@@ -432,9 +454,11 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     )
     .await;
     assert_eq!(unknown_projection.status, StatusCode::BAD_REQUEST);
-    assert!(unknown_projection
-        .text()
-        .contains("column 'unknown' is not available"));
+    assert!(
+        unknown_projection
+            .text()
+            .contains("column 'unknown' is not available")
+    );
 
     let duplicate_projection = request(
         &app,
@@ -445,9 +469,11 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     )
     .await;
     assert_eq!(duplicate_projection.status, StatusCode::BAD_REQUEST);
-    assert!(duplicate_projection
-        .text()
-        .contains("cannot be selected more than once"));
+    assert!(
+        duplicate_projection
+            .text()
+            .contains("cannot be selected more than once")
+    );
 
     let saved = request(&app, Method::GET, "/open-deals", None, &[]).await;
     assert_eq!(saved.status, StatusCode::OK);
@@ -493,9 +519,11 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     )
     .await;
     assert_eq!(greater_than.status, StatusCode::OK);
-    assert!(greater_than
-        .text()
-        .contains("data-filter-disclosure=\"true\" data-active-filters=\"1\""));
+    assert!(
+        greater_than
+            .text()
+            .contains("data-filter-disclosure=\"true\" data-active-filters=\"1\"")
+    );
     assert!(greater_than.text().contains("value=\"gt\" selected"));
     assert!(greater_than.text().contains("alpha"));
     assert!(!greater_than.text().contains("beta"));
@@ -558,9 +586,11 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
         &[],
     )
     .await;
-    assert!(any_first_page
-        .text()
-        .contains("filter_match=any&amp;filter_field=status"));
+    assert!(
+        any_first_page
+            .text()
+            .contains("filter_match=any&amp;filter_field=status")
+    );
     assert!(any_first_page.text().contains("limit=1&amp;offset=1"));
 
     let invalid_match = request(&app, Method::GET, "/deals?filter_match=neither", None, &[]).await;
@@ -700,9 +730,11 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     assert!(board.text().contains("value=\"score\" selected"));
     assert!(board.text().contains("value=\"asc\" selected"));
     assert!(board.text().contains("Unassigned"));
-    assert!(board
-        .text()
-        .contains("&lt;script&gt;alert('x')&lt;/script&gt;"));
+    assert!(
+        board
+            .text()
+            .contains("&lt;script&gt;alert('x')&lt;/script&gt;")
+    );
     assert!(!board.text().contains("<script>alert('x')</script>"));
     let qualification = board.text().find(">qualification<").unwrap();
     let interview = board.text().find(">interview<").unwrap();
@@ -757,12 +789,16 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     .await;
     assert_eq!(typed_filter.status, StatusCode::OK);
     assert!(typed_filter.text().contains("value=\"stage\" selected"));
-    assert!(typed_filter
-        .text()
-        .contains("name=\"filter_value\" data-filter-value=\"true\""));
-    assert!(typed_filter
-        .text()
-        .contains("value=\"offer\" selected>Offer</option>"));
+    assert!(
+        typed_filter
+            .text()
+            .contains("name=\"filter_value\" data-filter-value=\"true\"")
+    );
+    assert!(
+        typed_filter
+            .text()
+            .contains("value=\"offer\" selected>Offer</option>")
+    );
     assert!(typed_filter.text().contains("beta"));
     assert!(!typed_filter.text().contains("alpha"));
 
@@ -842,12 +878,14 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     )
     .await;
     assert_eq!(unassigned.status, StatusCode::SEE_OTHER);
-    assert!(database
-        .get("deals", "beta")
-        .unwrap()
-        .field("stage")
-        .unwrap()
-        .is_none());
+    assert!(
+        database
+            .get("deals", "beta")
+            .unwrap()
+            .field("stage")
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         database
             .audit_recent(1, AuditFilter::record("deals", "beta"))
@@ -961,17 +999,21 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
     assert_eq!(edit_page.status, StatusCode::OK);
     assert!(edit_page.text().contains("Schema-powered"));
     assert!(edit_page.text().contains("name=\"attribute.status\""));
-    assert!(edit_page
-        .text()
-        .contains("value=\"open\" selected>Open</option>"));
+    assert!(
+        edit_page
+            .text()
+            .contains("value=\"open\" selected>Open</option>")
+    );
     assert!(edit_page.text().contains("name=\"attribute.value\""));
     assert!(edit_page.text().contains("value=\"12500\""));
     assert!(edit_page.text().contains("Audit history"));
     assert!(edit_page.text().contains("sales@example.com"));
     assert!(edit_page.text().contains("create"));
-    assert!(edit_page
-        .text()
-        .contains("/audit?collection=deals&amp;id=acme"));
+    assert!(
+        edit_page
+            .text()
+            .contains("/audit?collection=deals&amp;id=acme")
+    );
     let edit_token = csrf(edit_page.text()).to_owned();
 
     let invalid = request(
@@ -1090,28 +1132,40 @@ async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
     let new_page = request(&app, Method::GET, "/candidates/new", None, &[]).await;
     assert_eq!(new_page.status, StatusCode::OK);
     assert!(new_page.text().contains("Schema-powered"));
-    assert!(new_page
-        .text()
-        .contains("name=\"_form_mode\" value=\"structured\""));
+    assert!(
+        new_page
+            .text()
+            .contains("name=\"_form_mode\" value=\"structured\"")
+    );
     assert!(new_page.text().contains("Candidate &lt;name&gt;"));
-    assert!(new_page
-        .text()
-        .contains("Displayed &lt;script&gt;alert('schema')&lt;/script&gt; name"));
+    assert!(
+        new_page
+            .text()
+            .contains("Displayed &lt;script&gt;alert('schema')&lt;/script&gt; name")
+    );
     assert!(!new_page.text().contains("<script>alert('schema')</script>"));
-    assert!(new_page
-        .text()
-        .contains("type=\"email\" name=\"attribute.email\""));
-    assert!(new_page
-        .text()
-        .contains("type=\"number\" step=\"any\" name=\"attribute.budget\""));
-    assert!(new_page
-        .text()
-        .contains("select id=\"field-stage\" name=\"attribute.stage\""));
+    assert!(
+        new_page
+            .text()
+            .contains("type=\"email\" name=\"attribute.email\"")
+    );
+    assert!(
+        new_page
+            .text()
+            .contains("type=\"number\" step=\"any\" name=\"attribute.budget\"")
+    );
+    assert!(
+        new_page
+            .text()
+            .contains("select id=\"field-stage\" name=\"attribute.stage\"")
+    );
     assert!(new_page.text().contains("Single select"));
     assert!(new_page.text().contains("Multi-select"));
-    assert!(new_page
-        .text()
-        .contains("type=\"checkbox\" name=\"attribute.tags\""));
+    assert!(
+        new_page
+            .text()
+            .contains("type=\"checkbox\" name=\"attribute.tags\"")
+    );
     assert!(new_page.text().contains("Structured YAML"));
     assert!(new_page.text().contains("+ Additional attributes"));
     assert!(
@@ -1163,12 +1217,16 @@ async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
     let edit_page = request(&app, Method::GET, "/candidates/records/jane-doe", None, &[]).await;
     assert_eq!(edit_page.status, StatusCode::OK);
     assert!(edit_page.text().contains("value=\"jane@example.com\""));
-    assert!(edit_page
-        .text()
-        .contains("value=\"interview\" selected>Interview</option>"));
-    assert!(edit_page
-        .text()
-        .contains("name=\"attribute.tags\" value=\"rust\" checked"));
+    assert!(
+        edit_page
+            .text()
+            .contains("value=\"interview\" selected>Interview</option>")
+    );
+    assert!(
+        edit_page
+            .text()
+            .contains("name=\"attribute.tags\" value=\"rust\" checked")
+    );
     assert!(edit_page.text().contains("source: referral"));
 
     let invalid = request(
@@ -1266,12 +1324,16 @@ async fn global_audit_view_renders_filters_and_paginates_field_changes() {
     assert!(global.text().contains("/attributes/stage"));
     assert!(global.text().contains("proposal"));
     assert!(global.text().contains("won"));
-    assert!(global
-        .text()
-        .contains("&lt;script&gt;alert('historical')&lt;/script&gt;"));
-    assert!(!global
-        .text()
-        .contains("<script>alert('historical')</script>"));
+    assert!(
+        global
+            .text()
+            .contains("&lt;script&gt;alert('historical')&lt;/script&gt;")
+    );
+    assert!(
+        !global
+            .text()
+            .contains("<script>alert('historical')</script>")
+    );
     assert!(
         global.text().find("contacts/beta").unwrap() < global.text().find("deals/alpha").unwrap()
     );
@@ -1368,9 +1430,11 @@ async fn view_routes_respect_api_authentication_and_return_html_errors() {
     )
     .await;
     assert_eq!(invalid_operators.status, StatusCode::BAD_REQUEST);
-    assert!(invalid_operators
-        .text()
-        .contains("one matching filter_operator"));
+    assert!(
+        invalid_operators
+            .text()
+            .contains("one matching filter_operator")
+    );
 }
 
 /// Server-rendered error pages are redacted exactly like the JSON API, and

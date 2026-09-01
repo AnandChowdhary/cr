@@ -834,7 +834,7 @@ impl IntentPartSpec {
             (true, true) => {
                 return Err(invalid(format!(
                     "{field} must carry either text or a digest, not both"
-                )))
+                )));
             }
             (false, false) => return Err(invalid(format!("{field} must carry text or a digest"))),
         }
@@ -951,8 +951,8 @@ fn optional_timestamp(value: Option<&str>, field: &str) -> Result<Option<String>
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_agent, parse_authorization, parse_intent, AgentEvidence, Attribution,
-        AttributionOverrides, AuditAgent, AuthorizationMode, IntentAuthor, MAX_INTENT_TEXT_CHARS,
+        AgentEvidence, Attribution, AttributionOverrides, AuditAgent, AuthorizationMode,
+        IntentAuthor, MAX_INTENT_TEXT_CHARS, parse_agent, parse_authorization, parse_intent,
     };
     use crate::DomainError;
 

@@ -11,20 +11,20 @@ mod value;
 mod views;
 
 pub use attribution::{
-    parse_agent, parse_authorization, parse_intent, AgentEvidence, Attribution,
-    AttributionOverrides, AuditAgent, AuditAuthorization, AuditIntent, AuditIntentPart,
-    AuthorizationMode, IntentAuthor,
+    AgentEvidence, Attribution, AttributionOverrides, AuditAgent, AuditAuthorization, AuditIntent,
+    AuditIntentPart, AuthorizationMode, IntentAuthor, parse_agent, parse_authorization,
+    parse_intent,
 };
 pub use audit::{
     AuditAction, AuditChange, AuditEntry, AuditFilter, AuditHead, AuditSource, AuditVerification,
     ChangePreview,
 };
 pub use database::{
-    sort_records_by_field, CollectionModel, Database, Record, SortDirection, WorkingChange,
-    WorkingChangeKind,
+    CollectionModel, Database, Record, SortDirection, WorkingChange, WorkingChangeKind,
+    sort_records_by_field,
 };
 pub use error::DomainError;
 pub use search::{SearchQuery, SearchTarget};
 pub use sync::{SyncAttribution, SyncDefinition, SyncRunSummary};
-pub use value::{compare_yaml_values, Assignment, FilterExpression, FilterOperator};
+pub use value::{Assignment, FilterExpression, FilterOperator, compare_yaml_values};
 pub use views::{ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch};

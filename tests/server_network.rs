@@ -10,7 +10,7 @@ use std::{
 };
 
 use common::{binary, run_success};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct ChildGuard(Child);
 

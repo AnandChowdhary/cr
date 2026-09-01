@@ -66,10 +66,12 @@ fn create_query_update_and_link_records() {
         fetched["attributes"]["relations"]["company"][0]["collection"],
         "companies"
     );
-    assert!(fetched["body"]
-        .as_str()
-        .unwrap()
-        .contains("systems candidate"));
+    assert!(
+        fetched["body"]
+            .as_str()
+            .unwrap()
+            .contains("systems candidate")
+    );
 
     let listed = run_success(command_for(&database).args([
         "list",

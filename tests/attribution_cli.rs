@@ -10,7 +10,7 @@ mod common;
 
 use std::{fs, path::Path, process::Command};
 
-use common::{binary, command_for, run_failure, run_success, TestDatabase};
+use common::{TestDatabase, binary, command_for, run_failure, run_success};
 use serde_json::Value;
 
 /// The head hash `cr` at `0ca95fb` wrote for `tests/fixtures/legacy-journal`,
@@ -275,15 +275,19 @@ fn an_agent_run_update_records_the_human_the_agent_and_both_intents() {
     assert_eq!(event["authorization"]["at"], "2026-09-01T09:17:55Z");
     assert!(event["authorization"].get("approved_changes").is_none());
     assert_eq!(event["intent"]["request"]["author"], "human");
-    assert!(event["intent"]["request"]["text"]
-        .as_str()
-        .expect("the request is text")
-        .contains("want to buy"));
+    assert!(
+        event["intent"]["request"]["text"]
+            .as_str()
+            .expect("the request is text")
+            .contains("want to buy")
+    );
     assert_eq!(event["intent"]["rationale"]["author"], "agent");
-    assert!(event["intent"]["rationale"]["text"]
-        .as_str()
-        .expect("the rationale is text")
-        .contains("Value left unchanged"));
+    assert!(
+        event["intent"]["rationale"]["text"]
+            .as_str()
+            .expect("the rationale is text")
+            .contains("Value left unchanged")
+    );
 
     run_success(database.command().args(["audit", "verify"]));
 }
@@ -643,14 +647,16 @@ fn invalid_attribution_is_refused_without_naming_anything_internal() {
             "{error}"
         );
     }
-    assert!(database
-        .command()
-        .args(["get", "deals", "one"])
-        .output()
-        .expect("cr runs")
-        .status
-        .code()
-        .is_some_and(|code| code != 0));
+    assert!(
+        database
+            .command()
+            .args(["get", "deals", "one"])
+            .output()
+            .expect("cr runs")
+            .status
+            .code()
+            .is_some_and(|code| code != 0)
+    );
 
     let long = "x".repeat(5000);
     let error = run_failure(

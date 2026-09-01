@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::{run_failure, run_success, TestDatabase};
+use common::{TestDatabase, run_failure, run_success};
 use serde_json::Value;
 
 fn write_script(database: &TestDatabase, name: &str, contents: &str) -> String {
@@ -102,10 +102,12 @@ printf '%s\n' '{"type":"checkpoint","state":{"cursor":"page-1","history_id":42}}
     for event in first_audit.as_array().unwrap() {
         assert_eq!(event["actor"], "automation@example.com");
         assert_eq!(event["source"], "sync");
-        assert!(event["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("sync:daily run:"));
+        assert!(
+            event["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("sync:daily run:")
+        );
     }
 
     let second = json_output(&database, &["sync", "run", "daily", "--json"]);
@@ -357,8 +359,10 @@ printf '%s\n' '{"type":"upsert","collection":"items","id":"from-sync","front_mat
 
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("database audit head changed while the sync command was running"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("database audit head changed while the sync command was running")
+    );
     assert!(database.root.join("records/items/concurrent.md").exists());
     assert!(!database.root.join("records/items/from-sync.md").exists());
     assert_eq!(

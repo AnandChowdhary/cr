@@ -2,7 +2,7 @@ mod common;
 
 use std::{fs, process::Stdio};
 
-use common::{run_success, TestDatabase};
+use common::{TestDatabase, run_success};
 use serde_json::Value;
 
 #[test]

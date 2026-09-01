@@ -15,10 +15,10 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
 };
-use common::{command_for, run_failure, run_success, TestDatabase};
+use common::{TestDatabase, command_for, run_failure, run_success};
 use cr::{
-    server::{router, ServerConfig},
     Database,
+    server::{ServerConfig, router},
 };
 use http_body_util::BodyExt;
 use serde_json::Value;

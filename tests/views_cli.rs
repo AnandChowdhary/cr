@@ -2,7 +2,7 @@ mod common;
 
 use std::fs;
 
-use common::{run_failure, run_success, TestDatabase};
+use common::{TestDatabase, run_failure, run_success};
 use serde_json::Value;
 
 #[test]
@@ -94,16 +94,20 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
     ))
     .unwrap();
     assert_eq!(listed.as_array().unwrap().len(), 2);
-    assert!(listed
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|view| view["name"] == "deals" && view["saved"] == false));
-    assert!(listed
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|view| view["name"] == "open-deals" && view["saved"] == true));
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|view| view["name"] == "deals" && view["saved"] == false)
+    );
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|view| view["name"] == "open-deals" && view["saved"] == true)
+    );
 }
 
 #[test]
