@@ -3,9 +3,9 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
-    AgentEvidence, Assignment, AttributionOverrides, AuditFilter, Database, FilterExpression,
-    Record, SearchQuery, SearchTarget, SortDirection, SyncAttribution, ViewLayout,
-    sort_records_by_field,
+    AgentEvidence, Assignment, AttributionOverrides, AuditFilter, CheckReport, CheckScope,
+    Database, FilterExpression, Record, SearchQuery, SearchTarget, SortDirection, SyncAttribution,
+    ViewLayout, parse_threshold, sort_records_by_field,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -365,6 +365,28 @@ enum Command {
         json: bool,
     },
 
+    /// Report every integrity problem in the database without changing anything.
+    ///
+    /// Reports dangling relations, malformed relation values, records that no
+    /// longer satisfy their schema, names that cannot be a record or
+    /// collection, and records that do not reconcile with the audit journal.
+    /// It is strictly read-only and has no repair mode. Exit status is 0 when
+    /// nothing reached the failure threshold, 2 when something did, and 1 when
+    /// the check could not run at all.
+    Check {
+        /// Check one collection instead of the whole database.
+        #[arg(long, value_name = "COLLECTION")]
+        collection: Option<String>,
+
+        /// Return the complete report as JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Lowest severity that makes this command exit 2: error, warning, or never.
+        #[arg(long, value_name = "SEVERITY", default_value = "error")]
+        fail_on: String,
+    },
+
     /// Record selected direct Markdown changes in the audit journal.
     Save {
         /// Records to accept, written as COLLECTION/ID.
@@ -637,9 +659,17 @@ enum AuditCommand {
     },
 }
 
+/// Exit status for a command that ran successfully and found problems.
+///
+/// Distinct from the failure status on purpose. `cr check` belongs in CI and
+/// cron, where "the database has a dangling link" and "the check could not
+/// run" call for completely different responses; collapsing both into 1 would
+/// make a missing database look like a clean bill of health with findings.
+const FOUND_PROBLEMS: u8 = 2;
+
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("error: {error:#}");
             ExitCode::FAILURE
@@ -647,14 +677,14 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
 
     if let Command::Init { path } = cli.command {
         let path = cli.database.unwrap_or(path);
         let database = Database::init(path)?;
         println!("Initialized database at {}", database.root().display());
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     let database = Database::discover(cli.database.as_deref())?;
@@ -1005,6 +1035,18 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Command::Check {
+            collection,
+            json,
+            fail_on,
+        } => {
+            let threshold = parse_threshold(&fail_on)?;
+            let report = database.check(&CheckScope { collection })?;
+            print_check(&report, json)?;
+            if threshold.is_some_and(|threshold| report.summary.fails(threshold)) {
+                return Ok(ExitCode::from(FOUND_PROBLEMS));
+            }
+        }
         Command::Save {
             records,
             all,
@@ -1025,7 +1067,7 @@ fn run() -> Result<()> {
                         print_preview(preview, false)?;
                     }
                 }
-                return Ok(());
+                return Ok(ExitCode::SUCCESS);
             }
             let entries = database.save(&records, all, message.as_deref())?;
             if json {
@@ -1156,6 +1198,54 @@ fn run() -> Result<()> {
         },
     }
 
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Print an integrity report.
+///
+/// Findings go to standard output rather than standard error: they are this
+/// command's result, not a diagnostic about it, and a caller redirecting
+/// stdout wants them. The summary is the last line so a human reading a long
+/// report ends on the count.
+fn print_check(report: &CheckReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    for finding in &report.findings {
+        println!(
+            "{:<7} {:<23} {}",
+            finding.severity.label(),
+            finding.kind.code(),
+            finding.message
+        );
+    }
+    let scope = match &report.collection {
+        Some(collection) => format!("collection '{collection}'"),
+        None => format!(
+            "{} {}",
+            report.summary.collections,
+            plural(report.summary.collections, "collection")
+        ),
+    };
+    println!(
+        "Checked {scope}: {} {} on disk, {} audited {}.",
+        report.summary.records,
+        plural(report.summary.records, "record"),
+        report.summary.audited_records,
+        plural(report.summary.audited_records, "record")
+    );
+    if report.findings.is_empty() {
+        println!("No problems found.");
+    } else {
+        println!(
+            "{} {}, {} {}.",
+            report.summary.errors,
+            plural(report.summary.errors, "error"),
+            report.summary.warnings,
+            plural(report.summary.warnings, "warning")
+        );
+    }
     Ok(())
 }
 
@@ -1184,6 +1274,14 @@ fn report_sync_run(summary: &cr::SyncRunSummary, json: bool) -> Result<()> {
         }
     );
     Ok(())
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        noun.to_owned()
+    } else {
+        format!("{noun}s")
+    }
 }
 
 /// Print a change set that was computed but not written.

@@ -137,6 +137,16 @@ pub struct SyncRunLedger {
     pub foreign_events: bool,
 }
 
+/// A sync that has a run ledger on disk, so a run stopped partway.
+///
+/// Carries only what can be learned without the audit chain. `cr sync recover
+/// <name> --check` is the command that says how far the run actually got.
+pub(crate) struct InterruptedSyncRun {
+    pub name: String,
+    /// The run identifier, absent when the ledger itself could not be read.
+    pub run_id: Option<String>,
+}
+
 /// One side of a run ledger's checkpoint pair.
 ///
 /// Stored as an explicit flag beside the value rather than as a JSON `null`,
@@ -302,6 +312,61 @@ impl Database {
         serde_json::from_str(&serialized)
             .with_context(|| format!("sync state for '{name}' is not valid JSON"))
             .map(Some)
+    }
+
+    /// Every sync that has left a run ledger behind, named and identified.
+    ///
+    /// Deliberately weaker than [`Self::pending_sync_run`]: it reads the run
+    /// directory and the ledgers in it and nothing else. It never takes the
+    /// audit lock, never replays the chain, and never fails because the
+    /// database is dirty. `cr check` calls it while already holding the audit
+    /// lock and while the database may be in any state at all, so anything
+    /// stronger would either deadlock or refuse exactly when it is most needed.
+    ///
+    /// A ledger this cannot parse still yields an entry with no run
+    /// identifier. The ledger is a durability record, not a hash-chained one,
+    /// so a damaged one says nothing about tampering — but its presence still
+    /// means a run stopped in the middle, which is the fact worth reporting.
+    pub(crate) fn interrupted_sync_runs(&self) -> Result<Vec<InterruptedSyncRun>> {
+        let entries = paths::list_directory(
+            self.root(),
+            Path::new(SYNC_RUN_DIRECTORY),
+            "the sync run directory",
+        )?
+        .unwrap_or_default();
+
+        let mut names = Vec::new();
+        for entry in entries {
+            let Some(file) = entry.name.to_str() else {
+                continue;
+            };
+            let path = Path::new(file);
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_component(name, "sync").is_err() {
+                continue;
+            }
+            names.push(name.to_owned());
+        }
+        names.sort();
+
+        Ok(names
+            .into_iter()
+            .filter_map(|name| {
+                let run_id = match self.read_sync_run(&name) {
+                    Ok(Some(stored)) => Some(stored.run_id),
+                    // A ledger that vanished between the listing and the read
+                    // belongs to a run that just finished; report neither.
+                    Ok(None) => return None,
+                    Err(_) => None,
+                };
+                Some(InterruptedSyncRun { name, run_id })
+            })
+            .collect())
     }
 
     /// The interrupted run this sync has left behind, if any.

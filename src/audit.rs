@@ -778,6 +778,17 @@ impl<'a> AuditLog<'a> {
         self.states(false).map(|(states, _)| states)
     }
 
+    /// Replay the chain checking every stored change set against the approval
+    /// recorded beside it, discarding the replayed state.
+    ///
+    /// `cr check` needs this branch of [`Self::verify`] without the
+    /// record reconciliation that `verify` performs in the same pass, because
+    /// it reconciles records itself and reports every divergence instead of
+    /// failing on the first.
+    pub fn verify_approvals(&self) -> Result<()> {
+        self.states(true).map(|_| ())
+    }
+
     /// Replay the chain into per-record state.
     ///
     /// `check_approvals` recomputes each event's previewed-change digest from

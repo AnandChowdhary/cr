@@ -784,6 +784,64 @@ cr save candidates/alex-smith --message 'Reviewed' --json
 
 Do not run `cr save --all` automatically from a watcher or scheduled task. An explicit save is the point where you acknowledge that filesystem changes are legitimate rather than tampering. For unattended imports, use the validated `cr sync` protocol below instead of writing records and auto-accepting them.
 
+## Check the whole database
+
+`cr status` tells you what has changed since the last save. `cr check` tells you whether the database is *coherent* — and, unlike every other integrity command, it reports everything it finds instead of stopping at the first problem:
+
+```sh
+cr check
+# error   dangling_link           record deals/acme-renewal has a relation 'company' pointing at companies/acme, which does not exist
+# error   schema_violation        record deals/globex-expansion does not match the schema for collection 'deals': "stage" is a required property
+# warning record_content_mismatch record companies/globex does not match its latest audited state; 'cr status' reports it as modified and 'cr save' records the change
+# Checked 2 collections: 4 records on disk, 4 audited records.
+# 2 errors, 1 warning.
+```
+
+It reports:
+
+- **dangling links** — a relation pointing at a record that no longer exists;
+- **malformed relation values** — a `relations` entry that is not a `{ collection, id }` reference at all;
+- **schema failures** — records that no longer satisfy their collection's JSON Schema, which is what happens whenever a schema changes after its records were written, plus schema files that are themselves unusable;
+- **invalid record names** — files and directories that cannot be a record ID or a collection;
+- **unreadable records** — Markdown that cannot be parsed, and anything behind a symbolic link;
+- **audit reconciliation problems** — records with no audit history, audited records whose file has gone, files whose content does not match the audited state, a journal whose chain cannot be replayed, and a stored change set that does not match the approval recorded beside it;
+- **interrupted sync runs** — a `cr sync run` that stopped partway, leaving part of an import applied and its checkpoint behind.
+
+Every finding names a record as `collection/id`, or a sync by name. None of them ever prints a filesystem path.
+
+The interrupted-sync finding is worth calling out, because nothing else surfaces it. The records a stopped run did commit agree with the journal, so `cr status` reports `Clean` and `cr audit verify` passes; without `cr check` you would only find out by running `cr sync recover <name> --check` on a sync you already suspected, or by being refused the next time you ran it. `check` reports it as a warning and tells you the command to inspect it with — it never recovers anything itself.
+
+### `check` versus `status`
+
+They answer different questions, and `check` does not repeat `status`'s answer.
+
+- `cr status` is the working tree: *what would `cr save` record next?* Every line it prints is a normal, resolvable direct edit.
+- `cr check` is integrity: *is this database coherent?* When a divergence from the journal is one `cr save` can reconcile, `check` reports it as a **warning** and points you back at `status`. When the same record also fails to parse or fails its schema, `save` will refuse it, so `check` raises it to an **error** — that record is stuck, and `check` is the only command that says why.
+
+Everything else `check` reports — dangling links, malformed relations, schema drift, invalid names, journal damage — is invisible to `status`.
+
+### Exit status, scope, and output
+
+```sh
+cr check                              # whole database
+cr check --collection deals           # one collection; links, journal and syncs are still checked
+cr check --json                       # the complete report, including the summary
+cr check --fail-on warning            # unsaved direct edits fail too
+cr check --fail-on never              # report without ever failing
+```
+
+| Exit | Meaning |
+| ---- | ------- |
+| `0`  | Ran successfully; nothing reached the failure threshold. |
+| `2`  | Ran successfully; found problems at or above the threshold. |
+| `1`  | Could not run at all — no database, an unknown `--collection`, unreadable configuration. |
+
+That split is the point in CI and cron: a typo in a scheduled job must never look like a clean bill of health. The default threshold is `error`, so an ordinary unsaved edit does not fail the build.
+
+`check` never writes. It cannot repair anything, and there is no `--fix`: a dangling link might want the relation removed, the target restored, or a delete policy applied, and only you know which.
+
+It reads and parses every record in scope and replays the journal, so it costs about what `cr search` over the whole database costs, and it holds the write lock while it runs. Use `--collection` on a large database.
+
 ## Audit history
 
 Every successful `create`, `update`, `link`, `delete`, direct `save`, and changed sync upsert/delete writes an attributed event.
@@ -1380,6 +1438,7 @@ The REST equivalents of the direct-edit and audit commands are:
 
 ```text
 GET  /api/v1/status
+GET  /api/v1/check
 POST /api/v1/save
 GET  /api/v1/audit/log
 GET  /api/v1/audit/head
@@ -1400,6 +1459,14 @@ curl -X POST http://127.0.0.1:3000/api/v1/save \
 ```
 
 Use `{"all": true}` instead of `records` to accept every reported change.
+
+`GET /api/v1/check` returns the same report as the command, with findings paginated by `limit` and `offset` and an optional `collection` scope:
+
+```sh
+curl 'http://127.0.0.1:3000/api/v1/check?limit=20'
+```
+
+It answers `200` whether or not it found anything — the findings are the resource, so a broken database is not an HTTP error. The `summary` object sits beside the page rather than inside it, so a client reading one page can still tell a clean database from a broken one. Decide from `summary.errors`, which is what the CLI's exit status is computed from.
 
 ### Generated OpenAPI
 
@@ -1496,6 +1563,7 @@ cr sync recover NAME [--check] [--json]
 cr sync state NAME
 
 cr status [--json]
+cr check [--collection COLLECTION] [--json] [--fail-on error|warning|never]
 cr save COLLECTION/ID... [--message TEXT] [--json] [--preview] [ATTRIBUTION]
 cr save --all [--message TEXT] [--json] [--preview] [ATTRIBUTION]
 
@@ -1533,6 +1601,10 @@ cr status
 cr save collection/id --message 'Explain the change'
 cr audit verify
 ```
+
+### Something is wrong and you do not know what
+
+Run `cr check`. It reports every problem it can find in one pass instead of failing on the first one, and its warnings tell you which of them `cr save` would resolve on its own.
 
 ### A record has no audit history
 
