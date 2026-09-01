@@ -93,3 +93,51 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Read the floor out of `package.rust-version` rather than hardcoding it
+      # here. Hardcoding gives you two numbers that can disagree; this way the
+      # declared MSRV is the one that gets proven, always.
+      - name: Resolve declared MSRV
+        id: msrv
+        run: |
+          version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].rust_version')"
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "::error file=Cargo.toml::package.rust-version is not set"
+            exit 1
+          fi
+          # This value reaches `rustup` from a pull request's own Cargo.toml, so
+          # constrain it to a version number before it is used.
+          if ! printf '%s' "$version" | grep -Eq '^1\.[0-9]+(\.[0-9]+)?$'; then
+            echo "::error file=Cargo.toml::package.rust-version '$version' is not a plain version number"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          rustup toolchain install "$MSRV" --profile minimal --no-self-update
+          rustup default "$MSRV"
+          rustc --version && cargo --version
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+
+      # Build *and* test on the floor. Building alone is not enough: a
+      # dev-dependency or a test-only code path can require a newer compiler
+      # than the library itself does.
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Test
+        run: cargo test --locked

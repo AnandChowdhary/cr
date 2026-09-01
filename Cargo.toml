@@ -2,6 +2,29 @@
 name = "cr"
 version = "0.1.0"
 edition = "2021"
+# `src/audit.rs` and `src/sync.rs` use `File::lock`/`File::try_lock` (the std
+# `file_lock` feature), stabilised in Rust 1.89. Nothing in `Cargo.lock` needs a
+# newer compiler, so 1.89 is the true floor. The `msrv` job in
+# `.github/workflows/ci.yml` builds and tests on exactly this version so the
+# number cannot drift without CI noticing.
+rust-version = "1.89"
+description = "A local-first database made from Markdown files with typed YAML front matter, a tamper-evident audit log, a CLI, a REST API, and server-rendered views"
+repository = "https://github.com/AnandChowdhary/cr"
+license = "MIT"
+readme = "README.md"
+keywords = ["markdown", "database", "local-first", "audit-log", "cli"]
+categories = [
+  "command-line-utilities",
+  "database",
+  "filesystem",
+  "web-programming::http-server",
+]
+
+# Keep the published tarball to source and prose. The screenshots are ~300 KiB of
+# already-compressed JPEG (roughly 80% of the crate) and crates.io rewrites the
+# README's relative image links to `repository`, so they still render there.
+# CI configuration is meaningless to a downstream consumer.
+exclude = ["/docs/screenshots/", "/.github/"]
 
 [dependencies]
 anyhow = "1.0"
@@ -26,3 +49,46 @@ yaml_serde = "0.10"
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+
+# `cargo install cr` builds with this profile, so it is the one users actually
+# get. Measured on this tree: 12.7 MB -> 8.3 MB (-35%), with no build-time
+# regression (95s -> 90s, one sample each). Nothing in CI builds release, so
+# this costs the pipeline nothing.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Lint policy lives here rather than only in CI flags, so `cargo clippy` on a
+# laptop gates on exactly what the pipeline gates on. Every lint below is
+# already satisfied by the tree as it stands: this encodes the status quo so it
+# cannot regress, it is not a cleanup backlog.
+[lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+# `forbid(unsafe_code)` would be a lie: `src/sync.rs` needs `libc::kill` to stop
+# a sync adapter's whole process group. The useful policy is not "no unsafe" but
+# "every unsafe block is justified in writing and does exactly one thing".
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+
+# The HTTP server is async and the audit/sync paths hold file locks. Holding a
+# lock across an await is the failure mode that class of code actually has.
+await_holding_lock = "warn"
+
+# `mem::forget` on a lock guard would silently defeat the sync mutual exclusion.
+mem_forget = "warn"
+
+# Debugging scaffolding must not reach main.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+# Guards the `[package]` metadata above against quietly rotting. Deliberately
+# not the whole `clippy::cargo` group: `multiple_crate_versions` fires on
+# transitive duplicates (`syn`, `getrandom`, `r-efi`) we do not control.
+cargo_common_metadata = "warn"
