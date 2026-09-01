@@ -747,9 +747,20 @@ async fn every_public_error_mapping_is_typed_redacted_and_correlated() {
     let (_temporary, database) = test_database("server-errors");
     let root = database.root().display().to_string();
     database.create("deals", "alpha", &[], "Alpha\n").unwrap();
-    // A directory where a record file belongs is an internal fault, not
-    // something a caller can correct.
+    // A record path that is not a regular Markdown file, and one that is only
+    // reachable through a symbolic link, are both refused as conflicting
+    // durable state rather than followed.
     fs::create_dir(database.root().join("records/deals/broken.md")).unwrap();
+    #[cfg(unix)]
+    {
+        let outside = database.root().join("outside.md");
+        fs::write(&outside, "---\nstatus: leaked\n---\n").unwrap();
+        std::os::unix::fs::symlink(&outside, database.root().join("records/deals/linked.md"))
+            .unwrap();
+        let elsewhere = database.root().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, database.root().join("records/escaped")).unwrap();
+    }
     // Editing a record outside the audited path makes the next mutation stale.
     database.create("deals", "stale", &[], "Stale\n").unwrap();
     fs::write(
@@ -769,7 +780,8 @@ async fn every_public_error_mapping_is_typed_redacted_and_correlated() {
     .unwrap();
     let authorization = ("authorization", "Bearer secret");
 
-    let cases: Vec<ErrorCase> = vec![
+    #[allow(unused_mut)]
+    let mut cases: Vec<ErrorCase> = vec![
         (
             "unauthorized",
             StatusCode::UNAUTHORIZED,
@@ -880,14 +892,37 @@ async fn every_public_error_mapping_is_typed_redacted_and_correlated() {
         ),
         (
             "record file replaced by a directory",
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
+            StatusCode::CONFLICT,
+            "conflict",
             Method::GET,
             "/api/v1/collections/deals/records/broken".to_owned(),
             None,
             vec![authorization],
         ),
     ];
+
+    // Symbolic links can only be planted where the platform has them.
+    #[cfg(unix)]
+    cases.extend([
+        (
+            "record reached through a symbolic link",
+            StatusCode::CONFLICT,
+            "conflict",
+            Method::GET,
+            "/api/v1/collections/deals/records/linked".to_owned(),
+            None,
+            vec![authorization],
+        ),
+        (
+            "collection directory replaced by a symbolic link",
+            StatusCode::CONFLICT,
+            "conflict",
+            Method::GET,
+            "/api/v1/collections/escaped/records".to_owned(),
+            None,
+            vec![authorization],
+        ),
+    ]);
 
     for (label, status, code, method, uri, body, headers) in cases {
         let response = request(&app, method, &uri, body.as_deref(), &headers).await;
@@ -918,25 +953,25 @@ async fn every_public_error_mapping_is_typed_redacted_and_correlated() {
 async fn unexpected_failures_reveal_only_a_generic_message_and_a_request_id() {
     let (_temporary, database) = test_database("server-internal");
     let root = database.root().display().to_string();
-    fs::create_dir(database.root().join("records")).ok();
-    fs::create_dir_all(database.root().join("records/deals/broken.md")).unwrap();
+    // A journal whose last line was lost is an internal inconsistency no caller
+    // can act on, so it must stay unclassified and redacted.
+    fs::write(
+        database
+            .root()
+            .join(".cr/audit/segments/00000000000000000001.jsonl"),
+        "{\"hash\":\"sha256:none\",\"payload\":{}}",
+    )
+    .unwrap();
     let app = router(database, ServerConfig::default()).unwrap();
 
-    let response = request(
-        &app,
-        Method::GET,
-        "/api/v1/collections/deals/records/broken",
-        None,
-        &[],
-    )
-    .await;
+    let response = request(&app, Method::GET, "/api/v1/audit/head", None, &[]).await;
     assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
     let payload = response.json();
     assert_eq!(payload["error"]["code"], "internal_error");
     let message = payload["error"]["message"].as_str().unwrap();
     assert!(message.contains("request ID"), "{message}");
     assert!(!message.contains(&root));
-    assert!(!message.contains("must be a regular file"));
+    assert!(!message.contains("truncated tail"));
     assert!(!payload["error"]["request_id"].as_str().unwrap().is_empty());
 
     // Successful responses carry the same correlation ID for access logs.

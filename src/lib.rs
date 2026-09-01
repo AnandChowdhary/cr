@@ -2,6 +2,7 @@ mod audit;
 mod database;
 mod error;
 mod frontmatter;
+mod paths;
 mod search;
 pub mod server;
 mod sync;

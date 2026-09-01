@@ -113,6 +113,14 @@ audit:
   segment_max_events: 500
 ```
 
+`data_dir` must be a relative path inside the database, and every directory `cr`
+opens beneath the root must be a real directory rather than a symbolic link.
+That includes `records/`, each collection directory, `.cr/`, and everything
+under it. A link anywhere in the chain is refused with an error naming the
+record, collection, or view involved; the database itself may still be reached
+through a linked path, because the root is resolved once before any of this
+applies.
+
 Commands search the current directory and its parents for a database. If you are elsewhere, pass its path explicitly:
 
 ```sh

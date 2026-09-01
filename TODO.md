@@ -24,8 +24,8 @@ Priorities:
 - [x] **P0 — Redact internal error details in HTTP responses.**
   Every request carries a correlation ID returned as `X-Request-Id` and in the error envelope. Unexpected failures return a fixed generic message; expected client errors keep actionable wording that names records, views, and fields rather than filesystem paths or operating-system errors. JSON and HTML responses share the rules, and the complete chain reaches the server log under the request ID.
 
-- [ ] **P0 — Harden every parent path against symlink escapes.**
-  Final record files and explicitly listed collection directories are checked, but a replaced `data_dir` or an intermediate configured directory could still be a symlink. Resolve or open path components safely beneath the database root for every read and mutation.
+- [x] **P0 — Harden every parent path against symlink escapes.**
+  Every database-relative path is walked component by component from a descriptor for the resolved root, with `openat` and `O_NOFOLLOW`, and the target is opened, replaced, linked, renamed, or unlinked through its verified parent's descriptor. That covers `data_dir` and its intermediate directories, collection directories, record files, `.cr/`, and the audit, schema, view, and sync trees, on reads as well as mutations. Refusals are classified `DomainError::Conflict` and name the record, collection, or view rather than a path. `tests/symlink_escape.rs` constructs each escape and asserts nothing outside the root is read or written; nine of its eleven tests fail against the previous implementation, two of them by disclosing file contents from outside the database.
 
 - [ ] **P0 — Add authenticated actor identity for stronger audit attribution.**
   CLI actors, `X-CR-Actor`, and bearer tokens are assertions, not authenticated people. Define a trusted identity integration or signed-request mode and distinguish authenticated principals from display attribution in audit events.
@@ -60,6 +60,9 @@ Priorities:
 - [ ] **P2 — Add structured server observability.**
   Request IDs and a structured error log line now exist. Add structured access logs for successful requests, latency/error metrics, a real logging framework with levels instead of `eprintln!`, and safe audit-operation fields without logging bearer tokens or sensitive record contents.
 
+- [ ] **P2 — Close the two remaining check-then-use windows in path resolution.**
+  Directory listings are read from the resolved path rather than the verified descriptor, and the sync working directory is verified before adapter output is staged in it with `tempfile`. Neither is exploitable by a planted link—every listed name is reopened through the safe walk before it is read—but both are races rather than descriptor-relative operations. Use `fdopendir` for listings and stage sync output through the verified descriptor. The non-Unix fallback checks components with `symlink_metadata` and has no descriptor guarantee at all; decide whether Windows is supported before relying on it.
+
 - [ ] **P3 — Add opt-in CORS configuration.**
   The API intentionally sends no permissive CORS headers. Add an explicit origin allowlist for browser clients without weakening the local-only default.
 
@@ -73,7 +76,7 @@ Priorities:
   View definitions, collection schemas, sync definitions, and mutable sync checkpoints are Git-friendly files but are not record audit events. Define configuration and operational-state history without confusing either with record history or exposing adapter secrets.
 
 - [ ] **P1 — Add sync sandboxing and complete resource controls.**
-  Sync adapters are trusted local executables that inherit the caller's environment, filesystem, and network access. Add opt-in environment allowlists, stderr bounds, CPU/memory/process limits, and a defensible sandbox profile. POSIX timeouts terminate the adapter process group; define and test equivalent descendant termination on Windows.
+  Sync adapters are trusted local executables that inherit the caller's environment, filesystem, and network access. A relative sync program is still resolved with `canonicalize` under the root, so a linked program can point outside it; that is consistent with allowing absolute programs, but a sandbox design should decide it explicitly. Add opt-in environment allowlists, stderr bounds, CPU/memory/process limits, and a defensible sandbox profile. POSIX timeouts terminate the adapter process group; define and test equivalent descendant termination on Windows.
 
 - [ ] **P2 — Add scheduler helpers and durable run history.**
   Version 1 delegates recurrence and job logs to cron, systemd, `launchd`, containers, or CI. Add optional platform-specific schedule install/remove/status helpers and a bounded run ledger with start/end time, exit result, counts, checkpoint hash, and safe diagnostics—without turning `cr serve` into an implicit scheduler.

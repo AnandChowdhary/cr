@@ -238,14 +238,19 @@ fn unsaved_direct_edits_are_immediately_searchable_without_being_accepted() {
         )
         .unwrap();
         std::os::unix::fs::symlink(&external, database.root.join("records/external-link")).unwrap();
-        assert!(run_success(database.command().args([
+        // Naming the linked collection is refused rather than silently
+        // answered from outside the database.
+        assert!(run_failure(database.command().args([
             "search",
             "outside",
             "--collection",
             "external-link"
         ]))
-        .is_empty());
-        assert!(run_success(database.command().args(["list", "external-link"])).is_empty());
+        .contains("symbolic link"));
+        assert!(
+            run_failure(database.command().args(["list", "external-link"]))
+                .contains("symbolic link")
+        );
     }
 
     let searched = run_success(database.command().args(["search", "won"]));

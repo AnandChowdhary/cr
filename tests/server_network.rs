@@ -234,7 +234,8 @@ fn error_responses_are_redacted_while_the_server_log_keeps_the_full_chain() {
         "{line}"
     );
     assert!(line.contains("could not read record"), "{line}");
-    assert!(line.contains("records/deals/nope.md"), "{line}");
+    // The resolved location the walk stopped at, which a caller never sees.
+    assert!(line.contains("records/deals"), "{line}");
     assert!(line.contains("os error"), "{line}");
 }
 

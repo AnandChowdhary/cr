@@ -307,9 +307,8 @@ fn symlinked_markdown_paths_are_never_treated_as_audited_records() {
     let untracked_link = collection.join("alias.md");
     symlink(&outside, &untracked_link).unwrap();
 
-    assert!(run_failure(database.command().arg("status")).contains("must be a regular file"));
-    assert!(run_failure(database.command().args(["audit", "verify"]))
-        .contains("must be a regular file"));
+    assert!(run_failure(database.command().arg("status")).contains("symbolic link"));
+    assert!(run_failure(database.command().args(["audit", "verify"])).contains("symbolic link"));
     fs::remove_file(untracked_link).unwrap();
 
     run_success(
@@ -331,7 +330,19 @@ fn symlinked_markdown_paths_are_never_treated_as_audited_records() {
         vec!["delete", "items", "one", "--yes"],
         vec!["save", "items/one"],
     ] {
-        assert!(run_failure(database.command().args(arguments)).contains("must be a regular file"));
+        assert!(run_failure(database.command().args(arguments)).contains("symbolic link"));
     }
     assert_eq!(audit_head(&database)["sequence"], 1);
+
+    // A record path that is a directory rather than Markdown is refused with
+    // the plainer wording, and never hashed as if it were a record.
+    fs::remove_file(&record).unwrap();
+    fs::create_dir(&record).unwrap();
+    for arguments in [
+        vec!["status"],
+        vec!["audit", "verify"],
+        vec!["get", "items", "one"],
+    ] {
+        assert!(run_failure(database.command().args(arguments)).contains("is not a regular file"));
+    }
 }

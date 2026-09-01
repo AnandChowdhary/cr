@@ -1,15 +1,23 @@
-use std::{collections::BTreeMap, fs, path::PathBuf, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    database::{validate_component, write_new},
-    error::{invalid, is_already_exists, DomainError},
+    database::validate_component,
+    error::{invalid, is_already_exists, is_missing, DomainError},
+    paths,
     value::parse_path,
     Assignment, Database, SortDirection,
 };
 
+/// Where saved view definitions live beneath the database root.
+pub(crate) const VIEW_DIRECTORY: &str = ".cr/views";
+const VIEW_DIRECTORY_LABEL: &str = "the view directory";
 const VIEW_FORMAT_VERSION: u32 = 1;
 const DEFAULT_VIEW_PAGE_SIZE: usize = 50;
 const MAX_VIEW_PAGE_SIZE: usize = 1_000;
@@ -174,25 +182,24 @@ impl Database {
         };
         validate_stored(name, &stored)?;
 
-        let path = self.view_path(name);
+        let path = view_path(name);
         let serialized = yaml_serde::to_string(&stored).context("could not serialize view")?;
-        write_new(&path, serialized.as_bytes())
-            .with_context(|| format!("could not create view '{name}'"))
-            .map_err(|error| {
+        paths::write_new(self.root(), &path, serialized.as_bytes(), &view_label(name)).map_err(
+            |error| {
                 if is_already_exists(&error) {
                     error.context(DomainError::view_exists(name))
                 } else {
                     error
                 }
-            })?;
+            },
+        )?;
         Ok(to_public(name, stored, true))
     }
 
     pub fn view(&self, name: &str) -> Result<ViewDefinition> {
         validate_component(name, "view")?;
-        let path = self.view_path(name);
-        if path.exists() {
-            return self.read_view(name);
+        if let Some(view) = self.read_view_optional(name)? {
+            return Ok(view);
         }
 
         if self
@@ -216,34 +223,21 @@ impl Database {
             })
             .collect();
 
-        let directory = self.root().join(".cr/views");
-        let metadata = match fs::symlink_metadata(&directory) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(views.into_values().collect())
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("could not inspect view directory {}", directory.display())
-                })
-            }
+        let Some(entries) =
+            paths::list_directory(self.root(), Path::new(VIEW_DIRECTORY), VIEW_DIRECTORY_LABEL)?
+        else {
+            return Ok(views.into_values().collect());
         };
-        if !metadata.file_type().is_dir() {
-            bail!("view path {} must be a directory", directory.display());
-        }
 
         let mut names = Vec::new();
-        for entry in fs::read_dir(&directory)
-            .with_context(|| format!("could not read view directory {}", directory.display()))?
-        {
-            let entry = entry?;
-            if !entry.file_type()?.is_file()
-                || entry.path().extension().and_then(|value| value.to_str()) != Some("yaml")
+        for entry in entries {
+            let entry_path = Path::new(&entry.name);
+            if !entry.kind.is_file()
+                || entry_path.extension().and_then(|value| value.to_str()) != Some("yaml")
             {
                 continue;
             }
-            let name = entry
-                .path()
+            let name = entry_path
                 .file_stem()
                 .and_then(|value| value.to_str())
                 .context("view filename is not valid UTF-8")?
@@ -259,24 +253,33 @@ impl Database {
     }
 
     fn read_view(&self, name: &str) -> Result<ViewDefinition> {
+        self.read_view_optional(name)?
+            .ok_or_else(|| DomainError::view_not_found(name).into())
+    }
+
+    /// Read a saved view, reporting one that is not defined as `None` while
+    /// still refusing a definition reached through a symbolic link.
+    fn read_view_optional(&self, name: &str) -> Result<Option<ViewDefinition>> {
         validate_view_name(name)?;
-        let path = self.view_path(name);
-        let metadata =
-            fs::symlink_metadata(&path).with_context(|| DomainError::view_not_found(name))?;
-        if !metadata.file_type().is_file() {
-            bail!("view path {} must be a regular file", path.display());
-        }
         let serialized =
-            fs::read_to_string(&path).with_context(|| format!("could not read view '{name}'"))?;
+            match paths::read_to_string(self.root(), &view_path(name), &view_label(name)) {
+                Ok(serialized) => serialized,
+                Err(error) if is_missing(&error) => return Ok(None),
+                Err(error) => return Err(error),
+            };
         let stored: StoredViewDefinition = yaml_serde::from_str(&serialized)
             .with_context(|| DomainError::Invalid(format!("view '{name}' is not valid YAML")))?;
         validate_stored(name, &stored)?;
-        Ok(to_public(name, stored, true))
+        Ok(Some(to_public(name, stored, true)))
     }
+}
 
-    fn view_path(&self, name: &str) -> PathBuf {
-        self.root().join(".cr/views").join(format!("{name}.yaml"))
-    }
+fn view_path(name: &str) -> PathBuf {
+    Path::new(VIEW_DIRECTORY).join(format!("{name}.yaml"))
+}
+
+fn view_label(name: &str) -> String {
+    format!("view '{name}'")
 }
 
 fn validate_view_name(name: &str) -> Result<()> {
@@ -436,6 +439,8 @@ fn is_ascending(direction: &SortDirection) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::tempdir;
 
     use super::*;
