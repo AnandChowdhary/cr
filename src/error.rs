@@ -85,6 +85,54 @@ impl DomainError {
     pub fn view_exists(name: &str) -> Self {
         Self::AlreadyExists(format!("view '{name}' already exists"))
     }
+
+    /// A Markdown file in a collection's directory cannot be a record, because
+    /// its name is not a usable record ID.
+    ///
+    /// A named constructor rather than a message per call site, because four
+    /// paths enumerate a collection directory and the whole point of this
+    /// error is that they refuse the same file in the same words. It names the
+    /// collection and the filename — the two facts needed to find and fix the
+    /// file — and neither is a filesystem path.
+    ///
+    /// [`Self::Conflict`], not [`Self::Invalid`]: the request is well formed
+    /// and it is the database's stored state that is not usable, exactly as
+    /// for the entry kinds `paths::refuse_entry` rejects a few lines away. A
+    /// client asking for `GET /api/v1/records/deals` did nothing wrong, so
+    /// answering `422` would blame the wrong side.
+    pub fn invalid_record_name(collection: &str, file_name: &str) -> Self {
+        Self::Conflict(format!(
+            "collection '{collection}' contains a Markdown file named '{file_name}' whose name cannot be a record ID"
+        ))
+    }
+
+    /// A Markdown file in a collection's directory has a name that is not
+    /// valid UTF-8, so it cannot be a record ID.
+    ///
+    /// `file_name` is rendered lossily by the caller: the name is by
+    /// definition unprintable, and a replacement character in the right place
+    /// still tells somebody which file is meant.
+    pub fn non_utf8_record_name(collection: &str, file_name: &str) -> Self {
+        Self::Conflict(format!(
+            "collection '{collection}' contains a Markdown file named '{file_name}' whose name is not valid UTF-8"
+        ))
+    }
+
+    /// A directory inside the records directory cannot be a collection,
+    /// because its name is not a usable path component.
+    pub fn invalid_collection_name(directory_name: &str) -> Self {
+        Self::Conflict(format!(
+            "the records directory contains a directory named '{directory_name}' whose name cannot be a collection"
+        ))
+    }
+
+    /// A directory inside the records directory has a name that is not valid
+    /// UTF-8, so it cannot be a collection.
+    pub fn non_utf8_collection_name(directory_name: &str) -> Self {
+        Self::Conflict(format!(
+            "the records directory contains a directory named '{directory_name}' whose name is not valid UTF-8"
+        ))
+    }
 }
 
 impl Display for DomainError {
@@ -169,6 +217,30 @@ mod tests {
         assert_eq!(
             DomainError::of(&invalid("bad field")).map(DomainError::code),
             Some("validation_failed")
+        );
+    }
+
+    #[test]
+    fn unusable_stored_names_are_conflicts_naming_the_file_and_its_collection() {
+        let bad_id = DomainError::invalid_record_name("deals", "..md");
+        assert_eq!(bad_id.code(), "conflict");
+        assert_eq!(
+            bad_id.message(),
+            "collection 'deals' contains a Markdown file named '..md' whose name cannot be a record ID"
+        );
+        assert!(!bad_id.message().contains('/'), "{bad_id}");
+
+        let bad_utf8 = DomainError::non_utf8_record_name("deals", "bad\u{fffd}.md");
+        assert_eq!(bad_utf8.code(), "conflict");
+        assert!(bad_utf8.message().contains("not valid UTF-8"), "{bad_utf8}");
+
+        assert_eq!(
+            DomainError::invalid_collection_name("..").message(),
+            "the records directory contains a directory named '..' whose name cannot be a collection"
+        );
+        assert_eq!(
+            DomainError::non_utf8_collection_name("bad\u{fffd}").code(),
+            "conflict"
         );
     }
 

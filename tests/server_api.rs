@@ -985,3 +985,63 @@ async fn unexpected_failures_reveal_only_a_generic_message_and_a_request_id() {
     assert_eq!(health.status, StatusCode::OK);
     assert!(health.headers.contains_key("x-request-id"));
 }
+
+/// A record filename that cannot be an ID is the database's stored state being
+/// unusable, not the request being wrong, so it is a `409 conflict` rather
+/// than a `422` blaming a caller who asked for nothing unusual — and above all
+/// not an unclassified `500`, which would hide the one sentence that says how
+/// to fix it.
+#[tokio::test]
+async fn an_unusable_record_filename_is_a_classified_conflict_over_http() {
+    let (_temporary, database) = test_database("server-unusable-record-name");
+    database.create("deals", "acme", &[], "").unwrap();
+    fs::write(
+        database.root().join("records/deals/..md"),
+        "---\nvalue: 1\n---\n",
+    )
+    .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let root = database.root().to_string_lossy().to_string();
+
+    for uri in [
+        "/api/v1/collections/deals/records",
+        "/api/v1/search?q=acme",
+        "/api/v1/status",
+    ] {
+        let response = request(&app, Method::GET, uri, None, &[]).await;
+        assert_eq!(
+            response.status,
+            StatusCode::CONFLICT,
+            "{uri}: {:?}",
+            response.text()
+        );
+        assert_eq!(response.json()["error"]["code"], "conflict", "{uri}");
+        let message = response.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            message.contains("collection 'deals'") && message.contains("'..md'"),
+            "{uri} did not name the file and its collection: {message}"
+        );
+        assert!(
+            message.contains("cannot be a record ID"),
+            "{uri} did not say what is wrong: {message}"
+        );
+        assert!(
+            !message.contains(&root) && !message.contains("records/deals"),
+            "{uri} leaked a filesystem path: {message}"
+        );
+    }
+
+    // The healthy record beside it is still addressable by name.
+    let single = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/records/acme",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(single.status, StatusCode::OK);
+}

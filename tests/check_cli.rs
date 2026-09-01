@@ -327,13 +327,55 @@ fn a_markdown_file_that_cannot_be_a_record_id_is_reported_by_name() {
     let finding = run.one("invalid_record_name");
     assert_eq!(finding["severity"], "error");
     assert_eq!(finding["collection"], "deals");
-    assert!(
-        finding["message"]
-            .as_str()
-            .unwrap()
-            .contains("cannot be a record ID"),
-        "{finding:#?}"
+    let message = finding["message"].as_str().unwrap();
+    assert!(message.contains("cannot be a record ID"), "{finding:#?}");
+    // Which file. Every other command refuses this database with this same
+    // sentence, so the finding is also the repair instruction.
+    assert!(message.contains("'..md'"), "{finding:#?}");
+}
+
+/// `check` is the tool that explains a database nothing else will touch, so it
+/// has to survive exactly the names that stop everything else.
+#[test]
+fn check_still_enumerates_a_database_that_every_other_command_refuses() {
+    let database = seeded();
+    fs::write(
+        database.root.join("records/deals/..md"),
+        "---\nvalue: 1\n---\n",
+    )
+    .unwrap();
+
+    // The premise: this database is wedged for every enumerating command.
+    for arguments in [
+        ["list", "deals"].as_slice(),
+        ["status"].as_slice(),
+        ["audit", "verify"].as_slice(),
+    ] {
+        let mut command = database.command();
+        let output = command.args(arguments).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "cr {} unexpectedly succeeded",
+            arguments.join(" ")
+        );
+    }
+
+    // `check` reports it and keeps going: both healthy records are still read,
+    // parsed, and reconciled against the journal, and the honest relation
+    // between them still resolves.
+    let run = check(&database.root, &["--json"]);
+    assert_eq!(run.status, FOUND_PROBLEMS);
+    assert_eq!(run.kinds(), ["invalid_record_name"], "{}", run.stdout);
+    assert_eq!(run.json()["summary"]["records"], 2, "{}", run.stdout);
+    assert_eq!(
+        run.json()["summary"]["audited_records"],
+        2,
+        "{}",
+        run.stdout
     );
+    assert_eq!(run.json()["summary"]["collections"], 2, "{}", run.stdout);
+    assert_eq!(run.json()["summary"]["errors"], 1, "{}", run.stdout);
+    assert_eq!(run.json()["summary"]["warnings"], 0, "{}", run.stdout);
 }
 
 #[test]
@@ -681,9 +723,24 @@ fn no_finding_ever_names_a_filesystem_path() {
     for finding in run.json()["findings"].as_array().unwrap() {
         let message = finding["message"].as_str().unwrap();
         assert!(
-            !message.contains(&root) && !message.contains(".md") && !message.contains("/records/"),
-            "a finding named a filesystem path: {message}"
+            !message.contains(&root),
+            "a finding named the database root: {message}"
         );
+        assert!(
+            !message.contains("records/") && !message.contains(".cr/"),
+            "a finding named a directory inside the database: {message}"
+        );
+        // Naming the offending file is the whole value of an invalid-name
+        // finding — `'..md'` is how somebody knows what to delete — but naming
+        // where it sits is the leak. A bare filename carries no separator; a
+        // filename with one in front of it is a path.
+        for token in message.split(|character: char| character.is_whitespace() || character == '\'')
+        {
+            assert!(
+                !(token.contains('/') && token.ends_with(".md")),
+                "a finding named a filesystem path: {message}"
+            );
+        }
     }
     assert!(!run.stdout.contains(&root), "{}", run.stdout);
 }
