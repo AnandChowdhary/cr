@@ -27,9 +27,11 @@ use sha2::{Digest, Sha256};
 use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
-    audit::AuditChange, sort_records_by_field, Assignment, AuditEntry, AuditSource,
-    CollectionModel, Database, DomainError, FilterExpression, FilterOperator, Record, SearchQuery,
-    SearchTarget, SortDirection, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
+    audit::AuditChange, sort_records_by_field, AgentEvidence, Assignment, Attribution,
+    AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
+    AuditIntentPart, AuditSource, CollectionModel, Database, DomainError, FilterExpression,
+    FilterOperator, Record, SearchQuery, SearchTarget, SortDirection, ViewDefinition,
+    ViewFilterGroup, ViewLayout, ViewPredicateMatch,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -39,6 +41,11 @@ const MAX_PAGE_OFFSET: usize = 1_000_000;
 const MAX_VIEW_FILTERS: usize = 20;
 const MAX_VIEW_COLUMNS: usize = 50;
 const ACTOR_HEADER: &str = "x-cr-actor";
+/// Attribution headers. Like `X-CR-Actor`, every one of them is an assertion by
+/// the caller: the server records what it is told and authenticates none of it.
+const AGENT_HEADER: &str = "x-cr-agent";
+const AUTHORIZATION_ATTRIBUTION_HEADER: &str = "x-cr-authorization";
+const INTENT_HEADER: &str = "x-cr-intent";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 /// The only message an unexpected failure may reveal. Everything else about it
 /// stays in the server log, correlated by request ID.
@@ -381,6 +388,8 @@ fn saved_filter_group_matches(
 struct AuditViewQuery {
     collection: Option<String>,
     id: Option<String>,
+    agent: Option<String>,
+    session: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
 }
@@ -524,6 +533,8 @@ struct SearchParameters {
 struct AuditLogParameters {
     collection: Option<String>,
     id: Option<String>,
+    agent: Option<String>,
+    session: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
 }
@@ -586,6 +597,9 @@ struct BaselineResponse {
 #[derive(Debug, Serialize)]
 struct IdentityResponse {
     actor: String,
+    agent: Option<AuditAgent>,
+    authorization: Option<AuditAuthorization>,
+    intent: Option<AuditIntent>,
 }
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -931,6 +945,11 @@ async fn audit_view(
             .clone()
             .filter(|value| !value.trim().is_empty());
         let id = query.id.clone().filter(|value| !value.trim().is_empty());
+        let agent = query.agent.clone().filter(|value| !value.trim().is_empty());
+        let session = query
+            .session
+            .clone()
+            .filter(|value| !value.trim().is_empty());
         if id.is_some() && collection.is_none() {
             return Err(ApiError::bad_request(
                 "invalid_audit_filter",
@@ -943,7 +962,15 @@ async fn audit_view(
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| ApiError::unprocessable("pagination window is too large"))?;
         let entries = run_database(&state, &headers, move |database| {
-            database.audit_recent(requested, collection.as_deref(), id.as_deref())
+            database.audit_recent(
+                requested,
+                AuditFilter {
+                    collection: collection.as_deref(),
+                    id: id.as_deref(),
+                    agent: agent.as_deref(),
+                    session: session.as_deref(),
+                },
+            )
         })
         .await?;
         let page = paginate_unknown_total(entries, bounds);
@@ -1171,8 +1198,7 @@ async fn edit_record_form(
                 let record = database.get(&view.collection, &requested_id)?;
                 let audit_entries = database.audit_recent(
                     DEFAULT_PAGE_SIZE,
-                    Some(&view.collection),
-                    Some(&requested_id),
+                    AuditFilter::record(&view.collection, &requested_id),
                 )?;
                 let schema = collection_schema(database, &view.collection)?;
                 Ok((view, record, audit_entries, schema))
@@ -1351,8 +1377,12 @@ async fn identity(
     headers: HeaderMap,
 ) -> ApiResult<Json<IdentityResponse>> {
     let database = request_database(&state, &headers)?;
+    let attribution: Attribution = database.attribution().clone();
     Ok(Json(IdentityResponse {
         actor: database.actor().to_owned(),
+        agent: attribution.agent,
+        authorization: attribution.authorization,
+        intent: attribution.intent,
     }))
 }
 
@@ -1605,8 +1635,12 @@ async fn audit_log(
     let entries = run_database(&state, &headers, move |database| {
         database.audit_recent(
             requested,
-            parameters.collection.as_deref(),
-            parameters.id.as_deref(),
+            AuditFilter {
+                collection: parameters.collection.as_deref(),
+                id: parameters.id.as_deref(),
+                agent: parameters.agent.as_deref(),
+                session: parameters.session.as_deref(),
+            },
         )
     })
     .await?;
@@ -1756,7 +1790,56 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
         },
         "Identity": {
             "type": "object", "required": ["actor"],
-            "properties": { "actor": { "type": "string" } }
+            "description": "The attribution this request would record. Every field is asserted by the caller and authenticated by nothing.",
+            "properties": {
+                "actor": { "type": "string" },
+                "agent": { "oneOf": [{ "$ref": "#/components/schemas/AuditAgent" }, { "type": "null" }] },
+                "authorization": { "oneOf": [{ "$ref": "#/components/schemas/AuditAuthorization" }, { "type": "null" }] },
+                "intent": { "oneOf": [{ "$ref": "#/components/schemas/AuditIntent" }, { "type": "null" }] }
+            }
+        },
+        "AuditAgent": {
+            "type": "object", "required": ["id", "detected_from"],
+            "description": "Software that acted on the actor's behalf. Asserted, never verified.",
+            "properties": {
+                "id": { "type": "string" },
+                "version": { "type": "string" },
+                "model": { "type": "string" },
+                "session": { "type": "string" },
+                "turn": { "type": "string" },
+                "detected_from": {
+                    "enum": ["environment", "flag", "header", "config"],
+                    "description": "How cr came to believe this. No value means verified."
+                },
+                "via": { "type": "array", "items": { "$ref": "#/components/schemas/AuditAgent" }, "description": "Delegation chain, nearest actor first." }
+            }
+        },
+        "AuditAuthorization": {
+            "type": "object", "required": ["mode"],
+            "properties": {
+                "mode": { "enum": ["direct", "interactive", "delegated", "autonomous", "unknown"] },
+                "grant": { "type": "string" },
+                "approved_by": { "type": "string" },
+                "at": { "type": "string", "format": "date-time" },
+                "approved_changes": { "type": "string", "description": "Reserved for a previewed-change digest that cr does not yet verify. Callers cannot supply it." }
+            }
+        },
+        "AuditIntentPart": {
+            "type": "object", "required": ["author"],
+            "properties": {
+                "author": { "enum": ["human", "agent", "system"] },
+                "text": { "type": "string" },
+                "digest": { "type": "string" },
+                "ref": { "type": "string" },
+                "at": { "type": "string", "format": "date-time" }
+            }
+        },
+        "AuditIntent": {
+            "type": "object",
+            "properties": {
+                "request": { "$ref": "#/components/schemas/AuditIntentPart" },
+                "rationale": { "$ref": "#/components/schemas/AuditIntentPart" }
+            }
         },
         "CollectionModel": {
             "type": "object", "required": ["name"],
@@ -1830,7 +1913,11 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "source": { "enum": ["cli", "api", "filesystem", "sync"] },
                 "action": { "enum": ["baseline", "create", "update", "link", "delete"] },
                 "record": { "type": "object" },
-                "changes": { "type": "array", "items": { "type": "object" } }
+                "changes": { "type": "array", "items": { "type": "object" } },
+                "agent": { "$ref": "#/components/schemas/AuditAgent" },
+                "authorization": { "$ref": "#/components/schemas/AuditAuthorization" },
+                "intent": { "$ref": "#/components/schemas/AuditIntent" },
+                "message": { "type": "string" }
             },
             "additionalProperties": true
         },
@@ -1891,8 +1978,36 @@ fn openapi_paths() -> JsonValue {
         "in": "header",
         "required": false,
         "schema": { "type": "string" },
-        "description": "Audit identity override for this request."
+        "description": "Audit identity override for this request. Asserted, not authenticated."
     });
+    let attribution_headers = [
+        actor.clone(),
+        json!({
+            "name": "X-CR-Agent",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Software acting on the actor's behalf: 'none', a bare identifier such as claude-code, or a JSON agent object. Recorded as detected_from: header and authenticated by nothing."
+        }),
+        json!({
+            "name": "X-CR-Authorization",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Approval this change was made under: a bare mode (direct, interactive, delegated, autonomous, unknown) or a JSON authorization object."
+        }),
+        json!({
+            "name": "X-CR-Intent",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "JSON intent object with a request, a rationale, or both. Header values are visible ASCII, so other characters must use JSON \\u escapes."
+        }),
+    ];
+    let mutation_parameters = |mut path: Vec<JsonValue>| {
+        path.extend(attribution_headers.iter().cloned());
+        JsonValue::Array(path)
+    };
     let collection = json!({
         "name": "collection", "in": "path", "required": true,
         "schema": { "type": "string" }
@@ -1939,7 +2054,7 @@ fn openapi_paths() -> JsonValue {
             }
         },
         "/api/v1/identity": {
-            "get": { "operationId": "getIdentity", "responses": ok("#/components/schemas/Identity") }
+            "get": { "operationId": "getIdentity", "parameters": mutation_parameters(Vec::new()), "responses": ok("#/components/schemas/Identity") }
         },
         "/api/v1/collections": {
             "get": { "operationId": "listCollections", "parameters": page_parameters.clone(), "responses": ok("#/components/schemas/CollectionPage") }
@@ -1957,7 +2072,7 @@ fn openapi_paths() -> JsonValue {
                 "responses": ok("#/components/schemas/RecordPage")
             },
             "post": {
-                "operationId": "createRecord", "parameters": [collection.clone(), actor.clone()],
+                "operationId": "createRecord", "parameters": mutation_parameters(vec![collection.clone()]),
                 "requestBody": json_body("#/components/schemas/CreateRecordRequest"),
                 "responses": created("#/components/schemas/Record")
             }
@@ -1965,11 +2080,11 @@ fn openapi_paths() -> JsonValue {
         "/api/v1/collections/{collection}/records/{id}": {
             "get": { "operationId": "getRecord", "parameters": [collection.clone(), id.clone()], "responses": ok("#/components/schemas/Record") },
             "patch": {
-                "operationId": "patchRecord", "parameters": [collection.clone(), id.clone(), actor.clone()],
+                "operationId": "patchRecord", "parameters": mutation_parameters(vec![collection.clone(), id.clone()]),
                 "requestBody": json_body("#/components/schemas/PatchRecordRequest"),
                 "responses": ok("#/components/schemas/Record")
             },
-            "delete": { "operationId": "deleteRecord", "parameters": [collection.clone(), id.clone(), actor.clone()], "responses": ok("#/components/schemas/DeleteResponse") }
+            "delete": { "operationId": "deleteRecord", "parameters": mutation_parameters(vec![collection.clone(), id.clone()]), "responses": ok("#/components/schemas/DeleteResponse") }
         },
         "/api/v1/collections/{collection}/records/{id}/document": {
             "get": { "operationId": "getRecordDocument", "parameters": [collection.clone(), id.clone()], "responses": { "200": { "description": "Exact Markdown document", "content": { "text/markdown": { "schema": { "type": "string" } } } }, "404": error_response() } }
@@ -1978,7 +2093,7 @@ fn openapi_paths() -> JsonValue {
             "get": { "operationId": "getRecordField", "parameters": [collection.clone(), id.clone(), json!({ "name": "field", "in": "path", "required": true, "schema": { "type": "string" } })], "responses": ok("#/components/schemas/FieldResponse") }
         },
         "/api/v1/collections/{collection}/records/{id}/links": {
-            "post": { "operationId": "linkRecord", "parameters": [collection, id, actor], "requestBody": json_body("#/components/schemas/LinkRequest"), "responses": ok("#/components/schemas/Record") }
+            "post": { "operationId": "linkRecord", "parameters": mutation_parameters(vec![collection, id]), "requestBody": json_body("#/components/schemas/LinkRequest"), "responses": ok("#/components/schemas/Record") }
         },
         "/api/v1/search": {
             "get": { "operationId": "searchRecords", "parameters": [
@@ -1997,8 +2112,10 @@ fn openapi_paths() -> JsonValue {
             ], "responses": ok("#/components/schemas/RecordPage") }
         },
         "/api/v1/status": { "get": { "operationId": "getStatus", "parameters": page_parameters, "responses": ok("#/components/schemas/WorkingChangePage") } },
-        "/api/v1/save": { "post": { "operationId": "saveDirectEdits", "requestBody": json_body("#/components/schemas/SaveRequest"), "responses": ok("#/components/schemas/AuditEntries") } },
+        "/api/v1/save": { "post": { "operationId": "saveDirectEdits", "parameters": mutation_parameters(Vec::new()), "requestBody": json_body("#/components/schemas/SaveRequest"), "responses": ok("#/components/schemas/AuditEntries") } },
         "/api/v1/audit/log": { "get": { "operationId": "getAuditLog", "parameters": [
+            { "name": "agent", "in": "query", "description": "Only events whose acting agent, or any delegate in its chain, carries this identifier.", "schema": { "type": "string" } },
+            { "name": "session", "in": "query", "description": "Only events whose acting agent, or any delegate in its chain, carries this session identifier.", "schema": { "type": "string" } },
             { "name": "collection", "in": "query", "schema": { "type": "string" } },
             { "name": "id", "in": "query", "schema": { "type": "string" } },
             { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
@@ -2139,7 +2256,7 @@ fn render_audit_view(page: &Page<AuditEntry>, query: &AuditViewQuery) -> Markup 
                 }
                 a href="/api/v1/audit/log" class="cr-button" { "JSON API" span aria-hidden="true" { " ↗" } }
             }
-            form method="get" action=(reset_url) class="cr-surface mb-5 grid gap-3 p-4 sm:grid-cols-[1fr_1fr_auto]" {
+            form method="get" action=(reset_url) class="cr-surface mb-5 grid gap-3 p-4 sm:grid-cols-[1fr_1fr_1fr_1fr_auto]" {
                 label class="block" {
                     span class="mb-1 block text-xs font-semibold text-slate-600" { "Collection" }
                     input type="text" name="collection" value=(query.collection.as_deref().unwrap_or("")) placeholder="deals" autocomplete="off" spellcheck="false" class="w-full border px-3 py-2 font-mono text-sm outline-none";
@@ -2147,6 +2264,14 @@ fn render_audit_view(page: &Page<AuditEntry>, query: &AuditViewQuery) -> Markup 
                 label class="block" {
                     span class="mb-1 block text-xs font-semibold text-slate-600" { "Record ID" }
                     input type="text" name="id" value=(query.id.as_deref().unwrap_or("")) placeholder="acme-renewal" autocomplete="off" spellcheck="false" class="w-full border px-3 py-2 font-mono text-sm outline-none";
+                }
+                label class="block" {
+                    span class="mb-1 block text-xs font-semibold text-slate-600" { "Agent" }
+                    input type="text" name="agent" value=(query.agent.as_deref().unwrap_or("")) placeholder="claude-code" autocomplete="off" spellcheck="false" class="w-full border px-3 py-2 font-mono text-sm outline-none";
+                }
+                label class="block" {
+                    span class="mb-1 block text-xs font-semibold text-slate-600" { "Agent session" }
+                    input type="text" name="session" value=(query.session.as_deref().unwrap_or("")) placeholder="6d1baa69" autocomplete="off" spellcheck="false" class="w-full border px-3 py-2 font-mono text-sm outline-none";
                 }
                 div class="flex items-end gap-2" {
                     button type="submit" class="cr-button cr-button-primary" { "Filter events" }
@@ -2191,7 +2316,30 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
                                 }
                                 p class="mt-1 text-xs text-slate-500" {
                                     "by " span class="font-medium text-slate-700" { (&entry.payload.actor) }
+                                    @if let Some(agent) = &entry.payload.agent {
+                                        " · via " a href=(audit_agent_url(&agent.id)) class="font-medium text-slate-700 hover:text-blue-700" { (&agent.id) }
+                                    }
                                     " · " time datetime=(&entry.payload.timestamp) { (&entry.payload.timestamp) }
+                                }
+                                @if let Some(agent) = &entry.payload.agent {
+                                    (render_audit_agent(agent))
+                                }
+                                @if let Some(authorization) = &entry.payload.authorization {
+                                    p class="mt-2 text-xs text-slate-500" {
+                                        "Authorization "
+                                        span class="font-medium text-slate-700" { (authorization.mode.label()) }
+                                        @if let Some(grant) = &authorization.grant { " · grant " (grant) }
+                                        @if let Some(approved_by) = &authorization.approved_by { " · approved by " (approved_by) }
+                                        @if let Some(at) = &authorization.at { " · " (at) }
+                                    }
+                                }
+                                @if let Some(intent) = &entry.payload.intent {
+                                    @if let Some(request) = &intent.request {
+                                        (render_intent_part("Requested", request))
+                                    }
+                                    @if let Some(rationale) = &intent.rationale {
+                                        (render_intent_part("Agent rationale", rationale))
+                                    }
                                 }
                                 @if let Some(message) = &entry.payload.message {
                                     p class="mt-2 text-sm text-slate-600" { (message) }
@@ -4126,6 +4274,61 @@ fn short_hash(hash: &str) -> String {
     hash.chars().take(20).collect()
 }
 
+/// One agent line, including the delegation chain behind it.
+fn render_audit_agent(agent: &AuditAgent) -> Markup {
+    let chain: Vec<&AuditAgent> = agent.via.iter().flatten().collect();
+    html! {
+        p class="mt-2 text-xs text-slate-500" {
+            "Agent " span class="font-medium text-slate-700" { (&agent.id) }
+            @if let Some(version) = &agent.version { " " (version) }
+            @if let Some(model) = &agent.model { " · model " (model) }
+            @if let Some(session) = &agent.session {
+                " · session " a href=(audit_session_url(session)) class="hover:text-blue-700" { (session) }
+            }
+            @if let Some(turn) = &agent.turn { " · turn " (turn) }
+            @for delegate in &chain { " · via " (&delegate.id) }
+            " · asserted, detected from " (agent.detected_from.label())
+        }
+    }
+}
+
+/// One intent half, bounded for display. The complete text stays in the event.
+fn render_intent_part(label: &str, part: &AuditIntentPart) -> Markup {
+    html! {
+        p class="mt-2 text-sm text-slate-600" {
+            span class="text-xs font-semibold uppercase tracking-wide text-slate-500" { (label) }
+            " (" (part.author.label()) ") "
+            @if let Some(text) = &part.text { (text_preview(text)) }
+            @else if let Some(digest) = &part.digest { "text not retained; digest " (digest) }
+        }
+    }
+}
+
+/// Bound one attribution string for a page without losing it from the journal.
+fn text_preview(value: &str) -> String {
+    const MAX_CHARS: usize = 400;
+    let mut characters = value.chars();
+    let preview: String = characters.by_ref().take(MAX_CHARS).collect();
+    let preview = preview.replace(['\n', '\r'], " ");
+    if characters.next().is_some() {
+        format!("{preview} …")
+    } else {
+        preview
+    }
+}
+
+fn audit_agent_url(agent: &str) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("agent", agent);
+    format!("/audit?{}", serializer.finish())
+}
+
+fn audit_session_url(session: &str) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("session", session);
+    format!("/audit?{}", serializer.finish())
+}
+
 fn audit_filter_url(collection: &str, id: &str) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     serializer.append_pair("collection", collection);
@@ -4144,6 +4347,20 @@ fn audit_page_url(query: &AuditViewQuery, limit: usize, offset: usize) -> String
     }
     if let Some(id) = query.id.as_deref().filter(|value| !value.trim().is_empty()) {
         serializer.append_pair("id", id);
+    }
+    if let Some(agent) = query
+        .agent
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        serializer.append_pair("agent", agent);
+    }
+    if let Some(session) = query
+        .session
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        serializer.append_pair("session", session);
     }
     serializer.append_pair("limit", &limit.to_string());
     serializer.append_pair("offset", &offset.to_string());
@@ -4721,14 +4938,63 @@ async fn method_not_allowed() -> ApiError {
 }
 
 fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database> {
-    let database = state.database.clone();
-    let Some(actor) = headers.get(ACTOR_HEADER) else {
+    let mut database = state.database.clone();
+    if let Some(actor) = headers.get(ACTOR_HEADER) {
+        let actor = actor.to_str().map_err(|_| {
+            ApiError::bad_request("invalid_actor", "X-CR-Actor must be valid UTF-8")
+        })?;
+        database = database.with_actor(actor).map_err(ApiError::from_domain)?;
+    }
+    let agent = attribution_header(headers, AGENT_HEADER, "X-CR-Agent", "invalid_agent")?;
+    let authorization = attribution_header(
+        headers,
+        AUTHORIZATION_ATTRIBUTION_HEADER,
+        "X-CR-Authorization",
+        "invalid_authorization",
+    )?;
+    let intent = attribution_header(headers, INTENT_HEADER, "X-CR-Intent", "invalid_intent")?;
+    if agent.is_none() && authorization.is_none() && intent.is_none() {
         return Ok(database);
-    };
-    let actor = actor
-        .to_str()
-        .map_err(|_| ApiError::bad_request("invalid_actor", "X-CR-Actor must be valid UTF-8"))?;
-    database.with_actor(actor).map_err(ApiError::from_domain)
+    }
+    let mut attribution = database.attribution().clone();
+    attribution
+        .apply(
+            &AttributionOverrides {
+                agent,
+                authorization,
+                intent,
+                ..AttributionOverrides::default()
+            },
+            AgentEvidence::Header,
+        )
+        .map_err(ApiError::from_domain)?;
+    Ok(database.with_attribution(attribution))
+}
+
+/// Read one attribution header.
+///
+/// HTTP header values are visible ASCII, so non-ASCII intent text must arrive
+/// as JSON `\uXXXX` escapes. The rejection says so without naming anything
+/// internal.
+fn attribution_header<'a>(
+    headers: &'a HeaderMap,
+    header: &str,
+    name: &str,
+    code: &'static str,
+) -> ApiResult<Option<&'a str>> {
+    headers
+        .get(header)
+        .map(|value| {
+            value.to_str().map_err(|_| {
+                ApiError::bad_request(
+                    code,
+                    format!(
+                        "{name} must be visible ASCII; encode other characters as JSON \\u escapes"
+                    ),
+                )
+            })
+        })
+        .transpose()
 }
 
 async fn run_database<T, F>(state: &AppState, headers: &HeaderMap, operation: F) -> ApiResult<T>

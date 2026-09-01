@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use yaml_serde::{Mapping, Value};
 
 use crate::{
-    audit::{record_hash, AuditLog, AuditMutation, ReconciledMutation},
+    attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
+    audit::{record_hash, AuditFilter, AuditLog, AuditMutation, ReconciledMutation},
     error::{conflict, invalid, is_already_exists, is_missing, DomainError},
     frontmatter::Document,
     paths,
@@ -90,6 +91,7 @@ pub struct Database {
     actor: String,
     source: AuditSource,
     audit_message: Option<String>,
+    attribution: Attribution,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -242,6 +244,7 @@ impl Database {
             actor: String::new(),
             source: AuditSource::Cli,
             audit_message: None,
+            attribution: Attribution::from_environment()?,
         };
         let database = database.with_default_actor();
         database.audit().ensure_layout()?;
@@ -309,6 +312,7 @@ impl Database {
             actor: String::new(),
             source: AuditSource::Cli,
             audit_message: None,
+            attribution: Attribution::from_environment()?,
         };
         let database = database.with_default_actor();
         let audit = database.audit();
@@ -332,6 +336,37 @@ impl Database {
         }
         self.actor = actor;
         Ok(self)
+    }
+
+    /// The agent, authorization, and intent that will be recorded beside
+    /// `actor` on every event this database appends.
+    pub fn attribution(&self) -> &Attribution {
+        &self.attribution
+    }
+
+    /// The agent that carried out changes on the actor's behalf, if any.
+    pub fn agent(&self) -> Option<&AuditAgent> {
+        self.attribution.agent.as_ref()
+    }
+
+    /// The approval recorded for changes, if any.
+    pub fn authorization(&self) -> Option<&AuditAuthorization> {
+        self.attribution.authorization.as_ref()
+    }
+
+    /// The intent recorded for changes, if any.
+    pub fn intent(&self) -> Option<&AuditIntent> {
+        self.attribution.intent.as_ref()
+    }
+
+    /// Replace the attribution recorded beside `actor`.
+    ///
+    /// Nothing here is authenticated. It is a cooperating process's claim about
+    /// itself, exactly like `actor`, and it never affects what an operation is
+    /// permitted to do.
+    pub fn with_attribution(mut self, attribution: Attribution) -> Self {
+        self.attribution = attribution;
+        self
     }
 
     pub fn with_source(mut self, source: AuditSource) -> Self {
@@ -833,25 +868,20 @@ impl Database {
         Ok(entries)
     }
 
-    pub fn audit_recent(
-        &self,
-        limit: usize,
-        collection: Option<&str>,
-        id: Option<&str>,
-    ) -> Result<Vec<AuditEntry>> {
-        if id.is_some() && collection.is_none() {
+    pub fn audit_recent(&self, limit: usize, filter: AuditFilter<'_>) -> Result<Vec<AuditEntry>> {
+        if filter.id.is_some() && filter.collection.is_none() {
             return Err(invalid("an audit record ID requires a collection"));
         }
-        if let Some(collection) = collection {
+        if let Some(collection) = filter.collection {
             validate_component(collection, "collection")?;
         }
-        if let Some(id) = id {
+        if let Some(id) = filter.id {
             validate_component(id, "id")?;
         }
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        audit.recent(limit, collection, id)
+        audit.recent(limit, filter)
     }
 
     pub fn audit_head(&self) -> Result<AuditHead> {
@@ -1082,6 +1112,7 @@ impl Database {
             self.config.audit.segment_max_events,
             self.config.audit.segment_max_bytes,
             &self.actor,
+            &self.attribution,
         )
     }
 

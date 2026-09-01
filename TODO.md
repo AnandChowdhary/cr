@@ -29,6 +29,16 @@ Priorities:
 
 - [ ] **P0 — Add authenticated actor identity for stronger audit attribution.**
   CLI actors, `X-CR-Actor`, and bearer tokens are assertions, not authenticated people. Define a trusted identity integration or signed-request mode and distinguish authenticated principals from display attribution in audit events.
+  Partially addressed and deliberately left open. Optional `agent`, `authorization`, and `intent` objects now sit beside `actor`, so an agent acting for a human is expressible instead of invisible, and `agent.detected_from` marks every such claim as asserted — none of its values means verified. That closes the *expressibility* half. It closes none of the *authentication* half: a local process still has no attestation authority, and `CR_AGENT=none` produces an event indistinguishable from a human's. The remaining work is server-side and separable: replace the single `CR_API_TOKEN` with a token table binding bearer tokens to principals, then record the authenticated principal distinctly from any claimed `X-CR-Actor`. The attribution shape means that lands as another optional sibling rather than a migration.
+
+- [ ] **P1 — Verify a previewed change set against what was applied.**
+  `authorization.approved_changes` is defined in the schema and reserved: nothing writes it, and callers are explicitly refused if they try, because a digest nobody checks looks like proof and is none. Add `--preview` to compute a change set without writing and print a digest over the canonical serialization of the `changes` array, `--approved-changes sha256:…` to record it, and a branch in `audit verify` that recomputes the digest from the stored `changes` and fails with a distinct named error on mismatch. This is the one element of the attribution design that is checkable rather than asserted; combined with the existing `before_hash` guard it gives a real "the human approved exactly this" property. No schema change is needed.
+
+- [ ] **P2 — Make attribution enum growth safe.**
+  `AgentEvidence`, `AuthorizationMode`, and `IntentAuthor` are closed enums inside the hashed payload. Adding a variant is a compatibility event, not a metadata addition: an older `cr` cannot deserialize a variant it does not know, and a payload that fails to deserialize fails the whole chain, which is exactly the failure mode the no-version-bump decision exists to avoid. Decide on a tolerant representation — an unknown-variant fallback that preserves the original string for output, or a documented freeze — before any of the three needs a new value.
+
+- [ ] **P3 — Populate attribution from agent harnesses instead of flags.**
+  Agent, authorization, and intent are currently supplied by flags, `CR_*` variables, or `X-CR-*` headers, so an agent has to remember to pass them and the model self-reports its own grant. A Claude Code `PreToolUse` hook receives `session_id`, `prompt_id`, and `permission_mode` on stdin and could export `CR_AGENT` and `CR_AUTHORIZATION` without the model's involvement, which is a materially better source for exactly the two fields environment probing cannot reach. Separately, document a Git convention — human as author, agent as committer, `Co-authored-by:`, and a `Cr-Audit-Head:` trailer — so the commit history stops having the same defect the journal just lost.
 
 - [ ] **P1 — Generate OpenAPI route metadata from the router contract.**
   HTTP routes and the static portion of `openapi_paths()` are maintained separately. Adopt route metadata or a derive/build-time mechanism that makes drift impossible, then validate the generated document with an independent OpenAPI validator.
@@ -251,6 +261,7 @@ Priorities:
 - [x] Literal/regex search across paths, front matter, fields, bodies, and collections.
 - [x] REST API covering current database, search, direct-edit, relation, and audit operations.
 - [x] Bounded HTTP pagination, bearer-token option, request actor attribution, and typed, redacted, request-correlated errors.
+- [x] Optional agent, authorization, and intent attribution recorded beside the responsible human, with documented-variable detection, explicit precedence, an escape hatch, bounded asserted values, `--agent`/`--session` history filters across CLI, REST, and HTML, and no audit format version bump.
 - [x] Live OpenAPI 3.1 collection-schema components.
 - [x] Automatic collection tables and saved server-rendered HTML views with CSRF-protected audited forms.
 - [x] Per-record and global server-rendered audit history with filtering, pagination, attribution, and expandable field diffs.

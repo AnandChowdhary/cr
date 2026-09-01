@@ -7,7 +7,7 @@ use axum::{
 };
 use cr::{
     server::{router, ServerConfig},
-    Assignment, AuditAction, AuditSource, Database, ViewLayout, ViewPredicateMatch,
+    Assignment, AuditAction, AuditFilter, AuditSource, Database, ViewLayout, ViewPredicateMatch,
 };
 use http_body_util::BodyExt;
 use tempfile::TempDir;
@@ -818,7 +818,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
         "interview"
     );
     let audit = database
-        .audit_recent(1, Some("deals"), Some("alpha"))
+        .audit_recent(1, AuditFilter::record("deals", "alpha"))
         .unwrap();
     assert_eq!(audit[0].payload.action, AuditAction::Update);
     assert_eq!(audit[0].payload.source, AuditSource::Api);
@@ -850,7 +850,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
         .is_none());
     assert_eq!(
         database
-            .audit_recent(1, Some("deals"), Some("beta"))
+            .audit_recent(1, AuditFilter::record("deals", "beta"))
             .unwrap()[0]
             .payload
             .action,
@@ -951,7 +951,7 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
     );
     assert_eq!(record.body, "First contact");
     let audit = database
-        .audit_recent(1, Some("deals"), Some("acme"))
+        .audit_recent(1, AuditFilter::record("deals", "acme"))
         .unwrap();
     assert_eq!(audit[0].payload.action, AuditAction::Create);
     assert_eq!(audit[0].payload.source, AuditSource::Api);
@@ -989,7 +989,10 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
     assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(invalid.text().contains("does not match schema"));
     assert_eq!(database.get("deals", "acme").unwrap().body, "First contact");
-    assert_eq!(database.audit_recent(10, None, None).unwrap().len(), 1);
+    assert_eq!(
+        database.audit_recent(10, AuditFilter::all()).unwrap().len(),
+        1
+    );
 
     let bad_csrf = request(
         &app,
@@ -1022,7 +1025,7 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
     assert_eq!(record.attributes["status"], "won");
     assert_eq!(record.body, "Closed won");
     let audit = database
-        .audit_recent(1, Some("deals"), Some("acme"))
+        .audit_recent(1, AuditFilter::record("deals", "acme"))
         .unwrap();
     assert_eq!(audit[0].payload.action, AuditAction::Update);
     assert_eq!(audit[0].payload.source, AuditSource::Api);
@@ -1047,7 +1050,7 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
     assert_eq!(deleted.status, StatusCode::SEE_OTHER);
     assert!(database.get("deals", "acme").is_err());
     let audit = database
-        .audit_recent(1, Some("deals"), Some("acme"))
+        .audit_recent(1, AuditFilter::record("deals", "acme"))
         .unwrap();
     assert_eq!(audit[0].payload.action, AuditAction::Delete);
     assert_eq!(audit[0].payload.source, AuditSource::Api);
@@ -1151,7 +1154,7 @@ async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
     assert_eq!(record.attributes["source"], "referral");
     assert_eq!(record.body, "# Jane\n\nStrong systems background.");
     let audit = database
-        .audit_recent(1, Some("candidates"), Some("jane-doe"))
+        .audit_recent(1, AuditFilter::record("candidates", "jane-doe"))
         .unwrap();
     assert_eq!(audit[0].payload.action, AuditAction::Create);
     assert_eq!(audit[0].payload.source, AuditSource::Api);
@@ -1194,7 +1197,7 @@ async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
     );
     assert_eq!(
         database
-            .audit_recent(10, Some("candidates"), Some("jane-doe"))
+            .audit_recent(10, AuditFilter::record("candidates", "jane-doe"))
             .unwrap()
             .len(),
         1

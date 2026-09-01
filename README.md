@@ -153,6 +153,152 @@ Identity is resolved from `--actor`, `CR_ACTOR`, `CR_NAME` and `CR_EMAIL`, Git a
 
 This provides attribution, not cryptographically authenticated identity. For stronger assurance, store signed audit checkpoints outside the database.
 
+## Record the agent acting for you
+
+`--actor` is the responsible human, always. When an AI coding agent or another
+program runs `cr` on that human's behalf, three optional objects are recorded
+beside it: **who acted**, **under what approval**, and **why**.
+
+```sh
+cr update deals acme-renewal --set status=closed-won \
+  --agent claude-code --agent-model claude-opus-4-5 --agent-session "$CLAUDE_CODE_SESSION_ID" \
+  --authorization delegated --grant acceptEdits \
+  --intent-request 'they messaged that they want to buy — mark this deal closed-won' \
+  --intent-rationale 'Set status to closed-won. Value left unchanged because no figures were given.'
+```
+
+That event records `actor` as the human, `agent` as the software, `authorization`
+as the approval it acted under, and `intent` as both the instruction and the
+agent's own account of what it did:
+
+```json
+{
+  "actor": "Anand Chowdhary <anand@example.com>",
+  "source": "cli",
+  "agent": {
+    "id": "claude-code",
+    "model": "claude-opus-4-5",
+    "session": "6d1baa69-f114-490c-ae19-4be99c2bd744",
+    "detected_from": "flag"
+  },
+  "authorization": { "mode": "delegated", "grant": "acceptEdits" },
+  "intent": {
+    "request": { "author": "human", "text": "they messaged that they want to buy — mark this deal closed-won" },
+    "rationale": { "author": "agent", "text": "Set status to closed-won. Value left unchanged because no figures were given." }
+  },
+  "action": "update"
+}
+```
+
+A human at the keyboard records none of this, and the resulting event is
+byte-for-byte what earlier versions of `cr` wrote.
+
+### What is asserted, and what that means
+
+**Everything here is a claim the calling process makes about itself.** `cr` runs
+as you, with your environment and your files, so it has no way to prove that an
+agent is what it says it is, that you really asked, or that a recorded rationale
+is honest or complete. Like `--actor`, this channel is for attribution: it does
+not affect authentication, and it never affects what an operation is allowed to
+do. `CR_AGENT=none` suppresses detection entirely and produces an event
+indistinguishable from a human's — that is a property of a local-first tool, not
+a gap to be closed later.
+
+What it does buy is legibility in the honest case, which is nearly every case,
+and a conventional slot: once the fields exist and tools fill them, *their
+absence becomes information*.
+
+`agent.detected_from` records how `cr` came to believe an agent was involved.
+**None of its values means "verified".**
+
+| Value | Meaning |
+| --- | --- |
+| `environment` | A documented agent variable was present: `CLAUDECODE` or `CURSOR_AGENT`. |
+| `flag` | Declared with `--agent` or the `CR_AGENT` environment variable. |
+| `header` | Declared with the `X-CR-Agent` request header. |
+| `config` | Declared in a stored sync definition. |
+
+An explicit declaration always outranks a sniffed environment. `cr` records only
+what it actually observed: `CLAUDECODE=1` with no session ID records an
+identifier and nothing else. `agent.model` is never detected, because no agent
+publishes it — declare it or leave it absent.
+
+### The approval mode
+
+`--authorization` answers the question an auditor actually asks: did a person see
+*this* change before it happened?
+
+| Mode | Meaning |
+| --- | --- |
+| `direct` | A human ran the command. No agent involved. |
+| `interactive` | A human was present and approved this specific invocation. |
+| `delegated` | A human instructed the task; this write was covered by a standing grant. |
+| `autonomous` | No human in the session: scheduled, headless, or unattended. |
+| `unknown` | The approval path could not be determined. |
+
+`--grant` stores the raw vendor string verbatim beside the normalized mode, so
+`acceptEdits` survives even though only `delegated` is queryable.
+
+### Both halves of the intent
+
+`--intent-request` is the instruction and is attributed to the human.
+`--intent-rationale` is the agent's account of what this particular write was
+discharging and is attributed to the agent. Both are stored because they answer
+different questions, and the gap between them is where an agent's misreadings
+show up. `author: "human"` means *this text is attributed to the human*, not
+*`cr` watched them type it* — the agent still chose what to quote.
+
+Each is capped at 4,096 characters, with 8,192 characters total per event. Going
+over is an error, not a silent truncation.
+
+`-m/--message` also now works on `create`, `update`, `link`, and `delete`, not
+only `save`. It keeps its existing meaning: a short note about the change.
+
+### Find what an agent did
+
+```sh
+cr audit log --agent claude-code
+cr audit log --session 6d1baa69-f114-490c-ae19-4be99c2bd744
+```
+
+Both match the acting agent or any delegate in its `via` chain, so a sub-agent's
+writes are still findable under the agent that spawned it. The same filters exist
+at `GET /api/v1/audit/log?agent=…&session=…` and on the `/audit` page.
+
+Preview what would be recorded without writing anything:
+
+```sh
+cr identity --json --agent claude-code --authorization delegated
+```
+
+### Structured and chained agents
+
+`--agent`, `--authorization`, and `--intent` each also accept a JSON object, which
+is how a wrapper supplies everything at once, and how a sub-agent records the
+chain behind it:
+
+```sh
+export CR_AGENT='{"id":"claude-code-subagent","session":"child",
+                  "via":[{"id":"claude-code","session":"parent"}]}'
+```
+
+`via` is ordered nearest actor first. Delegates are informational only.
+
+`CR_AGENT`, `CR_AUTHORIZATION`, and `CR_INTENT` apply to every command, so an
+agent harness can set them once for a whole session.
+
+### Compatibility
+
+These fields are optional and are omitted entirely when absent, so the audit
+format version does not change. A journal written before they existed verifies
+to exactly the same head hash, and an older `cr` still verifies a journal that
+contains them — it simply does not display them. That last point matters in a
+shared repository: an older binary shows an agent-written event with no sign that
+anything was omitted.
+
+Intent text is stored inline and is therefore **permanent**, like every other
+value in the journal.
+
 ## How records work
 
 A record is identified by its collection and ID:
@@ -565,7 +711,7 @@ For records that existed before audit logging was introduced, establish their st
 cr --actor 'migration@example.com' audit baseline
 ```
 
-Audit events retain historical field values and deleted record bodies. Protect `.cr/audit/` at least as carefully as `records/`, particularly for personal CRM and recruiting data.
+Audit events retain historical field values and deleted record bodies, and now also any recorded intent text. Everything written to the journal is permanent: removing it would break verification for that event and every event after it. Protect `.cr/audit/` at least as carefully as `records/`, particularly for personal CRM and recruiting data, and treat `--intent-request` and `--intent-rationale` as a bounded attribution channel rather than a place to paste a transcript.
 
 ## Add validation with JSON Schema
 
@@ -971,6 +1117,25 @@ curl -X POST http://127.0.0.1:3000/api/v1/collections/deals/records \
 
 Without the header, requests use the identity resolved when the server starts. As with `--actor`, this header provides attribution, not authenticated personal identity.
 
+Three more headers carry the agent, the approval, and the intent, with exactly
+the same trust boundary — the server records what it is told and authenticates
+none of it:
+
+```sh
+curl -X PATCH http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal \
+  -H 'Content-Type: application/json' \
+  -H 'X-CR-Actor: anand@example.com' \
+  -H 'X-CR-Agent: {"id":"claude-code","session":"6d1baa69"}' \
+  -H 'X-CR-Authorization: {"mode":"delegated","grant":"acceptEdits"}' \
+  -H 'X-CR-Intent: {"request":{"text":"mark it closed-won"},"rationale":{"text":"set status to closed-won"}}' \
+  -d '{ "front_matter": { "status": "closed-won" } }'
+```
+
+Each accepts the same compact or JSON form as its command-line option, and is
+recorded with `detected_from: header`. HTTP header values are visible ASCII, so
+non-ASCII intent text must use JSON `\uXXXX` escapes. `GET /api/v1/identity`
+returns the complete attribution a request would record.
+
 ### CRUD requests
 
 Fetch one record:
@@ -1165,9 +1330,9 @@ ID so it can be quoted in a report.
 
 ```text
 cr init PATH
-cr identity
+cr identity [--json] [ATTRIBUTION]
 
-cr create COLLECTION ID [--set KEY=YAML]... [--body TEXT]
+cr create COLLECTION ID [--set KEY=YAML]... [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
 cr get COLLECTION ID [--json | --field KEY]
 cr list COLLECTION [--where KEY=YAML]... [--where-expr EXPRESSION]...
                    [--sort FIELD [--desc]] [--json]
@@ -1175,9 +1340,10 @@ cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]...
                   [--where-expr EXPRESSION]... [--sort FIELD [--desc]] [--json]
                   [--front-matter | --field KEY | --body | --path]
                   [--ignore-case] [--regex]
-cr update COLLECTION ID [--set KEY=YAML]... [--body TEXT]
+cr update COLLECTION ID [--set KEY=YAML]... [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
 cr link SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
-cr delete COLLECTION ID --yes
+              [-m MESSAGE] [ATTRIBUTION]
+cr delete COLLECTION ID --yes [-m MESSAGE] [ATTRIBUTION]
 cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N]
 
 cr view create NAME --collection COLLECTION [--where KEY=YAML]... [--column FIELD]...
@@ -1186,20 +1352,26 @@ cr view create NAME --collection COLLECTION [--where KEY=YAML]... [--column FIEL
 cr view list [--json]
 cr view show NAME [--json]
 
-cr sync create NAME [--actor IDENTITY] [--timeout-seconds N] -- COMMAND...
+cr sync create NAME [--actor IDENTITY] [--agent AGENT] [--timeout-seconds N] -- COMMAND...
 cr sync list [--json]
 cr sync show NAME [--json]
 cr sync run NAME [--json]
 cr sync state NAME
 
 cr status [--json]
-cr save COLLECTION/ID... [--message TEXT] [--json]
-cr save --all [--message TEXT] [--json]
+cr save COLLECTION/ID... [--message TEXT] [--json] [ATTRIBUTION]
+cr save --all [--message TEXT] [--json] [ATTRIBUTION]
 
-cr audit log [COLLECTION] [ID] [--limit N] [--json]
+cr audit log [COLLECTION] [ID] [--agent AGENT] [--session SESSION] [--limit N] [--json]
 cr audit verify [--expected-head HASH]
 cr audit head [--json]
 cr audit baseline
+
+ATTRIBUTION = [--agent AGENT] [--agent-version V] [--agent-model MODEL]
+              [--agent-session SESSION] [--agent-turn TURN]
+              [--authorization MODE] [--grant GRANT]
+              [--approved-by IDENTITY] [--approved-at TIMESTAMP]
+              [--intent JSON] [--intent-request TEXT] [--intent-rationale TEXT]
 ```
 
 Run `cr COMMAND --help` for complete command-specific help.

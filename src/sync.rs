@@ -48,6 +48,26 @@ pub struct SyncDefinition {
     pub max_operations: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+    /// Software this sync records as acting for its actor.
+    ///
+    /// A sync is a program running for a person, so its audit events can name
+    /// both. The value is stored configuration and is recorded with
+    /// `detected_from: config`; like every other attribution value it is
+    /// asserted rather than verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+/// Attribution a sync records on every audit event its runs append.
+///
+/// A sync is a program running on a person's behalf, so both parties can be
+/// named. Both values are stored configuration and are asserted, never verified.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SyncAttribution {
+    /// Identity recorded as the responsible human.
+    pub actor: Option<String>,
+    /// Software recorded as acting for that identity.
+    pub agent: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -63,6 +83,8 @@ struct StoredSyncDefinition {
     max_operations: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -104,7 +126,7 @@ impl Database {
         timeout_seconds: u64,
         max_output_bytes: u64,
         max_operations: usize,
-        actor: Option<String>,
+        attribution: SyncAttribution,
     ) -> Result<SyncDefinition> {
         validate_component(name, "sync")?;
         let stored = StoredSyncDefinition {
@@ -113,7 +135,8 @@ impl Database {
             timeout_seconds,
             max_output_bytes,
             max_operations,
-            actor,
+            actor: attribution.actor,
+            agent: attribution.agent,
         };
         validate_stored(name, &stored)?;
         let serialized =
@@ -289,6 +312,17 @@ impl Database {
         if let Some(actor) = definition.actor {
             sync_database = sync_database.with_actor(actor)?;
         }
+        if let Some(agent) = definition.agent.as_deref() {
+            let mut attribution = sync_database.attribution().clone();
+            attribution.apply(
+                &crate::AttributionOverrides {
+                    agent: Some(agent),
+                    ..crate::AttributionOverrides::default()
+                },
+                crate::AgentEvidence::Config,
+            )?;
+            sync_database = sync_database.with_attribution(attribution);
+        }
 
         let mut summary = SyncRunSummary {
             name: name.to_owned(),
@@ -428,6 +462,10 @@ fn validate_stored(name: &str, sync: &StoredSyncDefinition) -> Result<()> {
     {
         bail!("sync '{name}' actor cannot be empty");
     }
+    if let Some(agent) = sync.agent.as_deref() {
+        crate::attribution::parse_agent(agent, crate::AgentEvidence::Config)
+            .with_context(|| format!("sync '{name}' agent is not valid"))?;
+    }
     Ok(())
 }
 
@@ -561,6 +599,7 @@ fn to_public(name: &str, stored: StoredSyncDefinition) -> SyncDefinition {
         max_output_bytes: stored.max_output_bytes,
         max_operations: stored.max_operations,
         actor: stored.actor,
+        agent: stored.agent,
     }
 }
 
