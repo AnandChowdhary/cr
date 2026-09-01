@@ -13,7 +13,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
-    database::{RECORDS_LABEL, record_label, validate_component},
+    database::{
+        CollectionEntry, RECORDS_LABEL, collection_directory_name, collection_entry, record_label,
+        validate_component,
+    },
     error::{approval_mismatch, conflict},
     frontmatter::Document,
     paths::{self, EntryKind},
@@ -1011,24 +1014,20 @@ impl<'a> AuditLog<'a> {
             if !collection.kind.is_directory() {
                 continue;
             }
-            let collection_name = collection
-                .name
-                .to_str()
-                .context("collection filename is not valid UTF-8")?
-                .to_owned();
+            let collection_name = collection_directory_name(&collection.name)?;
             let directory = self.records_dir.join(&collection.name);
             let label = format!("collection '{collection_name}'");
             let records = paths::list_directory(self.root, &directory, &label)?.unwrap_or_default();
             for record in records {
-                let name = Path::new(&record.name);
-                if name.extension().and_then(|value| value.to_str()) != Some("md") {
+                // Shared with `Database::list` and `Database::record_files`.
+                // Without it this loop took the stem on trust, so `..md`
+                // reached the check below as an ID of `.` and `audit verify`
+                // reported a record named `deals/.` that nothing could name,
+                // read, or repair.
+                let CollectionEntry::Record(id) = collection_entry(&collection_name, &record.name)?
+                else {
                     continue;
-                }
-                let id = name
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .context("record filename is not valid UTF-8")?
-                    .to_owned();
+                };
                 if !record.kind.is_file() {
                     return Err(paths::refuse_entry(
                         &record_label(&collection_name, &id),

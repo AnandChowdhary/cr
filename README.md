@@ -445,6 +445,33 @@ Account notes go here.
 
 Values passed to `--set` and `--where` are parsed as YAML. Strings, numbers, booleans, lists, objects, and `null` retain their types. Quote arguments containing spaces or YAML punctuation.
 
+### What counts as a record
+
+A collection directory may hold anything you like: a `README`, an image, a
+subdirectory of attachments. `cr` treats a file as a record only if its name
+ends in `.md`, and the rest of the name has to be a usable record ID — not
+empty, not `.` or `..`, and free of path separators. Files that are not
+Markdown are ignored everywhere, silently and permanently.
+
+A `.md` file whose name *cannot* be an ID is a different case, and every
+command refuses it rather than guessing:
+
+```console
+$ cr list deals
+error: collection 'deals' contains a Markdown file named '..md' whose name cannot be a record ID
+```
+
+`list`, `search`, `status`, `save`, `audit verify`, `audit baseline`, `sync
+run`, the REST API, and the web views all stop with that one sentence, which
+names the collection and the file but never where the database lives. One such
+file therefore blocks writes to the whole database until you remove or rename
+it — deliberately, so that `cr` never disagrees with itself about which files
+are records.
+
+The exception is [`cr check`](#check-the-whole-database), which reports the
+same problem as an `invalid_record_name` finding and keeps scanning. It is the
+command to reach for when everything else refuses.
+
 ## Everyday commands
 
 Create a record:
@@ -802,12 +829,12 @@ It reports:
 - **dangling links** — a relation pointing at a record that no longer exists;
 - **malformed relation values** — a `relations` entry that is not a `{ collection, id }` reference at all;
 - **schema failures** — records that no longer satisfy their collection's JSON Schema, which is what happens whenever a schema changes after its records were written, plus schema files that are themselves unusable;
-- **invalid record names** — files and directories that cannot be a record ID or a collection;
+- **invalid record names** — files and directories that cannot be a record ID or a collection. Every other command refuses such a database outright, so this is the one finding `check` exists to be able to report: it names the offending filename and keeps scanning the records around it;
 - **unreadable records** — Markdown that cannot be parsed, and anything behind a symbolic link;
 - **audit reconciliation problems** — records with no audit history, audited records whose file has gone, files whose content does not match the audited state, a journal whose chain cannot be replayed, and a stored change set that does not match the approval recorded beside it;
 - **interrupted sync runs** — a `cr sync run` that stopped partway, leaving part of an import applied and its checkpoint behind.
 
-Every finding names a record as `collection/id`, or a sync by name. None of them ever prints a filesystem path.
+Every finding names a record as `collection/id`, or a sync by name. A file that cannot be a record is named by its filename inside its collection, because that is the only way to say which file to remove. None of them ever prints a filesystem path.
 
 The interrupted-sync finding is worth calling out, because nothing else surfaces it. The records a stopped run did commit agree with the journal, so `cr status` reports `Clean` and `cr audit verify` passes; without `cr check` you would only find out by running `cr sync recover <name> --check` on a sync you already suspected, or by being refused the next time you ran it. `check` reports it as a warning and tells you the command to inspect it with — it never recovers anything itself.
 

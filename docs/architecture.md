@@ -84,13 +84,31 @@ database-root/
 ```
 
 - `.cr/` is the database marker. An absent `.cr/config.yaml` uses format version 1, `records/`, 256 events per audit segment, and an 8 MiB segment limit. A present config can override any subset while unknown, malformed, unsafe, or unsupported settings remain errors.
-- A collection is a directory; a record ID is its Markdown filename without `.md`.
+- A collection is a directory; a record ID is its Markdown filename without `.md`. See [What a record is](#what-a-record-is) for what happens when a filename cannot be one.
 - Front matter contains arbitrary model attributes.
 - The Markdown body is opaque user content and is preserved by metadata-only updates.
 - Relations live under `relations.<name>` as lists of `{ collection, id }` references. `cr link` verifies the target exists and is idempotent.
 - A collection schema is optional and validates only its front matter.
 - A saved view is an optional versioned query/display definition. Collections also receive automatic views without a file.
 - A saved sync is an optional versioned command definition. Its mutable JSON checkpoint and advisory lock are stored separately from configuration, as is the ledger of a run that has started applying records and not yet finished.
+
+### What a record is
+
+The records tree is enumerated from four places: `Database::list` (and so `search` and every view), `Database::record_files` (and so `status`, `save`, `audit baseline`, and `sync run`), `AuditLog::verify_records`, and `cr check`'s index. A filename that is a record to one of them and not to another is a database that disagrees with itself, so all four call `database::collection_entry` and `database::collection_directory_name` and there is no second definition to drift from.
+
+The definition: a directory under `records/` is a collection if its name is a usable path component; a file inside one is a record if its name ends in `.md` and the rest is a usable path component. A usable component is non-empty, is neither `.` nor `..`, and contains no `/`, `\`, or NUL — the same rule `cr create` applies to an ID a caller types, so a record that can be enumerated is exactly a record that could have been created.
+
+Anything that is not a `.md` file is ignored, and always was. A `.md` file whose name cannot be an ID is an error, everywhere, rather than being skipped. That is a deliberate trade: one such file blocks every write path in the database until it is removed. Skipping it instead would mean `cr save` silently not saving a file the user can see, and `audit verify` passing over a record it never examined, which is a worse failure for a tool whose value is that the journal accounts for every record.
+
+What makes the trade payable is the refusal itself. It is a `DomainError::Conflict` — the stored state is unusable, not the request, so a `GET /api/v1/collections/deals/records` that asked for nothing unusual gets `409 conflict` rather than a `422` blaming the caller or an unclassified `500` hiding the reason. And it names both facts needed to fix it:
+
+```text
+collection 'deals' contains a Markdown file named '..md' whose name cannot be a record ID
+```
+
+A bare filename inside a named collection is not a filesystem path, so this stays inside the no-path-leakage invariant while still being enough to act on. `cr check` reports the identical sentence as an `invalid_record_name` finding and carries on scanning, so the database remains diagnosable at exactly the moment nothing else will touch it.
+
+Two enumerations of the same shape are deliberately not part of this: saved views and sync definitions name themselves from `.cr/views/` and `.cr/syncs/` and validate independently, because they are separate namespaces with their own labels.
 
 ### Path resolution
 

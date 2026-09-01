@@ -259,3 +259,99 @@ fn non_utf8_record_names_are_reported_instead_of_silently_ignored() {
     let stderr = run_failure(database.command().args(["list", "items"]));
     assert!(stderr.contains("not valid UTF-8"));
 }
+
+/// The `..md` file from the P1 report, and every command that has to agree
+/// about it.
+///
+/// Three enumeration paths used to disagree three ways on this exact database:
+/// `list` never checked the stem and returned the file as a record with exit
+/// 0, `record_files` refused the whole database with `id must be a non-empty
+/// path component`, and the audit log's own walk invented a record called
+/// `deals/.` and reported it as unaudited. None of the refusals said which
+/// file or which collection, so nobody could save an edit to the healthy
+/// record beside it without first finding the bad file themselves.
+#[test]
+fn one_unusable_record_filename_is_refused_by_name_by_every_command() {
+    let database = TestDatabase::new("unusable-record-name");
+    run_success(database.command().args(["create", "deals", "acme"]));
+    fs::write(
+        database.root.join("records/deals/..md"),
+        "---\nvalue: 1\n---\n",
+    )
+    .unwrap();
+
+    let root = database.root.to_string_lossy().to_string();
+    for arguments in [
+        vec!["list", "deals"],
+        vec!["status"],
+        vec!["save", "--all"],
+        vec!["search", "acme"],
+        vec!["audit", "verify"],
+        vec!["audit", "baseline"],
+    ] {
+        let command = arguments.join(" ");
+        let stderr = run_failure(database.command().args(&arguments));
+        assert!(
+            stderr.contains("collection 'deals'"),
+            "cr {command} did not name the collection: {stderr}"
+        );
+        assert!(
+            stderr.contains("'..md'"),
+            "cr {command} did not name the file: {stderr}"
+        );
+        assert!(
+            stderr.contains("cannot be a record ID"),
+            "cr {command} disagreed about what is wrong: {stderr}"
+        );
+        // Naming the file is what makes the refusal actionable; naming where
+        // it lives would break the invariant that a caller-facing message is
+        // safe to return over HTTP.
+        assert!(
+            !stderr.contains(&root) && !stderr.contains("records/deals"),
+            "cr {command} leaked a filesystem path: {stderr}"
+        );
+    }
+
+    // Naming a record directly never enumerates its collection, so the healthy
+    // record beside the bad file stays readable.
+    run_success(database.command().args(["get", "deals", "acme"]));
+
+    // And deleting the one file named in the refusal is the whole repair.
+    fs::remove_file(database.root.join("records/deals/..md")).unwrap();
+    assert_eq!(
+        run_success(database.command().args(["list", "deals"])).trim(),
+        "records/deals/acme.md"
+    );
+    run_success(database.command().args(["audit", "verify"]));
+    run_success(database.command().args(["status"]));
+}
+
+/// The collection half of the same split. A directory cannot be called `.` or
+/// `..` — the kernel refuses — but a backslash is an ordinary character in a
+/// POSIX filename and a path separator to `validate_component`, so `a\b` is a
+/// directory name that exists and cannot be a collection.
+#[cfg(unix)]
+#[test]
+fn an_unusable_collection_directory_name_is_refused_by_name() {
+    let database = TestDatabase::new("unusable-collection-name");
+    run_success(database.command().args(["create", "deals", "acme"]));
+    fs::create_dir(database.root.join("records").join("a\\b")).unwrap();
+
+    let root = database.root.to_string_lossy().to_string();
+    for arguments in [
+        vec!["status"],
+        vec!["search", "acme"],
+        vec!["audit", "verify"],
+    ] {
+        let command = arguments.join(" ");
+        let stderr = run_failure(database.command().args(&arguments));
+        assert!(
+            stderr.contains("named 'a\\b'") && stderr.contains("cannot be a collection"),
+            "cr {command} did not name the directory: {stderr}"
+        );
+        assert!(
+            !stderr.contains(&root),
+            "cr {command} leaked a filesystem path: {stderr}"
+        );
+    }
+}

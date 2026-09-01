@@ -59,7 +59,9 @@ use yaml_serde::{Mapping, Value};
 
 use crate::{
     audit::record_hash,
-    database::{Database, validate_component},
+    database::{
+        CollectionEntry, Database, collection_directory_name, collection_entry, validate_component,
+    },
     error::{DomainError, invalid},
     frontmatter::Document,
     paths::{self, EntryKind},
@@ -480,26 +482,18 @@ fn index_records(
         if !entry.kind.is_directory() {
             continue;
         }
-        let Some(name) = entry.name.to_str() else {
-            findings.push(Finding::database(
+        // The same definition every other path uses, reported instead of
+        // propagated: `check` exists to describe a database nothing else will
+        // touch, so it must keep scanning past exactly the names that stop
+        // `list`, `status`, and `audit verify`.
+        match collection_directory_name(&entry.name) {
+            Ok(name) => collections.push(name),
+            Err(error) => findings.push(Finding::database(
                 FindingKind::InvalidRecordName,
                 Severity::Error,
-                "the records directory contains a collection directory whose name is not valid UTF-8",
-            ));
-            continue;
-        };
-        if let Err(error) = validate_component(name, "collection") {
-            findings.push(Finding::database(
-                FindingKind::InvalidRecordName,
-                Severity::Error,
-                format!(
-                    "a collection directory cannot be used as a collection: {}",
-                    safe(&error)
-                ),
-            ));
-            continue;
+                safe(&error),
+            )),
         }
-        collections.push(name.to_owned());
     }
     collections.sort();
 
@@ -512,42 +506,24 @@ fn index_records(
             continue;
         };
         for entry in entries {
-            let Some(name) = entry.name.to_str() else {
-                if in_scope {
-                    findings.push(Finding::collection(
-                        FindingKind::InvalidRecordName,
-                        &collection,
-                        format!(
-                            "collection '{collection}' contains a record filename that is not valid UTF-8"
-                        ),
-                    ));
+            let id = match collection_entry(&collection, &entry.name) {
+                Ok(CollectionEntry::Record(id)) => id,
+                Ok(CollectionEntry::Ignored) => continue,
+                Err(error) => {
+                    if in_scope {
+                        findings.push(Finding::collection(
+                            FindingKind::InvalidRecordName,
+                            &collection,
+                            safe(&error),
+                        ));
+                    }
+                    continue;
                 }
-                continue;
             };
-            let path = Path::new(name);
-            if path.extension().and_then(|value| value.to_str()) != Some("md") {
-                continue;
-            }
-            let id = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default();
-            if validate_component(id, "id").is_err() {
-                if in_scope {
-                    findings.push(Finding::collection(
-                        FindingKind::InvalidRecordName,
-                        &collection,
-                        format!(
-                            "collection '{collection}' contains a Markdown file whose name cannot be a record ID"
-                        ),
-                    ));
-                }
-                continue;
-            }
             if !entry.kind.is_file() {
-                index.symlinked.insert((collection.clone(), id.to_owned()));
+                index.symlinked.insert((collection.clone(), id.clone()));
             }
-            index.records.insert((collection.clone(), id.to_owned()));
+            index.records.insert((collection.clone(), id));
         }
     }
     Ok(index)

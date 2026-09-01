@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
     fs,
     path::{Component, Path, PathBuf},
     process::Command,
@@ -563,22 +564,16 @@ impl Database {
 
         let mut identifiers = Vec::new();
         for entry in entries {
+            // The name decides whether this claims to be a record, and the
+            // kind decides whether it is usable as one — in that order, as in
+            // `record_files` and `cr check`, so a `.md` name that cannot be an
+            // ID is refused rather than quietly listed.
+            let CollectionEntry::Record(id) = collection_entry(collection, &entry.name)? else {
+                continue;
+            };
             if !entry.kind.is_file() {
                 continue;
             }
-            let name = Path::new(&entry.name);
-            if name.extension().and_then(|value| value.to_str()) != Some("md") {
-                continue;
-            }
-            let id = name
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .with_context(|| {
-                    DomainError::Invalid(format!(
-                        "{label} contains a record filename that is not valid UTF-8"
-                    ))
-                })?
-                .to_owned();
             identifiers.push(id);
         }
         identifiers.sort();
@@ -646,12 +641,24 @@ impl Database {
             {
                 continue;
             }
+            // The schema directory names collections the same way the records
+            // directory does, so an unusable name is refused the same way:
+            // classified, and naming the file rather than only the rule it
+            // broke.
+            let unusable = || {
+                anyhow::Error::new(DomainError::Conflict(format!(
+                    "the schema directory contains a file named '{}' whose name cannot be a collection",
+                    entry.name.to_string_lossy()
+                )))
+            };
             let name = entry_path
                 .file_stem()
                 .and_then(|value| value.to_str())
-                .context("schema filename is not valid UTF-8")?
+                .ok_or_else(unusable)?
                 .to_owned();
-            validate_component(&name, "collection")?;
+            if validate_component(&name, "collection").is_err() {
+                return Err(unusable());
+            }
             let serialized = paths::read_to_string(
                 &self.root,
                 &schema_root.join(&entry.name),
@@ -1344,16 +1351,10 @@ impl Database {
             let entries =
                 paths::list_directory(&self.root, &directory, &label)?.unwrap_or_default();
             for entry in entries {
-                let name = Path::new(&entry.name);
-                if name.extension().and_then(|value| value.to_str()) != Some("md") {
+                let CollectionEntry::Record(id) = collection_entry(&collection_name, &entry.name)?
+                else {
                     continue;
-                }
-                let id = name
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .context("record filename is not valid UTF-8")?
-                    .to_owned();
-                validate_component(&id, "id")?;
+                };
                 if !entry.kind.is_file() {
                     return Err(paths::refuse_entry(
                         &record_label(&collection_name, &id),
@@ -1379,13 +1380,7 @@ impl Database {
             if !entry.kind.is_directory() {
                 continue;
             }
-            let name = entry
-                .name
-                .to_str()
-                .context("collection filename is not valid UTF-8")?
-                .to_owned();
-            validate_component(&name, "collection")?;
-            collections.push(name);
+            collections.push(collection_directory_name(&entry.name)?);
         }
         collections.sort();
         Ok(collections)
@@ -1553,6 +1548,74 @@ fn record_from_document(collection: &str, id: &str, path: PathBuf, document: Doc
 fn parse_record(collection: &str, id: &str, raw: &str) -> Result<Document> {
     Document::parse(raw)
         .with_context(|| DomainError::Invalid(format!("could not parse record {collection}/{id}")))
+}
+
+/// What one entry of a collection's directory is, as far as records go.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum CollectionEntry {
+    /// Not a Markdown file, so not a record — and not a problem either.
+    Ignored,
+    /// A Markdown file whose stem is a usable record ID.
+    Record(String),
+}
+
+/// Decide what the collection-directory entry named `file_name` is.
+///
+/// This is the single definition of "a file in this directory is a record".
+/// Four paths enumerate a collection directory — [`Database::list`] (and so
+/// `search` and every view), [`Database::record_files`] (and so `status`,
+/// `save`, `audit baseline`, and `sync run`), `AuditLog::verify_records`, and
+/// `cr check`'s index — and before this they disagreed: `list` never checked
+/// the stem and returned `..md` as a record, `verify_records` never checked it
+/// either and reported a record called `deals/.`, and `record_files` refused
+/// the whole database with a message naming neither the file nor its
+/// collection. They now share this function, so a name is a record ID
+/// everywhere or nowhere.
+///
+/// The refusal is a `DomainError` so the CLI and the HTTP layer classify it
+/// the same way, and it names the collection and the filename so the file can
+/// be found without a path ever reaching the caller. `cr check` calls this too
+/// and turns the refusal into a finding instead of propagating it, which is
+/// what keeps a wedged database diagnosable.
+pub(crate) fn collection_entry(collection: &str, file_name: &OsStr) -> Result<CollectionEntry> {
+    let path = Path::new(file_name);
+    if path.extension().and_then(|value| value.to_str()) != Some("md") {
+        return Ok(CollectionEntry::Ignored);
+    }
+    let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+        return Err(anyhow::Error::new(DomainError::non_utf8_record_name(
+            collection,
+            &file_name.to_string_lossy(),
+        )));
+    };
+    if validate_component(id, "id").is_err() {
+        return Err(anyhow::Error::new(DomainError::invalid_record_name(
+            collection,
+            &file_name.to_string_lossy(),
+        )));
+    }
+    Ok(CollectionEntry::Record(id.to_owned()))
+}
+
+/// The collection that the records-directory entry named `file_name` names.
+///
+/// The counterpart of [`collection_entry`] one level up, shared by
+/// [`Database::collection_names`], `AuditLog::verify_records`, and `cr check`
+/// for the same reason: a directory is a collection everywhere or nowhere, and
+/// a refusal says which directory rather than only that some name was
+/// unusable. Callers skip entries that are not directories before calling.
+pub(crate) fn collection_directory_name(file_name: &OsStr) -> Result<String> {
+    let Some(name) = file_name.to_str() else {
+        return Err(anyhow::Error::new(DomainError::non_utf8_collection_name(
+            &file_name.to_string_lossy(),
+        )));
+    };
+    if validate_component(name, "collection").is_err() {
+        return Err(anyhow::Error::new(DomainError::invalid_collection_name(
+            name,
+        )));
+    }
+    Ok(name.to_owned())
 }
 
 pub(crate) fn validate_component(value: &str, label: &str) -> Result<()> {
