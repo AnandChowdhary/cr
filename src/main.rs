@@ -582,6 +582,18 @@ enum SyncCommand {
         json: bool,
     },
 
+    /// Complete a run that stopped after applying some of its records.
+    Recover {
+        name: String,
+
+        /// Report an interrupted run without applying anything.
+        #[arg(long)]
+        check: bool,
+
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Print the last committed checkpoint state as JSON.
     State { name: String },
 }
@@ -881,24 +893,42 @@ fn run() -> Result<()> {
                 }
             }
             SyncCommand::Run { name, json } => {
-                let summary = database.run_sync(&name)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&summary)?);
-                } else {
-                    println!(
-                        "Sync {} {}: {} created, {} updated, {} deleted, {} unchanged; checkpoint {}",
-                        summary.name,
-                        summary.run_id,
-                        summary.created,
-                        summary.updated,
-                        summary.deleted,
-                        summary.unchanged,
-                        if summary.checkpoint_updated {
-                            "updated"
-                        } else {
-                            "unchanged"
+                report_sync_run(&database.run_sync(&name)?, json)?;
+            }
+            SyncCommand::Recover { name, check, json } => {
+                if check {
+                    let pending = database.pending_sync_run(&name)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&pending)?);
+                    } else {
+                        match pending {
+                            Some(ledger) => println!(
+                                "Sync {} run {} was interrupted at {}: {} operations recorded, {} audit events committed, checkpoint {}{}",
+                                ledger.name,
+                                ledger.run_id,
+                                ledger.started,
+                                ledger.operations,
+                                ledger.events_committed,
+                                if ledger.checkpoint_pending {
+                                    "pending"
+                                } else {
+                                    "committed"
+                                },
+                                if ledger.foreign_events {
+                                    "; unrelated events were committed after it stopped"
+                                } else {
+                                    ""
+                                }
+                            ),
+                            None => println!("Sync {name} has no interrupted run"),
                         }
-                    );
+                    }
+                } else {
+                    match database.recover_sync(&name)? {
+                        Some(summary) => report_sync_run(&summary, json)?,
+                        None if json => println!("null"),
+                        None => println!("Sync {name} has no interrupted run"),
+                    }
                 }
             }
             SyncCommand::State { name } => {
@@ -1126,6 +1156,33 @@ fn run() -> Result<()> {
         },
     }
 
+    Ok(())
+}
+
+/// Print what a sync run applied.
+///
+/// A resumed run reports the interrupted run's own identifier, because the
+/// audit events it just committed carry that identifier too.
+fn report_sync_run(summary: &cr::SyncRunSummary, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(summary)?);
+        return Ok(());
+    }
+    println!(
+        "Sync {} {}{}: {} created, {} updated, {} deleted, {} unchanged; checkpoint {}",
+        summary.name,
+        summary.run_id,
+        if summary.resumed { " (resumed)" } else { "" },
+        summary.created,
+        summary.updated,
+        summary.deleted,
+        summary.unchanged,
+        if summary.checkpoint_updated {
+            "updated"
+        } else {
+            "unchanged"
+        }
+    );
     Ok(())
 }
 

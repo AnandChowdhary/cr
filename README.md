@@ -935,7 +935,7 @@ Stdout is reserved for protocol messages. Send diagnostics and progress to stder
 
 - `upsert` creates the record or completely replaces its front matter and Markdown. It is unchanged when the parsed front matter and exact Markdown body already match.
 - `delete` is idempotent: deleting a missing record counts as unchanged.
-- `checkpoint` is optional, must be the final message, and is stored only after all preceding record operations succeed.
+- `checkpoint` is optional, must be the final message, and is stored only after all preceding record operations succeed. It is recorded in the run ledger first, so an interrupted run knows which checkpoint it still owes.
 - A run cannot target the same `collection/id` twice. Every message and every upsert schema is preflighted before the first mutation.
 - Output defaults to 16 MiB and 10,000 messages; the command defaults to a 300-second timeout. `sync create` can lower or raise these within the built-in safety bounds.
 
@@ -960,7 +960,19 @@ The database must pass `audit verify` before an adapter starts and again after i
 
 Do not have an unattended adapter write `records/` directly. If it does, the second verification rejects its protocol output and leaves the direct file edit visible in `cr status`; a person can review it with the normal selective `cr save` flow. This is what keeps sync automation from silently accepting unrelated manual edits or tampering.
 
-Record operations are preflighted together but currently committed as sequential audited single-record mutations, not one all-or-nothing multi-record transaction. A rare durable-write failure midway through application can therefore leave earlier operations committed and the checkpoint unchanged. Retry-safe upserts and deletes make recovery straightforward, but adapters should not assume transactionality.
+Record operations are preflighted together but committed as sequential audited single-record mutations, not one all-or-nothing multi-record transaction. A durable-write failure midway through application therefore still leaves earlier operations committed. What it can no longer do is leave that fact unrecorded.
+
+Before the first mutation `cr` writes a run ledger, and the exact operation stream beside it, under `.cr/sync/runs/`, and removes both only once the checkpoint agrees with the committed work. An interrupted run is then a durable fact rather than something to infer:
+
+```sh
+cr sync recover notion-meeting --check          # report an interrupted run, change nothing
+cr sync recover notion-meeting --check --json
+cr sync recover notion-meeting                  # complete it
+```
+
+`cr sync run` refuses to start while a ledger is present, so a stale checkpoint can never be silently replayed from the beginning. `cr sync recover` completes the interrupted run by replaying its recorded stream. That is roll-forward, never rollback: the audit chain is append-only and nothing already committed is ever unwound. It is sound because the protocol stream is idempotent — a target appears at most once, an upsert carries the whole record, and deleting a missing record is a no-op — so the replay commits only the operations the interrupted run never reached and appends no event for the rest. The events it commits carry the original run's ID, so the audit log shows one run rather than two.
+
+Recovery refuses, rather than guessing, when a record the run still has to write changed after the run stopped, or when the recorded stream no longer matches its ledger. An unrelated record changing in the meantime is reported by `--check` but does not block completion. If the original failure is still present, recovery fails the same way and leaves the ledger intact, so the run stays completable once the cause is fixed.
 
 An adapter may also perform external effects, such as creating a calendar event or sending a message. `cr` cannot roll those effects back if a later record operation fails. Use the remote service's idempotency keys, design the adapter to retry safely, and emit the checkpoint only for work that can be resumed.
 
@@ -970,8 +982,11 @@ An adapter may also perform external effects, such as creating a calendar event 
 
 ```sh
 cd /absolute/path/to/my-database
+/absolute/path/to/cr sync recover notion-meeting
 /absolute/path/to/cr sync run notion-meeting
 ```
+
+`cr sync recover` succeeds and prints `Sync NAME has no interrupted run` when there is nothing to complete, so an unattended job can run it unconditionally before each fetch. Leave it out and a run interrupted by a reboot or an OOM kill will make every later run exit nonzero until somebody looks — which is the intended failure mode, not a silent one.
 
 Schedulers often start with a small environment and a different working directory. Use absolute paths and inject credentials through the scheduler's protected environment or a secret manager, never into `.cr/syncs/*.yaml`. Capture stdout/stderr in your normal job logs and alert on the nonzero exit status.
 
@@ -1477,6 +1492,7 @@ cr sync create NAME [--actor IDENTITY] [--agent AGENT] [--timeout-seconds N] -- 
 cr sync list [--json]
 cr sync show NAME [--json]
 cr sync run NAME [--json]
+cr sync recover NAME [--check] [--json]
 cr sync state NAME
 
 cr status [--json]
