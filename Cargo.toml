@@ -49,3 +49,37 @@ yaml_serde = "0.10"
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+
+# Lint policy lives here rather than only in CI flags, so `cargo clippy` on a
+# laptop gates on exactly what the pipeline gates on. Every lint below is
+# already satisfied by the tree as it stands: this encodes the status quo so it
+# cannot regress, it is not a cleanup backlog.
+[lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+# `forbid(unsafe_code)` would be a lie: `src/sync.rs` needs `libc::kill` to stop
+# a sync adapter's whole process group. The useful policy is not "no unsafe" but
+# "every unsafe block is justified in writing and does exactly one thing".
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+
+# The HTTP server is async and the audit/sync paths hold file locks. Holding a
+# lock across an await is the failure mode that class of code actually has.
+await_holding_lock = "warn"
+
+# `mem::forget` on a lock guard would silently defeat the sync mutual exclusion.
+mem_forget = "warn"
+
+# Debugging scaffolding must not reach main.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+# Guards the `[package]` metadata above against quietly rotting. Deliberately
+# not the whole `clippy::cargo` group: `multiple_crate_versions` fires on
+# transitive duplicates (`syn`, `getrandom`, `r-efi`) we do not control.
+cargo_common_metadata = "warn"
