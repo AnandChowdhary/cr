@@ -50,6 +50,15 @@ yaml_serde = "0.10"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 
+# `cargo install cr` builds with this profile, so it is the one users actually
+# get. Measured on this tree: 12.7 MB -> 8.3 MB (-35%), with no build-time
+# regression (95s -> 90s, one sample each). Nothing in CI builds release, so
+# this costs the pipeline nothing.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
 # Lint policy lives here rather than only in CI flags, so `cargo clippy` on a
 # laptop gates on exactly what the pipeline gates on. Every lint below is
 # already satisfied by the tree as it stands: this encodes the status quo so it
