@@ -844,7 +844,16 @@ fn log_error(status: StatusCode, code: &str, request_id: &str, detail: &str) {
 }
 
 pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
-    let access_controlled = database.access_enabled()?;
+    // A malformed or linked records directory is stored-state corruption, not
+    // a reason to make the HTTP application impossible to construct. Defer a
+    // classified conflict to the request that touches it, as the rest of the
+    // server does for record-path failures. A healthy RBAC database still gets
+    // the stricter owner and loopback startup boundary below.
+    let access_controlled = match database.access_enabled() {
+        Ok(enabled) => enabled,
+        Err(error) if matches!(DomainError::of(&error), Some(DomainError::Conflict(_))) => false,
+        Err(error) => return Err(error),
+    };
     if access_controlled && !config.bind.ip().is_loopback() {
         bail!(
             "the RBAC perspective switcher is an owner-only local console and must bind to a loopback address"
