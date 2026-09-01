@@ -390,3 +390,299 @@ fn sync_definition_validation_rejects_unsafe_names_and_unknown_versions() {
     let error = run_failure(database.command().args(["sync", "show", "versioned"]));
     assert!(error.contains("unsupported format version 2"));
 }
+
+/// Force a run to fail durably partway through applying its stream.
+///
+/// A plain file where a collection directory would go is invisible to the
+/// pre-run verification — `records/` listings skip entries that are not
+/// directories — and is not something preflight can see either, because
+/// preflight only schema-checks front matter. The operation that has to write
+/// through it therefore fails after earlier operations are already committed,
+/// which is exactly the shape of a disk error or a permission change arriving
+/// mid-run.
+fn block_collection(database: &TestDatabase, collection: &str) {
+    fs::write(database.root.join("records").join(collection), "blocked\n").unwrap();
+}
+
+fn unblock_collection(database: &TestDatabase, collection: &str) {
+    fs::remove_file(database.root.join("records").join(collection)).unwrap();
+}
+
+/// A database whose sync stopped durably after committing two of its four
+/// record operations, with its checkpoint still on the previous cursor.
+fn interrupted_sync(name: &str) -> TestDatabase {
+    let database = TestDatabase::new(name);
+    let script = write_script(
+        &database,
+        "partial",
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"upsert","collection":"notes","id":"first","front_matter":{"n":1},"markdown":"first\n"}'
+printf '%s\n' '{"type":"upsert","collection":"notes","id":"second","front_matter":{"n":2},"markdown":"second\n"}'
+printf '%s\n' '{"type":"upsert","collection":"blocked","id":"third","front_matter":{"n":3},"markdown":"third\n"}'
+printf '%s\n' '{"type":"upsert","collection":"notes","id":"fourth","front_matter":{"n":4},"markdown":"fourth\n"}'
+printf '%s\n' '{"type":"checkpoint","state":{"cursor":"page-2"}}'
+"#,
+    );
+    create_sync(&database, "partial", &script, &[]);
+    fs::create_dir_all(database.root.join("records")).unwrap();
+    block_collection(&database, "blocked");
+    run_failure(database.command().args(["sync", "run", "partial"]));
+    assert!(database.root.join("records/notes/first.md").exists());
+    assert!(database.root.join("records/notes/second.md").exists());
+    assert!(!database.root.join("records/notes/fourth.md").exists());
+    assert_eq!(
+        json_output(&database, &["sync", "state", "partial"]),
+        Value::Null
+    );
+    database
+}
+
+fn interrupted_run_id(database: &TestDatabase) -> String {
+    json_output(
+        database,
+        &["sync", "recover", "partial", "--check", "--json"],
+    )["run_id"]
+        .as_str()
+        .expect("an interrupted run is recorded")
+        .to_owned()
+}
+
+/// The failure this whole mechanism exists to prevent, stated on its own.
+///
+/// Before the run ledger, this second run succeeded: it replayed the stale
+/// checkpoint's stream from the beginning, committed the operations the first
+/// run never reached, and advanced the checkpoint, leaving nothing anywhere to
+/// say that a run had been abandoned halfway. Nothing about that outcome is
+/// wrong for a deterministic adapter and nothing about it is safe for one whose
+/// operations are not.
+#[test]
+fn a_run_left_partly_applied_cannot_be_silently_restarted() {
+    let database = interrupted_sync("sync-silent-restart");
+    // Even with the underlying failure gone, the abandoned run has to be
+    // acknowledged rather than papered over by a fresh one.
+    unblock_collection(&database, "blocked");
+    let error = run_failure(database.command().args(["sync", "run", "partial"]));
+    assert!(error.contains("has an interrupted run"), "{error}");
+    assert_eq!(
+        json_output(&database, &["sync", "state", "partial"]),
+        Value::Null
+    );
+    assert!(!database.root.join("records/notes/fourth.md").exists());
+}
+
+#[test]
+fn a_run_that_fails_partway_through_is_detectable_and_rolls_forward() {
+    let database = interrupted_sync("sync-partial-failure");
+    let run_id = interrupted_run_id(&database);
+
+    // The disagreement is a durable, inspectable fact rather than something an
+    // operator has to infer from the audit log.
+    let ledger = json_output(
+        &database,
+        &["sync", "recover", "partial", "--check", "--json"],
+    );
+    assert_eq!(ledger["name"], "partial");
+    assert_eq!(ledger["operations"], 5);
+    assert_eq!(ledger["events_committed"], 2);
+    assert_eq!(ledger["checkpoint_pending"], true);
+    assert_eq!(ledger["foreign_events"], false);
+
+    // A second run must not silently restart from the stale checkpoint.
+    let error = run_failure(database.command().args(["sync", "run", "partial"]));
+    assert!(error.contains("has an interrupted run"));
+    assert!(error.contains(&run_id));
+    assert!(error.contains("cr sync recover partial"));
+
+    // While the underlying failure persists, recovery reports it and changes
+    // nothing about the ledger, so the run stays completable.
+    run_failure(database.command().args(["sync", "recover", "partial"]));
+    assert_eq!(
+        json_output(
+            &database,
+            &["sync", "recover", "partial", "--check", "--json"]
+        )["run_id"],
+        run_id.as_str()
+    );
+
+    unblock_collection(&database, "blocked");
+    let recovered = json_output(&database, &["sync", "recover", "partial", "--json"]);
+    assert_eq!(recovered["run_id"], run_id.as_str());
+    assert_eq!(recovered["resumed"], true);
+    assert_eq!(recovered["created"], 2);
+    assert_eq!(recovered["unchanged"], 2);
+    assert_eq!(recovered["checkpoint_updated"], true);
+
+    // Committed work and the recorded checkpoint now agree.
+    assert_eq!(
+        json_output(&database, &["sync", "state", "partial"])["cursor"],
+        "page-2"
+    );
+    assert_eq!(run_success(database.command().arg("status")), "Clean\n");
+    run_success(database.command().args(["audit", "verify"]));
+
+    // Roll-forward is forward-only: every event, including the ones the
+    // interrupted run committed, stays in the chain under that run's identifier.
+    let events = json_output(&database, &["audit", "log", "--json"]);
+    let events = events.as_array().unwrap();
+    assert_eq!(events.len(), 4);
+    for event in events {
+        assert_eq!(event["message"], format!("sync:partial run:{run_id}"));
+    }
+
+    // The ledger is retired, so the next run starts normally and is idempotent.
+    assert_eq!(
+        json_output(
+            &database,
+            &["sync", "recover", "partial", "--check", "--json"]
+        ),
+        Value::Null
+    );
+    let next = json_output(&database, &["sync", "run", "partial", "--json"]);
+    assert_eq!(next["resumed"], false);
+    assert_eq!(next["unchanged"], 4);
+    assert_eq!(next["checkpoint_updated"], false);
+}
+
+#[test]
+fn an_interrupted_run_refuses_to_overwrite_a_record_edited_after_it_stopped() {
+    let database = interrupted_sync("sync-conflicting-edit");
+    let run_id = interrupted_run_id(&database);
+    unblock_collection(&database, "blocked");
+
+    // An unrelated record moving on is not a reason to refuse.
+    run_success(
+        database
+            .command()
+            .args(["create", "notes", "unrelated", "--set", "n=9"]),
+    );
+    let ledger = json_output(
+        &database,
+        &["sync", "recover", "partial", "--check", "--json"],
+    );
+    assert_eq!(ledger["foreign_events"], true);
+    assert_eq!(ledger["events_committed"], 2);
+
+    // A record the run still has to write is.
+    run_success(
+        database
+            .command()
+            .args(["update", "notes", "first", "--set", "n=99"]),
+    );
+    let error = run_failure(database.command().args(["sync", "recover", "partial"]));
+    assert!(error.contains("record notes/first changed after it stopped"));
+    assert!(error.contains(&run_id));
+    assert_eq!(
+        json_output(&database, &["sync", "state", "partial"]),
+        Value::Null
+    );
+    assert_eq!(
+        json_output(
+            &database,
+            &["sync", "recover", "partial", "--check", "--json"]
+        )["run_id"],
+        run_id.as_str()
+    );
+}
+
+#[test]
+fn a_killed_run_leaves_a_ledger_that_completes_the_remaining_records() {
+    let database = TestDatabase::new("sync-killed-run");
+    let total = 120;
+    let mut stream = String::new();
+    for index in 0..total {
+        stream.push_str(&format!(
+            "printf '%s\\n' '{{\"type\":\"upsert\",\"collection\":\"notes\",\"id\":\"r{index:03}\",\"front_matter\":{{\"n\":{index}}},\"markdown\":\"body {index}\"}}'\n"
+        ));
+    }
+    stream.push_str("printf '%s\\n' '{\"type\":\"checkpoint\",\"state\":{\"cursor\":\"done\"}}'\n");
+    let script = write_script(&database, "bulk", &format!("#!/bin/sh\n{stream}"));
+    create_sync(&database, "bulk", &script, &["--max-operations", "1000"]);
+
+    let mut child = database
+        .command()
+        .args(["sync", "run", "bulk"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let records = database.root.join("records/notes");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let applied = fs::read_dir(&records).map_or(0, |entries| entries.count());
+        if applied >= 10 {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the run finished before it could be interrupted"
+        );
+        assert!(Instant::now() < deadline, "the run never began applying");
+        thread::sleep(Duration::from_millis(5));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let applied = fs::read_dir(&records).unwrap().count();
+    assert!(
+        applied < total,
+        "the run applied every record before the kill"
+    );
+    assert_eq!(
+        json_output(&database, &["sync", "state", "bulk"]),
+        Value::Null
+    );
+
+    let ledger = json_output(&database, &["sync", "recover", "bulk", "--check", "--json"]);
+    assert_eq!(ledger["operations"], total + 1);
+    assert!(ledger["events_committed"].as_u64().unwrap() > 0);
+    assert_eq!(ledger["checkpoint_pending"], true);
+    let run_id = ledger["run_id"].as_str().unwrap().to_owned();
+
+    let error = run_failure(database.command().args(["sync", "run", "bulk"]));
+    assert!(error.contains("has an interrupted run"));
+
+    let recovered = json_output(&database, &["sync", "recover", "bulk", "--json"]);
+    assert_eq!(recovered["run_id"], run_id.as_str());
+    assert_eq!(recovered["resumed"], true);
+    assert_eq!(
+        recovered["created"].as_u64().unwrap() + recovered["unchanged"].as_u64().unwrap(),
+        total as u64
+    );
+    assert_eq!(
+        json_output(&database, &["sync", "state", "bulk"])["cursor"],
+        "done"
+    );
+    assert_eq!(fs::read_dir(&records).unwrap().count(), total);
+    assert_eq!(run_success(database.command().arg("status")), "Clean\n");
+    run_success(database.command().args(["audit", "verify"]));
+}
+
+#[test]
+fn a_completed_run_keeps_no_ledger_and_recovery_is_a_no_op() {
+    let database = TestDatabase::new("sync-completed-run");
+    let script = write_script(
+        &database,
+        "clean",
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"upsert","collection":"notes","id":"only","front_matter":{"n":1},"markdown":"only\n"}'
+printf '%s\n' '{"type":"checkpoint","state":{"cursor":"one"}}'
+"#,
+    );
+    create_sync(&database, "clean", &script, &[]);
+    run_success(database.command().args(["sync", "run", "clean"]));
+
+    assert!(
+        fs::read_dir(database.root.join(".cr/sync/runs")).map_or(0, |entries| entries.count()) == 0
+    );
+    assert_eq!(
+        run_success(database.command().args(["sync", "recover", "clean"])),
+        "Sync clean has no interrupted run\n"
+    );
+    assert_eq!(
+        json_output(
+            &database,
+            &["sync", "recover", "clean", "--check", "--json"]
+        ),
+        Value::Null
+    );
+}

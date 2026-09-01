@@ -25,6 +25,6 @@ pub use database::{
 };
 pub use error::DomainError;
 pub use search::{SearchQuery, SearchTarget};
-pub use sync::{SyncAttribution, SyncDefinition, SyncRunSummary};
+pub use sync::{SyncAttribution, SyncDefinition, SyncRunLedger, SyncRunSummary};
 pub use value::{Assignment, FilterExpression, FilterOperator, compare_yaml_values};
 pub use views::{ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch};

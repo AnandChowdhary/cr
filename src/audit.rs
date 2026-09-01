@@ -1427,7 +1427,11 @@ pub(crate) fn record_hash(contents: &[u8]) -> String {
     digest(RECORD_HASH_DOMAIN, contents)
 }
 
-fn digest(domain: &[u8], contents: &[u8]) -> String {
+/// A domain-separated SHA-256 digest rendered as `sha256:<hex>`.
+///
+/// Shared so every hash `cr` records is separated by an explicit domain string
+/// rather than by each call site remembering to add one.
+pub(crate) fn digest(domain: &[u8], contents: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(domain);
     digest.update(contents);

@@ -14,12 +14,13 @@ use serde_json::Value as JsonValue;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use tempfile::NamedTempFile;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use yaml_serde::Mapping;
 
 use crate::{
-    AuditSource, Database,
+    AuditFilter, AuditSource, AuditVerification, Database,
     database::validate_component,
-    error::is_missing,
+    error::{conflict, is_missing},
     paths::{self, EntryKind},
 };
 
@@ -27,10 +28,19 @@ use crate::{
 pub(crate) const SYNC_DEFINITION_DIRECTORY: &str = ".cr/syncs";
 pub(crate) const SYNC_STATE_DIRECTORY: &str = ".cr/sync/state";
 pub(crate) const SYNC_LOCK_DIRECTORY: &str = ".cr/sync/locks";
+/// Where the ledger and recorded operation stream of an in-flight run live.
+pub(crate) const SYNC_RUN_DIRECTORY: &str = ".cr/sync/runs";
 const SYNC_WORK_DIRECTORY: &str = ".cr/sync";
 const SYNC_DIRECTORY_LABEL: &str = "the sync directory";
 const SYNC_WORK_LABEL: &str = "the sync working directory";
+const SYNC_RUN_LABEL: &str = "the sync run ledger";
 const SYNC_FORMAT_VERSION: u32 = 1;
+const SYNC_RUN_FORMAT_VERSION: u32 = 1;
+/// Domain separator for the digest binding a run ledger to its recorded stream.
+///
+/// Distinct from every audit domain so a stream digest can never be confused
+/// with an event, record, or change-set hash.
+const SYNC_STREAM_HASH_DOMAIN: &[u8] = b"cr:sync:stream:v1\0";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
 const MAX_TIMEOUT_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -96,6 +106,90 @@ pub struct SyncRunSummary {
     pub deleted: usize,
     pub unchanged: usize,
     pub checkpoint_updated: bool,
+    /// True when this summary completed a previously interrupted run rather
+    /// than starting a fresh one, so its `run_id` is that earlier run's.
+    pub resumed: bool,
+}
+
+/// What is durably known about a run that started applying and never finished.
+///
+/// Every field is either read back from the ledger written before the first
+/// mutation or derived from the audit chain. Nothing here is a second copy of
+/// progress that could disagree with the journal: `events_committed` counts the
+/// events the chain actually holds for this run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SyncRunLedger {
+    pub name: String,
+    pub run_id: String,
+    pub started: String,
+    /// Protocol messages the interrupted run recorded before applying any.
+    pub operations: usize,
+    /// Audit events this run has committed so far.
+    ///
+    /// Lower than the number of operations it applied when some of them matched
+    /// what was already stored, because an exact upsert and a missing delete
+    /// are counted as unchanged and append no event.
+    pub events_committed: u64,
+    /// True when the run recorded a checkpoint that has not been committed yet.
+    pub checkpoint_pending: bool,
+    /// True when audit events that do not belong to this run were committed
+    /// after it was interrupted, so completing it could overwrite them.
+    pub foreign_events: bool,
+}
+
+/// One side of a run ledger's checkpoint pair.
+///
+/// Stored as an explicit flag beside the value rather than as a JSON `null`,
+/// because `null` is itself a checkpoint an adapter may legitimately emit and
+/// "no checkpoint" has to stay distinguishable from "the checkpoint is null".
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCheckpoint {
+    #[serde(default)]
+    recorded: bool,
+    #[serde(default)]
+    state: JsonValue,
+}
+
+impl StoredCheckpoint {
+    fn new(state: Option<&JsonValue>) -> Self {
+        Self {
+            recorded: state.is_some(),
+            state: state.cloned().unwrap_or(JsonValue::Null),
+        }
+    }
+
+    fn value(&self) -> Option<&JsonValue> {
+        self.recorded.then_some(&self.state)
+    }
+
+    fn owned(&self) -> Option<JsonValue> {
+        self.value().cloned()
+    }
+}
+
+/// The durable ledger of a run that has begun applying records.
+///
+/// It is written, with the exact operation stream beside it, after preflight
+/// and before the first mutation, and removed only once the checkpoint agrees
+/// with the committed work. Its presence is therefore the single fact that
+/// distinguishes "a run finished" from "a run stopped somewhere in the middle".
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSyncRun {
+    version: u32,
+    sync: String,
+    run_id: String,
+    started: String,
+    operations: usize,
+    stream_hash: String,
+    audit_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audit_head: Option<String>,
+    #[serde(default)]
+    checkpoint_before: StoredCheckpoint,
+    #[serde(default)]
+    checkpoint_after: StoredCheckpoint,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,9 +304,31 @@ impl Database {
             .map(Some)
     }
 
+    /// The interrupted run this sync has left behind, if any.
+    ///
+    /// Reports rather than repairs: it never applies an operation and never
+    /// fails because another writer committed after the interruption, so an
+    /// operator can look at a wedged sync before deciding what to do about it.
+    pub fn pending_sync_run(&self, name: &str) -> Result<Option<SyncRunLedger>> {
+        let Some(stored) = self.read_sync_run(name)? else {
+            return Ok(None);
+        };
+        let audit = self
+            .audit_verify(None)
+            .context("database must be clean before an interrupted sync run can be described")?;
+        self.describe_sync_run(&stored, &audit).map(Some)
+    }
+
     pub fn run_sync(&self, name: &str) -> Result<SyncRunSummary> {
         let definition = self.sync(name)?;
         let _sync_lock = self.acquire_sync_lock(name)?;
+        if let Some(stored) = self.read_sync_run(name)? {
+            return Err(conflict(format!(
+                "sync '{name}' has an interrupted run {} that has not been completed; \
+                 complete it with 'cr sync recover {name}' before starting another run",
+                stored.run_id
+            )));
+        }
         let starting_audit = self
             .audit_verify(None)
             .context("database must be clean before a sync can run")?;
@@ -305,11 +421,145 @@ impl Database {
             bail!("sync '{name}' checkpoint changed while the command was running");
         }
 
+        // The ledger and the exact operation stream become durable before the
+        // first mutation, so from here on an interrupted run is a fact on disk
+        // rather than something only the audit chain hints at.
+        let checkpoint = final_checkpoint(&messages).cloned();
+        self.write_sync_run(
+            name,
+            &StoredSyncRun {
+                version: SYNC_RUN_FORMAT_VERSION,
+                sync: name.to_owned(),
+                run_id: run_id.clone(),
+                started: OffsetDateTime::now_utc()
+                    .format(&Rfc3339)
+                    .context("could not format sync run timestamp")?,
+                operations: messages.len(),
+                stream_hash: stream_hash(serialized.as_bytes()),
+                audit_sequence: current_audit.head.sequence,
+                audit_head: current_audit.head.hash.clone(),
+                checkpoint_before: StoredCheckpoint::new(current_state.as_ref()),
+                checkpoint_after: StoredCheckpoint::new(checkpoint.as_ref()),
+            },
+            serialized.as_bytes(),
+        )?;
+
+        let mut summary = self.apply_sync_messages(name, &run_id, &definition, messages, false)?;
+        if let Some(state) = checkpoint {
+            summary.checkpoint_updated = self.write_sync_state(name, &state, &current_state)?;
+        }
+        self.clear_sync_run(name)?;
+        Ok(summary)
+    }
+
+    /// Complete an interrupted run by replaying its recorded stream.
+    ///
+    /// Roll-forward rather than rollback: the audit chain is append-only, so an
+    /// abandoned prefix is never unwound. The `cr-jsonl-v1` stream is idempotent
+    /// by construction — every target appears at most once, an upsert carries
+    /// the complete record, and a delete of a missing record is a no-op — so
+    /// replaying it from the start commits exactly the operations the
+    /// interrupted run had not reached and appends no event for the rest.
+    ///
+    /// Returns `Ok(None)` when there is nothing to complete, so an unattended
+    /// caller can run it unconditionally before `run_sync`.
+    pub fn recover_sync(&self, name: &str) -> Result<Option<SyncRunSummary>> {
+        let definition = self.sync(name)?;
+        let _sync_lock = self.acquire_sync_lock(name)?;
+        let Some(stored) = self.read_sync_run(name)? else {
+            return Ok(None);
+        };
+        let _application_lock = self.acquire_sync_application_lock()?;
+        let audit = self
+            .audit_verify(None)
+            .context("database must be clean before an interrupted sync run can be completed")?;
+        let (_, foreign) = self.sync_run_events(&stored, &audit)?;
+        if audit.head.sequence == stored.audit_sequence && audit.head.hash != stored.audit_head {
+            return Err(conflict(format!(
+                "sync '{name}' cannot complete its interrupted run {} because audit history \
+                 changed after it stopped",
+                stored.run_id
+            )));
+        }
+
+        let serialized = paths::read_to_string(
+            self.root(),
+            &sync_stream_path(name),
+            &sync_stream_label(name),
+        )
+        .map_err(|error| {
+            if is_missing(&error) {
+                error.context(conflict(format!(
+                    "sync '{name}' recorded an interrupted run {} whose operations were not kept",
+                    stored.run_id
+                )))
+            } else {
+                error
+            }
+        })?;
+        if stream_hash(serialized.as_bytes()) != stored.stream_hash {
+            return Err(conflict(format!(
+                "the recorded operations of sync '{name}' run {} do not match its run ledger",
+                stored.run_id
+            )));
+        }
+        let messages = parse_messages(name, &serialized, definition.max_operations)?;
+        if messages.len() != stored.operations {
+            return Err(conflict(format!(
+                "the recorded operations of sync '{name}' run {} do not match its run ledger",
+                stored.run_id
+            )));
+        }
+        preflight_messages(self, &messages)?;
+        // An unrelated commit while the run was wedged is fine; a commit to a
+        // record this run still has to write is not, because completing the run
+        // would silently overwrite it.
+        if let Some((collection, id)) = message_targets(&messages).intersection(&foreign).next() {
+            return Err(conflict(format!(
+                "sync '{name}' cannot complete its interrupted run {} because record \
+                 {collection}/{id} changed after it stopped",
+                stored.run_id
+            )));
+        }
+
+        let current_state = self.sync_state(name)?;
+        let expected_state = stored.checkpoint_before.owned();
+        // A run interrupted after its checkpoint landed but before its ledger
+        // was cleared is already truthful; replaying it must not treat the
+        // committed checkpoint as somebody else's edit.
+        let checkpoint_committed =
+            stored.checkpoint_after.recorded && current_state == stored.checkpoint_after.owned();
+        if !checkpoint_committed && current_state != expected_state {
+            return Err(conflict(format!(
+                "sync '{name}' checkpoint changed after its interrupted run {} stopped",
+                stored.run_id
+            )));
+        }
+
+        let mut summary =
+            self.apply_sync_messages(name, &stored.run_id, &definition, messages, true)?;
+        if let Some(state) = stored.checkpoint_after.value()
+            && !checkpoint_committed
+        {
+            summary.checkpoint_updated = self.write_sync_state(name, state, &current_state)?;
+        }
+        self.clear_sync_run(name)?;
+        Ok(Some(summary))
+    }
+
+    fn apply_sync_messages(
+        &self,
+        name: &str,
+        run_id: &str,
+        definition: &SyncDefinition,
+        messages: Vec<SyncMessage>,
+        resumed: bool,
+    ) -> Result<SyncRunSummary> {
         let mut sync_database = self
             .clone()
             .with_source(AuditSource::Sync)
             .with_audit_message(format!("sync:{name} run:{run_id}"))?;
-        if let Some(actor) = definition.actor {
+        if let Some(actor) = definition.actor.clone() {
             sync_database = sync_database.with_actor(actor)?;
         }
         if let Some(agent) = definition.agent.as_deref() {
@@ -326,14 +576,14 @@ impl Database {
 
         let mut summary = SyncRunSummary {
             name: name.to_owned(),
-            run_id,
+            run_id: run_id.to_owned(),
             created: 0,
             updated: 0,
             deleted: 0,
             unchanged: 0,
             checkpoint_updated: false,
+            resumed,
         };
-        let mut checkpoint = None;
         for message in messages {
             match message {
                 SyncMessage::Upsert {
@@ -364,13 +614,129 @@ impl Database {
                         summary.unchanged += 1;
                     }
                 }
-                SyncMessage::Checkpoint { state } => checkpoint = Some(state),
+                SyncMessage::Checkpoint { .. } => {}
             }
         }
-        if let Some(state) = checkpoint {
-            summary.checkpoint_updated = self.write_sync_state(name, &state, &current_state)?;
-        }
         Ok(summary)
+    }
+
+    /// Read the run ledger, refusing one that does not describe this sync.
+    fn read_sync_run(&self, name: &str) -> Result<Option<StoredSyncRun>> {
+        validate_component(name, "sync")?;
+        let Some(serialized) =
+            paths::read_to_string_optional(self.root(), &sync_run_path(name), SYNC_RUN_LABEL)?
+        else {
+            return Ok(None);
+        };
+        let stored: StoredSyncRun = serde_json::from_str(&serialized)
+            .with_context(|| format!("the run ledger for sync '{name}' is not valid JSON"))?;
+        if stored.version != SYNC_RUN_FORMAT_VERSION {
+            return Err(conflict(format!(
+                "the run ledger for sync '{name}' uses unsupported format version {}",
+                stored.version
+            )));
+        }
+        if stored.sync != name || stored.run_id.trim().is_empty() {
+            return Err(conflict(format!(
+                "the run ledger for sync '{name}' does not describe this sync"
+            )));
+        }
+        Ok(Some(stored))
+    }
+
+    /// Derive an interrupted run's committed progress from the audit chain.
+    ///
+    /// Progress is read back from the journal rather than counted into the
+    /// ledger as the run goes, so the report can never claim work the chain
+    /// does not hold.
+    fn describe_sync_run(
+        &self,
+        stored: &StoredSyncRun,
+        audit: &AuditVerification,
+    ) -> Result<SyncRunLedger> {
+        let name = stored.sync.as_str();
+        let (events_committed, foreign) = self.sync_run_events(stored, audit)?;
+        Ok(SyncRunLedger {
+            name: name.to_owned(),
+            run_id: stored.run_id.clone(),
+            started: stored.started.clone(),
+            operations: stored.operations,
+            events_committed,
+            checkpoint_pending: stored.checkpoint_after.recorded
+                && self.sync_state(name)? != stored.checkpoint_after.owned(),
+            foreign_events: !foreign.is_empty(),
+        })
+    }
+
+    /// How many events an interrupted run committed, and which records were
+    /// changed after it stopped by anything other than that run.
+    fn sync_run_events(
+        &self,
+        stored: &StoredSyncRun,
+        audit: &AuditVerification,
+    ) -> Result<(u64, BTreeSet<(String, String)>)> {
+        let name = stored.sync.as_str();
+        if audit.head.sequence < stored.audit_sequence {
+            return Err(conflict(format!(
+                "sync '{name}' recorded run {} against audit history that no longer exists",
+                stored.run_id
+            )));
+        }
+        let appended = audit.head.sequence - stored.audit_sequence;
+        let limit = usize::try_from(appended).context("audit history is too long to inspect")?;
+        let expected = format!("sync:{name} run:{}", stored.run_id);
+        let mut events_committed = 0;
+        let mut foreign = BTreeSet::new();
+        for entry in self.audit_recent(limit, AuditFilter::all())? {
+            if entry.payload.sequence <= stored.audit_sequence {
+                continue;
+            }
+            if entry.payload.message.as_deref() == Some(expected.as_str()) {
+                events_committed += 1;
+            } else {
+                foreign.insert((
+                    entry.payload.record.collection.clone(),
+                    entry.payload.record.id.clone(),
+                ));
+            }
+        }
+        Ok((events_committed, foreign))
+    }
+
+    /// Make an in-flight run durable: the stream first, then the ledger that
+    /// points at it, so a ledger on disk always has its operations beside it.
+    fn write_sync_run(&self, name: &str, stored: &StoredSyncRun, stream: &[u8]) -> Result<()> {
+        let stream_path = sync_stream_path(name);
+        let stream_label = sync_stream_label(name);
+        // A stream without a ledger is the residue of a run that finished and
+        // was interrupted while tidying up. It describes no committed work.
+        if paths::entry_kind(self.root(), &stream_path, &stream_label)?.is_some() {
+            paths::remove_file(self.root(), &stream_path, &stream_label)?;
+        }
+        paths::write_new(self.root(), &stream_path, stream, &stream_label)?;
+        let mut serialized =
+            serde_json::to_vec_pretty(stored).context("could not serialize the sync run ledger")?;
+        serialized.push(b'\n');
+        paths::write_new(
+            self.root(),
+            &sync_run_path(name),
+            &serialized,
+            SYNC_RUN_LABEL,
+        )
+    }
+
+    /// Retire a completed run: the ledger first, so a crash here can only leave
+    /// a stream with no ledger, which claims nothing about committed work.
+    fn clear_sync_run(&self, name: &str) -> Result<()> {
+        for (path, label) in [
+            (sync_run_path(name), SYNC_RUN_LABEL.to_owned()),
+            (sync_stream_path(name), sync_stream_label(name)),
+        ] {
+            if paths::entry_kind(self.root(), &path, &label)?.is_some() {
+                paths::remove_file(self.root(), &path, &label)?;
+            }
+        }
+        Ok(())
     }
 
     fn write_sync_state(
@@ -430,6 +796,45 @@ fn sync_label(name: &str) -> String {
 
 fn sync_state_label(name: &str) -> String {
     format!("the checkpoint for sync '{name}'")
+}
+
+fn sync_run_path(name: &str) -> PathBuf {
+    Path::new(SYNC_RUN_DIRECTORY).join(format!("{name}.json"))
+}
+
+fn sync_stream_path(name: &str) -> PathBuf {
+    Path::new(SYNC_RUN_DIRECTORY).join(format!("{name}.jsonl"))
+}
+
+fn sync_stream_label(name: &str) -> String {
+    format!("the recorded operations for sync '{name}'")
+}
+
+/// Bind a run ledger to the exact bytes it promised to apply.
+fn stream_hash(stream: &[u8]) -> String {
+    crate::audit::digest(SYNC_STREAM_HASH_DOMAIN, stream)
+}
+
+/// Every record a parsed stream writes or deletes.
+fn message_targets(messages: &[SyncMessage]) -> BTreeSet<(String, String)> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            SyncMessage::Upsert { collection, id, .. } | SyncMessage::Delete { collection, id } => {
+                Some((collection.clone(), id.clone()))
+            }
+            SyncMessage::Checkpoint { .. } => None,
+        })
+        .collect()
+}
+
+/// The checkpoint a parsed stream ends with, which the protocol guarantees is
+/// its final message when one is present at all.
+fn final_checkpoint(messages: &[SyncMessage]) -> Option<&JsonValue> {
+    match messages.last() {
+        Some(SyncMessage::Checkpoint { state }) => Some(state),
+        _ => None,
+    }
 }
 
 fn validate_stored(name: &str, sync: &StoredSyncDefinition) -> Result<()> {
@@ -642,6 +1047,74 @@ mod tests {
                 .to_string()
                 .contains("final message")
         );
+    }
+
+    #[test]
+    fn a_run_ledger_tells_a_null_checkpoint_apart_from_no_checkpoint() {
+        let ledger = |checkpoint: Option<&JsonValue>| StoredSyncRun {
+            version: SYNC_RUN_FORMAT_VERSION,
+            sync: "test".to_owned(),
+            run_id: "abc".to_owned(),
+            started: "2026-01-01T00:00:00Z".to_owned(),
+            operations: 1,
+            stream_hash: stream_hash(b""),
+            audit_sequence: 0,
+            audit_head: None,
+            checkpoint_before: StoredCheckpoint::default(),
+            checkpoint_after: StoredCheckpoint::new(checkpoint),
+        };
+        let round_trip = |checkpoint: Option<&JsonValue>| {
+            let serialized = serde_json::to_string(&ledger(checkpoint)).unwrap();
+            let parsed: StoredSyncRun = serde_json::from_str(&serialized).unwrap();
+            parsed.checkpoint_after.owned()
+        };
+
+        // A checkpoint of `null` is a checkpoint. Recovery has to commit it,
+        // and must not confuse it with an adapter that emitted none at all.
+        assert_eq!(round_trip(Some(&JsonValue::Null)), Some(JsonValue::Null));
+        assert_eq!(round_trip(None), None);
+        assert_eq!(
+            round_trip(Some(&serde_json::json!({"cursor": 1}))),
+            Some(serde_json::json!({"cursor": 1}))
+        );
+    }
+
+    #[test]
+    fn a_recorded_stream_is_bound_to_its_exact_bytes() {
+        assert_eq!(stream_hash(b"one\n"), stream_hash(b"one\n"));
+        assert_ne!(stream_hash(b"one\n"), stream_hash(b"one\n\n"));
+        // Domain separation: the same bytes never digest to a record hash.
+        assert_ne!(stream_hash(b"one\n"), crate::audit::record_hash(b"one\n"));
+        assert!(stream_hash(b"").starts_with("sha256:"));
+    }
+
+    #[test]
+    fn the_final_checkpoint_is_the_only_one_a_stream_can_carry() {
+        let messages = parse_messages(
+            "test",
+            concat!(
+                "{\"type\":\"delete\",\"collection\":\"notes\",\"id\":\"one\"}\n",
+                "{\"type\":\"checkpoint\",\"state\":{\"cursor\":7}}\n"
+            ),
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            final_checkpoint(&messages),
+            Some(&serde_json::json!({"cursor": 7}))
+        );
+        assert_eq!(
+            message_targets(&messages),
+            BTreeSet::from([("notes".to_owned(), "one".to_owned())])
+        );
+
+        let without = parse_messages(
+            "test",
+            "{\"type\":\"delete\",\"collection\":\"notes\",\"id\":\"one\"}\n",
+            10,
+        )
+        .unwrap();
+        assert_eq!(final_checkpoint(&without), None);
     }
 
     #[test]
