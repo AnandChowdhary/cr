@@ -15,7 +15,10 @@ pub use attribution::{
     AttributionOverrides, AuditAgent, AuditAuthorization, AuditIntent, AuditIntentPart,
     AuthorizationMode, IntentAuthor,
 };
-pub use audit::{AuditAction, AuditEntry, AuditFilter, AuditHead, AuditSource, AuditVerification};
+pub use audit::{
+    AuditAction, AuditChange, AuditEntry, AuditFilter, AuditHead, AuditSource, AuditVerification,
+    ChangePreview,
+};
 pub use database::{
     sort_records_by_field, CollectionModel, Database, Record, SortDirection, WorkingChange,
     WorkingChangeKind,

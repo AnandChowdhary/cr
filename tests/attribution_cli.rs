@@ -601,7 +601,20 @@ fn invalid_attribution_is_refused_without_naming_anything_internal() {
                 "--authorization",
                 r#"{"mode":"delegated","approved_changes":"sha256:00"}"#,
             ],
-            "reserved",
+            "64 lowercase hexadecimal",
+        ),
+        (
+            vec!["--approved-changes", "sha256:00"],
+            "without an authorization mode",
+        ),
+        (
+            vec![
+                "--authorization",
+                "interactive",
+                "--approved-changes",
+                "not-a-digest",
+            ],
+            "64 lowercase hexadecimal",
         ),
         (
             vec!["--grant", "acceptEdits"],

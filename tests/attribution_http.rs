@@ -376,6 +376,122 @@ async fn the_html_history_names_the_agent_rather_than_only_the_human() {
         .contains("No audit events match this filter."));
 }
 
+/// `preview=true` computes the change set and writes nothing, and the digest it
+/// returns is the one `X-CR-Approved-Changes` then binds the write to.
+#[tokio::test]
+async fn a_previewed_change_set_is_computed_without_writing_and_can_then_be_approved() {
+    let (_temporary, app, _database) = test_app("http-preview");
+    request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/deals/records",
+        Some(json!({ "id": "acme-renewal", "front_matter": { "status": "open" } })),
+        &[],
+    )
+    .await;
+    let head = request(&app, Method::GET, "/api/v1/audit/head", None, &[])
+        .await
+        .json();
+
+    let preview = request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/deals/records/acme-renewal?preview=true",
+        Some(json!({ "front_matter": { "status": "closed-won" } })),
+        &[],
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK);
+    let preview = preview.json();
+    assert_eq!(preview["preview"], true);
+    assert_eq!(preview["action"], "update");
+    assert_eq!(preview["changes"][0]["path"], "/attributes/status");
+    let digest = preview["digest"].as_str().expect("a digest").to_owned();
+
+    // Nothing moved: no event, and the record still reads as it did.
+    assert_eq!(
+        request(&app, Method::GET, "/api/v1/audit/head", None, &[])
+            .await
+            .json(),
+        head
+    );
+    let record = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/records/acme-renewal",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(record.json()["front_matter"]["status"], "open");
+
+    // A different change under the same approval is refused, with its own code.
+    let refused = request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/deals/records/acme-renewal",
+        Some(json!({ "front_matter": { "status": "lost" } })),
+        &[
+            ("X-CR-Authorization", "interactive"),
+            ("X-CR-Approved-Changes", &digest),
+        ],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert_eq!(refused.json()["error"]["code"], "approval_mismatch");
+    assert!(refused.json()["error"]["message"]
+        .as_str()
+        .expect("a message")
+        .contains("does not match the approved change set"));
+
+    let applied = request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/deals/records/acme-renewal",
+        Some(json!({ "front_matter": { "status": "closed-won" } })),
+        &[
+            ("X-CR-Authorization", "interactive"),
+            ("X-CR-Approved-Changes", &digest),
+        ],
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::OK);
+    let log = request(&app, Method::GET, "/api/v1/audit/log", None, &[]).await;
+    assert_eq!(
+        log.json()["data"][0]["authorization"]["approved_changes"],
+        digest
+    );
+    let verified = request(&app, Method::GET, "/api/v1/audit/verify", None, &[]).await;
+    assert_eq!(verified.status, StatusCode::OK);
+}
+
+/// `preview` lives in the request target because it decides whether the request
+/// writes. A misspelled parameter must therefore be a rejection, not a write.
+#[tokio::test]
+async fn a_misspelled_preview_parameter_is_refused_rather_than_written() {
+    let (_temporary, app, _database) = test_app("http-preview-typo");
+    let response = request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/deals/records?previw=true",
+        Some(json!({ "id": "acme-renewal" })),
+        &[],
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(response.json()["error"]["code"], "invalid_query");
+
+    let missing = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/records/acme-renewal",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
 #[test]
 fn the_openapi_document_describes_the_attribution_contract() {
     let temporary = tempfile::tempdir().unwrap();
@@ -397,7 +513,7 @@ fn the_openapi_document_describes_the_attribution_contract() {
             ["description"]
             .as_str()
             .unwrap()
-            .contains("does not yet verify")
+            .contains("audit verify recomputes it")
     );
 
     let headers: Vec<&str> = document["paths"]["/api/v1/collections/{collection}/records"]["post"]
@@ -411,6 +527,8 @@ fn the_openapi_document_describes_the_attribution_contract() {
     assert!(headers.contains(&"X-CR-Agent"));
     assert!(headers.contains(&"X-CR-Authorization"));
     assert!(headers.contains(&"X-CR-Intent"));
+    assert!(headers.contains(&"X-CR-Approved-Changes"));
+    assert!(headers.contains(&"preview"));
 
     let query: Vec<&str> = document["paths"]["/api/v1/audit/log"]["get"]["parameters"]
         .as_array()

@@ -11,7 +11,7 @@ use yaml_serde::{Mapping, Value};
 
 use crate::{
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
-    audit::{record_hash, AuditFilter, AuditLog, AuditMutation, ReconciledMutation},
+    audit::{record_hash, AuditFilter, AuditLog, AuditMutation, ChangePreview, ReconciledMutation},
     error::{conflict, invalid, is_already_exists, is_missing, DomainError},
     frontmatter::Document,
     paths,
@@ -80,6 +80,43 @@ impl Default for Config {
             version: CURRENT_FORMAT_VERSION,
             data_dir: PathBuf::from("records"),
             audit: AuditConfig::default(),
+        }
+    }
+}
+
+/// Whether a mutation should be written or only computed.
+///
+/// `Preview` stops after the change set is known: nothing is written, no audit
+/// event is appended, no pending-mutation file is created, and the audit lock is
+/// released on the way out. It deliberately does not run pending-mutation
+/// recovery either, because recovery appends an event, and a preview that
+/// writes is not a preview. An interrupted mutation therefore makes a preview
+/// fail loudly on the audited-state check rather than quietly predicting the
+/// wrong result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationMode {
+    Apply,
+    Preview,
+}
+
+/// What running a mutation in one of those two modes produced.
+enum MutationOutcome {
+    Applied(Record),
+    Previewed(ChangePreview),
+}
+
+impl MutationOutcome {
+    fn record(self) -> Result<Record> {
+        match self {
+            Self::Applied(record) => Ok(record),
+            Self::Previewed(_) => bail!("an applied mutation returned a preview"),
+        }
+    }
+
+    fn preview(self) -> Result<ChangePreview> {
+        match self {
+            Self::Previewed(preview) => Ok(preview),
+            Self::Applied(_) => bail!("a previewed mutation returned a record"),
         }
     }
 }
@@ -395,6 +432,19 @@ impl Database {
         self.create_record(collection, id, attributes, body)
     }
 
+    /// Compute what `create` would record, without creating anything.
+    pub fn preview_create(
+        &self,
+        collection: &str,
+        id: &str,
+        assignments: &[Assignment],
+        body: &str,
+    ) -> Result<ChangePreview> {
+        let mut attributes = Mapping::new();
+        apply_all(&mut attributes, assignments)?;
+        self.preview_create_record(collection, id, attributes, body)
+    }
+
     pub fn create_record(
         &self,
         collection: &str,
@@ -402,11 +452,37 @@ impl Database {
         attributes: Mapping,
         body: &str,
     ) -> Result<Record> {
+        self.run_create(collection, id, attributes, body, MutationMode::Apply)?
+            .record()
+    }
+
+    /// Compute what `create_record` would record, without creating anything.
+    pub fn preview_create_record(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: Mapping,
+        body: &str,
+    ) -> Result<ChangePreview> {
+        self.run_create(collection, id, attributes, body, MutationMode::Preview)?
+            .preview()
+    }
+
+    fn run_create(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: Mapping,
+        body: &str,
+        mode: MutationMode,
+    ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
         let audit = self.audit();
         let _lock = audit.lock()?;
-        audit.recover_pending()?;
+        if mode == MutationMode::Apply {
+            audit.recover_pending()?;
+        }
         if paths::entry_kind(&self.root, &path, &label)?.is_some() {
             return Err(DomainError::record_exists(collection, id).into());
         }
@@ -427,6 +503,9 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
         })?;
+        if mode == MutationMode::Preview {
+            return Ok(MutationOutcome::Previewed(event.into_preview()));
+        }
         audit.commit(event, &path, || {
             paths::write_new(&self.root, &path, rendered.as_bytes(), &label).map_err(|error| {
                 if is_already_exists(&error) {
@@ -436,7 +515,9 @@ impl Database {
                 }
             })
         })?;
-        Ok(record_from_document(collection, id, path, document))
+        Ok(MutationOutcome::Applied(record_from_document(
+            collection, id, path, document,
+        )))
     }
 
     pub fn get(&self, collection: &str, id: &str) -> Result<Record> {
@@ -594,13 +675,30 @@ impl Database {
         assignments: &[Assignment],
         body: Option<&str>,
     ) -> Result<Record> {
-        self.update_document(collection, id, |document| {
-            apply_all(&mut document.attributes, assignments)?;
-            if let Some(body) = body {
-                document.body = body.to_owned();
-            }
-            Ok(())
-        })
+        self.run_update(
+            collection,
+            id,
+            update_with(assignments, body),
+            MutationMode::Apply,
+        )?
+        .record()
+    }
+
+    /// Compute what `update` would record, without writing anything.
+    pub fn preview_update(
+        &self,
+        collection: &str,
+        id: &str,
+        assignments: &[Assignment],
+        body: Option<&str>,
+    ) -> Result<ChangePreview> {
+        self.run_update(
+            collection,
+            id,
+            update_with(assignments, body),
+            MutationMode::Preview,
+        )?
+        .preview()
     }
 
     pub fn patch(
@@ -611,6 +709,46 @@ impl Database {
         remove: &[String],
         body: Option<&str>,
     ) -> Result<Record> {
+        self.run_patch(
+            collection,
+            id,
+            attributes,
+            remove,
+            body,
+            MutationMode::Apply,
+        )?
+        .record()
+    }
+
+    /// Compute what `patch` would record, without writing anything.
+    pub fn preview_patch(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        remove: &[String],
+        body: Option<&str>,
+    ) -> Result<ChangePreview> {
+        self.run_patch(
+            collection,
+            id,
+            attributes,
+            remove,
+            body,
+            MutationMode::Preview,
+        )?
+        .preview()
+    }
+
+    fn run_patch(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        remove: &[String],
+        body: Option<&str>,
+        mode: MutationMode,
+    ) -> Result<MutationOutcome> {
         if attributes.is_empty() && remove.is_empty() && body.is_none() {
             return Err(invalid("patch must change front matter or Markdown"));
         }
@@ -618,18 +756,23 @@ impl Database {
             .iter()
             .map(|path| Ok((path, parse_path(path)?)))
             .collect::<Result<Vec<_>>>()?;
-        self.update_document(collection, id, |document| {
-            merge_mapping(&mut document.attributes, attributes);
-            for (raw, path) in &remove {
-                if !remove_path(&mut document.attributes, path) {
-                    return Err(invalid(format!("field '{raw}' does not exist")));
+        self.run_update(
+            collection,
+            id,
+            |document| {
+                merge_mapping(&mut document.attributes, attributes);
+                for (raw, path) in &remove {
+                    if !remove_path(&mut document.attributes, path) {
+                        return Err(invalid(format!("field '{raw}' does not exist")));
+                    }
                 }
-            }
-            if let Some(body) = body {
-                document.body = body.to_owned();
-            }
-            Ok(())
-        })
+                if let Some(body) = body {
+                    document.body = body.to_owned();
+                }
+                Ok(())
+            },
+            mode,
+        )
     }
 
     /// Replace a record's complete front matter and Markdown body atomically.
@@ -643,24 +786,33 @@ impl Database {
         attributes: Mapping,
         body: &str,
     ) -> Result<Record> {
-        self.update_document(collection, id, |document| {
-            document.attributes = attributes;
-            document.body = body.to_owned();
-            Ok(())
-        })
+        self.run_update(
+            collection,
+            id,
+            |document| {
+                document.attributes = attributes;
+                document.body = body.to_owned();
+                Ok(())
+            },
+            MutationMode::Apply,
+        )?
+        .record()
     }
 
-    fn update_document(
+    fn run_update(
         &self,
         collection: &str,
         id: &str,
         mutate: impl FnOnce(&mut Document) -> Result<()>,
-    ) -> Result<Record> {
+        mode: MutationMode,
+    ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
         let audit = self.audit();
         let _lock = audit.lock()?;
-        audit.recover_pending()?;
+        if mode == MutationMode::Apply {
+            audit.recover_pending()?;
+        }
         let before_raw = self.read_record(collection, id, &path)?;
         let before = parse_record(collection, id, &before_raw)?;
         let mut document = before.clone();
@@ -678,10 +830,15 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
         })?;
+        if mode == MutationMode::Preview {
+            return Ok(MutationOutcome::Previewed(event.into_preview()));
+        }
         audit.commit(event, &path, || {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
         })?;
-        Ok(record_from_document(collection, id, path, document))
+        Ok(MutationOutcome::Applied(record_from_document(
+            collection, id, path, document,
+        )))
     }
 
     pub fn link(
@@ -692,10 +849,52 @@ impl Database {
         target_collection: &str,
         target_id: &str,
     ) -> Result<Record> {
+        self.run_link(
+            collection,
+            id,
+            relation,
+            target_collection,
+            target_id,
+            MutationMode::Apply,
+        )?
+        .record()
+    }
+
+    /// Compute what `link` would record, without writing anything.
+    pub fn preview_link(
+        &self,
+        collection: &str,
+        id: &str,
+        relation: &str,
+        target_collection: &str,
+        target_id: &str,
+    ) -> Result<ChangePreview> {
+        self.run_link(
+            collection,
+            id,
+            relation,
+            target_collection,
+            target_id,
+            MutationMode::Preview,
+        )?
+        .preview()
+    }
+
+    fn run_link(
+        &self,
+        collection: &str,
+        id: &str,
+        relation: &str,
+        target_collection: &str,
+        target_id: &str,
+        mode: MutationMode,
+    ) -> Result<MutationOutcome> {
         validate_component(relation, "relation")?;
         let audit = self.audit();
         let _lock = audit.lock()?;
-        audit.recover_pending()?;
+        if mode == MutationMode::Apply {
+            audit.recover_pending()?;
+        }
         let target_path = self.record_path(target_collection, target_id)?;
         let target_raw = self
             .read_record(target_collection, target_id, &target_path)
@@ -737,18 +936,41 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
         })?;
+        if mode == MutationMode::Preview {
+            return Ok(MutationOutcome::Previewed(event.into_preview()));
+        }
         audit.commit(event, &path, || {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
         })?;
-        Ok(record_from_document(collection, id, path, document))
+        Ok(MutationOutcome::Applied(record_from_document(
+            collection, id, path, document,
+        )))
     }
 
     pub fn delete(&self, collection: &str, id: &str) -> Result<Record> {
+        self.run_delete(collection, id, MutationMode::Apply)?
+            .record()
+    }
+
+    /// Compute what `delete` would record, without deleting anything.
+    pub fn preview_delete(&self, collection: &str, id: &str) -> Result<ChangePreview> {
+        self.run_delete(collection, id, MutationMode::Preview)?
+            .preview()
+    }
+
+    fn run_delete(
+        &self,
+        collection: &str,
+        id: &str,
+        mode: MutationMode,
+    ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
         let audit = self.audit();
         let _lock = audit.lock()?;
-        audit.recover_pending()?;
+        if mode == MutationMode::Apply {
+            audit.recover_pending()?;
+        }
         let before_raw = self.read_record(collection, id, &path)?;
         let document = parse_record(collection, id, &before_raw)?;
         let event = audit.prepare(AuditMutation {
@@ -762,10 +984,15 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
         })?;
+        if mode == MutationMode::Preview {
+            return Ok(MutationOutcome::Previewed(event.into_preview()));
+        }
         audit.commit(event, &path, || {
             paths::remove_file(&self.root, &path, &label)
         })?;
-        Ok(record_from_document(collection, id, path, document))
+        Ok(MutationOutcome::Applied(record_from_document(
+            collection, id, path, document,
+        )))
     }
 
     pub fn status(&self) -> Result<Vec<WorkingChange>> {
@@ -781,6 +1008,29 @@ impl Database {
         all: bool,
         message: Option<&str>,
     ) -> Result<Vec<AuditEntry>> {
+        self.run_save(references, all, message, MutationMode::Apply)
+            .map(|(entries, _)| entries)
+    }
+
+    /// Compute what `save` would record for each selected record, without
+    /// recording anything.
+    pub fn preview_save(
+        &self,
+        references: &[String],
+        all: bool,
+        message: Option<&str>,
+    ) -> Result<Vec<ChangePreview>> {
+        self.run_save(references, all, message, MutationMode::Preview)
+            .map(|(_, previews)| previews)
+    }
+
+    fn run_save(
+        &self,
+        references: &[String],
+        all: bool,
+        message: Option<&str>,
+        mode: MutationMode,
+    ) -> Result<(Vec<AuditEntry>, Vec<ChangePreview>)> {
         if all && !references.is_empty() {
             return Err(invalid("--all cannot be combined with record references"));
         }
@@ -795,9 +1045,26 @@ impl Database {
             .iter()
             .map(|reference| parse_reference(reference))
             .collect::<Result<BTreeSet<_>>>()?;
+        // One digest cannot approve several independent change sets, and
+        // silently checking it against only one of them would be worse than
+        // refusing. Approving a multi-record save needs a per-record mapping;
+        // that waits on the bulk-mutation design in `TODO.md`.
+        if self
+            .attribution
+            .authorization
+            .as_ref()
+            .is_some_and(|authorization| authorization.approved_changes.is_some())
+            && (all || selected.len() != 1)
+        {
+            return Err(invalid(
+                "an approved change set applies to one record, so save it by naming exactly one COLLECTION/ID",
+            ));
+        }
         let audit = self.audit();
         let _lock = audit.lock()?;
-        audit.recover_pending()?;
+        if mode == MutationMode::Apply {
+            audit.recover_pending()?;
+        }
         let states = audit.record_states()?;
         let changes = self.working_changes_from_states(&states)?;
         let available: BTreeMap<_, _> = changes
@@ -851,6 +1118,7 @@ impl Database {
         }
 
         let mut entries = Vec::with_capacity(prepared.len());
+        let mut previews = Vec::with_capacity(prepared.len());
         for (change, before, after, after_raw, action) in prepared {
             let event = audit.prepare_reconciled(ReconciledMutation {
                 action,
@@ -863,9 +1131,13 @@ impl Database {
                 had_history: states.contains_key(&(change.collection.clone(), change.id.clone())),
                 message,
             })?;
+            if mode == MutationMode::Preview {
+                previews.push(event.into_preview());
+                continue;
+            }
             entries.push(audit.accept(event, &change.path)?);
         }
-        Ok(entries)
+        Ok((entries, previews))
     }
 
     pub fn audit_recent(&self, limit: usize, filter: AuditFilter<'_>) -> Result<Vec<AuditEntry>> {
@@ -1187,6 +1459,21 @@ fn parse_reference(reference: &str) -> Result<(String, String)> {
     validate_component(collection, "collection")?;
     validate_component(id, "id")?;
     Ok((collection.to_owned(), id.to_owned()))
+}
+
+/// The mutation `update` applies: assignments over front matter, and an
+/// optional whole-body replacement.
+fn update_with<'a>(
+    assignments: &'a [Assignment],
+    body: Option<&'a str>,
+) -> impl FnOnce(&mut Document) -> Result<()> + 'a {
+    move |document| {
+        apply_all(&mut document.attributes, assignments)?;
+        if let Some(body) = body {
+            document.body = body.to_owned();
+        }
+        Ok(())
+    }
 }
 
 fn apply_all(attributes: &mut Mapping, assignments: &[Assignment]) -> Result<()> {

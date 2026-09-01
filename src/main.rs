@@ -72,6 +72,10 @@ struct AttributionArgs {
     #[arg(long, value_name = "TIMESTAMP")]
     approved_at: Option<String>,
 
+    /// Digest printed by --preview. The mutation is refused unless its change set matches.
+    #[arg(long, value_name = "SHA256")]
+    approved_changes: Option<String>,
+
     /// JSON intent object carrying a request, a rationale, or both.
     #[arg(long, value_name = "JSON")]
     intent: Option<String>,
@@ -97,6 +101,7 @@ impl AttributionArgs {
             grant: self.grant.as_deref(),
             approved_by: self.approved_by.as_deref(),
             approved_at: self.approved_at.as_deref(),
+            approved_changes: self.approved_changes.as_deref(),
             intent: self.intent.as_deref(),
             intent_request: self.intent_request.as_deref(),
             intent_rationale: self.intent_rationale.as_deref(),
@@ -167,6 +172,14 @@ enum Command {
         /// Explain why this record is being created.
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
+
+        /// Compute the change set without writing, and print the digest that approves it.
+        #[arg(long, conflicts_with = "approved_changes")]
+        preview: bool,
+
+        /// Print the preview as JSON.
+        #[arg(long, requires = "preview")]
+        json: bool,
 
         #[command(flatten)]
         attribution: AttributionArgs,
@@ -309,6 +322,14 @@ enum Command {
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
 
+        /// Compute the change set without writing, and print the digest that approves it.
+        #[arg(long, conflicts_with = "approved_changes")]
+        preview: bool,
+
+        /// Print the preview as JSON.
+        #[arg(long, requires = "preview")]
+        json: bool,
+
         #[command(flatten)]
         attribution: AttributionArgs,
     },
@@ -324,6 +345,14 @@ enum Command {
         /// Explain why this relation is being added.
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
+
+        /// Compute the change set without writing, and print the digest that approves it.
+        #[arg(long, conflicts_with = "approved_changes")]
+        preview: bool,
+
+        /// Print the preview as JSON.
+        #[arg(long, requires = "preview")]
+        json: bool,
 
         #[command(flatten)]
         attribution: AttributionArgs,
@@ -354,6 +383,10 @@ enum Command {
         #[arg(long)]
         json: bool,
 
+        /// Compute each change set without recording it, and print its digest.
+        #[arg(long, conflicts_with = "approved_changes")]
+        preview: bool,
+
         #[command(flatten)]
         attribution: AttributionArgs,
     },
@@ -372,13 +405,21 @@ enum Command {
         collection: String,
         id: String,
 
-        /// Confirm the destructive operation.
-        #[arg(long, required = true)]
+        /// Confirm the destructive operation. Not needed with --preview, which deletes nothing.
+        #[arg(long)]
         yes: bool,
 
         /// Explain why this record is being deleted.
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
+
+        /// Compute the change set without writing, and print the digest that approves it.
+        #[arg(long, conflicts_with = "approved_changes")]
+        preview: bool,
+
+        /// Print the preview as JSON.
+        #[arg(long, requires = "preview")]
+        json: bool,
 
         #[command(flatten)]
         attribution: AttributionArgs,
@@ -618,11 +659,18 @@ fn run() -> Result<()> {
             assignments,
             body,
             message,
+            preview,
+            json,
             attribution,
         } => {
             let database = attributed(database, &attribution, message.as_deref())?;
-            let record = database.create(&collection, &id, &assignments, &body)?;
-            println!("{}", record.reference());
+            if preview {
+                let preview = database.preview_create(&collection, &id, &assignments, &body)?;
+                print_preview(&preview, json)?;
+            } else {
+                let record = database.create(&collection, &id, &assignments, &body)?;
+                println!("{}", record.reference());
+            }
         }
         Command::Get {
             collection,
@@ -871,14 +919,22 @@ fn run() -> Result<()> {
             assignments,
             body,
             message,
+            preview,
+            json,
             attribution,
         } => {
             if assignments.is_empty() && body.is_none() {
                 bail!("provide at least one --set or --body value");
             }
             let database = attributed(database, &attribution, message.as_deref())?;
-            let record = database.update(&collection, &id, &assignments, body.as_deref())?;
-            println!("{}", record.reference());
+            if preview {
+                let preview =
+                    database.preview_update(&collection, &id, &assignments, body.as_deref())?;
+                print_preview(&preview, json)?;
+            } else {
+                let record = database.update(&collection, &id, &assignments, body.as_deref())?;
+                println!("{}", record.reference());
+            }
         }
         Command::Link {
             collection,
@@ -887,12 +943,25 @@ fn run() -> Result<()> {
             target_collection,
             target_id,
             message,
+            preview,
+            json,
             attribution,
         } => {
             let database = attributed(database, &attribution, message.as_deref())?;
-            let record =
-                database.link(&collection, &id, &relation, &target_collection, &target_id)?;
-            println!("{}", record.reference());
+            if preview {
+                let preview = database.preview_link(
+                    &collection,
+                    &id,
+                    &relation,
+                    &target_collection,
+                    &target_id,
+                )?;
+                print_preview(&preview, json)?;
+            } else {
+                let record =
+                    database.link(&collection, &id, &relation, &target_collection, &target_id)?;
+                println!("{}", record.reference());
+            }
         }
         Command::Status { json } => {
             let changes = database.status()?;
@@ -911,9 +980,23 @@ fn run() -> Result<()> {
             all,
             message,
             json,
+            preview,
             attribution,
         } => {
             let database = attribution.apply(database)?;
+            if preview {
+                let previews = database.preview_save(&records, all, message.as_deref())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&previews)?);
+                } else if previews.is_empty() {
+                    println!("No changes to save");
+                } else {
+                    for preview in &previews {
+                        print_preview(preview, false)?;
+                    }
+                }
+                return Ok(());
+            }
             let entries = database.save(&records, all, message.as_deref())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&entries)?);
@@ -954,13 +1037,23 @@ fn run() -> Result<()> {
         Command::Delete {
             collection,
             id,
-            yes: _,
+            yes,
             message,
+            preview,
+            json,
             attribution,
         } => {
             let database = attributed(database, &attribution, message.as_deref())?;
-            let record = database.delete(&collection, &id)?;
-            println!("{}", record.reference());
+            if preview {
+                let preview = database.preview_delete(&collection, &id)?;
+                print_preview(&preview, json)?;
+            } else {
+                if !yes {
+                    bail!("deleting a record requires --yes to confirm the destructive operation");
+                }
+                let record = database.delete(&collection, &id)?;
+                println!("{}", record.reference());
+            }
         }
         Command::Audit { command } => match command {
             AuditCommand::Baseline => {
@@ -1036,6 +1129,55 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// Print a change set that was computed but not written.
+///
+/// The last line is always `digest sha256:…`, so a caller can lift the value to
+/// pass back as `--approved-changes` without parsing the rest.
+fn print_preview(preview: &cr::ChangePreview, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(preview)?);
+        return Ok(());
+    }
+    println!("{} {}", preview.action, preview.record.reference());
+    for change in &preview.changes {
+        match change {
+            cr::AuditChange::Add { path, after } => {
+                println!("add {} {}", change_path(path), compact(after)?);
+            }
+            cr::AuditChange::Remove { path, before } => {
+                println!("remove {} {}", change_path(path), compact(before)?);
+            }
+            cr::AuditChange::Replace {
+                path,
+                before,
+                after,
+            } => {
+                println!(
+                    "replace {} {} -> {}",
+                    change_path(path),
+                    compact(before)?,
+                    compact(after)?
+                );
+            }
+        }
+    }
+    println!("digest {}", preview.digest);
+    Ok(())
+}
+
+/// Name the whole document rather than printing an empty JSON Pointer.
+fn change_path(path: &str) -> &str {
+    if path.is_empty() {
+        "(record)"
+    } else {
+        path
+    }
+}
+
+fn compact(value: &serde_json::Value) -> Result<String> {
+    Ok(serde_json::to_string(value)?)
+}
+
 /// Print the agent, authorization, and intent an event would carry.
 ///
 /// Prints nothing when there is nothing to say, so a human at the keyboard sees
@@ -1074,6 +1216,9 @@ fn print_attribution(attribution: &cr::Attribution) {
         }
         if let Some(at) = &authorization.at {
             line.push_str(&format!(" at={at}"));
+        }
+        if let Some(approved) = &authorization.approved_changes {
+            line.push_str(&format!(" approved_changes={approved}"));
         }
         println!("{line}");
     }

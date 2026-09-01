@@ -278,13 +278,14 @@ pub struct AuditAuthorization {
     /// When the approval was given, as an RFC 3339 timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
-    /// Digest of a change set a human previewed and approved.
+    /// Digest of the change set that was previewed and approved.
     ///
-    /// Reserved. The preview command that produces this digest, and the
-    /// verification that recomputes it from the stored `changes`, are a
-    /// separate change. The field is defined here so adopting them later needs
-    /// no migration; nothing writes it today and no caller may supply it,
-    /// because a digest nobody checks would look like proof and be none.
+    /// The one field in this module that is checked rather than believed. `cr`
+    /// refuses to apply a mutation whose change set hashes differently, and
+    /// `audit verify` recomputes the digest from the event's stored `changes`.
+    ///
+    /// It commits to *what* was applied, not to *who saw it*. That a human read
+    /// the preview is asserted, exactly like everything else here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_changes: Option<String>,
 }
@@ -377,6 +378,8 @@ pub struct AttributionOverrides<'a> {
     pub approved_by: Option<&'a str>,
     /// When the change was approved.
     pub approved_at: Option<&'a str>,
+    /// `sha256:` digest of the change set that was previewed and approved.
+    pub approved_changes: Option<&'a str>,
     /// A JSON intent object.
     pub intent: Option<&'a str>,
     /// The instruction, attributed to the human.
@@ -397,6 +400,7 @@ impl<'a> AttributionOverrides<'a> {
             && self.grant.is_none()
             && self.approved_by.is_none()
             && self.approved_at.is_none()
+            && self.approved_changes.is_none()
             && self.intent.is_none()
             && self.intent_request.is_none()
             && self.intent_rationale.is_none()
@@ -501,6 +505,7 @@ impl Attribution {
             ("authorization grant", overrides.grant),
             ("approving identity", overrides.approved_by),
             ("approval timestamp", overrides.approved_at),
+            ("approved change set", overrides.approved_changes),
         ];
         if details.iter().all(|(_, value)| value.is_none()) {
             return Ok(());
@@ -522,6 +527,9 @@ impl Attribution {
         }
         if let Some(value) = overrides.approved_at {
             authorization.at = Some(timestamp(value, "approval timestamp")?);
+        }
+        if let Some(value) = overrides.approved_changes {
+            authorization.approved_changes = Some(digest(value, "approved change set")?);
         }
         Ok(())
     }
@@ -635,11 +643,6 @@ pub fn parse_authorization(spec: &str) -> Result<AuditAuthorization> {
             approved_changes: None,
         });
     }
-    if spec.contains("\"approved_changes\"") {
-        return Err(invalid(
-            "authorization approved_changes is reserved for a previewed-change digest that cr does not yet verify, and cannot be supplied",
-        ));
-    }
     let parsed: AuthorizationSpec = serde_json::from_str(spec).map_err(|error| {
         invalid(format!(
             "authorization is not a valid authorization object: {error}"
@@ -650,7 +653,11 @@ pub fn parse_authorization(spec: &str) -> Result<AuditAuthorization> {
         grant: optional_identifier(parsed.grant.as_deref(), "authorization grant")?,
         approved_by: optional_identifier(parsed.approved_by.as_deref(), "approving identity")?,
         at: optional_timestamp(parsed.at.as_deref(), "approval timestamp")?,
-        approved_changes: None,
+        approved_changes: parsed
+            .approved_changes
+            .as_deref()
+            .map(|value| digest(value, "approved change set"))
+            .transpose()?,
     })
 }
 
@@ -776,6 +783,7 @@ struct AuthorizationSpec {
     grant: Option<String>,
     approved_by: Option<String>,
     at: Option<String>,
+    approved_changes: Option<String>,
 }
 
 /// The strict input shape for a declared intent.
@@ -1090,11 +1098,37 @@ mod tests {
         assert!(message(&error).contains("must be direct, interactive"));
     }
 
+    /// The approved-change digest is shaped input like any other: `cr` checks
+    /// it before recording it, so a malformed digest fails at the flag rather
+    /// than becoming a permanent value that can never match anything.
     #[test]
-    fn an_unverified_approved_change_digest_cannot_be_supplied() {
+    fn an_approved_change_digest_must_be_a_sha256_digest() {
         let error = parse_authorization(r#"{"mode":"delegated","approved_changes":"sha256:abc"}"#)
             .unwrap_err();
-        assert!(message(&error).contains("reserved"));
+        assert!(message(&error).contains("64 lowercase hexadecimal"));
+
+        let accepted = parse_authorization(
+            r#"{"mode":"interactive","approved_changes":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            accepted.approved_changes.as_deref(),
+            Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+
+        let mut attribution = Attribution::default();
+        let orphan = attribution
+            .apply(
+                &AttributionOverrides {
+                    approved_changes: Some(
+                        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    ),
+                    ..overrides()
+                },
+                AgentEvidence::Flag,
+            )
+            .unwrap_err();
+        assert!(message(&orphan).contains("without an authorization mode"));
     }
 
     #[test]
