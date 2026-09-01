@@ -2,6 +2,12 @@
 name = "cr"
 version = "0.1.0"
 edition = "2021"
+# `src/audit.rs` and `src/sync.rs` use `File::lock`/`File::try_lock` (the std
+# `file_lock` feature), stabilised in Rust 1.89. Nothing in `Cargo.lock` needs a
+# newer compiler, so 1.89 is the true floor. The `msrv` job in
+# `.github/workflows/ci.yml` builds and tests on exactly this version so the
+# number cannot drift without CI noticing.
+rust-version = "1.89"
 license = "MIT"
 
 [dependencies]
