@@ -18,9 +18,20 @@ use serde_json::Value;
 /// unnoticed.
 const LEGACY_HEAD: &str = "sha256:5b872015034716e3845cf69dc5c7ced7d801b05fe21aef406de4f965ff54f3ef";
 
+/// The head hash of `tests/fixtures/future-journal`, whose events name
+/// attribution values this build does not know.
+const FUTURE_HEAD: &str = "sha256:b63e39719e07ca692675af1a16c98eed9749d5be01b4369a35e0668849733b60";
+
 /// Copy the committed pre-attribution database into a scratch directory.
 fn legacy_database(target: &Path) {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy-journal");
+    copy_fixture("legacy-journal", target);
+}
+
+/// Copy a committed fixture database into a scratch directory.
+fn copy_fixture(name: &str, target: &Path) {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
     copy_tree(&source, target);
 }
 
@@ -70,6 +81,97 @@ fn a_journal_written_before_attribution_existed_still_verifies() {
         assert!(entry.get("authorization").is_none());
         assert!(entry.get("intent").is_none());
     }
+}
+
+/// A journal written by a later `cr` that grew an attribution value must still
+/// verify here, and the value it named must survive unchanged.
+///
+/// `tests/fixtures/future-journal` carries an `agent.detected_from` of
+/// `attestation`, an `authorization.mode` of `escalated`, and an
+/// `intent.request.author` of `operator`. None of them exists in this build.
+/// Before the reader was made tolerant, `audit verify` on this fixture failed
+/// with `unknown variant \`attestation\`` and refused the *entire* chain,
+/// including the two events that carry no attribution at all — the precise
+/// hard failure that not bumping the audit version exists to prevent.
+///
+/// Appending to that journal must leave the earlier bytes alone, so the head
+/// still chains from the fixture's own head hash.
+#[test]
+fn a_journal_naming_unknown_attribution_values_still_verifies() {
+    let temporary = tempfile::tempdir().expect("could not create a temporary directory");
+    let root = temporary.path().join("future");
+    copy_fixture("future-journal", &root);
+
+    let verified = run_success(command_for(&root).args(["audit", "verify"]));
+    assert!(verified.contains("Verified 4 audit events and 2 records"));
+    assert!(verified.contains(FUTURE_HEAD));
+    run_success(command_for(&root).args(["audit", "verify", "--expected-head", FUTURE_HEAD]));
+
+    let entries: Value = serde_json::from_str(&run_success(
+        command_for(&root).args(["audit", "log", "--json"]),
+    ))
+    .expect("audit log is JSON");
+    let entries = entries.as_array().expect("audit log is an array");
+    let unknown = entries
+        .iter()
+        .find(|entry| entry["sequence"] == 3)
+        .expect("the unknown-value event is present");
+    assert_eq!(unknown["agent"]["detected_from"], "attestation");
+    assert_eq!(unknown["authorization"]["mode"], "escalated");
+    assert_eq!(unknown["intent"]["request"]["author"], "operator");
+
+    let known = entries
+        .iter()
+        .find(|entry| entry["sequence"] == 4)
+        .expect("the known-value event is present");
+    assert_eq!(known["agent"]["detected_from"], "environment");
+    assert_eq!(known["authorization"]["mode"], "delegated");
+
+    run_success(
+        command_for(&root)
+            .args(["update", "deals", "acme-renewal", "--set", "stage=won"])
+            .args(["--agent", "claude-code"]),
+    );
+    run_success(command_for(&root).args(["audit", "verify"]));
+    let entries: Value = serde_json::from_str(&run_success(
+        command_for(&root).args(["audit", "log", "--json", "-n", "1"]),
+    ))
+    .expect("audit log is JSON");
+    assert_eq!(entries[0]["previous_hash"], FUTURE_HEAD);
+}
+
+/// Reading an unknown value is not the same as accepting one. `cr` must never
+/// record an approval mode it cannot name: a permanent record of `escalated`
+/// would look stronger than `delegated` to a reader and mean nothing.
+#[test]
+fn an_unknown_attribution_value_cannot_be_declared() {
+    let database = TestDatabase::new("unknown-values");
+    run_success(database.command().args(["create", "deals", "one"]));
+
+    let error = run_failure(
+        database
+            .command()
+            .args(["update", "deals", "one", "--set", "stage=won"])
+            .args(["--authorization", "escalated"]),
+    );
+    assert!(
+        error.contains("must be direct, interactive"),
+        "unexpected error: {error}"
+    );
+
+    let error = run_failure(
+        database
+            .command()
+            .args(["update", "deals", "one", "--set", "stage=won"])
+            .args([
+                "--intent",
+                r#"{"request":{"author":"operator","text":"go"}}"#,
+            ]),
+    );
+    assert!(
+        error.contains("author must be human, agent, or system"),
+        "unexpected error: {error}"
+    );
 }
 
 /// A change written today with attribution must still extend that same chain,

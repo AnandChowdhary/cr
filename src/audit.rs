@@ -1341,6 +1341,17 @@ mod tests {
     const LEGACY_HASH: &str =
         "sha256:859fd73ce851c6098b4b186a67cb38ab54f855624c591cd3902e0c8633f0f8a3";
 
+    /// One audit event from `tests/fixtures/future-journal`, copied verbatim.
+    ///
+    /// It names an `AgentEvidence`, an `AuthorizationMode`, and an
+    /// `IntentAuthor` that this build has never heard of, standing in for a
+    /// journal written by a later `cr` that grew a value.
+    const FUTURE_PAYLOAD: &str = r#"{"version":2,"sequence":3,"timestamp":"2026-09-01T10:06:28.583165677Z","actor":"Ada Lovelace <ada@example.com>","source":"cli","agent":{"id":"future-agent","session":"s-1","detected_from":"attestation"},"authorization":{"mode":"escalated","grant":"planMode"},"intent":{"request":{"author":"operator","text":"close the renewal"}},"action":"update","record":{"collection":"deals","id":"acme-renewal"},"changes":[{"operation":"replace","path":"/attributes/stage","before":"negotiation","after":"closed"},{"operation":"replace","path":"/attributes/status","before":"open","after":"closed-won"}],"before_hash":"sha256:bff41b4063a1c3174a78757ba233661b8e009f20023193b68d9024d39f48f7fe","after_hash":"sha256:6ae98ae2e84c09ef640b8c8c69c0a316a1b7c945274b4eb85d47eb3061519c8d","previous_hash":"sha256:df5581e0fabd9d6a1a96a3d863680dbead1e5a9efa18e6b62ece155390d41858"}"#;
+
+    /// The hash stored beside those bytes in the fixture.
+    const FUTURE_HASH: &str =
+        "sha256:e34dfe8559e82230cc466d143f547b75f4de3b1aa4eb8a75b3c5ebb7e2dc28a0";
+
     fn attributed_payload() -> AuditPayload {
         AuditPayload {
             version: 2,
@@ -1478,6 +1489,57 @@ mod tests {
             .unwrap()
             .rationale
             .is_some());
+    }
+
+    /// An attribution value this build does not know must survive a read and a
+    /// rewrite byte for byte, under the hash that was stored beside it.
+    ///
+    /// This is the whole point of the tolerant reader. A closed enum rejects the
+    /// label, and a payload that fails to deserialize fails the entire chain —
+    /// exactly the hard failure that not bumping the audit version exists to
+    /// prevent. A tolerant reader that *normalized* the unknown label to a
+    /// default would be worse still: the read would succeed and the rewrite
+    /// would silently change the bytes the hash covers. Neither is acceptable,
+    /// so the assertion here is byte equality against a literal, not a round
+    /// trip that would agree with itself.
+    #[test]
+    fn an_unknown_attribution_value_round_trips_byte_for_byte() {
+        let payload: AuditPayload = serde_json::from_str(FUTURE_PAYLOAD).unwrap();
+        let agent = payload.agent.as_ref().unwrap();
+        let authorization = payload.authorization.as_ref().unwrap();
+        let author = &payload
+            .intent
+            .as_ref()
+            .unwrap()
+            .request
+            .as_ref()
+            .unwrap()
+            .author;
+
+        assert_eq!(
+            agent.detected_from,
+            AgentEvidence::Other("attestation".to_owned())
+        );
+        assert_eq!(
+            authorization.mode,
+            AuthorizationMode::Other("escalated".to_owned())
+        );
+        assert_eq!(*author, IntentAuthor::Other("operator".to_owned()));
+        assert!(!agent.detected_from.is_known());
+        assert!(!authorization.mode.is_known());
+        assert!(!author.is_known());
+        assert_eq!(agent.detected_from.label(), "attestation");
+        assert_eq!(authorization.mode.label(), "escalated");
+        assert_eq!(author.label(), "operator");
+
+        let reserialized = serde_json::to_string(&payload).unwrap();
+        assert_eq!(reserialized, FUTURE_PAYLOAD);
+        assert_eq!(event_hash(reserialized.as_bytes()), FUTURE_HASH);
+
+        let line = stored_line(FUTURE_HASH, FUTURE_PAYLOAD).unwrap();
+        let stored = parse_line(line.trim_end().as_bytes()).unwrap();
+        assert_eq!(stored.entry.hash, FUTURE_HASH);
+        assert_eq!(stored.payload, FUTURE_PAYLOAD);
     }
 
     /// An event written by a newer `cr` that added another optional sibling must

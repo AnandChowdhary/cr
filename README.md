@@ -296,6 +296,12 @@ contains them — it simply does not display them. That last point matters in a
 shared repository: an older binary shows an agent-written event with no sign that
 anything was omitted.
 
+The same holds for the *values* of `detected_from`, `mode`, and `author`. If a
+later `cr` adds one, this one reads it, prints it verbatim, and rewrites it
+unchanged, so the event keeps its hash and the journal keeps verifying. `cr`
+still refuses to *record* a value it does not know, so an approval mode in a
+journal always means what this table says it means.
+
 Intent text is stored inline and is therefore **permanent**, like every other
 value in the journal.
 
