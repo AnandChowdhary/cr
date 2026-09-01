@@ -13,10 +13,14 @@ use yaml_serde::{Mapping, Value};
 use crate::{
     AnchorReport, Assignment, AuditAction, AuditAnchor, AuditEntry, AuditHead, AuditSource,
     AuditVerification, SearchQuery,
+    access::{
+        AccessAction, AccessDecision, AccessIdentity, Resource as AccessResource, Role,
+        USERS_COLLECTION, User, UserKind, UserStatus, display_name, principal_id, users_schema,
+    },
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     audit::{AuditFilter, AuditLog, AuditMutation, ChangePreview, ReconciledMutation, record_hash},
     check::{CheckReport, CheckScope},
-    error::{DomainError, conflict, invalid, is_already_exists, is_missing},
+    error::{DomainError, conflict, forbidden, invalid, is_already_exists, is_missing},
     frontmatter::Document,
     paths,
     sync::{SYNC_DEFINITION_DIRECTORY, SYNC_LOCK_DIRECTORY, SYNC_STATE_DIRECTORY},
@@ -108,6 +112,31 @@ enum MutationOutcome {
     Previewed(ChangePreview),
 }
 
+#[derive(Clone, Debug)]
+struct AccessRequest {
+    action: AccessAction,
+    resource: AccessResource,
+    owner_only: bool,
+}
+
+impl AccessRequest {
+    fn new(action: AccessAction, resource: AccessResource) -> Self {
+        Self {
+            action,
+            resource,
+            owner_only: false,
+        }
+    }
+
+    fn owner(resource: AccessResource) -> Self {
+        Self {
+            action: AccessAction::ManageAccess,
+            resource,
+            owner_only: true,
+        }
+    }
+}
+
 impl MutationOutcome {
     fn record(self) -> Result<Record> {
         match self {
@@ -129,6 +158,8 @@ pub struct Database {
     root: PathBuf,
     config: Config,
     actor: String,
+    principal: String,
+    impersonated_by: Option<AccessIdentity>,
     source: AuditSource,
     audit_message: Option<String>,
     attribution: Attribution,
@@ -282,6 +313,8 @@ impl Database {
             root,
             config: Config::default(),
             actor: String::new(),
+            principal: String::new(),
+            impersonated_by: None,
             source: AuditSource::Cli,
             audit_message: None,
             attribution: Attribution::from_environment()?,
@@ -350,6 +383,8 @@ impl Database {
             root,
             config,
             actor: String::new(),
+            principal: String::new(),
+            impersonated_by: None,
             source: AuditSource::Cli,
             audit_message: None,
             attribution: Attribution::from_environment()?,
@@ -375,6 +410,7 @@ impl Database {
     /// The whole implementation lives in [`crate::check`]; this is the seam
     /// that gives it the root, the records directory, and the audit log.
     pub fn check(&self, scope: &CheckScope) -> Result<CheckReport> {
+        self.authorize_owner(&AccessResource::Database)?;
         crate::check::run(self, scope)
     }
 
@@ -382,13 +418,68 @@ impl Database {
         &self.actor
     }
 
+    /// Stable policy identity derived from the audit actor.
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    /// The owner operating this perspective, when the server is impersonating
+    /// another registered principal.
+    pub fn impersonated_by(&self) -> Option<&AccessIdentity> {
+        self.impersonated_by.as_ref()
+    }
+
     pub fn with_actor(mut self, actor: impl Into<String>) -> Result<Self> {
         let actor = actor.into();
         if actor.trim().is_empty() {
             return Err(invalid("audit actor cannot be empty"));
         }
+        let principal = principal_id(&actor)?;
+        if self.access_enabled()? && principal != self.principal {
+            return Err(forbidden(format!(
+                "access control is enabled, so --actor cannot impersonate principal '{principal}'"
+            )));
+        }
         self.actor = actor;
+        self.principal = principal;
+        self.impersonated_by = None;
         Ok(self)
+    }
+
+    /// Evaluate subsequent operations as another registered user while
+    /// retaining the launching owner as explicit audit evidence.
+    pub fn impersonate(&self, principal: &str) -> Result<Self> {
+        if !self.access_enabled()? {
+            return Err(conflict("access control is not initialized"));
+        }
+        self.authorize_owner(&AccessResource::Database)?;
+        let canonical = principal_id(principal)?;
+        if canonical != principal {
+            return Err(invalid(format!(
+                "principal '{principal}' is not canonical; use '{canonical}'"
+            )));
+        }
+        let Some((user, _)) = self.user_unchecked_optional(principal)? else {
+            return Err(DomainError::record_not_found(USERS_COLLECTION, principal).into());
+        };
+        if principal == self.principal {
+            let mut database = self.clone();
+            database.impersonated_by = None;
+            return Ok(database);
+        }
+
+        let mut database = self.clone();
+        database.impersonated_by = Some(AccessIdentity {
+            principal: self.principal.clone(),
+            display: self.actor.clone(),
+        });
+        database.principal = principal.to_owned();
+        database.actor = format!(
+            "{} <{}>",
+            user.name,
+            user.email.as_deref().unwrap_or(principal)
+        );
+        Ok(database)
     }
 
     /// The agent, authorization, and intent that will be recorded beside
@@ -436,6 +527,336 @@ impl Database {
         Ok(self)
     }
 
+    /// Whether the reserved users collection has bootstrapped access control.
+    ///
+    /// Existing databases remain open until the first user record is created
+    /// by `cr access init`. An empty directory is not enough to enable RBAC,
+    /// which keeps an interrupted bootstrap recoverable.
+    pub fn access_enabled(&self) -> Result<bool> {
+        let directory = self.config.data_dir.join(USERS_COLLECTION);
+        let Some(entries) = paths::list_directory(&self.root, &directory, "the users collection")?
+        else {
+            return Ok(false);
+        };
+        Ok(entries.into_iter().any(|entry| {
+            entry.kind.is_file()
+                && Path::new(&entry.name)
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    == Some("md")
+        }))
+    }
+
+    /// The current principal's fixed-schema user record.
+    pub fn current_user(&self) -> Result<Option<User>> {
+        if !self.access_enabled()? {
+            return Ok(None);
+        }
+        self.user_unchecked_optional(&self.principal)
+            .map(|user| user.map(|(user, _)| user))
+    }
+
+    /// Evaluate the current principal without performing an operation.
+    pub fn access_check(
+        &self,
+        action: AccessAction,
+        resource: &AccessResource,
+    ) -> Result<Option<AccessDecision>> {
+        self.authorize(action, resource)
+    }
+
+    /// Whether an operation would be permitted, without performing it.
+    pub fn access_allowed(&self, action: AccessAction, resource: &AccessResource) -> Result<bool> {
+        self.can_access(action, resource)
+    }
+
+    /// Whether the current principal owns the resource, without performing an
+    /// operation.
+    pub fn owner_access_allowed(&self, resource: &AccessResource) -> Result<bool> {
+        if !self.access_enabled()? {
+            return Ok(true);
+        }
+        match self.authorize(AccessAction::ManageAccess, resource) {
+            Ok(Some(decision)) => Ok(decision.role == Role::Owner),
+            Ok(None) => Ok(true),
+            Err(error) if matches!(DomainError::of(&error), Some(DomainError::Forbidden(_))) => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn authorize(
+        &self,
+        action: AccessAction,
+        resource: &AccessResource,
+    ) -> Result<Option<AccessDecision>> {
+        if !self.access_enabled()? {
+            return Ok(None);
+        }
+        let Some((user, policy_hash)) = self.user_unchecked_optional(&self.principal)? else {
+            return Err(forbidden(format!(
+                "principal '{}' is not registered in the users collection",
+                self.principal
+            )));
+        };
+        user.decision(&self.principal, &self.actor, action, resource, &policy_hash)
+            .map(|mut decision| {
+                decision.impersonated_by = self.impersonated_by.clone();
+                decision
+            })
+            .map(Some)
+            .ok_or_else(|| {
+                forbidden(format!(
+                    "principal '{}' cannot {action} {resource}",
+                    self.principal
+                ))
+            })
+    }
+
+    fn can_access(&self, action: AccessAction, resource: &AccessResource) -> Result<bool> {
+        match self.authorize(action, resource) {
+            Ok(_) => Ok(true),
+            Err(error) if matches!(DomainError::of(&error), Some(DomainError::Forbidden(_))) => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn authorize_owner(
+        &self,
+        resource: &AccessResource,
+    ) -> Result<Option<AccessDecision>> {
+        let decision = self.authorize(AccessAction::ManageAccess, resource)?;
+        if self.access_enabled()?
+            && decision
+                .as_ref()
+                .is_some_and(|decision| decision.role != Role::Owner)
+        {
+            return Err(forbidden(format!(
+                "principal '{}' must be an owner of {resource}",
+                self.principal
+            )));
+        }
+        Ok(decision)
+    }
+
+    fn user_unchecked_optional(&self, id: &str) -> Result<Option<(User, String)>> {
+        let path = self.record_path(USERS_COLLECTION, id)?;
+        if paths::entry_kind(&self.root, &path, &record_label(USERS_COLLECTION, id))?.is_none() {
+            return Ok(None);
+        }
+        let raw = self.read_record(USERS_COLLECTION, id, &path)?;
+        let document = parse_record(USERS_COLLECTION, id, &raw)?;
+        let user = User::from_attributes(&document.attributes)?;
+        Ok(Some((user, record_hash(raw.as_bytes()))))
+    }
+
+    /// Bootstrap RBAC by creating the current principal as database owner.
+    pub fn initialize_access(&self, name: Option<&str>, email: Option<&str>) -> Result<Record> {
+        if self.access_enabled()? {
+            return Err(conflict("access control is already initialized"));
+        }
+        if self.principal == "unknown" {
+            return Err(invalid(
+                "set CR_EMAIL, CR_ACTOR, or Git user.email before initializing access control",
+            ));
+        }
+        let user = User {
+            name: name
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| display_name(&self.actor)),
+            email: email
+                .map(str::to_owned)
+                .or_else(|| self.principal.contains('@').then(|| self.principal.clone())),
+            kind: UserKind::Human,
+            status: UserStatus::Active,
+            access: vec![crate::AccessGrant {
+                resource: AccessResource::Database,
+                role: Role::Owner,
+            }],
+        };
+        self.run_create(
+            USERS_COLLECTION,
+            &self.principal,
+            user.attributes()?,
+            "",
+            MutationMode::Apply,
+            None,
+        )?
+        .record()
+    }
+
+    /// Register a principal without granting it access to any resource.
+    pub fn add_user(
+        &self,
+        id: &str,
+        name: &str,
+        email: Option<&str>,
+        kind: UserKind,
+    ) -> Result<Record> {
+        validate_component(id, "user")?;
+        let canonical = principal_id(id)?;
+        if canonical != id {
+            return Err(invalid(format!(
+                "user ID '{id}' is not canonical; use '{canonical}'"
+            )));
+        }
+        let user = User {
+            name: name.to_owned(),
+            email: email.map(str::to_owned),
+            kind,
+            status: UserStatus::Active,
+            access: Vec::new(),
+        };
+        self.run_create(
+            USERS_COLLECTION,
+            id,
+            user.attributes()?,
+            "",
+            MutationMode::Apply,
+            Some(AccessRequest::new(
+                AccessAction::ManageAccess,
+                AccessResource::Database,
+            )),
+        )?
+        .record()
+    }
+
+    /// Read one registered user. Everyone may inspect their own effective
+    /// policy; inspecting another principal requires access management.
+    pub fn user(&self, id: &str) -> Result<User> {
+        if !self.access_enabled()? {
+            return Err(conflict("access control is not initialized"));
+        }
+        if id != self.principal {
+            self.authorize(AccessAction::ReadAccess, &AccessResource::Database)?;
+        }
+        self.user_unchecked_optional(id)?
+            .map(|(user, _)| user)
+            .ok_or_else(|| DomainError::record_not_found(USERS_COLLECTION, id).into())
+    }
+
+    /// List the user registry for owners and access managers.
+    pub fn users(&self) -> Result<Vec<(String, User)>> {
+        self.authorize(AccessAction::ReadAccess, &AccessResource::Database)?;
+        let mut users = Vec::new();
+        for id in self.user_ids_unchecked()? {
+            let Some((user, _)) = self.user_unchecked_optional(&id)? else {
+                continue;
+            };
+            users.push((id, user));
+        }
+        Ok(users)
+    }
+
+    /// Create or replace the target user's role at one resource.
+    pub fn grant_access(&self, id: &str, resource: AccessResource, role: Role) -> Result<Record> {
+        if self.user_unchecked_optional(id)?.is_none() {
+            return Err(DomainError::record_not_found(USERS_COLLECTION, id).into());
+        }
+        let access = if matches!(role, Role::Owner | Role::AccessManager) {
+            self.authorize_owner(&resource)?;
+            AccessRequest::owner(resource.clone())
+        } else {
+            AccessRequest::new(AccessAction::ManageAccess, resource.clone())
+        };
+        self.run_update(
+            USERS_COLLECTION,
+            id,
+            move |document| {
+                let mut user = User::from_attributes(&document.attributes)?;
+                user.grant(resource, role);
+                document.attributes = user.attributes()?;
+                Ok(())
+            },
+            MutationMode::Apply,
+            access,
+        )?
+        .record()
+    }
+
+    /// Remove the target user's role at one resource.
+    pub fn revoke_access(&self, id: &str, resource: &AccessResource) -> Result<Record> {
+        let Some((existing, _)) = self.user_unchecked_optional(id)? else {
+            return Err(DomainError::record_not_found(USERS_COLLECTION, id).into());
+        };
+        let existing_role = existing
+            .access
+            .iter()
+            .find(|grant| &grant.resource == resource)
+            .map(|grant| grant.role)
+            .ok_or_else(|| conflict(format!("user '{id}' has no direct role at {resource}")))?;
+        let access = if matches!(existing_role, Role::Owner | Role::AccessManager) {
+            self.authorize_owner(resource)?;
+            AccessRequest::owner(resource.clone())
+        } else {
+            AccessRequest::new(AccessAction::ManageAccess, resource.clone())
+        };
+        let removing_database_owner =
+            resource == &AccessResource::Database && existing_role == Role::Owner;
+        let resource = resource.clone();
+        self.run_update(
+            USERS_COLLECTION,
+            id,
+            move |document| {
+                if removing_database_owner && !self.has_database_owner_other_than(id)? {
+                    return Err(conflict("cannot remove the final database owner"));
+                }
+                let mut user = User::from_attributes(&document.attributes)?;
+                if !user.revoke(&resource) {
+                    return Err(conflict(format!(
+                        "user '{id}' has no direct role at {resource}"
+                    )));
+                }
+                document.attributes = user.attributes()?;
+                Ok(())
+            },
+            MutationMode::Apply,
+            access,
+        )?
+        .record()
+    }
+
+    fn user_ids_unchecked(&self) -> Result<Vec<String>> {
+        let directory = self.config.data_dir.join(USERS_COLLECTION);
+        let entries = paths::list_directory(&self.root, &directory, "the users collection")?
+            .unwrap_or_default();
+        let mut ids = Vec::new();
+        for entry in entries {
+            let CollectionEntry::Record(id) = collection_entry(USERS_COLLECTION, &entry.name)?
+            else {
+                continue;
+            };
+            if !entry.kind.is_file() {
+                return Err(paths::refuse_entry(
+                    &record_label(USERS_COLLECTION, &id),
+                    entry.kind,
+                ));
+            }
+            ids.push(id);
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    fn has_database_owner_other_than(&self, excluded: &str) -> Result<bool> {
+        for id in self.user_ids_unchecked()? {
+            if id == excluded {
+                continue;
+            }
+            if self.user_unchecked_optional(&id)?.is_some_and(|(user, _)| {
+                user.status == UserStatus::Active && user.is_database_owner()
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn create(
         &self,
         collection: &str,
@@ -468,8 +889,23 @@ impl Database {
         attributes: Mapping,
         body: &str,
     ) -> Result<Record> {
-        self.run_create(collection, id, attributes, body, MutationMode::Apply)?
-            .record()
+        if collection == USERS_COLLECTION {
+            return Err(invalid(
+                "the users collection is managed through 'cr user' and 'cr access'",
+            ));
+        }
+        self.run_create(
+            collection,
+            id,
+            attributes,
+            body,
+            MutationMode::Apply,
+            Some(AccessRequest::new(
+                AccessAction::Create,
+                AccessResource::record(collection, id),
+            )),
+        )?
+        .record()
     }
 
     /// Compute what `create_record` would record, without creating anything.
@@ -480,8 +916,23 @@ impl Database {
         attributes: Mapping,
         body: &str,
     ) -> Result<ChangePreview> {
-        self.run_create(collection, id, attributes, body, MutationMode::Preview)?
-            .preview()
+        if collection == USERS_COLLECTION {
+            return Err(invalid(
+                "the users collection is managed through 'cr user' and 'cr access'",
+            ));
+        }
+        self.run_create(
+            collection,
+            id,
+            attributes,
+            body,
+            MutationMode::Preview,
+            Some(AccessRequest::new(
+                AccessAction::Create,
+                AccessResource::record(collection, id),
+            )),
+        )?
+        .preview()
     }
 
     fn run_create(
@@ -491,6 +942,7 @@ impl Database {
         attributes: Mapping,
         body: &str,
         mode: MutationMode,
+        access: Option<AccessRequest>,
     ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -499,6 +951,22 @@ impl Database {
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
         }
+        if access.is_none() && self.access_enabled()? {
+            return Err(conflict(
+                "access control was initialized by another process; retry as a registered principal",
+            ));
+        }
+        let decision = access
+            .as_ref()
+            .map(|access| {
+                if access.owner_only {
+                    self.authorize_owner(&access.resource)
+                } else {
+                    self.authorize(access.action, &access.resource)
+                }
+            })
+            .transpose()?
+            .flatten();
         if paths::entry_kind(&self.root, &path, &label)?.is_some() {
             return Err(DomainError::record_exists(collection, id).into());
         }
@@ -518,6 +986,7 @@ impl Database {
             after_bytes: Some(rendered.as_bytes()),
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
+            access: decision.as_ref(),
         })?;
         if mode == MutationMode::Preview {
             return Ok(MutationOutcome::Previewed(event.into_preview()));
@@ -537,6 +1006,7 @@ impl Database {
     }
 
     pub fn get(&self, collection: &str, id: &str) -> Result<Record> {
+        self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
         let path = self.record_path(collection, id)?;
         let document = self.read_document(collection, id, &path)?;
         Ok(record_from_document(collection, id, path, document))
@@ -551,6 +1021,7 @@ impl Database {
     }
 
     pub fn read_raw(&self, collection: &str, id: &str) -> Result<String> {
+        self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
         let path = self.record_path(collection, id)?;
         self.read_record(collection, id, &path)
     }
@@ -581,10 +1052,18 @@ impl Database {
 
         identifiers
             .into_iter()
-            .map(|id| {
-                let path = directory.join(format!("{id}.md"));
-                let document = self.read_document(collection, &id, &path)?;
-                Ok(record_from_document(collection, &id, path, document))
+            .filter_map(|id| {
+                match self.can_access(AccessAction::Read, &AccessResource::record(collection, &id))
+                {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(error) => return Some(Err(error)),
+                }
+                Some((|| {
+                    let path = directory.join(format!("{id}.md"));
+                    let document = self.read_document(collection, &id, &path)?;
+                    Ok(record_from_document(collection, &id, path, document))
+                })())
             })
             .filter(|record: &Result<Record>| {
                 record
@@ -631,6 +1110,9 @@ impl Database {
             .into_iter()
             .map(|name| (name, None))
             .collect();
+        if models.contains_key(USERS_COLLECTION) {
+            models.insert(USERS_COLLECTION.to_owned(), Some(users_schema()));
+        }
         let schema_root = Path::new(SCHEMA_DIRECTORY);
         let entries =
             paths::list_directory(&self.root, schema_root, SCHEMA_LABEL)?.unwrap_or_default();
@@ -657,6 +1139,11 @@ impl Database {
                 .and_then(|value| value.to_str())
                 .ok_or_else(unusable)?
                 .to_owned();
+            if name == USERS_COLLECTION {
+                return Err(invalid(
+                    "the users collection has a built-in schema and cannot define .cr/schemas/users.json",
+                ));
+            }
             if validate_component(&name, "collection").is_err() {
                 return Err(unusable());
             }
@@ -679,6 +1166,32 @@ impl Database {
             models.insert(name, Some(schema));
         }
 
+        if self.access_enabled()? {
+            let user = self.current_user()?.ok_or_else(|| {
+                forbidden(format!(
+                    "principal '{}' is not registered in the users collection",
+                    self.principal
+                ))
+            })?;
+            let mut visible = BTreeMap::new();
+            for (name, schema) in models {
+                let has_record_grant = user.status == UserStatus::Active
+                    && user.access.iter().any(|grant| {
+                        matches!(
+                            &grant.resource,
+                            AccessResource::Record { collection, .. } if collection == &name
+                        )
+                    });
+                if has_record_grant
+                    || self
+                        .can_access(AccessAction::Discover, &AccessResource::collection(&name))?
+                {
+                    visible.insert(name, schema);
+                }
+            }
+            models = visible;
+        }
+
         Ok(models
             .into_iter()
             .map(|(name, schema)| CollectionModel { name, schema })
@@ -697,11 +1210,13 @@ impl Database {
         assignments: &[Assignment],
         body: Option<&str>,
     ) -> Result<Record> {
+        reject_users_mutation(collection)?;
         self.run_update(
             collection,
             id,
             update_with(assignments, body),
             MutationMode::Apply,
+            AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
         )?
         .record()
     }
@@ -714,11 +1229,13 @@ impl Database {
         assignments: &[Assignment],
         body: Option<&str>,
     ) -> Result<ChangePreview> {
+        reject_users_mutation(collection)?;
         self.run_update(
             collection,
             id,
             update_with(assignments, body),
             MutationMode::Preview,
+            AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
         )?
         .preview()
     }
@@ -731,6 +1248,7 @@ impl Database {
         remove: &[String],
         body: Option<&str>,
     ) -> Result<Record> {
+        reject_users_mutation(collection)?;
         self.run_patch(
             collection,
             id,
@@ -751,6 +1269,7 @@ impl Database {
         remove: &[String],
         body: Option<&str>,
     ) -> Result<ChangePreview> {
+        reject_users_mutation(collection)?;
         self.run_patch(
             collection,
             id,
@@ -794,6 +1313,7 @@ impl Database {
                 Ok(())
             },
             mode,
+            AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
         )
     }
 
@@ -808,6 +1328,7 @@ impl Database {
         attributes: Mapping,
         body: &str,
     ) -> Result<Record> {
+        reject_users_mutation(collection)?;
         self.run_update(
             collection,
             id,
@@ -817,6 +1338,7 @@ impl Database {
                 Ok(())
             },
             MutationMode::Apply,
+            AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
         )?
         .record()
     }
@@ -827,6 +1349,7 @@ impl Database {
         id: &str,
         mutate: impl FnOnce(&mut Document) -> Result<()>,
         mode: MutationMode,
+        access: AccessRequest,
     ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -835,6 +1358,11 @@ impl Database {
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
         }
+        let decision = if access.owner_only {
+            self.authorize_owner(&access.resource)?
+        } else {
+            self.authorize(access.action, &access.resource)?
+        };
         let before_raw = self.read_record(collection, id, &path)?;
         let before = parse_record(collection, id, &before_raw)?;
         let mut document = before.clone();
@@ -851,6 +1379,7 @@ impl Database {
             after_bytes: Some(rendered.as_bytes()),
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
+            access: decision.as_ref(),
         })?;
         if mode == MutationMode::Preview {
             return Ok(MutationOutcome::Previewed(event.into_preview()));
@@ -871,6 +1400,7 @@ impl Database {
         target_collection: &str,
         target_id: &str,
     ) -> Result<Record> {
+        reject_users_mutation(collection)?;
         self.run_link(
             collection,
             id,
@@ -891,6 +1421,7 @@ impl Database {
         target_collection: &str,
         target_id: &str,
     ) -> Result<ChangePreview> {
+        reject_users_mutation(collection)?;
         self.run_link(
             collection,
             id,
@@ -917,6 +1448,12 @@ impl Database {
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
         }
+        let decision =
+            self.authorize(AccessAction::Link, &AccessResource::record(collection, id))?;
+        self.authorize(
+            AccessAction::Read,
+            &AccessResource::record(target_collection, target_id),
+        )?;
         let target_path = self.record_path(target_collection, target_id)?;
         let target_raw = self
             .read_record(target_collection, target_id, &target_path)
@@ -957,6 +1494,7 @@ impl Database {
             after_bytes: Some(rendered.as_bytes()),
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
+            access: decision.as_ref(),
         })?;
         if mode == MutationMode::Preview {
             return Ok(MutationOutcome::Previewed(event.into_preview()));
@@ -970,12 +1508,14 @@ impl Database {
     }
 
     pub fn delete(&self, collection: &str, id: &str) -> Result<Record> {
+        reject_users_mutation(collection)?;
         self.run_delete(collection, id, MutationMode::Apply)?
             .record()
     }
 
     /// Compute what `delete` would record, without deleting anything.
     pub fn preview_delete(&self, collection: &str, id: &str) -> Result<ChangePreview> {
+        reject_users_mutation(collection)?;
         self.run_delete(collection, id, MutationMode::Preview)?
             .preview()
     }
@@ -993,6 +1533,10 @@ impl Database {
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
         }
+        let decision = self.authorize(
+            AccessAction::Delete,
+            &AccessResource::record(collection, id),
+        )?;
         let before_raw = self.read_record(collection, id, &path)?;
         let document = parse_record(collection, id, &before_raw)?;
         let event = audit.prepare(AuditMutation {
@@ -1005,6 +1549,7 @@ impl Database {
             after_bytes: None,
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
+            access: decision.as_ref(),
         })?;
         if mode == MutationMode::Preview {
             return Ok(MutationOutcome::Previewed(event.into_preview()));
@@ -1021,6 +1566,7 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
+        self.authorize_owner(&AccessResource::Database)?;
         self.working_changes(&audit)
     }
 
@@ -1087,6 +1633,9 @@ impl Database {
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
         }
+        if all {
+            self.authorize_owner(&AccessResource::Database)?;
+        }
         let states = audit.record_states()?;
         let changes = self.working_changes_from_states(&states)?;
         let available: BTreeMap<_, _> = changes
@@ -1112,6 +1661,7 @@ impl Database {
 
         let mut prepared = Vec::with_capacity(selected_changes.len());
         for change in &selected_changes {
+            reject_users_mutation(&change.collection)?;
             let key = (change.collection.clone(), change.id.clone());
             let prior = states.get(&key);
             let before = prior
@@ -1136,12 +1686,24 @@ impl Database {
                 WorkingChangeKind::Modified => AuditAction::Update,
                 WorkingChangeKind::Deleted => AuditAction::Delete,
             };
-            prepared.push((change, before, after, after_raw, action));
+            let access_action = match change.status {
+                WorkingChangeKind::Added => AccessAction::Create,
+                WorkingChangeKind::Modified => AccessAction::Update,
+                WorkingChangeKind::Deleted => AccessAction::Delete,
+            };
+            let resource = match change.status {
+                WorkingChangeKind::Added => AccessResource::record(&change.collection, &change.id),
+                WorkingChangeKind::Modified | WorkingChangeKind::Deleted => {
+                    AccessResource::record(&change.collection, &change.id)
+                }
+            };
+            let decision = self.authorize(access_action, &resource)?;
+            prepared.push((change, before, after, after_raw, action, decision));
         }
 
         let mut entries = Vec::with_capacity(prepared.len());
         let mut previews = Vec::with_capacity(prepared.len());
-        for (change, before, after, after_raw, action) in prepared {
+        for (change, before, after, after_raw, action, decision) in prepared {
             let event = audit.prepare_reconciled(ReconciledMutation {
                 action,
                 collection: &change.collection,
@@ -1152,6 +1714,7 @@ impl Database {
                 after_bytes: after_raw.as_deref().map(str::as_bytes),
                 had_history: states.contains_key(&(change.collection.clone(), change.id.clone())),
                 message,
+                access: decision.as_ref(),
             })?;
             if mode == MutationMode::Preview {
                 previews.push(event.into_preview());
@@ -1175,6 +1738,27 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
+        match (filter.collection, filter.id) {
+            (Some(USERS_COLLECTION), _) => {
+                self.authorize(AccessAction::ReadAccess, &AccessResource::Database)?;
+            }
+            (Some(collection), Some(id)) => {
+                self.authorize(
+                    AccessAction::ReadAudit,
+                    &AccessResource::record(collection, id),
+                )?;
+            }
+            (Some(collection), None) => {
+                self.authorize(
+                    AccessAction::ReadAudit,
+                    &AccessResource::collection(collection),
+                )?;
+            }
+            (None, None) => {
+                self.authorize_owner(&AccessResource::Database)?;
+            }
+            (None, Some(_)) => unreachable!(),
+        }
         audit.recent(limit, filter)
     }
 
@@ -1182,6 +1766,7 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
+        self.authorize_owner(&AccessResource::Database)?;
         audit.head()
     }
 
@@ -1193,6 +1778,7 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
+        self.authorize_owner(&AccessResource::Database)?;
         audit.anchor_report()
     }
 
@@ -1205,6 +1791,7 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
+        self.authorize_owner(&AccessResource::Database)?;
         audit.write_anchor()
     }
 
@@ -1212,6 +1799,7 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
+        self.authorize_owner(&AccessResource::Database)?;
         audit.verify(expected_head)
     }
 
@@ -1219,6 +1807,7 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
+        let decision = self.authorize_owner(&AccessResource::Database)?;
         let mut added = 0;
 
         for (collection, id, path) in self.record_files()? {
@@ -1237,6 +1826,7 @@ impl Database {
                 after_bytes: Some(raw.as_bytes()),
                 source: self.source.clone(),
                 message: self.audit_message.as_deref(),
+                access: decision.as_ref(),
             })?;
             audit.commit(event, &path, || Ok(()))?;
             added += 1;
@@ -1329,6 +1919,12 @@ impl Database {
     }
 
     fn validate(&self, collection: &str, attributes: &Mapping) -> Result<()> {
+        if collection == USERS_COLLECTION {
+            let schema = users_schema();
+            validate_schema_instance(collection, attributes, &schema, "the built-in users schema")?;
+            User::from_attributes(attributes)?;
+            return Ok(());
+        }
         let schema_path = Path::new(SCHEMA_DIRECTORY).join(format!("{collection}.json"));
         let label = schema_label(collection);
         let Some(serialized) = paths::read_to_string_optional(&self.root, &schema_path, &label)?
@@ -1347,24 +1943,7 @@ impl Database {
         jsonschema::meta::validate(&schema)
             .map_err(|error| anyhow!("invalid JSON Schema for {label}: {error}"))
             .with_context(unusable)?;
-        let validator = jsonschema::validator_for(&schema)
-            .map_err(|error| anyhow!("could not compile {label}: {error}"))
-            .with_context(unusable)?;
-        let instance = serde_json::to_value(attributes)
-            .context("front matter cannot be represented as JSON for schema validation")?;
-        let errors: Vec<_> = validator
-            .iter_errors(&instance)
-            .map(|error| format!("- {error}"))
-            .collect();
-
-        if !errors.is_empty() {
-            return Err(invalid(format!(
-                "record does not match schema for collection '{collection}':\n{}",
-                errors.join("\n")
-            )));
-        }
-
-        Ok(())
+        validate_schema_instance(collection, attributes, &schema, &label)
     }
 
     fn record_files(&self) -> Result<Vec<(String, String, PathBuf)>> {
@@ -1423,6 +2002,7 @@ impl Database {
 
     fn with_default_actor(mut self) -> Self {
         self.actor = default_actor(&self.root);
+        self.principal = principal_id(&self.actor).unwrap_or_else(|_| "unknown".to_owned());
         self
     }
 }
@@ -1572,6 +2152,38 @@ fn record_from_document(collection: &str, id: &str, path: PathBuf, document: Doc
 fn parse_record(collection: &str, id: &str, raw: &str) -> Result<Document> {
     Document::parse(raw)
         .with_context(|| DomainError::Invalid(format!("could not parse record {collection}/{id}")))
+}
+
+fn reject_users_mutation(collection: &str) -> Result<()> {
+    if collection == USERS_COLLECTION {
+        return Err(invalid(
+            "the users collection is managed through 'cr user' and 'cr access'",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_schema_instance(
+    collection: &str,
+    attributes: &Mapping,
+    schema: &serde_json::Value,
+    label: &str,
+) -> Result<()> {
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|error| anyhow!("could not compile {label}: {error}"))?;
+    let instance = serde_json::to_value(attributes)
+        .context("front matter cannot be represented as JSON for schema validation")?;
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| format!("- {error}"))
+        .collect();
+    if !errors.is_empty() {
+        return Err(invalid(format!(
+            "record does not match schema for collection '{collection}':\n{}",
+            errors.join("\n")
+        )));
+    }
+    Ok(())
 }
 
 /// What one entry of a collection's directory is, as far as records go.

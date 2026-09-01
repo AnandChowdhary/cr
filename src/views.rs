@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Assignment, Database, SortDirection,
+    AccessResource, Assignment, Database, SortDirection,
     database::validate_component,
     error::{DomainError, invalid, is_already_exists, is_missing},
     paths,
@@ -23,7 +23,14 @@ const DEFAULT_VIEW_PAGE_SIZE: usize = 50;
 const MAX_VIEW_PAGE_SIZE: usize = 1_000;
 const MAX_VIEW_FILTER_GROUPS: usize = 20;
 const MAX_VIEW_GROUP_EXPRESSIONS: usize = 20;
-const RESERVED_VIEW_NAMES: &[&str] = &["api", "audit", "health", "openapi.json"];
+const RESERVED_VIEW_NAMES: &[&str] = &[
+    "api",
+    "audit",
+    "health",
+    "openapi.json",
+    "perspective",
+    "users",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ViewDefinition {
@@ -159,6 +166,7 @@ impl Database {
         sort_by: Option<String>,
         sort_direction: SortDirection,
     ) -> Result<ViewDefinition> {
+        self.authorize_owner(&AccessResource::Database)?;
         validate_view_name(name)?;
         validate_component(collection, "collection")?;
         let title = title.unwrap_or(name).trim();
@@ -198,8 +206,19 @@ impl Database {
 
     pub fn view(&self, name: &str) -> Result<ViewDefinition> {
         validate_component(name, "view")?;
+        if RESERVED_VIEW_NAMES.contains(&name) {
+            return Err(DomainError::view_not_found(name).into());
+        }
         if let Some(view) = self.read_view_optional(name)? {
-            return Ok(view);
+            if !self.access_enabled()?
+                || self
+                    .collection_models()?
+                    .into_iter()
+                    .any(|model| model.name == view.collection)
+            {
+                return Ok(view);
+            }
+            return Err(DomainError::view_not_found(name).into());
         }
 
         if self
@@ -213,8 +232,12 @@ impl Database {
     }
 
     pub fn views(&self) -> Result<Vec<ViewDefinition>> {
-        let mut views: BTreeMap<String, ViewDefinition> = self
-            .collection_models()?
+        let models = self.collection_models()?;
+        let visible_collections = models
+            .iter()
+            .map(|model| model.name.clone())
+            .collect::<BTreeSet<_>>();
+        let mut views: BTreeMap<String, ViewDefinition> = models
             .into_iter()
             .filter(|model| !RESERVED_VIEW_NAMES.contains(&model.name.as_str()))
             .map(|model| {
@@ -247,7 +270,10 @@ impl Database {
         }
         names.sort();
         for name in names {
-            views.insert(name.clone(), self.read_view(&name)?);
+            let view = self.read_view(&name)?;
+            if !self.access_enabled()? || visible_collections.contains(&view.collection) {
+                views.insert(name, view);
+            }
         }
         Ok(views.into_values().collect())
     }

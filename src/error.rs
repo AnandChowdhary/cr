@@ -24,6 +24,8 @@ pub enum DomainError {
     AlreadyExists(String),
     /// The request conflicts with durable record or audit state.
     Conflict(String),
+    /// The authenticated principal is not permitted to perform this action.
+    Forbidden(String),
     /// The request is well formed but is not valid for this database.
     Invalid(String),
     /// A change set does not match the digest that was approved for it.
@@ -65,6 +67,7 @@ impl DomainError {
             Self::NotFound(_) => "not_found",
             Self::AlreadyExists(_) => "already_exists",
             Self::Conflict(_) => "conflict",
+            Self::Forbidden(_) => "forbidden",
             Self::Invalid(_) => "validation_failed",
             Self::ApprovalMismatch(_) => "approval_mismatch",
             Self::AnchorMismatch(_) => "anchor_mismatch",
@@ -77,6 +80,7 @@ impl DomainError {
             Self::NotFound(message)
             | Self::AlreadyExists(message)
             | Self::Conflict(message)
+            | Self::Forbidden(message)
             | Self::Invalid(message)
             | Self::ApprovalMismatch(message)
             | Self::AnchorMismatch(message) => message,
@@ -170,6 +174,11 @@ pub(crate) fn conflict(message: impl Display) -> anyhow::Error {
     anyhow::Error::new(DomainError::Conflict(message.to_string()))
 }
 
+/// Build an authorization refusal for `bail!`-style returns.
+pub(crate) fn forbidden(message: impl Display) -> anyhow::Error {
+    anyhow::Error::new(DomainError::Forbidden(message.to_string()))
+}
+
 /// Build an approved-change-digest mismatch for `bail!`-style returns.
 pub(crate) fn approval_mismatch(message: impl Display) -> anyhow::Error {
     anyhow::Error::new(DomainError::ApprovalMismatch(message.to_string()))
@@ -201,8 +210,8 @@ fn io_kind_matches(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DomainError, anchor_mismatch, approval_mismatch, conflict, invalid, is_already_exists,
-        is_missing,
+        DomainError, anchor_mismatch, approval_mismatch, conflict, forbidden, invalid,
+        is_already_exists, is_missing,
     };
     use anyhow::anyhow;
 
@@ -235,6 +244,10 @@ mod tests {
             "view 'board' already exists"
         );
         assert_eq!(conflict("stale").to_string(), "stale");
+        assert_eq!(
+            DomainError::of(&forbidden("not allowed")).map(DomainError::code),
+            Some("forbidden")
+        );
         assert_eq!(
             DomainError::of(&approval_mismatch("not approved")).map(DomainError::code),
             Some("approval_mismatch")

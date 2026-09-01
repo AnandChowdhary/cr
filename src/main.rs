@@ -3,9 +3,9 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
-    AgentEvidence, Assignment, AttributionOverrides, AuditFilter, CheckReport, CheckScope,
-    Database, FilterExpression, Record, SearchQuery, SearchTarget, SortDirection, SyncAttribution,
-    ViewLayout, parse_threshold, sort_records_by_field,
+    AccessAction, AccessResource, AgentEvidence, Assignment, AttributionOverrides, AuditFilter,
+    CheckReport, CheckScope, Database, FilterExpression, Record, Role, SearchQuery, SearchTarget,
+    SortDirection, SyncAttribution, UserKind, ViewLayout, parse_threshold, sort_records_by_field,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -305,6 +305,18 @@ enum Command {
         command: SyncCommand,
     },
 
+    /// Register principals in CR's fixed-schema users collection.
+    User {
+        #[command(subcommand)]
+        command: UserCommand,
+    },
+
+    /// Initialize, inspect, grant, and revoke record access.
+    Access {
+        #[command(subcommand)]
+        command: AccessCommand,
+    },
+
     /// Update a record's front matter and optionally its Markdown body.
     Update {
         collection: String,
@@ -451,6 +463,73 @@ enum Command {
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum UserCommand {
+    /// Register a principal in the fixed-schema users collection without granting access.
+    Add {
+        /// Stable principal ID. Email addresses are recommended for people.
+        id: String,
+
+        #[arg(long)]
+        name: String,
+
+        #[arg(long)]
+        email: Option<String>,
+
+        /// Register an unattended service instead of a person.
+        #[arg(long)]
+        service: bool,
+    },
+
+    /// List registered principals. Requires database access management.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show one principal and its direct grants. Defaults to the current principal.
+    Show {
+        id: Option<String>,
+
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AccessCommand {
+    /// Enable RBAC and make the current principal the first database owner.
+    Init {
+        #[arg(long)]
+        name: Option<String>,
+
+        #[arg(long)]
+        email: Option<String>,
+    },
+
+    /// Show whether the current principal may perform an action.
+    Check {
+        action: AccessAction,
+        resource: AccessResource,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Set a user's direct role at a database, collection, or record.
+    Grant {
+        user: String,
+        role: Role,
+        resource: AccessResource,
+    },
+
+    /// Remove a user's direct role at a database, collection, or record.
+    Revoke {
+        user: String,
+        resource: AccessResource,
     },
 }
 
@@ -989,6 +1068,104 @@ fn run() -> Result<ExitCode> {
                 );
             }
         },
+        Command::User { command } => match command {
+            UserCommand::Add {
+                id,
+                name,
+                email,
+                service,
+            } => {
+                let record = database.add_user(
+                    &id,
+                    &name,
+                    email.as_deref(),
+                    if service {
+                        UserKind::Service
+                    } else {
+                        UserKind::Human
+                    },
+                )?;
+                println!("{}", record.reference());
+            }
+            UserCommand::List { json } => {
+                let users = database.users()?;
+                if json {
+                    let users: Vec<_> = users
+                        .into_iter()
+                        .map(|(id, user)| serde_json::json!({ "id": id, "user": user }))
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&users)?);
+                } else {
+                    for (id, user) in users {
+                        println!("{}\t{}\t{}", id, user.status, user.name);
+                    }
+                }
+            }
+            UserCommand::Show { id, json } => {
+                let id = id.unwrap_or_else(|| database.principal().to_owned());
+                let user = database.user(&id)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({ "id": id, "user": user })
+                        )?
+                    );
+                } else {
+                    print!("{}", yaml_serde::to_string(&user)?);
+                }
+            }
+        },
+        Command::Access { command } => match command {
+            AccessCommand::Init { name, email } => {
+                let record = database.initialize_access(name.as_deref(), email.as_deref())?;
+                println!(
+                    "Initialized access control with {} as database owner",
+                    record.id
+                );
+            }
+            AccessCommand::Check {
+                action,
+                resource,
+                json,
+            } => {
+                let enabled = database.access_enabled()?;
+                let decision = database.access_check(action, &resource)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "allowed": true,
+                            "access_control": enabled,
+                            "decision": decision,
+                        }))?
+                    );
+                } else if let Some(decision) = decision {
+                    println!(
+                        "Allowed: {} may {} {} as {} granted at {}",
+                        decision.principal,
+                        decision.action,
+                        decision.resource,
+                        decision.role,
+                        decision.granted_at
+                    );
+                } else {
+                    println!("Allowed: access control is not initialized (legacy open mode)");
+                }
+            }
+            AccessCommand::Grant {
+                user,
+                role,
+                resource,
+            } => {
+                database.grant_access(&user, resource.clone(), role)?;
+                println!("Granted {role} on {resource} to {user}");
+            }
+            AccessCommand::Revoke { user, resource } => {
+                database.revoke_access(&user, &resource)?;
+                println!("Revoked direct access on {resource} from {user}");
+            }
+        },
         Command::Update {
             collection,
             id,
@@ -1112,6 +1289,8 @@ fn run() -> Result<ExitCode> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "actor": database.actor(),
+                        "principal": database.principal(),
+                        "access_control": database.access_enabled()?,
                         "agent": attribution.agent,
                         "authorization": attribution.authorization,
                         "intent": attribution.intent,

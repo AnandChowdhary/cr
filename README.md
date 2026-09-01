@@ -153,6 +153,63 @@ Identity is resolved from `--actor`, `CR_ACTOR`, `CR_NAME` and `CR_EMAIL`, Git a
 
 This provides attribution, not cryptographically authenticated identity. For stronger assurance, store signed audit checkpoints outside the database.
 
+## Control record access
+
+Access control is opt-in. Existing databases stay in legacy open mode until the
+current CLI identity initializes the reserved, fixed-schema `users` collection:
+
+```sh
+export CR_NAME='Jane Doe'
+export CR_EMAIL='jane@example.com'
+cr access init
+```
+
+The first user becomes the database owner. Its record is ordinary readable
+Markdown at `records/users/jane@example.com.md`, but its schema and mutation
+surface are owned by CR: generic `create`, `update`, `save`, and `delete`
+commands cannot change `users`. Use the dedicated commands instead:
+
+```sh
+cr user add maria@example.com --name Maria --email maria@example.com
+cr access grant maria@example.com editor collection:deals
+cr access grant maria@example.com viewer record:deals/sensitive-renewal
+cr access check update record:deals/acme-renewal
+cr access revoke maria@example.com record:deals/sensitive-renewal
+```
+
+Resources are written as `database`, `collection:NAME`, or
+`record:COLLECTION/ID`. Database grants inherit into every collection and
+record; collection grants inherit into their records; and a direct record
+grant replaces the broader role for that record. Database ownership is never
+accidentally narrowed by a more specific grant.
+
+| Role | Effective capability |
+| --- | --- |
+| `viewer` | Discover and read records and their permitted audit history. |
+| `editor` | Viewer access plus create, update, and link. Deletion is deliberately excluded. |
+| `access_manager` | List users and grant or revoke ordinary roles, without receiving record contents. |
+| `owner` | Every operation, including deletion, ownership, integrity checks, and access administration. |
+
+User records carry their direct `access` grants, so every policy change is a
+normal versioned audit event. A permitted record mutation stores the principal,
+effective role, grant scope, and hash of the user policy that allowed it.
+`cr access check ACTION RESOURCE` explains the same decision without writing.
+
+The principal and audit actor are normally one user-facing identity. Once RBAC
+is enabled, `--actor` may repeat that principal but cannot impersonate another
+one. The deliberate exception is the local `cr serve` perspective console: an
+owner can select any registered user in the top-right switcher, after which
+HTML and REST requests are evaluated as that user. An allowed mutation records
+the selected actor and principal plus an `impersonated_by` owner identity.
+
+The local identity is still an assertion supplied by the process, so this is
+strong CR gating, not a sandbox: somebody who can read or edit the backing
+Markdown can bypass CR. The RBAC perspective console therefore requires an
+owner to launch it and refuses non-loopback binds. It is an administrative
+preview, not a per-user login system. A future managed mode can make
+enforcement non-bypassable by keeping the backing directory private and
+authenticating CLI clients through a daemon or server.
+
 ## Record the agent acting for you
 
 `--actor` is the responsible human, always. When an AI coding agent or another
@@ -195,12 +252,12 @@ byte-for-byte what earlier versions of `cr` wrote.
 
 ### What is asserted, and what that means
 
-**Everything here is a claim the calling process makes about itself.** `cr` runs
+**Everything in the agent channel is a claim the calling process makes about itself.** `cr` runs
 as you, with your environment and your files, so it has no way to prove that an
 agent is what it says it is, that you really asked, or that a recorded rationale
-is honest or complete. Like `--actor`, this channel is for attribution: it does
-not affect authentication, and it never affects what an operation is allowed to
-do. `CR_AGENT=none` suppresses detection entirely and produces an event
+is honest or complete. Agent, approval, and intent fields are attribution: they
+do not affect authentication, and they never affect what an operation is allowed
+to do. `CR_AGENT=none` suppresses detection entirely and produces an event
 indistinguishable from a human's — that is a property of a local-first tool, not
 a gap to be closed later.
 
@@ -1157,6 +1214,19 @@ Use another address or port when needed:
 cr serve --bind 127.0.0.1:8080
 ```
 
+For an RBAC-enabled database, launch `cr serve` as a database owner. The header
+then includes a **Perspective** switcher containing every registered user. Its
+session cookie applies the selected principal to both HTML pages and REST API
+requests: collections and records are filtered, record pages become read-only
+for viewers, create/edit/delete controls follow the effective role, and Kanban
+movement is enabled per record. Disabled users can also be selected to inspect
+their no-access state. Switching perspective does not mutate policy.
+
+This console is intentionally administrative and loopback-only. It does not
+authenticate different browser users. If the selected perspective performs an
+allowed mutation, the audit event names that user as actor and records the
+launching owner under `access.impersonated_by`.
+
 The HTTP layer calls the same Rust database methods as the CLI. It does not spawn a `cr` subprocess. Schema validation, atomic writes, audit locking, direct-edit reconciliation, and tamper checks therefore behave the same way in both interfaces. HTTP mutations are recorded with `source: api`.
 
 ### Browse automatic views
@@ -1360,7 +1430,12 @@ curl http://127.0.0.1:3000/api/v1/identity \
   -H "Authorization: Bearer $CR_API_TOKEN"
 ```
 
-`GET /health` remains public so process supervisors can check readiness. If you bind to a non-loopback address without a token, `cr` prints a warning. The built-in server does not terminate TLS; use a trusted reverse proxy for access across a network.
+`GET /health` remains public so process supervisors can check readiness. For a
+database without RBAC, binding to a non-loopback address without a token prints
+a warning. An RBAC-enabled server refuses every non-loopback bind because its
+user switcher is an owner impersonation console, not a network authentication
+boundary. The built-in server does not terminate TLS; use a trusted reverse
+proxy for access across a network.
 
 The token mechanism is an HTTP bearer header. A normal browser address-bar request cannot attach that header, so the built-in HTML UI is currently intended for the default loopback-without-token setup or a trusted proxy that injects authentication. A browser login/session flow is tracked in `TODO.md`.
 

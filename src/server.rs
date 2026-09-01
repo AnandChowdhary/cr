@@ -20,18 +20,21 @@ use axum::{
     routing::{get, post},
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
-use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use percent_encoding::{
+    AsciiSet, CONTROLS, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
-    AgentEvidence, Assignment, Attribution, AttributionOverrides, AuditAgent, AuditAuthorization,
-    AuditEntry, AuditFilter, AuditIntent, AuditIntentPart, AuditSource, CheckScope, CheckSummary,
-    CollectionModel, Database, DomainError, FilterExpression, FilterOperator, Finding, Record,
-    SearchQuery, SearchTarget, SortDirection, ViewDefinition, ViewFilterGroup, ViewLayout,
-    ViewPredicateMatch, audit::AuditChange, sort_records_by_field,
+    AccessAction, AccessIdentity, AccessResource, AgentEvidence, Assignment, Attribution,
+    AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
+    AuditIntentPart, AuditSource, CheckScope, CheckSummary, CollectionModel, Database, DomainError,
+    FilterExpression, FilterOperator, Finding, Record, SearchQuery, SearchTarget, SortDirection,
+    UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
+    audit::AuditChange, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -55,6 +58,7 @@ const INTENT_HEADER: &str = "x-cr-intent";
 /// whether it was present.
 const APPROVED_CHANGES_HEADER: &str = "x-cr-approved-changes";
 const REQUEST_ID_HEADER: &str = "x-request-id";
+const PERSPECTIVE_COOKIE: &str = "cr_perspective";
 /// The only message an unexpected failure may reveal. Everything else about it
 /// stays in the server log, correlated by request ID.
 const INTERNAL_MESSAGE: &str =
@@ -101,9 +105,34 @@ impl Default for ServerConfig {
 #[derive(Clone)]
 struct AppState {
     database: Database,
+    access_controlled: bool,
     max_page_size: usize,
     api_token: Option<Arc<str>>,
     csrf_token: Arc<str>,
+}
+
+#[derive(Clone, Debug)]
+struct UiUser {
+    id: String,
+    name: String,
+    role: String,
+    status: UserStatus,
+}
+
+#[derive(Clone, Debug)]
+struct UiContext {
+    operator: AccessIdentity,
+    selected: String,
+    selected_name: String,
+    selected_status: UserStatus,
+    can_view_global_audit: bool,
+    users: Vec<UiUser>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecordPermissions {
+    update: bool,
+    delete: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -482,6 +511,14 @@ struct HtmlDeleteForm {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct HtmlPerspectiveForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    principal: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HtmlKanbanMoveForm {
     #[serde(rename = "_csrf")]
     csrf: String,
@@ -627,6 +664,8 @@ struct BaselineResponse {
 #[derive(Debug, Serialize)]
 struct IdentityResponse {
     actor: String,
+    principal: String,
+    impersonated_by: Option<AccessIdentity>,
     agent: Option<AuditAgent>,
     authorization: Option<AuditAuthorization>,
     intent: Option<AuditIntent>,
@@ -712,6 +751,7 @@ impl ApiError {
             | DomainError::Conflict(_)
             | DomainError::ApprovalMismatch(_)
             | DomainError::AnchorMismatch(_) => StatusCode::CONFLICT,
+            DomainError::Forbidden(_) => StatusCode::FORBIDDEN,
             DomainError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
         };
         let code = domain.code();
@@ -804,6 +844,24 @@ fn log_error(status: StatusCode, code: &str, request_id: &str, detail: &str) {
 }
 
 pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
+    // A malformed or linked records directory is stored-state corruption, not
+    // a reason to make the HTTP application impossible to construct. Defer a
+    // classified conflict to the request that touches it, as the rest of the
+    // server does for record-path failures. A healthy RBAC database still gets
+    // the stricter owner and loopback startup boundary below.
+    let access_controlled = match database.access_enabled() {
+        Ok(enabled) => enabled,
+        Err(error) if matches!(DomainError::of(&error), Some(DomainError::Conflict(_))) => false,
+        Err(error) => return Err(error),
+    };
+    if access_controlled && !config.bind.ip().is_loopback() {
+        bail!(
+            "the RBAC perspective switcher is an owner-only local console and must bind to a loopback address"
+        );
+    }
+    if access_controlled {
+        database.impersonate(database.principal())?;
+    }
     if config.max_page_size == 0 {
         bail!("maximum page size must be greater than zero");
     }
@@ -816,6 +874,7 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
 
     let state = AppState {
         database: database.with_source(AuditSource::Api),
+        access_controlled,
         max_page_size: config.max_page_size,
         api_token: config.api_token.map(Arc::from),
         csrf_token: Arc::from(random_token()?),
@@ -823,6 +882,7 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
     let protected = Router::new()
         .route("/openapi.json", get(openapi))
         .route("/", get(views_home))
+        .route("/perspective", post(switch_perspective))
         .route("/audit", get(audit_view))
         .route("/{view}", get(view_records))
         .route("/{view}/save-view", post(save_view_form))
@@ -926,35 +986,76 @@ async fn request_context(request: Request<Body>, next: Next) -> Response {
 }
 
 async fn authorize(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
-    let Some(token) = &state.api_token else {
-        return next.run(request).await;
-    };
-    let authorized = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|value| value == token.as_ref());
-    if authorized {
-        next.run(request).await
-    } else {
-        ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "provide a valid Bearer token",
-        )
-        .into_response()
+    if let Some(token) = &state.api_token {
+        let authorized = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|value| value == token.as_ref());
+        if !authorized {
+            return ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "provide a valid Bearer token",
+            )
+            .into_response();
+        }
     }
+    let mut response = next.run(request).await;
+    if state.access_controlled {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
+            .headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("Cookie"));
+    }
+    response
 }
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
+async fn switch_perspective(State(state): State<AppState>, RawForm(raw): RawForm) -> Response {
+    let result: ApiResult<Response> = async {
+        if !state.access_controlled {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "route_not_found",
+                "route not found",
+            ));
+        }
+        let form: HtmlPerspectiveForm = parse_html_form(&raw)?;
+        verify_csrf(&state, &form.csrf)?;
+        let principal = form.principal.trim().to_owned();
+        let database = state.database.clone();
+        let principal_for_check = principal.clone();
+        tokio::task::spawn_blocking(move || database.impersonate(&principal_for_check))
+            .await
+            .map_err(|error| ApiError::internal(anyhow!(error).context("database task failed")))?
+            .map_err(ApiError::from_domain)?;
+
+        let cookie = format!(
+            "{PERSPECTIVE_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict",
+            utf8_percent_encode(&principal, NON_ALPHANUMERIC)
+        );
+        let cookie = HeaderValue::from_str(&cookie)
+            .map_err(|error| ApiError::bad_request("invalid_principal", error.to_string()))?;
+        let mut response = see_other("/")?;
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
+        Ok(response)
+    }
+    .await;
+    result.unwrap_or_else(html_error)
+}
+
 async fn views_home(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let result: ApiResult<Markup> = async {
         let views = run_database(&state, &headers, Database::views).await?;
-        Ok(render_views_home(&views))
+        let ui = ui_context(&state, &headers).await?;
+        Ok(render_views_home(&views, ui.as_ref(), &state.csrf_token))
     }
     .await;
     html_result(result)
@@ -1008,7 +1109,13 @@ async fn audit_view(
         })
         .await?;
         let page = paginate_unknown_total(entries, bounds);
-        Ok(render_audit_view(&page, &query))
+        let ui = ui_context(&state, &headers).await?;
+        Ok(render_audit_view(
+            &page,
+            &query,
+            ui.as_ref(),
+            &state.csrf_token,
+        ))
     }
     .await;
     html_result(result)
@@ -1025,56 +1132,76 @@ async fn view_records(
         let ad_hoc_filters = view_filter_expressions(&query)?;
         let query_for_database = query.clone();
         let requested_view = view_name.clone();
-        let (view, mut records, schema) = run_database(&state, &headers, move |database| {
-            let view = database.view(&requested_view)?;
-            let view_filters = view
-                .filters
-                .iter()
-                .map(|filter| Assignment::from_str(filter))
-                .collect::<Result<Vec<_>>>()?;
-            let view_expressions = view
-                .where_expr
-                .iter()
-                .map(|expression| FilterExpression::from_str(expression))
-                .collect::<Result<Vec<_>>>()?;
-            let view_filter_groups = view
-                .filter_groups
-                .iter()
-                .map(|group| {
-                    let expressions = group
-                        .expressions
-                        .iter()
-                        .map(|expression| FilterExpression::from_str(expression))
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok((group.match_mode, expressions))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
-                Some(pattern) => {
-                    let search = SearchQuery::new(pattern, SearchTarget::Document, false, true)?;
-                    database.search(Some(&view.collection), &view_filters, &search)?
-                }
-                None => database.list(&view.collection, &view_filters)?,
-            };
-            records.retain(|record| {
-                view_expressions
+        let (view, mut records, schema, can_create, can_manage_views, updatable) =
+            run_database(&state, &headers, move |database| {
+                let view = database.view(&requested_view)?;
+                let view_filters = view
+                    .filters
                     .iter()
-                    .all(|expression| expression.matches(&record.attributes))
-                    && view_filter_groups.iter().all(|(match_mode, expressions)| {
-                        saved_filter_group_matches(*match_mode, expressions, &record.attributes)
+                    .map(|filter| Assignment::from_str(filter))
+                    .collect::<Result<Vec<_>>>()?;
+                let view_expressions = view
+                    .where_expr
+                    .iter()
+                    .map(|expression| FilterExpression::from_str(expression))
+                    .collect::<Result<Vec<_>>>()?;
+                let view_filter_groups = view
+                    .filter_groups
+                    .iter()
+                    .map(|group| {
+                        let expressions = group
+                            .expressions
+                            .iter()
+                            .map(|expression| FilterExpression::from_str(expression))
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok((group.match_mode, expressions))
                     })
-                    && query_for_database
-                        .filter_match
-                        .matches(&ad_hoc_filters, &record.attributes)
-            });
-            let schema = database
-                .collection_models()?
-                .into_iter()
-                .find(|model| model.name == view.collection)
-                .and_then(|model| model.schema);
-            Ok((view, records, schema))
-        })
-        .await?;
+                    .collect::<Result<Vec<_>>>()?;
+                let mut records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
+                    Some(pattern) => {
+                        let search =
+                            SearchQuery::new(pattern, SearchTarget::Document, false, true)?;
+                        database.search(Some(&view.collection), &view_filters, &search)?
+                    }
+                    None => database.list(&view.collection, &view_filters)?,
+                };
+                records.retain(|record| {
+                    view_expressions
+                        .iter()
+                        .all(|expression| expression.matches(&record.attributes))
+                        && view_filter_groups.iter().all(|(match_mode, expressions)| {
+                            saved_filter_group_matches(*match_mode, expressions, &record.attributes)
+                        })
+                        && query_for_database
+                            .filter_match
+                            .matches(&ad_hoc_filters, &record.attributes)
+                });
+                let schema = database
+                    .collection_models()?
+                    .into_iter()
+                    .find(|model| model.name == view.collection)
+                    .and_then(|model| model.schema);
+                let can_create = can_create_in_collection(database, &view.collection)?;
+                let can_manage_views = database.owner_access_allowed(&AccessResource::Database)?;
+                let mut updatable = BTreeSet::new();
+                for record in &records {
+                    if database.access_allowed(
+                        AccessAction::Update,
+                        &AccessResource::record(&record.collection, &record.id),
+                    )? {
+                        updatable.insert(record.id.clone());
+                    }
+                }
+                Ok((
+                    view,
+                    records,
+                    schema,
+                    can_create,
+                    can_manage_views,
+                    updatable,
+                ))
+            })
+            .await?;
 
         if query.sort_field.is_none() {
             query.sort_field = view.sort_by.clone();
@@ -1095,6 +1222,7 @@ async fn view_records(
             state.max_page_size,
         )?;
         let page = paginate(records, bounds);
+        let ui = ui_context(&state, &headers).await?;
         Ok(render_view_records(
             &view,
             &columns,
@@ -1103,6 +1231,10 @@ async fn view_records(
             &query,
             schema.as_ref(),
             &state.csrf_token,
+            ui.as_ref(),
+            can_create,
+            can_manage_views,
+            &updatable,
         ))
     }
     .await;
@@ -1199,12 +1331,23 @@ async fn new_record_form(
 ) -> Response {
     let result: ApiResult<Markup> = async {
         let requested_view = view_name.clone();
-        let (view, schema) = run_database(&state, &headers, move |database| {
+        let (view, schema, can_create) = run_database(&state, &headers, move |database| {
             let view = database.view(&requested_view)?;
             let schema = collection_schema(database, &view.collection)?;
-            Ok((view, schema))
+            let can_create = can_create_in_collection(database, &view.collection)?;
+            Ok((view, schema, can_create))
         })
         .await?;
+        if !can_create {
+            return Err(ApiError::from_domain(
+                DomainError::Forbidden(format!(
+                    "principal cannot create records in collection:{}",
+                    view.collection
+                ))
+                .into(),
+            ));
+        }
+        let ui = ui_context(&state, &headers).await?;
         Ok(render_record_form(
             &view,
             None,
@@ -1212,6 +1355,11 @@ async fn new_record_form(
             schema.as_ref(),
             &state.csrf_token,
             None,
+            ui.as_ref(),
+            RecordPermissions {
+                update: true,
+                delete: false,
+            },
         ))
     }
     .await;
@@ -1226,7 +1374,7 @@ async fn edit_record_form(
     let result: ApiResult<Markup> = async {
         let requested_view = view_name.clone();
         let requested_id = id.clone();
-        let (view, record, audit_entries, schema) =
+        let (view, record, audit_entries, schema, permissions) =
             run_database(&state, &headers, move |database| {
                 let view = database.view(&requested_view)?;
                 let record = database.get(&view.collection, &requested_id)?;
@@ -1235,9 +1383,15 @@ async fn edit_record_form(
                     AuditFilter::record(&view.collection, &requested_id),
                 )?;
                 let schema = collection_schema(database, &view.collection)?;
-                Ok((view, record, audit_entries, schema))
+                let resource = AccessResource::record(&view.collection, &record.id);
+                let permissions = RecordPermissions {
+                    update: database.access_allowed(AccessAction::Update, &resource)?,
+                    delete: database.access_allowed(AccessAction::Delete, &resource)?,
+                };
+                Ok((view, record, audit_entries, schema, permissions))
             })
             .await?;
+        let ui = ui_context(&state, &headers).await?;
         Ok(render_record_form(
             &view,
             Some(&record),
@@ -1245,6 +1399,8 @@ async fn edit_record_form(
             schema.as_ref(),
             &state.csrf_token,
             None,
+            ui.as_ref(),
+            permissions,
         ))
     }
     .await;
@@ -1414,6 +1570,8 @@ async fn identity(
     let attribution: Attribution = database.attribution().clone();
     Ok(Json(IdentityResponse {
         actor: database.actor().to_owned(),
+        principal: database.principal().to_owned(),
+        impersonated_by: database.impersonated_by().cloned(),
         agent: attribution.agent,
         authorization: attribution.authorization,
         intent: attribution.intent,
@@ -1931,10 +2089,24 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
             }
         },
         "Identity": {
-            "type": "object", "required": ["actor"],
-            "description": "The attribution this request would record. Every field is asserted by the caller and authenticated by nothing.",
+            "type": "object", "required": ["actor", "principal", "impersonated_by"],
+            "description": "The effective principal and attribution this request would record. In the local RBAC console, impersonated_by identifies the owner operating the selected perspective.",
             "properties": {
                 "actor": { "type": "string" },
+                "principal": { "type": "string" },
+                "impersonated_by": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "required": ["principal", "display"],
+                            "properties": {
+                                "principal": { "type": "string" },
+                                "display": { "type": "string" }
+                            }
+                        },
+                        { "type": "null" }
+                    ]
+                },
                 "agent": { "oneOf": [{ "$ref": "#/components/schemas/AuditAgent" }, { "type": "null" }] },
                 "authorization": { "oneOf": [{ "$ref": "#/components/schemas/AuditAuthorization" }, { "type": "null" }] },
                 "intent": { "oneOf": [{ "$ref": "#/components/schemas/AuditIntent" }, { "type": "null" }] }
@@ -2422,7 +2594,7 @@ fn json_body(schema: &str) -> JsonValue {
     json!({ "required": true, "content": { "application/json": { "schema": { "$ref": schema } } } })
 }
 
-fn render_views_home(views: &[ViewDefinition]) -> Markup {
+fn render_views_home(views: &[ViewDefinition], ui: Option<&UiContext>, csrf_token: &str) -> Markup {
     page_layout(
         "Database views",
         html! {
@@ -2435,7 +2607,9 @@ fn render_views_home(views: &[ViewDefinition]) -> Markup {
                     }
                 }
                 div class="flex items-center gap-2" {
-                    a href="/audit" class="cr-button" { "Audit log" }
+                    @if ui.is_none_or(|ui| ui.can_view_global_audit) {
+                        a href="/audit" class="cr-button" { "Audit log" }
+                    }
                     a href="/openapi.json" class="cr-button" { "OpenAPI" span aria-hidden="true" { " ↗" } }
                 }
             }
@@ -2491,10 +2665,17 @@ fn render_views_home(views: &[ViewDefinition]) -> Markup {
                 }
             }
         },
+        ui,
+        csrf_token,
     )
 }
 
-fn render_audit_view(page: &Page<AuditEntry>, query: &AuditViewQuery) -> Markup {
+fn render_audit_view(
+    page: &Page<AuditEntry>,
+    query: &AuditViewQuery,
+    ui: Option<&UiContext>,
+    csrf_token: &str,
+) -> Markup {
     let reset_url = "/audit";
     let first = if page.pagination.returned == 0 {
         0
@@ -2555,6 +2736,8 @@ fn render_audit_view(page: &Page<AuditEntry>, query: &AuditViewQuery) -> Markup 
                 }
             }
         },
+        ui,
+        csrf_token,
     )
 }
 
@@ -2580,6 +2763,14 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
                                 }
                                 p class="mt-1 text-xs text-slate-500" {
                                     "by " span class="font-medium text-slate-700" { (&entry.payload.actor) }
+                                    @if let Some(operator) = entry
+                                        .payload
+                                        .access
+                                        .as_ref()
+                                        .and_then(|access| access.impersonated_by.as_ref())
+                                    {
+                                        " · impersonated by " span class="font-medium text-slate-700" { (&operator.display) }
+                                    }
                                     @if let Some(agent) = &entry.payload.agent {
                                         " · via " a href=(audit_agent_url(&agent.id)) class="font-medium text-slate-700 hover:text-blue-700" { (&agent.id) }
                                     }
@@ -2990,6 +3181,7 @@ const FILTER_BUILDER_SCRIPT: &str = r#"(() => {
   reindex();
 })();"#;
 
+#[allow(clippy::too_many_arguments)]
 fn render_view_records(
     view: &ViewDefinition,
     columns: &[String],
@@ -2998,6 +3190,10 @@ fn render_view_records(
     query: &ViewQuery,
     schema: Option<&JsonValue>,
     csrf_token: &str,
+    ui: Option<&UiContext>,
+    can_create: bool,
+    can_manage_views: bool,
+    updatable: &BTreeSet<String>,
 ) -> Markup {
     let new_url = format!("/{}/new", encode_segment(&view.name));
     let reset_url = format!("/{}", encode_segment(&view.name));
@@ -3072,13 +3268,15 @@ fn render_view_records(
                     }
                 }
                 div class="flex flex-wrap items-center gap-2" {
-                    (render_save_view_control(
-                        view,
-                        query,
-                        columns,
-                        available_columns,
-                        csrf_token,
-                    ))
+                    @if can_manage_views {
+                        (render_save_view_control(
+                            view,
+                            query,
+                            columns,
+                            available_columns,
+                            csrf_token,
+                        ))
+                    }
                     form method="get" action=(reset_url.clone()) data-filter-builder="true" data-max-filters=(MAX_VIEW_FILTERS) class="contents" {
                         div class="relative min-w-48 flex-1 sm:flex-none" {
                             label class="sr-only" { "Search records" }
@@ -3174,8 +3372,10 @@ fn render_view_records(
                             }
                         }
                     }
-                    a href=(new_url) class="cr-button cr-button-primary" {
-                        "New record"
+                    @if can_create {
+                        a href=(new_url) class="cr-button cr-button-primary" {
+                            "New record"
+                        }
                     }
                 }
             }
@@ -3184,7 +3384,7 @@ fn render_view_records(
             }
             script { (PreEscaped(FILTER_BUILDER_SCRIPT)) }
             @if view.layout == ViewLayout::Kanban {
-                (render_kanban_board(view, columns, page, query, schema, csrf_token))
+                (render_kanban_board(view, columns, page, query, schema, csrf_token, updatable))
             } @else {
             div class="cr-table-shell" {
                 div class="overflow-x-auto" {
@@ -3246,6 +3446,8 @@ fn render_view_records(
             }
             }
         },
+        ui,
+        csrf_token,
     )
 }
 
@@ -3340,6 +3542,7 @@ fn render_kanban_board(
     query: &ViewQuery,
     schema: Option<&JsonValue>,
     csrf_token: &str,
+    updatable: &BTreeSet<String>,
 ) -> Markup {
     let group_by = view
         .group_by
@@ -3363,7 +3566,11 @@ fn render_kanban_board(
             p {
                 "Kanban grouped by " code class="rounded bg-slate-200 px-1.5 py-0.5 font-mono text-xs font-semibold text-slate-800" { (group_by) }
             }
-            p { "Drag cards between lanes or use each card’s move control." }
+            @if updatable.is_empty() {
+                p { "This perspective can view cards but cannot move them." }
+            } @else {
+                p { "Drag permitted cards between lanes or use each card’s move control." }
+            }
         }
         div class="overflow-x-auto pb-3" {
             div data-kanban-board="true" class="flex min-w-max items-start gap-4" {
@@ -3383,11 +3590,12 @@ fn render_kanban_board(
                                 p class="rounded-xl border border-dashed border-slate-300 px-4 py-8 text-center text-xs text-slate-500" { "Drop cards here" }
                             }
                             @for record in &lane.records {
+                                @let can_move = updatable.contains(&record.id);
                                 article
-                                    draggable="true"
-                                    data-kanban-card="true"
+                                    draggable=(if can_move { "true" } else { "false" })
+                                    data-kanban-card=(if can_move { "true" } else { "false" })
                                     data-move-url=(kanban_move_url(view, &record.id))
-                                    class="cr-kanban-card cursor-grab p-4 active:cursor-grabbing"
+                                    class=(if can_move { "cr-kanban-card cursor-grab p-4 active:cursor-grabbing" } else { "cr-kanban-card p-4" })
                                 {
                                     div class="flex items-start justify-between gap-3" {
                                         a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="break-all font-mono text-sm font-bold text-slate-950 hover:text-indigo-700 hover:underline" { (&record.id) }
@@ -3403,21 +3611,23 @@ fn render_kanban_board(
                                             }
                                         }
                                     }
-                                    form method="post" action=(kanban_move_url(view, &record.id)) class="mt-4 flex items-center gap-2 border-t border-slate-100 pt-3" {
-                                        input type="hidden" name="_csrf" value=(csrf_token);
-                                        label class="min-w-0 flex-1" {
-                                            span class="sr-only" { "Move " (&record.id) " to" }
-                                            select name="target" aria-label=(format!("Move {} to", record.id)) class="w-full rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs outline-none ring-indigo-500 focus:ring-2" {
-                                                @for option_lane in &lanes {
-                                                    @if option_lane.target == lane.target {
-                                                        option value=(kanban_target_json(&option_lane.target)) selected { (&option_lane.label) }
-                                                    } @else {
-                                                        option value=(kanban_target_json(&option_lane.target)) { (&option_lane.label) }
+                                    @if can_move {
+                                        form method="post" action=(kanban_move_url(view, &record.id)) class="mt-4 flex items-center gap-2 border-t border-slate-100 pt-3" {
+                                            input type="hidden" name="_csrf" value=(csrf_token);
+                                            label class="min-w-0 flex-1" {
+                                                span class="sr-only" { "Move " (&record.id) " to" }
+                                                select name="target" aria-label=(format!("Move {} to", record.id)) class="w-full rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs outline-none ring-indigo-500 focus:ring-2" {
+                                                    @for option_lane in &lanes {
+                                                        @if option_lane.target == lane.target {
+                                                            option value=(kanban_target_json(&option_lane.target)) selected { (&option_lane.label) }
+                                                        } @else {
+                                                            option value=(kanban_target_json(&option_lane.target)) { (&option_lane.label) }
+                                                        }
                                                     }
                                                 }
                                             }
+                                            button type="submit" class="cr-button cr-button-primary min-h-0 px-2.5 py-1.5 text-xs" { "Move" }
                                         }
-                                        button type="submit" class="cr-button cr-button-primary min-h-0 px-2.5 py-1.5 text-xs" { "Move" }
                                     }
                                 }
                             }
@@ -3449,7 +3659,7 @@ const KANBAN_SCRIPT: &str = r#"(() => {
   if (!board) return;
   let draggedCard = null;
 
-  board.querySelectorAll('[data-kanban-card]').forEach((card) => {
+  board.querySelectorAll('[data-kanban-card="true"]').forEach((card) => {
     card.addEventListener('dragstart', () => {
       draggedCard = card;
       card.classList.add('opacity-50');
@@ -3594,6 +3804,31 @@ fn collection_schema(database: &Database, collection: &str) -> Result<Option<Jso
         .into_iter()
         .find(|model| model.name == collection)
         .and_then(|model| model.schema))
+}
+
+fn can_create_in_collection(database: &Database, collection: &str) -> Result<bool> {
+    if database.access_allowed(
+        AccessAction::Create,
+        &AccessResource::collection(collection),
+    )? {
+        return Ok(true);
+    }
+    let Some(user) = database.current_user()? else {
+        return Ok(false);
+    };
+    for grant in user.access {
+        if matches!(
+            &grant.resource,
+            AccessResource::Record {
+                collection: granted_collection,
+                ..
+            } if granted_collection == collection
+        ) && database.access_allowed(AccessAction::Create, &grant.resource)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn schema_form_fields(schema: &JsonValue, attributes: &Mapping) -> Option<Vec<SchemaFormField>> {
@@ -3862,6 +4097,7 @@ fn schema_allows_additional_attributes(schema: &JsonValue) -> bool {
     schema.get("additionalProperties") != Some(&JsonValue::Bool(false))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_record_form(
     view: &ViewDefinition,
     record: Option<&Record>,
@@ -3869,10 +4105,18 @@ fn render_record_form(
     schema: Option<&JsonValue>,
     csrf_token: &str,
     error: Option<&str>,
+    ui: Option<&UiContext>,
+    permissions: RecordPermissions,
 ) -> Markup {
     let editing = record.is_some();
     let title = record
-        .map(|record| format!("Edit {}", record.id))
+        .map(|record| {
+            if permissions.update {
+                format!("Edit {}", record.id)
+            } else {
+                format!("View {}", record.id)
+            }
+        })
         .unwrap_or_else(|| format!("New {} record", view.collection));
     let action = record
         .map(|record| {
@@ -3918,7 +4162,9 @@ fn render_record_form(
                     }
                 }
                 p class="cr-lede mt-2" {
-                    @if structured {
+                    @if editing && !permissions.update {
+                        "This perspective has read-only access to the record."
+                    } @else if structured {
                         "Edit typed fields generated from the collection schema. Saving validates the complete record and writes normal Markdown with YAML front matter."
                     } @else {
                         "This collection has no field schema yet, so front matter remains available as typed YAML."
@@ -3932,6 +4178,7 @@ fn render_record_form(
                     @if structured {
                         input type="hidden" name="_form_mode" value="structured";
                     }
+                    fieldset disabled[!permissions.update] class="contents disabled:opacity-80" {
                     section class="cr-form-section p-5 sm:p-6" {
                         div class="mb-5 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" {
                             div {
@@ -3983,10 +4230,15 @@ fn render_record_form(
                         }
                         textarea name="markdown" aria-label="Markdown notes" rows="12" class="w-full rounded-lg border border-slate-300 px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (markdown) }
                     }
+                    }
                     div class="cr-surface flex flex-wrap items-center justify-between gap-3 p-3" {
                         a href=(back.clone()) class="cr-button" { "Cancel" }
-                        button type="submit" class="cr-button cr-button-primary" {
-                            @if editing { "Save changes" } @else { "Create record" }
+                        @if permissions.update {
+                            button type="submit" class="cr-button cr-button-primary" {
+                                @if editing { "Save changes" } @else { "Create record" }
+                            }
+                        } @else {
+                            span class="cr-pill" { "Read-only perspective" }
                         }
                     }
                 }
@@ -4001,19 +4253,23 @@ fn render_record_form(
                         }
                         (render_audit_entries(audit_entries))
                     }
-                    form method="post" action=(format!("/{}/records/{}/delete", encode_segment(&view.name), encode_segment(&record.id))) onsubmit="return window.confirm('Delete this record? This cannot be undone from the web app.');" class="mt-8 rounded-lg border border-red-200 bg-red-50 p-5" {
-                        input type="hidden" name="_csrf" value=(csrf_token);
-                        div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
-                            div {
-                                h2 class="font-semibold text-red-900" { "Delete this record" }
-                                p class="mt-1 text-sm text-red-700" { "The previous document remains represented in the tamper-evident audit log." }
+                    @if permissions.delete {
+                        form method="post" action=(format!("/{}/records/{}/delete", encode_segment(&view.name), encode_segment(&record.id))) onsubmit="return window.confirm('Delete this record? This cannot be undone from the web app.');" class="mt-8 rounded-lg border border-red-200 bg-red-50 p-5" {
+                            input type="hidden" name="_csrf" value=(csrf_token);
+                            div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
+                                div {
+                                    h2 class="font-semibold text-red-900" { "Delete this record" }
+                                    p class="mt-1 text-sm text-red-700" { "The previous document remains represented in the tamper-evident audit log." }
+                                }
+                                button type="submit" class="rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-semibold text-red-700 hover:bg-red-100" { "Delete record" }
                             }
-                            button type="submit" class="rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-semibold text-red-700 hover:bg-red-100" { "Delete record" }
                         }
                     }
                 }
             }
         },
+        ui,
+        csrf_token,
     )
 }
 
@@ -4110,6 +4366,29 @@ html {
 }
 
 .cr-nav-link:hover { background: #f4f4f5; color: var(--cr-ink); }
+
+.cr-perspective {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-left: 1px solid var(--cr-line);
+  margin-left: 6px;
+  padding-left: 12px;
+}
+
+.cr-perspective select {
+  max-width: 250px;
+  min-height: 32px;
+  padding: 4px 30px 4px 9px;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.cr-perspective-banner {
+  border-bottom: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #1e3a8a;
+}
 
 .cr-main { min-height: calc(100vh - 116px); }
 
@@ -4338,6 +4617,9 @@ html {
   .cr-view-row > :nth-child(2) { grid-column: 1; }
   .cr-view-arrow { grid-column: 2; grid-row: 1 / span 2; }
   .cr-header nav { gap: 0; }
+  .cr-perspective-label { display: none; }
+  .cr-perspective { border-left: 0; margin-left: 0; padding-left: 0; }
+  .cr-perspective select { max-width: 165px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -4346,7 +4628,7 @@ html {
 }
 "#;
 
-fn page_layout(title: &str, content: Markup) -> Markup {
+fn page_layout(title: &str, content: Markup, ui: Option<&UiContext>, csrf_token: &str) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" class="h-full" {
@@ -4364,10 +4646,43 @@ fn page_layout(title: &str, content: Markup) -> Markup {
                 header class="cr-header" {
                     div class="mx-auto flex w-full max-w-[90rem] items-center justify-between px-4 py-2 sm:px-6 lg:px-8" {
                         a href="/" class="cr-wordmark" translate="no" aria-label="cr home" { "cr" }
-                        nav aria-label="Primary" class="flex items-center gap-1" {
-                            a href="/" class="cr-nav-link" { "Views" }
-                            a href="/audit" class="cr-nav-link" { "Audit log" }
-                            a href="/openapi.json" class="cr-nav-link" { "OpenAPI" }
+                        div class="flex items-center gap-1" {
+                            nav aria-label="Primary" class="flex items-center gap-1" {
+                                a href="/" class="cr-nav-link" { "Views" }
+                                @if ui.is_none_or(|ui| ui.can_view_global_audit) {
+                                    a href="/audit" class="cr-nav-link" { "Audit log" }
+                                }
+                                a href="/openapi.json" class="cr-nav-link" { "OpenAPI" }
+                            }
+                            @if let Some(ui) = ui {
+                                form method="post" action="/perspective" class="cr-perspective" {
+                                    input type="hidden" name="_csrf" value=(csrf_token);
+                                    label for="cr-perspective" class="cr-perspective-label text-[0.68rem] font-semibold uppercase tracking-wide text-slate-500" { "Perspective" }
+                                    select id="cr-perspective" name="principal" aria-label="View as user" onchange="this.form.submit()" {
+                                        @for user in &ui.users {
+                                            option value=(&user.id) selected[user.id == ui.selected] {
+                                                (&user.name) " — " (&user.role)
+                                                @if user.status == UserStatus::Disabled { " (disabled)" }
+                                            }
+                                        }
+                                    }
+                                    noscript { button type="submit" class="cr-button" { "View" } }
+                                }
+                            }
+                        }
+                    }
+                }
+                @if let Some(ui) = ui {
+                    @if ui.selected != ui.operator.principal {
+                        div role="status" class="cr-perspective-banner" {
+                            div class="mx-auto flex w-full max-w-[90rem] flex-wrap items-center justify-between gap-2 px-4 py-2 text-xs sm:px-6 lg:px-8" {
+                                span {
+                                    "Viewing as " strong { (&ui.selected_name) }
+                                    " (" code class="font-mono" { (&ui.selected) } ")"
+                                    @if ui.selected_status == UserStatus::Disabled { " · disabled" }
+                                }
+                                span { "Impersonated by " (&ui.operator.display) }
+                            }
                         }
                     }
                 }
@@ -5177,6 +5492,8 @@ fn html_error(error: ApiError) -> Response {
                 a href="/" class="mt-6 inline-flex rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Back to views" }
             }
         },
+        None,
+        "",
     );
     html_response(status, markup)
 }
@@ -5213,6 +5530,13 @@ fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database
         })?;
         database = database.with_actor(actor).map_err(ApiError::from_domain)?;
     }
+    if state.access_controlled {
+        let principal =
+            perspective_principal(headers)?.unwrap_or_else(|| database.principal().to_owned());
+        database = database
+            .impersonate(&principal)
+            .map_err(ApiError::from_domain)?;
+    }
     let agent = attribution_header(headers, AGENT_HEADER, "X-CR-Agent", "invalid_agent")?;
     let authorization = attribution_header(
         headers,
@@ -5245,6 +5569,102 @@ fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database
         )
         .map_err(ApiError::from_domain)?;
     Ok(database.with_attribution(attribution))
+}
+
+fn perspective_principal(headers: &HeaderMap) -> ApiResult<Option<String>> {
+    let mut selected = None;
+    for header in headers.get_all(header::COOKIE) {
+        let header = header.to_str().map_err(|_| {
+            ApiError::bad_request("invalid_cookie", "Cookie must be valid visible text")
+        })?;
+        for cookie in header.split(';').map(str::trim) {
+            let Some(value) = cookie.strip_prefix(&format!("{PERSPECTIVE_COOKIE}=")) else {
+                continue;
+            };
+            if selected.is_some() {
+                return Err(ApiError::bad_request(
+                    "invalid_cookie",
+                    "the perspective cookie may appear only once",
+                ));
+            }
+            let principal = percent_decode_str(value)
+                .decode_utf8()
+                .map_err(|_| {
+                    ApiError::bad_request(
+                        "invalid_cookie",
+                        "the perspective cookie is not valid UTF-8",
+                    )
+                })?
+                .into_owned();
+            selected = Some(principal);
+        }
+    }
+    Ok(selected)
+}
+
+async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<UiContext>> {
+    if !state.access_controlled {
+        return Ok(None);
+    }
+    let selected =
+        perspective_principal(headers)?.unwrap_or_else(|| state.database.principal().to_owned());
+    let database = state.database.clone();
+    tokio::task::spawn_blocking(move || {
+        let users = database.users()?;
+        let selected_user = users
+            .iter()
+            .find(|(id, _)| id == &selected)
+            .map(|(_, user)| user)
+            .ok_or_else(|| DomainError::record_not_found("users", &selected))?;
+        let selected_name = selected_user.name.clone();
+        let selected_status = selected_user.status;
+        let selected_database = database.impersonate(&selected)?;
+        let can_view_global_audit =
+            selected_database.owner_access_allowed(&AccessResource::Database)?;
+        let users = users
+            .into_iter()
+            .map(|(id, user)| UiUser {
+                id,
+                name: user.name,
+                role: user_role_summary(&user.access),
+                status: user.status,
+            })
+            .collect();
+        Ok(UiContext {
+            operator: AccessIdentity {
+                principal: database.principal().to_owned(),
+                display: database.actor().to_owned(),
+            },
+            selected,
+            selected_name,
+            selected_status,
+            can_view_global_audit,
+            users,
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow!(error).context("database task failed")))?
+    .map(Some)
+    .map_err(ApiError::from_domain)
+}
+
+fn user_role_summary(grants: &[crate::AccessGrant]) -> String {
+    if let Some(grant) = grants
+        .iter()
+        .find(|grant| grant.resource == AccessResource::Database)
+    {
+        return grant.role.to_string();
+    }
+    let roles = grants
+        .iter()
+        .map(|grant| grant.role.to_string())
+        .collect::<BTreeSet<_>>();
+    if roles.is_empty() {
+        "no access".to_owned()
+    } else {
+        let roles = roles.into_iter().collect::<Vec<_>>().join(" + ");
+        format!("{roles} · scoped")
+    }
 }
 
 /// Read one attribution header.
@@ -5497,6 +5917,11 @@ mod tests {
                 DomainError::Conflict("record people/ada has unsaved changes".to_owned()),
                 StatusCode::CONFLICT,
                 "conflict",
+            ),
+            (
+                DomainError::Forbidden("principal cannot read record people/ada".to_owned()),
+                StatusCode::FORBIDDEN,
+                "forbidden",
             ),
             (
                 DomainError::Invalid("field path cannot be empty".to_owned()),

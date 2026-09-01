@@ -217,6 +217,58 @@ Structured sync adapters are the unattended alternative. They propose typed oper
 
 Reconciliation observes net record-content state, not every low-level filesystem operation. Byte-for-byte reverted edits and metadata-only changes are outside this journal; deployments that need every write attempt require operating-system audit facilities in addition to `cr`.
 
+### Record authorization and the users collection
+
+RBAC is absent by default, preserving the behavior of every database created
+before it existed. `cr access init` enables it by creating the current
+principal at `records/users/<principal>.md` with database ownership. The
+presence of at least one Markdown user record is the feature switch; an empty
+directory is deliberately not enough, so a bootstrap interrupted before the
+record write leaves the database open and retryable.
+
+`users` is a reserved collection with a built-in JSON Schema. A user record
+contains `name`, optional `email`, `kind`, `status`, and direct `access` grants.
+Each grant pairs one of `viewer`, `editor`, `access_manager`, or `owner` with a
+resource string: `database`, `collection:<name>`, or
+`record:<collection>/<id>`. Database grants inherit through the resource tree,
+collection grants inherit to their records, and the most specific matching
+grant replaces broader roles. Ownership is the exception: an owner grant on an
+ancestor continues to authorize descendants, so a narrower viewer grant cannot
+silently strip an owner's recovery authority.
+
+The users collection is the policy store as well as the principal registry.
+That makes a policy version an ordinary audited user-record version rather than
+a second configuration history. Generic record mutations cannot target
+`users`; `cr user` and `cr access` preserve the fixed schema, prevent an access
+manager from minting ownership or another access manager, and prevent removal
+of the final active database owner. Each allowed data mutation stores an
+optional access decision beside the event: principal, display identity,
+action, target resource, effective role, grant scope, and the exact hash of the
+user record evaluated. Legacy and bootstrap events omit the object and retain
+their original bytes.
+
+Authorization happens inside `Database`. Mutations evaluate under the audit
+lock before preparing the event; list and search filter records by `read`; a
+specific history read requires `read_audit`; and database-wide status, check,
+head, anchor, verification, and baseline operations require ownership. The
+principal is the normalized policy identity derived from the actor (an email
+inside `Name <email>` when present), so actor and principal remain one
+user-facing identity. Once RBAC is enabled, an explicit actor with a different
+principal is rejected.
+
+This is an honest local boundary, not authenticated multi-user isolation. The
+process still supplies its actor environment and anyone with backing-file
+access can bypass CR. `cr serve` supports RBAC as a loopback-only owner
+perspective console: the launching principal must own the database, and a
+CSRF-protected switcher stores one selected registered principal in an
+HTTP-only, same-site session cookie. Every HTML and REST request clones the
+owner's database handle and explicitly impersonates that selection before it
+reaches `Database`. The effective actor and principal become the selected user;
+an allowed event's access decision additionally stores the launching owner as
+`impersonated_by`. Non-bypassable multi-user enforcement still requires a
+managed daemon or server that owns the Markdown directory and authenticates
+each client.
+
 `audit verify` validates the chain and reconciles every latest record hash, including deleted-record absence and manually added untracked files. `audit baseline` explicitly introduces legacy records into the chain. It cannot silently baseline a record that already has history.
 
 ## Whole-database integrity checks
@@ -291,13 +343,13 @@ Adapters are trusted local executables, not a sandbox. They inherit the caller's
 
 The hash chain detects modified payloads, missing or reordered middle events, segment gaps, internally inconsistent record changes, and current-record divergence. It cannot by itself prove that the final events were not removed or that an attacker with full write access did not rewrite the entire chain. The *newest* event is the specific weak point, and for the same reason: every other event is pinned by the `previous_hash` of the event after it, and that one has no successor. Two things still constrain it — the replay checks each change's `before` value against the state it reconstructed, and record reconciliation pins `after_hash` to the file on disk — but the rest of it, including `actor`, `timestamp`, `message`, attribution, and the `after` value of every change, can be rewritten and re-hashed without `audit verify` objecting. Verification also does not cross-check the replayed document against `after_hash`, only its presence. `audit head` exists so the sequence and head hash can be signed, timestamped, committed, or uploaded outside the database; `audit verify --expected-head` checks such a checkpoint, and `.cr-audit-head.json` maintains one automatically so that `audit verify` performs the check by default. That anchor moves the practice from "remember to do this" to "already done", and it moves nothing else: it lives at the database root, so the same write access that rewrites the journal rewrites it, and its value depends entirely on the copy in a pushed Git history rather than on the copy on disk. Stronger deployments can later automate Ed25519-signed checkpoints or remote transparency-log anchoring without changing event files.
 
-Actor values are assertions supplied by the process, not authenticated principals. Resolution prefers the explicit CLI override and `CR_*` environment, then Git author environment/configuration, then common email and OS-user fallbacks. Signed events or trusted operating-system identity integration would be required to authenticate them.
+Actor values are assertions supplied by the process, not authenticated principals. Resolution prefers the explicit CLI override and `CR_*` environment, then Git author environment/configuration, then common email and OS-user fallbacks. In an RBAC-enabled local database the normalized actor is also the policy principal and a later `--actor` cannot change it, but the original environment remains process-controlled; signed requests, trusted operating-system identity integration, or a managed service boundary would be required to authenticate it.
 
 Agent, authorization, and intent are assertions on exactly the same footing, and the schema says so rather than implying otherwise through field names. `cr` is an ordinary local process with no attestation authority, so it cannot establish that an agent is what it claims, that the human actually asked, or that a rationale is honest or complete; `CR_AGENT=none` suppresses detection and produces an event indistinguishable from a human's. None of it may ever gate an authorization decision, and the delegation chain is informational only. What the design does achieve is a conventional, cheap, structured slot, so that in the ordinary honest case the record stops making a false statement, and in every case the absence of attribution becomes information rather than silence. The one locally checkable property is the previewed-change digest below; everything else in this section is a claim.
 
 The journal contains historical values and deletion tombstones, and intent text adds volume to that permanence rather than a new class of risk. Text is bounded per field and per event, and exceeding the bound is an explicit error rather than a truncation. An intent part can alternatively carry a digest and reference instead of inline text, so a deployment that must be able to delete intent later can adopt content-addressed storage without a schema change.
 
-The journal contains historical values and deletion tombstones. Encryption, redaction rules, retention, and access control are deployment concerns and must be designed before storing regulated or highly sensitive data.
+The journal contains historical values and deletion tombstones. Encryption, redaction rules, retention, and non-bypassable backing-store isolation remain deployment concerns and must be designed before storing regulated or highly sensitive data.
 
 ## Query and indexing strategy
 
@@ -323,17 +375,28 @@ Failures carry a typed `DomainError` classification attached to the `anyhow` cha
 
 Every request receives a correlation ID, returned as `X-Request-Id` and inside the error envelope. Before a response is rendered, the server writes the complete chain to standard error under that ID together with the method, path, status, and code; unexpected failures replace their message with a fixed generic one. Expected client errors keep their actionable wording. This holds the line that internal detail is a server-side artifact: the log is authoritative for diagnosis and the response is authoritative for what a caller may know.
 
-The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentication for HTML views, the OpenAPI document, and all `/api/v1` routes; `/health` remains public. `X-CR-Actor` is an audit attribution override with the same assertion-only trust boundary as CLI actor values, and `X-CR-Agent`, `X-CR-Authorization`, and `X-CR-Intent` extend that boundary unchanged to the three attribution objects. Each accepts the same compact or JSON form as its command-line option and is recorded as `detected_from: header`; because HTTP header values are visible ASCII, non-ASCII intent text must arrive as JSON escapes, and a header that is not decodable is refused with a message that names the header and nothing internal. `GET /api/v1/identity` returns the complete attribution a request would record, which is how a client checks its wiring without writing anything. The server does not implement TLS, user accounts, authorization policies, or rate limiting; network deployments must supply those controls at a trusted reverse proxy or service boundary.
+The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentication for HTML views, the OpenAPI document, and all `/api/v1` routes; `/health` remains public. `X-CR-Actor` is an audit attribution override with the same assertion-only trust boundary as CLI actor values, and `X-CR-Agent`, `X-CR-Authorization`, and `X-CR-Intent` extend that boundary unchanged to the three attribution objects. Each accepts the same compact or JSON form as its command-line option and is recorded as `detected_from: header`; because HTTP header values are visible ASCII, non-ASCII intent text must arrive as JSON escapes, and a header that is not decodable is refused with a message that names the header and nothing internal. `GET /api/v1/identity` returns the effective actor, principal, optional impersonating owner, and attribution a request would record, which is how a client checks its wiring without writing anything.
+
+For RBAC, router construction proves the launching principal is a database
+owner and rejects a non-loopback bind before opening a listener. The single
+bearer token is not treated as a principal registry. Instead, the local owner
+console enumerates the live fixed-schema user records and switches perspective
+through a CSRF-protected POST. The resulting HTTP-only, same-site cookie is a
+selection, not an authentication credential: any client admitted to this
+local console is intentionally allowed to choose any user. Responses vary on
+the cookie and are marked `no-store`. The server still does not implement TLS,
+per-token users, or rate limiting; real network deployments must supply an
+authenticated principal boundary rather than exposing this console.
 
 ## Views and server-rendered HTML
 
-`.cr/views/<name>.yaml` stores a format version, title, target collection, typed equality `filters`, richer shared `where_expr` predicates, bounded structured `filter_groups`, visible dotted columns, layout, optional Kanban grouping field, optional default sort field and direction, and default page size. Equality and `where_expr` predicates are an immutable AND scope. Every structured group preserves its own all/any mode, and groups are ANDed with that base and with the browser's current ad hoc group, so a URL cannot broaden the configured view. These files contain no record data. A saved view overrides the automatic view with the same route name; otherwise each discovered collection is available at `/<collection>`. View names reserve their single-segment root routes, while `/health`, `/audit`, `/openapi.json`, and `/api` remain server-owned. Absent query sorting inherits the saved default; an explicitly empty `sort_field` clears it for that URL, while any chosen field overrides it. Legacy view files deserialize with no expression predicates or groups, no default sort, and ascending direction.
+`.cr/views/<name>.yaml` stores a format version, title, target collection, typed equality `filters`, richer shared `where_expr` predicates, bounded structured `filter_groups`, visible dotted columns, layout, optional Kanban grouping field, optional default sort field and direction, and default page size. Equality and `where_expr` predicates are an immutable AND scope. Every structured group preserves its own all/any mode, and groups are ANDed with that base and with the browser's current ad hoc group, so a URL cannot broaden the configured view. These files contain no record data. A saved view overrides the automatic view with the same route name; otherwise each discovered collection is available at `/<collection>`. Saved and automatic views whose collections the effective principal cannot discover are omitted. View names reserve their single-segment root routes, while `/health`, `/audit`, `/openapi.json`, `/perspective`, `/users`, and `/api` remain server-owned. Absent query sorting inherits the saved default; an explicitly empty `sort_field` clears it for that URL, while any chosen field overrides it. Legacy view files deserialize with no expression predicates or groups, no default sort, and ascending direction.
 
 The HTML query panel can replace the definition's default visible fields with a validated subset drawn from the saved columns, schema, and current records. `columns=custom` distinguishes an intentional projection and repeated `column` parameters preserve its order through table-header sorting and pagination. The same subset drives table cells and Kanban card details.
 
 The HTML `Save as view` POST copies the source view's immutable scopes and presentation settings, appends the currently applied browser group without flattening its Boolean mode, and persists the effective columns and sort. Its layout control can retain a table or create a Kanban view with a required grouping field drawn from the available schema/data fields; omitted layout inputs inherit the source for compatibility. It uses the same CSRF token and atomic no-clobber file creation as other local forms. Search text is not persisted in this version and stays in the shareable query URL. Creating a view changes configuration rather than record data, so it does not append a record audit event; configuration history remains an explicit backlog item.
 
-The root page, tables, search/filter controls, pagination, record forms, embedded record history, and global `/audit` timeline are rendered with Maud on the server. Dynamic schema metadata, title, front matter, ID, historical values, actor, message, and error text are HTML-escaped. Before/after previews are character-bounded in HTML while the authoritative complete events remain available through the CLI and JSON API. Tailwind's browser CDN supplies styling without a frontend build or JavaScript framework. Because the CDN is explicitly intended for development, a production/offline deployment should replace it with compiled and pinned CSS.
+The root page, tables, search/filter controls, pagination, record forms, embedded record history, and global `/audit` timeline are rendered with Maud on the server. Under RBAC, the same policy evaluator determines collection and record visibility plus whether new-record, save-view, edit, delete, and per-card Kanban movement controls render. A readable but non-editable record is rendered through a disabled fieldset with an explicit read-only label. Dynamic schema metadata, title, front matter, ID, historical values, actor, message, and error text are HTML-escaped. Before/after previews are character-bounded in HTML while the authoritative complete events remain available through the CLI and JSON API. Tailwind's browser CDN supplies styling without a frontend build or JavaScript framework. Because the CDN is explicitly intended for development, a production/offline deployment should replace it with compiled and pinned CSS.
 
 View filter forms submit a `filter_match=all|any` mode and repeated `filter_field`, `filter_operator`, and `filter_value` triples. The server requires one-to-one fields/values/operators, caps each request at 20 conditions, parses typed YAML values in the shared filter-expression layer, and combines the ad hoc conditions with AND or OR before paginating. Operators cover typed equality, numeric and ISO string ordering, string/array containment, prefixes/suffixes, and explicit empty checks. Missing fields count as empty but do not satisfy negative operators. Saved-view filters are a separate required AND scope, so OR matching cannot broaden a record set beyond the saved view. Generated controls offer only schema-compatible operators and enum, boolean, number, multi-select, or string-format value inputs; a small progressive script swaps those controls when a field or operator changes, but URLs and server behavior do not depend on JavaScript. Pagination preserves the match mode and every triple in order; legacy URLs without operators default to equality.
 
@@ -354,7 +417,7 @@ Mutating forms include a cryptographically random token generated when the serve
 ## Integrity boundaries
 
 - Collection names and IDs are single path components, preventing path traversal. `data_dir` must be a relative path of plain components.
-- Actor, agent, authorization, and intent values are asserted by the caller, are bounded in length, and never influence validation, locking, or permission. They are recorded evidence, not credentials.
+- Actor, agent, authorization, and intent values are asserted by the caller and bounded in length. Agent, authorization, and intent remain evidence only. In local RBAC mode the normalized actor is also the principal used by policy; the owner perspective console explicitly replaces both with the selected user and attaches the operator as `access.impersonated_by`. The documented process-controlled trust limitation remains explicit.
 - No directory between the root and a target may be a symbolic link. That covers `data_dir`, its intermediate directories, each collection directory, `.cr/`, and the audit, schema, view, and sync directories beneath it. A configured directory replaced by a link is refused rather than followed.
 - Markdown record paths must be regular files. Single-record CRUD, status, save, and audit verification reject symlinks and other special file types rather than trusting them by content hash; ordinary collection, schema, view, and sync listings continue to ignore non-file entries, and every name they do yield is reopened safely before it is read.
 - Creation never overwrites an existing record.
