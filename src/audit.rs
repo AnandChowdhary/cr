@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
+    ffi::OsStr,
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -18,7 +19,10 @@ use crate::{
         CollectionEntry, RECORDS_LABEL, collection_directory_name, collection_entry, record_label,
         validate_component,
     },
-    error::{DomainError, anchor_mismatch, approval_mismatch, audit_integrity, conflict},
+    error::{
+        DomainError, anchor_mismatch, approval_mismatch, audit_integrity, conflict,
+        idempotency_conflict, invalid,
+    },
     frontmatter::Document,
     paths::{self, EntryKind},
 };
@@ -230,6 +234,12 @@ pub struct AuditPayload {
     pub access: Option<AccessDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Retry identity committed atomically with this event.
+    ///
+    /// The caller's key is never stored: `key_hash` is domain-separated, and
+    /// the principal, operation, and record fields make its scope explicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency: Option<AuditIdempotency>,
     pub action: AuditAction,
     pub record: AuditRecord,
     pub changes: Vec<AuditChange>,
@@ -243,6 +253,26 @@ pub struct AuditPayload {
     pub before_hash: Option<String>,
     pub after_hash: Option<String>,
     pub previous_hash: Option<String>,
+}
+
+/// Durable replay data for a successfully committed single-record mutation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditIdempotency {
+    pub principal: String,
+    pub operation: String,
+    pub key_hash: String,
+    pub request_hash: String,
+    pub result: AuditIdempotencyResult,
+}
+
+/// Original single-record domain result returned to a retrying caller.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditIdempotencyResult {
+    pub path: PathBuf,
+    pub version: String,
+    pub markdown: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -538,6 +568,16 @@ struct StoredLine {
 struct ChainState {
     entries: u64,
     head_hash: Option<String>,
+    idempotency_identities: HashSet<IdempotencyIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct IdempotencyIdentity {
+    principal: String,
+    operation: String,
+    collection: String,
+    id: String,
+    key_hash: String,
 }
 
 pub(crate) struct AuditLog<'a> {
@@ -560,6 +600,7 @@ pub(crate) struct AuditMutation<'a> {
     pub source: AuditSource,
     pub message: Option<&'a str>,
     pub access: Option<&'a AccessDecision>,
+    pub idempotency: Option<&'a AuditIdempotency>,
 }
 
 pub(crate) struct ReconciledMutation<'a> {
@@ -588,6 +629,7 @@ struct PayloadMutation<'a> {
     source: AuditSource,
     message: Option<&'a str>,
     access: Option<&'a AccessDecision>,
+    idempotency: Option<&'a AuditIdempotency>,
 }
 
 #[derive(Clone)]
@@ -674,6 +716,7 @@ impl<'a> AuditLog<'a> {
             source: mutation.source,
             message: mutation.message,
             access: mutation.access,
+            idempotency: mutation.idempotency,
         })
     }
 
@@ -700,12 +743,17 @@ impl<'a> AuditLog<'a> {
             source: AuditSource::Filesystem,
             message: mutation.message,
             access: mutation.access,
+            idempotency: None,
         })
     }
 
     fn prepare_payload(&self, mutation: PayloadMutation<'_>) -> Result<PreparedEntry> {
-        let sequence = mutation.chain.entries + 1;
-        let previous_hash = mutation.chain.head_hash;
+        let ChainState {
+            entries,
+            head_hash: previous_hash,
+            mut idempotency_identities,
+        } = mutation.chain;
+        let sequence = entries + 1;
         let before = mutation.before_document.map(document_value).transpose()?;
         let after = mutation.after_document.map(document_value).transpose()?;
         let after_snapshot = exact_snapshot(mutation.after_document, mutation.after_bytes)?;
@@ -722,6 +770,7 @@ impl<'a> AuditLog<'a> {
             intent: self.attribution.intent.clone(),
             access: mutation.access.cloned(),
             message: mutation.message.map(str::to_owned),
+            idempotency: mutation.idempotency.cloned(),
             action: mutation.action,
             record: AuditRecord {
                 collection: mutation.collection.to_owned(),
@@ -733,6 +782,7 @@ impl<'a> AuditLog<'a> {
             after_hash: mutation.after_hash,
             previous_hash,
         };
+        register_idempotency_identity(&mut idempotency_identities, &payload)?;
         let serialized =
             serde_json::to_string(&payload).context("could not serialize audit event")?;
         let change_digest = change_set_hash(&serialized)?;
@@ -901,7 +951,7 @@ impl<'a> AuditLog<'a> {
         // Recovery is a write path too. Refuse to append or bless a pending
         // event on top of a journal whose change sets no longer reproduce the
         // states they claim, and name the guilty committed sequence first.
-        let (mut states, _) = self.states(false)?;
+        let (mut states, mut chain) = self.states(false)?;
         self.verify_legacy_representation_heads(&states)?;
         let head = self.load_head()?;
 
@@ -930,6 +980,7 @@ impl<'a> AuditLog<'a> {
             {
                 bail!("audit event does not extend the current chain head");
             }
+            register_idempotency_identity(&mut chain.idempotency_identities, &payload)?;
             replay_entry(
                 &mut states,
                 &AuditEntry {
@@ -958,6 +1009,46 @@ impl<'a> AuditLog<'a> {
 
     pub fn recent(&self, limit: usize, filter: AuditFilter<'_>) -> Result<Vec<AuditEntry>> {
         self.recent_where(limit, filter, |_| Ok(true))
+    }
+
+    /// Find the committed result for one fully scoped retry identity.
+    ///
+    /// Callers hold the audit lock. `verify_chain` both validates every event
+    /// and makes the journal itself authoritative; no disposable side index
+    /// can cause a replay or conflict by itself.
+    pub(crate) fn idempotency_result(
+        &self,
+        principal: &str,
+        operation: &str,
+        collection: &str,
+        id: &str,
+        key_hash: &str,
+        request_hash: &str,
+    ) -> Result<Option<AuditIdempotencyResult>> {
+        let mut result = None;
+        let mut latest = AuditedRecordStates::new();
+        self.verify_chain(|entry, _| {
+            replay_entry(&mut latest, entry)?;
+            let Some(stored) = entry.payload.idempotency.as_ref() else {
+                return Ok(());
+            };
+            if stored.principal != principal
+                || stored.operation != operation
+                || stored.key_hash != key_hash
+                || entry.payload.record.collection != collection
+                || entry.payload.record.id != id
+            {
+                return Ok(());
+            }
+            if stored.request_hash != request_hash {
+                return Err(idempotency_conflict(format!(
+                    "idempotency key was already used for a different {operation} request on record {collection}/{id}"
+                )));
+            }
+            result = Some(stored.result.clone());
+            Ok(())
+        })?;
+        Ok(result)
     }
 
     /// Return recent events that satisfy both the caller's filter and a
@@ -1349,6 +1440,11 @@ impl<'a> AuditLog<'a> {
     }
 
     fn append(&self, entry: &PreparedEntry) -> Result<()> {
+        // Recheck the complete journal immediately before publishing. Normal
+        // mutation preparation already refuses a reused identity, but append
+        // is also reached by pending recovery and must be safe on its own.
+        let (_, mut chain) = self.states(false)?;
+        register_idempotency_identity(&mut chain.idempotency_identities, &entry.parsed)?;
         let head = self.load_head()?;
         let expected_sequence = head
             .as_ref()
@@ -1456,6 +1552,7 @@ impl<'a> AuditLog<'a> {
         let mut expected_sequence = 1;
         let mut previous_hash: Option<String> = None;
         let mut previous_version: Option<u32> = None;
+        let mut idempotency_identities = HashSet::new();
 
         for path in paths {
             if segment_start(&path)? != expected_sequence {
@@ -1490,6 +1587,7 @@ impl<'a> AuditLog<'a> {
                         expected_sequence,
                     )?;
                 }
+                register_idempotency_identity(&mut idempotency_identities, &stored.entry.payload)?;
                 visitor(&stored.entry, &stored.payload)?;
                 previous_version = Some(stored.entry.payload.version);
                 previous_hash = Some(stored.entry.hash);
@@ -1505,6 +1603,7 @@ impl<'a> AuditLog<'a> {
         Ok(ChainState {
             entries: expected_sequence - 1,
             head_hash: previous_hash,
+            idempotency_identities,
         })
     }
 
@@ -1797,6 +1896,133 @@ fn segment_start(path: &Path) -> Result<u64> {
     stem.parse().context("invalid audit segment sequence")
 }
 
+/// Bind a stored retry result to the semantic state, exact bytes, and record
+/// identity the surrounding event already attests to.
+fn verify_idempotency_result(
+    entry: &AuditEntry,
+    before: Option<&Value>,
+    after: Option<&Value>,
+) -> Result<()> {
+    let Some(idempotency) = entry.payload.idempotency.as_ref() else {
+        return Ok(());
+    };
+    let invalid = |reason: &str| {
+        audit_integrity(format!(
+            "audit idempotency metadata is invalid at sequence {}: {reason}",
+            entry.payload.sequence
+        ))
+    };
+    if !valid_stored_digest(&idempotency.key_hash)
+        || !valid_stored_digest(&idempotency.request_hash)
+    {
+        return Err(invalid("digest has an invalid format"));
+    }
+    let effective_principal = entry.payload.access.as_ref().map_or_else(
+        || principal_id(&entry.payload.actor).map_err(|_| invalid("principal is invalid")),
+        |decision| Ok(decision.principal.clone()),
+    )?;
+    if idempotency.principal != effective_principal {
+        return Err(invalid("principal disagrees with the event"));
+    }
+    let expected_action = match idempotency.operation.as_str() {
+        "create" => AuditAction::Create,
+        "update" | "patch" | "replace" => AuditAction::Update,
+        "link" => AuditAction::Link,
+        "delete" => AuditAction::Delete,
+        _ => return Err(invalid("operation is unknown")),
+    };
+    if entry.payload.action != expected_action {
+        return Err(invalid("operation disagrees with the event"));
+    }
+    let (expected_document, expected_version) = if expected_action == AuditAction::Delete {
+        (before, entry.payload.before_hash.as_deref())
+    } else {
+        (after, entry.payload.after_hash.as_deref())
+    };
+    let Some(expected_document) = expected_document else {
+        return Err(invalid("result has no record state"));
+    };
+    let result = &idempotency.result;
+    validate_idempotency_result_path(entry, &result.path)?;
+    let parsed = Document::parse(&result.markdown).map_err(|error| {
+        error.context(DomainError::AuditIntegrity(format!(
+            "audit idempotency result is invalid at sequence {}",
+            entry.payload.sequence
+        )))
+    })?;
+    let result_document = document_value(&parsed).map_err(|error| {
+        error.context(DomainError::AuditIntegrity(format!(
+            "audit idempotency result is invalid at sequence {}",
+            entry.payload.sequence
+        )))
+    })?;
+    if expected_version != Some(result.version.as_str())
+        || record_hash(result.markdown.as_bytes()) != result.version
+        || &result_document != expected_document
+    {
+        return Err(audit_integrity(format!(
+            "audit idempotency result is inconsistent at sequence {}",
+            entry.payload.sequence
+        )));
+    }
+    Ok(())
+}
+
+/// Register the durable identity of one retry result exactly once.
+///
+/// The request hash is deliberately not part of this identity: once a key is
+/// committed for a principal, operation, and record, a second result is
+/// corrupt history whether it claims the same request or a different one.
+fn register_idempotency_identity(
+    seen: &mut HashSet<IdempotencyIdentity>,
+    payload: &AuditPayload,
+) -> Result<()> {
+    let Some(idempotency) = payload.idempotency.as_ref() else {
+        return Ok(());
+    };
+    let identity = IdempotencyIdentity {
+        principal: idempotency.principal.clone(),
+        operation: idempotency.operation.clone(),
+        collection: payload.record.collection.clone(),
+        id: payload.record.id.clone(),
+        key_hash: idempotency.key_hash.clone(),
+    };
+    if seen.insert(identity) {
+        return Ok(());
+    }
+    Err(audit_integrity(format!(
+        "audit replay is inconsistent at sequence {}: idempotency identity is duplicated",
+        payload.sequence
+    )))
+}
+
+fn valid_stored_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn validate_idempotency_result_path(entry: &AuditEntry, path: &Path) -> Result<()> {
+    let expected_file = format!("{}.md", entry.payload.record.id);
+    let safe = !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && path.file_name() == Some(OsStr::new(&expected_file))
+        && path.parent().and_then(Path::file_name)
+            == Some(OsStr::new(&entry.payload.record.collection));
+    if safe {
+        return Ok(());
+    }
+    Err(audit_integrity(format!(
+        "audit idempotency result path is invalid at sequence {}",
+        entry.payload.sequence
+    )))
+}
+
 /// A record that has never been audited cannot take part in `action`.
 fn missing_audit_history(collection: &str, id: &str, action: &str) -> anyhow::Error {
     conflict(format!(
@@ -1877,7 +2103,7 @@ fn validate_relative_target(path: &Path) -> Result<()> {
 fn document_value(document: &Document) -> Result<Value> {
     Ok(serde_json::json!({
         "attributes": serde_json::to_value(&document.attributes)
-            .context("front matter cannot be represented as JSON for auditing")?,
+            .map_err(|_| invalid("front matter cannot be represented as JSON for auditing"))?,
         "body": document.body,
     }))
 }
@@ -1906,7 +2132,8 @@ fn replay_entry(latest: &mut AuditedRecordStates, entry: &AuditEntry) -> Result<
             "audit replay is inconsistent at sequence {sequence}: baseline is not the first record event"
         )));
     }
-    let existed_before = state.document.is_some();
+    let before_document = state.document.clone();
+    let existed_before = before_document.is_some();
     apply_changes(&mut state.document, &entry.payload.changes).map_err(|error| {
         error.context(DomainError::AuditIntegrity(format!(
             "audit replay is inconsistent at sequence {sequence}: change set cannot be applied"
@@ -1918,6 +2145,7 @@ fn replay_entry(latest: &mut AuditedRecordStates, entry: &AuditEntry) -> Result<
     } else {
         Some(sequence)
     };
+    verify_idempotency_result(entry, before_document.as_ref(), state.document.as_ref())?;
     state.hash = entry.payload.after_hash.clone();
     Ok(())
 }
@@ -2237,16 +2465,17 @@ pub(crate) fn digest(domain: &[u8], contents: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditAction, AuditChange, AuditFilter, AuditLog, AuditMutation, AuditPayload, AuditRecord,
-        AuditSource, CHANGE_SET_HASH_DOMAIN, PENDING_PATH, PendingMutation, PreparedEntry,
-        ReconciledMutation, apply_changes, change_set_hash, diff_documents, digest, event_hash,
-        parse_line, record_hash, stored_line,
+        AuditAction, AuditChange, AuditFilter, AuditIdempotency, AuditIdempotencyResult, AuditLog,
+        AuditMutation, AuditPayload, AuditRecord, AuditSource, CHANGE_SET_HASH_DOMAIN,
+        PENDING_PATH, PendingMutation, PreparedEntry, ReconciledMutation, apply_changes,
+        change_set_hash, diff_documents, digest, event_hash, parse_line, record_hash, stored_line,
     };
     use crate::{
         attribution::{
             AgentEvidence, Attribution, AuditAgent, AuditAuthorization, AuditIntent,
             AuditIntentPart, AuthorizationMode, IntentAuthor,
         },
+        error::DomainError,
         frontmatter::Document,
         paths,
     };
@@ -2319,6 +2548,7 @@ mod tests {
                 }),
             }),
             access: None,
+            idempotency: None,
             message: None,
             action: AuditAction::Update,
             record: AuditRecord {
@@ -2733,6 +2963,7 @@ mod tests {
                 source: AuditSource::Cli,
                 message: None,
                 access: None,
+                idempotency: None,
             })
             .unwrap();
         audit
@@ -2803,6 +3034,7 @@ mod tests {
                 source: AuditSource::Cli,
                 message: None,
                 access: None,
+                idempotency: None,
             })
             .unwrap();
         store_pending(&committed, &entry, PathBuf::from("records/items/one.md"));
@@ -2842,6 +3074,7 @@ mod tests {
                 source: AuditSource::Cli,
                 message: None,
                 access: None,
+                idempotency: None,
             })
             .unwrap();
         store_pending(&aborted, &entry, PathBuf::from("records/items/one.md"));
@@ -2849,6 +3082,140 @@ mod tests {
         aborted.recover_pending().unwrap();
         assert!(!aborted_root.path().join(PENDING_PATH).exists());
         assert_eq!(aborted.head().unwrap().sequence, 0);
+    }
+
+    #[test]
+    fn preparation_and_append_each_refuse_a_second_idempotency_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let attribution = Attribution::default();
+        let audit = AuditLog::new(
+            root.path(),
+            Path::new("records"),
+            10,
+            1024 * 1024,
+            "tester",
+            &attribution,
+        );
+        let _lock = audit.lock().unwrap();
+        let target = Path::new("records/items/one.md");
+        let original = Document {
+            attributes: Mapping::new(),
+            body: "Original\n".to_owned(),
+        };
+        let original_raw = original.render().unwrap();
+        let created = audit
+            .prepare(AuditMutation {
+                action: AuditAction::Create,
+                collection: "items",
+                id: "one",
+                before_document: None,
+                after_document: Some(&original),
+                before_bytes: None,
+                after_bytes: Some(original_raw.as_bytes()),
+                source: AuditSource::Cli,
+                message: None,
+                access: None,
+                idempotency: None,
+            })
+            .unwrap();
+        audit
+            .commit(created, target, || {
+                paths::write_new(root.path(), target, original_raw.as_bytes(), "the record")
+            })
+            .unwrap();
+
+        let first = Document {
+            attributes: Mapping::new(),
+            body: "First\n".to_owned(),
+        };
+        let first_raw = first.render().unwrap();
+        let identity_key = digest(b"test:key\0", b"first");
+        let metadata = |key_hash: String, request: &[u8], raw: &str| AuditIdempotency {
+            principal: "tester".to_owned(),
+            operation: "update".to_owned(),
+            key_hash,
+            request_hash: digest(b"test:request\0", request),
+            result: AuditIdempotencyResult {
+                path: target.to_path_buf(),
+                version: record_hash(raw.as_bytes()),
+                markdown: raw.to_owned(),
+            },
+        };
+        let first_idempotency = metadata(identity_key.clone(), b"first", &first_raw);
+        let updated = audit
+            .prepare(AuditMutation {
+                action: AuditAction::Update,
+                collection: "items",
+                id: "one",
+                before_document: Some(&original),
+                after_document: Some(&first),
+                before_bytes: Some(original_raw.as_bytes()),
+                after_bytes: Some(first_raw.as_bytes()),
+                source: AuditSource::Cli,
+                message: None,
+                access: None,
+                idempotency: Some(&first_idempotency),
+            })
+            .unwrap();
+        audit
+            .commit(updated, target, || {
+                paths::write_replace(root.path(), target, first_raw.as_bytes(), "the record")
+            })
+            .unwrap();
+
+        let second = Document {
+            attributes: Mapping::new(),
+            body: "Second\n".to_owned(),
+        };
+        let second_raw = second.render().unwrap();
+        let duplicate = metadata(identity_key.clone(), b"different request", &second_raw);
+        let error = audit
+            .prepare(AuditMutation {
+                action: AuditAction::Update,
+                collection: "items",
+                id: "one",
+                before_document: Some(&first),
+                after_document: Some(&second),
+                before_bytes: Some(first_raw.as_bytes()),
+                after_bytes: Some(second_raw.as_bytes()),
+                source: AuditSource::Cli,
+                message: None,
+                access: None,
+                idempotency: Some(&duplicate),
+            })
+            .err()
+            .expect("duplicate identity must be rejected");
+        assert_eq!(
+            DomainError::of(&error).map(DomainError::code),
+            Some("audit_integrity_failed")
+        );
+
+        let alternate = metadata(digest(b"test:key\0", b"second"), b"second", &second_raw);
+        let mut forged = audit
+            .prepare(AuditMutation {
+                action: AuditAction::Update,
+                collection: "items",
+                id: "one",
+                before_document: Some(&first),
+                after_document: Some(&second),
+                before_bytes: Some(first_raw.as_bytes()),
+                after_bytes: Some(second_raw.as_bytes()),
+                source: AuditSource::Cli,
+                message: None,
+                access: None,
+                idempotency: Some(&alternate),
+            })
+            .unwrap();
+        forged.parsed.idempotency.as_mut().unwrap().key_hash = identity_key;
+        forged.payload = serde_json::to_string(&forged.parsed).unwrap();
+        forged.hash = event_hash(forged.payload.as_bytes());
+        forged.change_digest = change_set_hash(&forged.payload).unwrap();
+        let error = audit.append(&forged).unwrap_err();
+        assert_eq!(
+            DomainError::of(&error).map(DomainError::code),
+            Some("audit_integrity_failed")
+        );
+        assert_eq!(audit.head().unwrap().sequence, 2);
     }
 
     fn store_pending(audit: &AuditLog<'_>, entry: &PreparedEntry, target: PathBuf) {

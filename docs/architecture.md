@@ -191,6 +191,62 @@ That check is the part of the preview-to-apply gap the digest actually closes. S
 
 One digest approves one record. `cr save --preview` prints a digest per record, and an approved digest on `save` requires exactly one named record rather than being checked against one of several independent change sets; multi-record approval needs a per-record mapping and waits on the bulk-mutation design. Sync runs carry no approved digest, because an adapter has no human in the loop by construction.
 
+### Audited idempotency
+
+Supported single-record mutation calls may carry a validated 16–128 byte
+visible-ASCII idempotency key. `Database` hashes it with
+`cr:idempotency:key:v1\0` and never stores or reports the raw value. The lookup
+scope is the effective principal, canonical operation, and record identity. A
+second domain-separated digest commits to a canonical JSON request envelope:
+payload, conditional record versions, audit source and message, attribution,
+actor, and impersonating operator. JSON objects use `serde_json::Value`'s
+sorted map representation, so member order does not change the digest; arrays
+remain ordered where order can affect mutation semantics. YAML values inside
+the envelope use an explicit tagged tree rather than JSON object encoding.
+Scalar kinds, tags, sequences, and mappings therefore remain distinct;
+mapping entries are sorted by their canonical encoded keys, including boolean,
+null, sequence, and mapping keys. Request construction is lazy, so an operation
+without a retry key never serializes this envelope.
+
+The durable source of truth is an optional `idempotency` object in the audit
+event, not a check-then-write cache. It holds the principal, operation, key and
+request hashes, and the original `Record` result as its relative path, exact
+Markdown, and exact-byte version. The path must be a safe relative path ending
+in the event's collection and record ID. Keeping it rather than deriving it
+from the current configuration makes an exact replay stable across a later
+`data_dir` change.
+The object is serialized into the prepared event before `pending.json` is
+flushed. The audit lock therefore gives concurrent duplicates one linear
+answer, while ordinary pending recovery covers both the record-written/event-
+not-yet-appended window and the event-appended/response-lost window. A retry
+runs recovery and current authorization first, scans the verified journal, and
+either returns the stored result, reports typed `IdempotencyConflict`, or
+continues to the normal write. No reservation survives a failed request and a
+preview does not enter this path.
+
+The scoped identity — principal, operation, record, and key hash — may occur
+only once in the journal, independent of request hash. Full replay, retry
+lookup, event preparation, final append, and pending recovery all enforce that
+same invariant. A second result is typed `AuditIntegrity`, not an ordinary
+reuse conflict; a pending copy of the already-committed head remains the honest
+event-appended crash case and is only cleaned up.
+
+The result is not trusted merely because it sits in a hashed payload. Replay
+reconstructs semantic record state through every event and requires the stored
+Markdown to parse to that event's post-state, or its pre-state for a delete;
+its exact-byte hash must equal the stored result version and `after_hash`, or
+`before_hash` for delete. Full audit verification performs the same check and
+names the guilty sequence. The ordinary replay-integrity pass runs first, so a
+forger cannot make a changed event and retry result agree while leaving the
+event's exact snapshot inconsistent.
+
+V1 covers library operations behind CLI create/update/link/delete and REST
+record POST/PATCH/PUT/DELETE/link POST. It deliberately excludes multi-record
+save, sync application, managed user/access lifecycle commands, and HTML form
+posts: those need group or command-specific result semantics rather than a
+single event/result pair. The optional payload field preserves legacy journal
+bytes and audit format compatibility when absent.
+
 `audit log` filters by `--by-agent` and `--by-session` (`--agent` and
 `--session` remain compatibility aliases), matching the acting agent or any
 delegate in its chain over CLI, REST, and the HTML timeline. An explicitly

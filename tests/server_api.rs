@@ -91,6 +91,130 @@ async fn json_request(
     request(app, method, uri, Some(&body.to_string()), headers).await
 }
 
+const IDEMPOTENCY_KEY: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+#[tokio::test]
+async fn rest_idempotency_replays_exact_results_and_rejects_semantic_reuse() {
+    let (_temporary, database) = test_database("server-idempotency");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let headers = [("idempotency-key", IDEMPOTENCY_KEY)];
+    let payload = json!({
+        "id": "one",
+        "front_matter": { "stage": "screening" },
+        "markdown": "Original notes\n"
+    });
+
+    let first = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        payload.clone(),
+        &headers,
+    )
+    .await;
+    let replay = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        payload,
+        &headers,
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::CREATED);
+    assert_eq!(replay.status, StatusCode::CREATED);
+    assert_eq!(replay.body, first.body);
+    assert_eq!(replay.headers[header::ETAG], first.headers[header::ETAG]);
+    assert_eq!(database.audit_head().unwrap().sequence, 1);
+
+    let mismatch = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        json!({ "id": "one", "front_matter": { "stage": "hired" } }),
+        &headers,
+    )
+    .await;
+    assert_eq!(mismatch.status, StatusCode::CONFLICT);
+    assert_eq!(mismatch.json()["error"]["code"], "idempotency_conflict");
+    assert!(!mismatch.text().contains(IDEMPOTENCY_KEY));
+
+    let preview_key = "1d94a86a-10af-4cc0-a255-1d451d52d6ff";
+    let preview = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records?preview=true",
+        json!({ "id": "previewed", "front_matter": { "stage": "screening" } }),
+        &[("idempotency-key", preview_key)],
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK);
+    let applied = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        json!({ "id": "previewed", "front_matter": { "stage": "different" } }),
+        &[("idempotency-key", preview_key)],
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::CREATED);
+
+    let order_key = "663aa76b-f0a8-4c40-9dc5-d453659b96d4";
+    let ordered = request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        Some(r#"{"id":"order","front_matter":{"alpha":1,"nested":{"left":true,"right":false}},"markdown":""}"#),
+        &[("idempotency-key", order_key)],
+    )
+    .await;
+    let reordered = request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        Some(r#"{"markdown":"","front_matter":{"nested":{"right":false,"left":true},"alpha":1},"id":"order"}"#),
+        &[("idempotency-key", order_key)],
+    )
+    .await;
+    assert_eq!(ordered.status, StatusCode::CREATED);
+    assert_eq!(reordered.status, StatusCode::CREATED);
+    assert_eq!(reordered.body, ordered.body);
+
+    let delete_key = "d6aef8cf-e532-4ca3-ac85-ae2d66743f96";
+    let deleted = request(
+        &app,
+        Method::DELETE,
+        "/api/v1/collections/items/records/one",
+        None,
+        &[("idempotency-key", delete_key)],
+    )
+    .await;
+    let delete_replay = request(
+        &app,
+        Method::DELETE,
+        "/api/v1/collections/items/records/one",
+        None,
+        &[("idempotency-key", delete_key)],
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::OK);
+    assert_eq!(delete_replay.status, StatusCode::OK);
+    assert_eq!(delete_replay.body, deleted.body);
+    assert_eq!(deleted.json()["record"]["markdown"], "Original notes\n");
+    assert_eq!(database.audit_head().unwrap().sequence, 4);
+
+    let invalid = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        json!({ "id": "invalid" }),
+        &[("idempotency-key", "too-short")],
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(invalid.json()["error"]["code"], "validation_failed");
+    assert!(!invalid.text().contains("too-short"));
+}
+
 #[tokio::test]
 async fn rest_crud_search_relations_audit_and_pagination_share_database_semantics() {
     let (_temporary, database) = test_database("server-crud");
@@ -798,6 +922,19 @@ async fn openapi_authentication_and_http_errors_are_structured() {
         .find(|parameter| parameter["name"] == "If-Match")
         .expect("PUT documents If-Match");
     assert_eq!(if_match["required"], true);
+    let idempotency = put_parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "Idempotency-Key")
+        .expect("single-record mutations document Idempotency-Key");
+    assert_eq!(idempotency["schema"]["minLength"], 16);
+    let save_parameters = openapi["paths"]["/api/v1/save"]["post"]["parameters"]
+        .as_array()
+        .unwrap();
+    assert!(
+        save_parameters
+            .iter()
+            .all(|parameter| parameter["name"] != "Idempotency-Key")
+    );
     assert!(
         openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["put"]
             ["responses"]["200"]["headers"]["ETag"]

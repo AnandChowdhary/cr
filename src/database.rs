@@ -8,6 +8,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value as JsonValue, json};
+use sha2::{Digest, Sha256};
 use yaml_serde::{Mapping, Value};
 
 use crate::{
@@ -19,7 +21,10 @@ use crate::{
         UserRegistrationOptions, UserStatus, UserUpdate, display_name, principal_id, users_schema,
     },
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
-    audit::{AuditFilter, AuditLog, AuditMutation, ChangePreview, ReconciledMutation, record_hash},
+    audit::{
+        AuditFilter, AuditIdempotency, AuditIdempotencyResult, AuditLog, AuditMutation,
+        ChangePreview, ReconciledMutation, record_hash,
+    },
     check::{CheckReport, CheckScope},
     error::{
         DomainError, conflict, forbidden, invalid, is_already_exists, is_missing,
@@ -28,7 +33,7 @@ use crate::{
     frontmatter::Document,
     paths,
     sync::{SYNC_DEFINITION_DIRECTORY, SYNC_LOCK_DIRECTORY, SYNC_STATE_DIRECTORY},
-    value::{compare_yaml_values, get_path, parse_path, remove_path},
+    value::{canonical_yaml_value, compare_yaml_values, get_path, parse_path, remove_path},
     views::VIEW_DIRECTORY,
 };
 
@@ -36,6 +41,10 @@ const CONFIG_PATH: &str = ".cr/config.yaml";
 const DATABASE_DIRECTORY: &str = ".cr";
 pub(crate) const SCHEMA_DIRECTORY: &str = ".cr/schemas";
 const CURRENT_FORMAT_VERSION: u32 = 1;
+const IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] = b"cr:idempotency:key:v1\0";
+const IDEMPOTENCY_REQUEST_HASH_DOMAIN: &[u8] = b"cr:idempotency:request:v1\0";
+const MIN_IDEMPOTENCY_KEY_BYTES: usize = 16;
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 
 /// How the database directory itself is named to a caller.
 pub(crate) const DATABASE_LABEL: &str = "the database directory";
@@ -116,6 +125,18 @@ enum MutationOutcome {
     Previewed(ChangePreview),
 }
 
+/// A validated, scoped request whose success may be replayed from the audit
+/// journal. This is constructed before locking, but looked up and committed
+/// only while the audit lock is held.
+#[derive(Clone, Debug)]
+struct IdempotencyRequest {
+    operation: &'static str,
+    collection: String,
+    id: String,
+    key_hash: String,
+    request_hash: String,
+}
+
 #[derive(Clone, Debug)]
 struct AccessRequest {
     action: AccessAction,
@@ -130,6 +151,7 @@ struct CreateRequest {
     access: Option<AccessRequest>,
     reuse_deleted_user_id: bool,
     expected_audit_sequence: Option<u64>,
+    idempotency: Option<IdempotencyRequest>,
 }
 
 impl CreateRequest {
@@ -139,6 +161,7 @@ impl CreateRequest {
             access,
             reuse_deleted_user_id: false,
             expected_audit_sequence: None,
+            idempotency: None,
         }
     }
 
@@ -148,11 +171,17 @@ impl CreateRequest {
             access: Some(access),
             reuse_deleted_user_id: options.reuse_deleted_id,
             expected_audit_sequence: None,
+            idempotency: None,
         }
     }
 
     fn at_audit_sequence(mut self, sequence: u64) -> Self {
         self.expected_audit_sequence = Some(sequence);
+        self
+    }
+
+    fn with_idempotency(mut self, idempotency: Option<IdempotencyRequest>) -> Self {
+        self.idempotency = idempotency;
         self
     }
 }
@@ -215,6 +244,7 @@ pub struct Database {
     source: AuditSource,
     audit_message: Option<String>,
     attribution: Attribution,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -310,6 +340,19 @@ impl RecordPrecondition {
         Err(precondition_failed(format!(
             "record {collection}/{id} changed since the expected version"
         )))
+    }
+
+    fn idempotency_value(&self) -> JsonValue {
+        let versions = self.versions.as_ref().map(|versions| {
+            let mut versions = versions.clone();
+            versions.sort();
+            versions.dedup();
+            versions
+        });
+        json!({
+            "versions": versions,
+            "expected_audit_sequence": self.expected_audit_sequence,
+        })
     }
 }
 
@@ -459,6 +502,7 @@ impl Database {
             source: AuditSource::Cli,
             audit_message: None,
             attribution: Attribution::from_environment()?,
+            idempotency_key: None,
         };
         let database = database.with_default_actor();
         database.audit().ensure_layout()?;
@@ -529,6 +573,7 @@ impl Database {
             source: AuditSource::Cli,
             audit_message: None,
             attribution: Attribution::from_environment()?,
+            idempotency_key: None,
         };
         let database = database.with_default_actor();
         let audit = database.audit();
@@ -732,6 +777,17 @@ impl Database {
         self
     }
 
+    /// Attach a retry key to the next supported single-record mutation.
+    ///
+    /// Keys are bounded visible ASCII so the CLI and HTTP header share one
+    /// portable contract. Only a domain-separated hash is written to history.
+    pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Result<Self> {
+        let key = key.into();
+        validate_idempotency_key(&key)?;
+        self.idempotency_key = Some(key);
+        Ok(self)
+    }
+
     pub fn with_source(mut self, source: AuditSource) -> Self {
         self.source = source;
         self
@@ -744,6 +800,97 @@ impl Database {
         }
         self.audit_message = Some(message);
         Ok(self)
+    }
+
+    fn idempotency_request(
+        &self,
+        operation: &'static str,
+        collection: &str,
+        id: &str,
+        input: impl FnOnce() -> Result<JsonValue>,
+    ) -> Result<Option<IdempotencyRequest>> {
+        let Some(key) = self.idempotency_key.as_deref() else {
+            return Ok(None);
+        };
+        let input = input()?;
+        let envelope = json!({
+            "version": 1,
+            "operation": operation,
+            "record": { "collection": collection, "id": id },
+            "input": input,
+            "actor": self.actor,
+            "source": self.source,
+            "message": self.audit_message,
+            "agent": self.attribution.agent,
+            "authorization": self.attribution.authorization,
+            "intent": self.attribution.intent,
+            "impersonated_by": self.impersonated_by,
+        });
+        let serialized =
+            serde_json::to_vec(&envelope).context("could not serialize idempotency request")?;
+        Ok(Some(IdempotencyRequest {
+            operation,
+            collection: collection.to_owned(),
+            id: id.to_owned(),
+            key_hash: idempotency_digest(IDEMPOTENCY_KEY_HASH_DOMAIN, key.as_bytes()),
+            request_hash: idempotency_digest(IDEMPOTENCY_REQUEST_HASH_DOMAIN, &serialized),
+        }))
+    }
+
+    fn replay_idempotent_record(
+        &self,
+        audit: &AuditLog<'_>,
+        request: Option<&IdempotencyRequest>,
+    ) -> Result<Option<Record>> {
+        let Some(request) = request else {
+            return Ok(None);
+        };
+        let Some(value) = audit.idempotency_result(
+            &self.principal,
+            request.operation,
+            &request.collection,
+            &request.id,
+            &request.key_hash,
+            &request.request_hash,
+        )?
+        else {
+            return Ok(None);
+        };
+        let result = value;
+        validate_record_version(&result.version)
+            .context("the committed idempotency result has an invalid version")?;
+        let document = Document::parse(&result.markdown)
+            .context("the committed idempotency result is not valid Markdown")?;
+        Ok(Some(record_from_document(
+            &request.collection,
+            &request.id,
+            result.path,
+            document,
+            result.version,
+        )))
+    }
+
+    fn audit_idempotency(
+        &self,
+        request: Option<&IdempotencyRequest>,
+        record: &Record,
+        markdown: &str,
+    ) -> Result<Option<AuditIdempotency>> {
+        request
+            .map(|request| {
+                Ok(AuditIdempotency {
+                    principal: self.principal.clone(),
+                    operation: request.operation.to_owned(),
+                    key_hash: request.key_hash.clone(),
+                    request_hash: request.request_hash.clone(),
+                    result: AuditIdempotencyResult {
+                        path: record.path.clone(),
+                        version: record.version.clone(),
+                        markdown: markdown.to_owned(),
+                    },
+                })
+            })
+            .transpose()
     }
 
     /// Whether the reserved users collection has bootstrapped access control.
@@ -1167,6 +1314,7 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
+            idempotency: None,
         })?;
         audit.commit(event, &path, || {
             paths::write_new(&self.root, &path, rendered.as_bytes(), &label).map_err(|error| {
@@ -1250,6 +1398,7 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
+            idempotency: None,
         })?;
         audit.commit(event, &path, || {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
@@ -1397,6 +1546,7 @@ impl Database {
             MutationMode::Apply,
             access,
             None,
+            None,
         )?
         .record()
     }
@@ -1439,6 +1589,7 @@ impl Database {
             },
             MutationMode::Apply,
             access,
+            None,
             None,
         )?
         .record()
@@ -1535,6 +1686,12 @@ impl Database {
                 "the users collection is managed through 'cr user' and 'cr access'",
             ));
         }
+        let idempotency = self.idempotency_request("create", collection, id, || {
+            Ok(json!({
+                "attributes": canonical_yaml_value(&Value::Mapping(attributes.clone()))?,
+                "body": body,
+            }))
+        })?;
         self.run_create(
             collection,
             id,
@@ -1546,7 +1703,8 @@ impl Database {
                     AccessAction::Create,
                     AccessResource::record(collection, id),
                 )),
-            ),
+            )
+            .with_idempotency(idempotency),
         )?
         .record()
     }
@@ -1625,6 +1783,7 @@ impl Database {
             access,
             reuse_deleted_user_id,
             expected_audit_sequence,
+            idempotency,
         } = request;
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -1658,6 +1817,9 @@ impl Database {
             })
             .transpose()?
             .flatten();
+        if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
+            return Ok(MutationOutcome::Applied(record));
+        }
         if paths::entry_kind(&self.root, &path, &label)?.is_some() {
             return Err(DomainError::record_exists(collection, id).into());
         }
@@ -1675,6 +1837,14 @@ impl Database {
         };
         self.validate(collection, &document.attributes)?;
         let rendered = document.render()?;
+        let record = record_from_document(
+            collection,
+            id,
+            path.clone(),
+            document.clone(),
+            record_hash(rendered.as_bytes()),
+        );
+        let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
         let event = audit.prepare(AuditMutation {
             action: AuditAction::Create,
             collection,
@@ -1686,6 +1856,7 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
+            idempotency: idempotency.as_ref(),
         })?;
         if mode == MutationMode::Preview {
             return Ok(MutationOutcome::Previewed(event.into_preview()));
@@ -1699,13 +1870,7 @@ impl Database {
                 }
             })
         })?;
-        Ok(MutationOutcome::Applied(record_from_document(
-            collection,
-            id,
-            path,
-            document,
-            record_hash(rendered.as_bytes()),
-        )))
+        Ok(MutationOutcome::Applied(record))
     }
 
     pub fn get(&self, collection: &str, id: &str) -> Result<Record> {
@@ -1981,6 +2146,16 @@ impl Database {
         precondition: Option<&RecordPrecondition>,
     ) -> Result<Record> {
         let user_fields = validate_users_field_update(collection, assignments, body)?;
+        let idempotency = self.idempotency_request("update", collection, id, || {
+            Ok(json!({
+                "assignments": assignments
+                    .iter()
+                    .map(Assignment::idempotency_value)
+                    .collect::<Result<Vec<_>>>()?,
+                "body": body,
+                "precondition": precondition.map(RecordPrecondition::idempotency_value),
+            }))
+        })?;
         self.run_update(
             collection,
             id,
@@ -1992,6 +2167,7 @@ impl Database {
                 AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id))
             },
             precondition,
+            idempotency,
         )?
         .record()
     }
@@ -2028,6 +2204,7 @@ impl Database {
                 AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id))
             },
             precondition,
+            None,
         )?
         .preview()
     }
@@ -2061,6 +2238,14 @@ impl Database {
             body,
             MutationMode::Apply,
             precondition,
+            self.idempotency_request("patch", collection, id, || {
+                Ok(json!({
+                    "attributes": canonical_yaml_value(&Value::Mapping(attributes.clone()))?,
+                    "remove": remove,
+                    "body": body,
+                    "precondition": precondition.map(RecordPrecondition::idempotency_value),
+                }))
+            })?,
         )?
         .record()
     }
@@ -2095,6 +2280,7 @@ impl Database {
             body,
             MutationMode::Preview,
             precondition,
+            None,
         )?
         .preview()
     }
@@ -2109,6 +2295,7 @@ impl Database {
         body: Option<&str>,
         mode: MutationMode,
         precondition: Option<&RecordPrecondition>,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<MutationOutcome> {
         let user_fields = validate_users_field_patch(collection, attributes, remove, body)?;
         if attributes.is_empty() && remove.is_empty() && body.is_none() {
@@ -2140,6 +2327,7 @@ impl Database {
                 AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id))
             },
             precondition,
+            idempotency,
         )
     }
 
@@ -2167,6 +2355,13 @@ impl Database {
         precondition: Option<&RecordPrecondition>,
     ) -> Result<Record> {
         reject_users_mutation(collection)?;
+        let idempotency = self.idempotency_request("replace", collection, id, || {
+            Ok(json!({
+                "attributes": canonical_yaml_value(&Value::Mapping(attributes.clone()))?,
+                "body": body,
+                "precondition": precondition.map(RecordPrecondition::idempotency_value),
+            }))
+        })?;
         self.run_update(
             collection,
             id,
@@ -2178,6 +2373,7 @@ impl Database {
             MutationMode::Apply,
             AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
             precondition,
+            idempotency,
         )?
         .record()
     }
@@ -2203,10 +2399,12 @@ impl Database {
             MutationMode::Preview,
             AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
             precondition,
+            None,
         )?
         .preview()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_update(
         &self,
         collection: &str,
@@ -2215,6 +2413,7 @@ impl Database {
         mode: MutationMode,
         access: AccessRequest,
         precondition: Option<&RecordPrecondition>,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -2238,6 +2437,9 @@ impl Database {
         } else {
             self.authorize(access.action, &access.resource)?
         };
+        if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
+            return Ok(MutationOutcome::Applied(record));
+        }
         let before_raw = self.read_record_for_mutation(collection, id, &path, precondition)?;
         if let Some(precondition) = precondition {
             precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
@@ -2250,6 +2452,14 @@ impl Database {
         }
         self.validate(collection, &document.attributes)?;
         let rendered = document.render()?;
+        let record = record_from_document(
+            collection,
+            id,
+            path.clone(),
+            document.clone(),
+            record_hash(rendered.as_bytes()),
+        );
+        let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
         let event = audit.prepare(AuditMutation {
             action: AuditAction::Update,
             collection,
@@ -2261,6 +2471,7 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
+            idempotency: idempotency.as_ref(),
         })?;
         if mode == MutationMode::Preview {
             return Ok(MutationOutcome::Previewed(event.into_preview()));
@@ -2268,13 +2479,7 @@ impl Database {
         audit.commit(event, &path, || {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
         })?;
-        Ok(MutationOutcome::Applied(record_from_document(
-            collection,
-            id,
-            path,
-            document,
-            record_hash(rendered.as_bytes()),
-        )))
+        Ok(MutationOutcome::Applied(record))
     }
 
     pub fn link(
@@ -2299,6 +2504,14 @@ impl Database {
         precondition: Option<&RecordPrecondition>,
     ) -> Result<Record> {
         reject_users_mutation(collection)?;
+        let idempotency = self.idempotency_request("link", collection, id, || {
+            Ok(json!({
+                "relation": relation,
+                "target_collection": target_collection,
+                "target_id": target_id,
+                "precondition": precondition.map(RecordPrecondition::idempotency_value),
+            }))
+        })?;
         self.run_link(
             collection,
             id,
@@ -2307,6 +2520,7 @@ impl Database {
             target_id,
             MutationMode::Apply,
             precondition,
+            idempotency,
         )?
         .record()
     }
@@ -2349,6 +2563,7 @@ impl Database {
             target_id,
             MutationMode::Preview,
             precondition,
+            None,
         )?
         .preview()
     }
@@ -2363,6 +2578,7 @@ impl Database {
         target_id: &str,
         mode: MutationMode,
         precondition: Option<&RecordPrecondition>,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<MutationOutcome> {
         validate_component(relation, "relation")?;
         let audit = self.audit();
@@ -2379,6 +2595,9 @@ impl Database {
             AccessAction::Read,
             &AccessResource::record(target_collection, target_id),
         )?;
+        if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
+            return Ok(MutationOutcome::Applied(record));
+        }
         let target_path = self.record_path(target_collection, target_id)?;
         let target_raw = self
             .read_record(target_collection, target_id, &target_path)
@@ -2412,6 +2631,14 @@ impl Database {
 
         self.validate(collection, &document.attributes)?;
         let rendered = document.render()?;
+        let record = record_from_document(
+            collection,
+            id,
+            path.clone(),
+            document.clone(),
+            record_hash(rendered.as_bytes()),
+        );
+        let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
         let event = audit.prepare(AuditMutation {
             action: AuditAction::Link,
             collection,
@@ -2423,6 +2650,7 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
+            idempotency: idempotency.as_ref(),
         })?;
         if mode == MutationMode::Preview {
             return Ok(MutationOutcome::Previewed(event.into_preview()));
@@ -2430,13 +2658,7 @@ impl Database {
         audit.commit(event, &path, || {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
         })?;
-        Ok(MutationOutcome::Applied(record_from_document(
-            collection,
-            id,
-            path,
-            document,
-            record_hash(rendered.as_bytes()),
-        )))
+        Ok(MutationOutcome::Applied(record))
     }
 
     pub fn delete(&self, collection: &str, id: &str) -> Result<Record> {
@@ -2451,6 +2673,11 @@ impl Database {
         precondition: Option<&RecordPrecondition>,
     ) -> Result<Record> {
         reject_users_mutation(collection)?;
+        let idempotency = self.idempotency_request("delete", collection, id, || {
+            Ok(json!({
+                "precondition": precondition.map(RecordPrecondition::idempotency_value),
+            }))
+        })?;
         self.run_delete(
             collection,
             id,
@@ -2458,6 +2685,7 @@ impl Database {
             AccessRequest::new(AccessAction::Delete, AccessResource::record(collection, id)),
             false,
             precondition,
+            idempotency,
         )?
         .record()
     }
@@ -2482,6 +2710,7 @@ impl Database {
             AccessRequest::new(AccessAction::Delete, AccessResource::record(collection, id)),
             false,
             precondition,
+            None,
         )?
         .preview()
     }
@@ -2503,10 +2732,12 @@ impl Database {
             AccessRequest::owner(AccessResource::Database),
             options.if_unused,
             None,
+            None,
         )?
         .record()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_delete(
         &self,
         collection: &str,
@@ -2515,6 +2746,7 @@ impl Database {
         access: AccessRequest,
         if_unused: bool,
         precondition: Option<&RecordPrecondition>,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -2534,6 +2766,9 @@ impl Database {
         } else {
             self.authorize(access.action, &access.resource)?
         };
+        if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
+            return Ok(MutationOutcome::Applied(record));
+        }
         let before_raw = self.read_record_for_mutation(collection, id, &path, precondition)?;
         if let Some(precondition) = precondition {
             precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
@@ -2554,6 +2789,14 @@ impl Database {
                 )));
             }
         }
+        let record = record_from_document(
+            collection,
+            id,
+            path.clone(),
+            document.clone(),
+            record_hash(before_raw.as_bytes()),
+        );
+        let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &before_raw)?;
         let event = audit.prepare(AuditMutation {
             action: AuditAction::Delete,
             collection,
@@ -2565,6 +2808,7 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
+            idempotency: idempotency.as_ref(),
         })?;
         if mode == MutationMode::Preview {
             return Ok(MutationOutcome::Previewed(event.into_preview()));
@@ -2572,13 +2816,7 @@ impl Database {
         audit.commit(event, &path, || {
             paths::remove_file(&self.root, &path, &label)
         })?;
-        Ok(MutationOutcome::Applied(record_from_document(
-            collection,
-            id,
-            path,
-            document,
-            record_hash(before_raw.as_bytes()),
-        )))
+        Ok(MutationOutcome::Applied(record))
     }
 
     pub fn status(&self) -> Result<Vec<WorkingChange>> {
@@ -2898,6 +3136,7 @@ impl Database {
                 source: self.source.clone(),
                 message: self.audit_message.as_deref(),
                 access: decision.as_ref(),
+                idempotency: None,
             })?;
             audit.commit(event, &path, || Ok(()))?;
             added += 1;
@@ -3259,6 +3498,32 @@ fn validate_record_version(version: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_idempotency_key(key: &str) -> Result<()> {
+    if key.len() < MIN_IDEMPOTENCY_KEY_BYTES || key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+        return Err(invalid(format!(
+            "idempotency key must contain between {MIN_IDEMPOTENCY_KEY_BYTES} and {MAX_IDEMPOTENCY_KEY_BYTES} visible ASCII bytes"
+        )));
+    }
+    if !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(invalid(
+            "idempotency key must contain visible ASCII without whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn idempotency_digest(domain: &[u8], bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(bytes);
+    let digest = digest.finalize();
+    let hexadecimal = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{hexadecimal}")
 }
 
 /// Parse a stored record, naming it by collection and ID rather than by path.

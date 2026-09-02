@@ -131,6 +131,13 @@ fn attributed(
     }
 }
 
+fn retryable(database: Database, idempotency_key: Option<String>) -> Result<Database> {
+    match idempotency_key {
+        Some(key) => database.with_idempotency_key(key),
+        None => Ok(database),
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     version,
@@ -183,12 +190,16 @@ enum Command {
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
 
+        /// High-entropy retry key (16-128 visible ASCII bytes). Successful retries return the original result.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
+
         /// Compute the change set without writing, and print the digest that approves it.
         #[arg(long, conflicts_with = "approved_changes")]
         preview: bool,
 
-        /// Print the preview as JSON.
-        #[arg(long, requires = "preview")]
+        /// Print the applied record or preview as JSON.
+        #[arg(long)]
         json: bool,
 
         #[command(flatten)]
@@ -351,12 +362,16 @@ enum Command {
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
 
+        /// High-entropy retry key (16-128 visible ASCII bytes). Successful retries return the original result.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
+
         /// Compute the change set without writing, and print the digest that approves it.
         #[arg(long, conflicts_with = "approved_changes")]
         preview: bool,
 
-        /// Print the preview as JSON.
-        #[arg(long, requires = "preview")]
+        /// Print the applied record or preview as JSON.
+        #[arg(long)]
         json: bool,
 
         #[command(flatten)]
@@ -379,12 +394,16 @@ enum Command {
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
 
+        /// High-entropy retry key (16-128 visible ASCII bytes). Successful retries return the original result.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
+
         /// Compute the change set without writing, and print the digest that approves it.
         #[arg(long, conflicts_with = "approved_changes")]
         preview: bool,
 
-        /// Print the preview as JSON.
-        #[arg(long, requires = "preview")]
+        /// Print the applied record or preview as JSON.
+        #[arg(long)]
         json: bool,
 
         #[command(flatten)]
@@ -472,12 +491,16 @@ enum Command {
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
 
+        /// High-entropy retry key (16-128 visible ASCII bytes). Successful retries return the original deleted result.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
+
         /// Compute the change set without writing, and print the digest that approves it.
         #[arg(long, conflicts_with = "approved_changes")]
         preview: bool,
 
-        /// Print the preview as JSON.
-        #[arg(long, requires = "preview")]
+        /// Print the deleted record or preview as JSON.
+        #[arg(long)]
         json: bool,
 
         #[command(flatten)]
@@ -1020,17 +1043,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
             assignments,
             body,
             message,
+            idempotency_key,
             preview,
             json,
             attribution,
         } => {
-            let database = attributed(database, &attribution, message.as_deref())?;
+            let database = retryable(
+                attributed(database, &attribution, message.as_deref())?,
+                idempotency_key,
+            )?;
             if preview {
                 let preview = database.preview_create(&collection, &id, &assignments, &body)?;
                 print_preview(&preview, json)?;
             } else {
                 let record = database.create(&collection, &id, &assignments, &body)?;
-                println!("{}", record.reference());
+                print_mutation_result(&record, json)?;
             }
         }
         Command::Get {
@@ -1500,6 +1527,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             body,
             expected_record_hash,
             message,
+            idempotency_key,
             preview,
             json,
             attribution,
@@ -1507,7 +1535,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             if assignments.is_empty() && body.is_none() {
                 bail!("provide at least one --set or --body value");
             }
-            let database = attributed(database, &attribution, message.as_deref())?;
+            let database = retryable(
+                attributed(database, &attribution, message.as_deref())?,
+                idempotency_key,
+            )?;
             let precondition = expected_record_hash
                 .map(RecordPrecondition::version)
                 .transpose()?;
@@ -1528,7 +1559,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     body.as_deref(),
                     precondition.as_ref(),
                 )?;
-                println!("{}", record.reference());
+                print_mutation_result(&record, json)?;
             }
         }
         Command::Link {
@@ -1539,11 +1570,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             target_id,
             expected_record_hash,
             message,
+            idempotency_key,
             preview,
             json,
             attribution,
         } => {
-            let database = attributed(database, &attribution, message.as_deref())?;
+            let database = retryable(
+                attributed(database, &attribution, message.as_deref())?,
+                idempotency_key,
+            )?;
             let precondition = expected_record_hash
                 .map(RecordPrecondition::version)
                 .transpose()?;
@@ -1566,7 +1601,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     &target_id,
                     precondition.as_ref(),
                 )?;
-                println!("{}", record.reference());
+                print_mutation_result(&record, json)?;
             }
         }
         Command::Status { json } => {
@@ -1670,11 +1705,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             expected_record_hash,
             yes,
             message,
+            idempotency_key,
             preview,
             json,
             attribution,
         } => {
-            let database = attributed(database, &attribution, message.as_deref())?;
+            let database = retryable(
+                attributed(database, &attribution, message.as_deref())?,
+                idempotency_key,
+            )?;
             let precondition = expected_record_hash
                 .map(RecordPrecondition::version)
                 .transpose()?;
@@ -1691,7 +1730,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 let record =
                     database.delete_conditionally(&collection, &id, precondition.as_ref())?;
-                println!("{}", record.reference());
+                print_mutation_result(&record, json)?;
             }
         }
         Command::Audit { command } => match command {
@@ -2017,6 +2056,15 @@ fn print_records(records: Vec<Record>, json: bool) -> Result<()> {
         for record in records {
             println!("{}", record.path.display());
         }
+    }
+    Ok(())
+}
+
+fn print_mutation_result(record: &Record, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(record)?);
+    } else {
+        println!("{}", record.reference());
     }
     Ok(())
 }

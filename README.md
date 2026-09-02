@@ -416,6 +416,57 @@ field automatically. Leaving an old form open can no longer overwrite or
 delete a record changed in another tab; the stale submission returns 412 and
 creates no audit event.
 
+### Retry one mutation without doing it twice
+
+`create`, `update`, `link`, and `delete` accept `--idempotency-key`. Generate a
+fresh random key for one logical operation and keep it unchanged across retries:
+
+```sh
+key=$(openssl rand -hex 16)
+cr create deals acme-renewal --set status=open --idempotency-key "$key"
+# Safe after a timeout: prints the same result and appends no second event.
+cr create deals acme-renewal --set status=open --idempotency-key "$key"
+```
+
+Add `--json` to any supported CLI mutation to receive the original structured
+record result on both the first success and every exact replay. For delete,
+that JSON is the full pre-delete record retained by the event.
+
+Keys contain 16–128 visible ASCII bytes; use at least 128 bits of randomness.
+They are scoped by the effective principal, canonical operation, and target
+record. The request digest also covers the payload, record precondition, API or
+CLI source, audit message, attribution, and impersonating operator. Reusing a
+key in that scope with different semantics fails as
+`idempotency_conflict` (`409` over HTTP). JSON object member order is not a
+semantic difference. YAML input is encoded with explicit scalar, sequence,
+mapping, and tag types before hashing, so keys such as `true` and `"true"`
+remain different and non-string keys never pass through JSON's object-key
+coercion. Reusing the same key on another record is independent.
+
+Only a committed success consumes a key. Preview, validation, authorization,
+and write failures do not. A replay still runs current authorization before it
+returns the old result, so revoking access also revokes replay access. Delete
+retries return the original deleted record even though its file is now absent.
+
+The audit event is the idempotency store. It contains a domain-separated hash
+of the key—never the raw key—the canonical request hash, and the exact domain
+result, including its original relative path and exact Markdown. The stored
+path is checked against the event's collection and ID, so changing `data_dir`
+later does not alter a replayed response or open an arbitrary-path channel.
+Those fields pass through the same pending-mutation journal and audit lock as
+the record write. A concurrent duplicate waits and replays; a crash
+after the record write is recovered into the event before the retry is looked
+up; a lost success response is therefore safe to retry. `audit verify` binds
+the stored result back to the event's semantic state, exact bytes, and record
+version.
+
+REST uses the same contract through `Idempotency-Key` on record `POST`, `PATCH`,
+`PUT`, `DELETE`, and link `POST` requests. Keep the same `If-Match` and
+attribution headers on a retry. `save`, sync application, managed `cr user` and
+`cr access` lifecycle commands, and server-rendered form posts are not in this
+single-record v1 contract; `user ensure` remains declaratively idempotent on its
+own terms.
+
 ### Approve a change set before it is written
 
 Actor and agent attribution are asserted. The preview digest is a separate
@@ -1653,9 +1704,15 @@ recorded with `detected_from: header`. HTTP header values are visible ASCII, so
 non-ASCII intent text must use JSON `\uXXXX` escapes. `GET /api/v1/identity`
 returns the complete attribution a request would record.
 
-`X-CR-Approved-Changes` is the fifth header and the only one that can refuse a
+`X-CR-Approved-Changes` is the approval header and can refuse a
 request: it carries the digest from a `preview=true` response, and a mutation
 whose change set hashes differently is rejected with `409 approval_mismatch`.
+
+`Idempotency-Key` is the retry header for supported single-record mutations.
+It must contain 16–128 visible-ASCII bytes; callers should generate it with at
+least 128 bits of randomness. An exact retry returns the original status and
+JSON result without adding history; mismatched reuse is `409
+idempotency_conflict`.
 
 ### CRUD requests
 

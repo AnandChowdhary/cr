@@ -57,6 +57,7 @@ const INTENT_HEADER: &str = "x-cr-intent";
 /// a checked write and an unchecked one, which is why the event records
 /// whether it was present.
 const APPROVED_CHANGES_HEADER: &str = "x-cr-approved-changes";
+const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const PERSPECTIVE_COOKIE: &str = "cr_perspective";
 /// The only message an unexpected failure may reveal. Everything else about it
@@ -763,6 +764,7 @@ impl ApiError {
             DomainError::NotFound(_) => StatusCode::NOT_FOUND,
             DomainError::AlreadyExists(_)
             | DomainError::Conflict(_)
+            | DomainError::IdempotencyConflict(_)
             | DomainError::ApprovalMismatch(_)
             | DomainError::AuditIntegrity(_)
             | DomainError::AnchorMismatch(_) => StatusCode::CONFLICT,
@@ -1720,7 +1722,7 @@ async fn create_record(
     let query: PreviewQuery = parse_query(raw)?;
     let Json(payload) = json_payload(payload)?;
     if query.preview {
-        let preview = run_database(&state, &headers, move |database| {
+        let preview = run_idempotent_database(&state, &headers, move |database| {
             database.preview_create_record(
                 &collection,
                 &payload.id,
@@ -1737,7 +1739,7 @@ async fn create_record(
         encode_segment(&collection),
         encode_segment(&id)
     );
-    let record = run_database(&state, &headers, move |database| {
+    let record = run_idempotent_database(&state, &headers, move |database| {
         database.create_record(
             &collection,
             &payload.id,
@@ -1766,7 +1768,7 @@ async fn patch_record(
     let Json(payload) = json_payload(payload)?;
     let precondition = if_match(&headers, false)?;
     if query.preview {
-        let preview = run_database(&state, &headers, move |database| {
+        let preview = run_idempotent_database(&state, &headers, move |database| {
             database.preview_patch_conditionally(
                 &collection,
                 &id,
@@ -1779,7 +1781,7 @@ async fn patch_record(
         .await?;
         return Ok(Json(preview).into_response());
     }
-    let record = run_database(&state, &headers, move |database| {
+    let record = run_idempotent_database(&state, &headers, move |database| {
         database.patch_conditionally(
             &collection,
             &id,
@@ -1804,7 +1806,7 @@ async fn replace_record(
     let Json(payload) = json_payload(payload)?;
     let precondition = if_match(&headers, true)?.expect("required If-Match was parsed");
     if query.preview {
-        let preview = run_database(&state, &headers, move |database| {
+        let preview = run_idempotent_database(&state, &headers, move |database| {
             database.preview_replace_conditionally(
                 &collection,
                 &id,
@@ -1816,7 +1818,7 @@ async fn replace_record(
         .await?;
         return Ok(Json(preview).into_response());
     }
-    let record = run_database(&state, &headers, move |database| {
+    let record = run_idempotent_database(&state, &headers, move |database| {
         database.replace_conditionally(
             &collection,
             &id,
@@ -1838,13 +1840,13 @@ async fn delete_record(
     let query: PreviewQuery = parse_query(raw)?;
     let precondition = if_match(&headers, false)?;
     if query.preview {
-        let preview = run_database(&state, &headers, move |database| {
+        let preview = run_idempotent_database(&state, &headers, move |database| {
             database.preview_delete_conditionally(&collection, &id, precondition.as_ref())
         })
         .await?;
         return Ok(Json(preview).into_response());
     }
-    let record = run_database(&state, &headers, move |database| {
+    let record = run_idempotent_database(&state, &headers, move |database| {
         database.delete_conditionally(&collection, &id, precondition.as_ref())
     })
     .await?;
@@ -1866,7 +1868,7 @@ async fn link_record(
     let Json(payload) = json_payload(payload)?;
     let precondition = if_match(&headers, false)?;
     if query.preview {
-        let preview = run_database(&state, &headers, move |database| {
+        let preview = run_idempotent_database(&state, &headers, move |database| {
             database.preview_link_conditionally(
                 &collection,
                 &id,
@@ -1879,7 +1881,7 @@ async fn link_record(
         .await?;
         return Ok(Json(preview).into_response());
     }
-    let record = run_database(&state, &headers, move |database| {
+    let record = run_idempotent_database(&state, &headers, move |database| {
         database.link_conditionally(
             &collection,
             &id,
@@ -2404,9 +2406,32 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "agent": { "$ref": "#/components/schemas/AuditAgent" },
                 "authorization": { "$ref": "#/components/schemas/AuditAuthorization" },
                 "intent": { "$ref": "#/components/schemas/AuditIntent" },
+                "idempotency": { "$ref": "#/components/schemas/AuditIdempotency" },
                 "message": { "type": "string" }
             },
             "additionalProperties": true
+        },
+        "AuditIdempotency": {
+            "type": "object",
+            "required": ["principal", "operation", "key_hash", "request_hash", "result"],
+            "description": "Durable retry identity committed in the same event as a successful single-record mutation. The caller's raw key is never stored.",
+            "properties": {
+                "principal": { "type": "string" },
+                "operation": { "enum": ["create", "update", "patch", "replace", "link", "delete"] },
+                "key_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                "request_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                "result": {
+                    "type": "object",
+                    "required": ["path", "version", "markdown"],
+                    "properties": {
+                        "path": { "type": "string" },
+                        "version": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                        "markdown": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
         },
         "AuditEntries": {
             "type": "array", "items": { "$ref": "#/components/schemas/AuditEntry" }
@@ -2525,6 +2550,13 @@ fn openapi_paths() -> JsonValue {
         "schema": { "type": "string" },
         "description": "Strong ETag returned by a record read. When present, cr compares it with the exact current record bytes while holding the audit lock and returns 412 precondition_failed on a stale value."
     });
+    let idempotency_key = json!({
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "schema": { "type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[!-~]+$" },
+        "description": "A caller-generated, high-entropy retry key for one effective principal, operation, and record. Successful single-record mutations are replayed with their original result and no extra audit event. Reusing a scoped key for different request semantics returns 409 idempotency_conflict. Preview requests and failed mutations do not consume the key."
+    });
     let attribution_parameters = |mut path: Vec<JsonValue>| {
         path.extend(attribution_headers.iter().cloned());
         JsonValue::Array(path)
@@ -2534,9 +2566,16 @@ fn openapi_paths() -> JsonValue {
         path.extend(attribution_headers.iter().cloned());
         JsonValue::Array(path)
     };
+    let single_record_mutation_parameters = |mut path: Vec<JsonValue>| {
+        path.push(preview.clone());
+        path.push(idempotency_key.clone());
+        path.extend(attribution_headers.iter().cloned());
+        JsonValue::Array(path)
+    };
     let conditional_mutation_parameters = |mut path: Vec<JsonValue>| {
         path.push(preview.clone());
         path.push(if_match.clone());
+        path.push(idempotency_key.clone());
         path.extend(attribution_headers.iter().cloned());
         JsonValue::Array(path)
     };
@@ -2545,6 +2584,7 @@ fn openapi_paths() -> JsonValue {
         let mut required_if_match = if_match.clone();
         required_if_match["required"] = JsonValue::Bool(true);
         path.push(required_if_match);
+        path.push(idempotency_key.clone());
         path.extend(attribution_headers.iter().cloned());
         JsonValue::Array(path)
     };
@@ -2612,7 +2652,7 @@ fn openapi_paths() -> JsonValue {
                 "responses": ok("#/components/schemas/RecordPage")
             },
             "post": {
-                "operationId": "createRecord", "parameters": mutation_parameters(vec![collection.clone()]),
+                "operationId": "createRecord", "parameters": single_record_mutation_parameters(vec![collection.clone()]),
                 "requestBody": json_body("#/components/schemas/CreateRecordRequest"),
                 "responses": created_record_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview")
             }
@@ -6050,6 +6090,28 @@ fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database
     Ok(database.with_attribution(attribution))
 }
 
+fn single_header<'a>(
+    headers: &'a HeaderMap,
+    header: &str,
+    name: &str,
+    code: &'static str,
+) -> ApiResult<Option<&'a str>> {
+    let mut values = headers.get_all(header).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ApiError::bad_request(
+            code,
+            format!("{name} may appear only once"),
+        ));
+    }
+    value
+        .to_str()
+        .map(Some)
+        .map_err(|_| ApiError::bad_request(code, format!("{name} must be visible ASCII")))
+}
+
 fn perspective_principal(headers: &HeaderMap) -> ApiResult<Option<String>> {
     let mut selected = None;
     for header in headers.get_all(header::COOKIE) {
@@ -6353,6 +6415,32 @@ where
         .map_err(ApiError::from_domain)
 }
 
+async fn run_idempotent_database<T, F>(
+    state: &AppState,
+    headers: &HeaderMap,
+    operation: F,
+) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Database) -> Result<T> + Send + 'static,
+{
+    let mut database = request_database(state, headers)?;
+    if let Some(key) = single_header(
+        headers,
+        IDEMPOTENCY_HEADER,
+        "Idempotency-Key",
+        "invalid_idempotency_key",
+    )? {
+        database = database
+            .with_idempotency_key(key)
+            .map_err(ApiError::from_domain)?;
+    }
+    tokio::task::spawn_blocking(move || operation(&database))
+        .await
+        .map_err(|error| ApiError::internal(anyhow!(error).context("database task failed")))?
+        .map_err(ApiError::from_domain)
+}
+
 fn json_payload<T>(payload: std::result::Result<Json<T>, JsonRejection>) -> ApiResult<Json<T>> {
     payload.map_err(|error| {
         if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
@@ -6572,6 +6660,13 @@ mod tests {
                 ),
                 StatusCode::PRECONDITION_FAILED,
                 "precondition_failed",
+            ),
+            (
+                DomainError::IdempotencyConflict(
+                    "idempotency key was already used for a different request".to_owned(),
+                ),
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
             ),
             (
                 DomainError::Forbidden("principal cannot read record people/ada".to_owned()),

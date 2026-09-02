@@ -30,6 +30,11 @@ pub enum DomainError {
     /// `412 Precondition Failed`, and CLI callers can branch on the stable
     /// `precondition_failed` code instead of parsing prose.
     PreconditionFailed(String),
+    /// An idempotency key was already committed for a different request.
+    ///
+    /// This has its own stable code so callers can distinguish a programming
+    /// error in retry handling from an ordinary record-state conflict.
+    IdempotencyConflict(String),
     /// The authenticated principal is not permitted to perform this action.
     Forbidden(String),
     /// The request is well formed but is not valid for this database.
@@ -83,6 +88,7 @@ impl DomainError {
             Self::AlreadyExists(_) => "already_exists",
             Self::Conflict(_) => "conflict",
             Self::PreconditionFailed(_) => "precondition_failed",
+            Self::IdempotencyConflict(_) => "idempotency_conflict",
             Self::Forbidden(_) => "forbidden",
             Self::Invalid(_) => "validation_failed",
             Self::ApprovalMismatch(_) => "approval_mismatch",
@@ -98,6 +104,7 @@ impl DomainError {
             | Self::AlreadyExists(message)
             | Self::Conflict(message)
             | Self::PreconditionFailed(message)
+            | Self::IdempotencyConflict(message)
             | Self::Forbidden(message)
             | Self::Invalid(message)
             | Self::ApprovalMismatch(message)
@@ -198,6 +205,11 @@ pub(crate) fn precondition_failed(message: impl Display) -> anyhow::Error {
     anyhow::Error::new(DomainError::PreconditionFailed(message.to_string()))
 }
 
+/// Build a failure for reuse of an idempotency key with different semantics.
+pub(crate) fn idempotency_conflict(message: impl Display) -> anyhow::Error {
+    anyhow::Error::new(DomainError::IdempotencyConflict(message.to_string()))
+}
+
 /// Build an authorization refusal for `bail!`-style returns.
 pub(crate) fn forbidden(message: impl Display) -> anyhow::Error {
     anyhow::Error::new(DomainError::Forbidden(message.to_string()))
@@ -240,7 +252,7 @@ fn io_kind_matches(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
 mod tests {
     use super::{
         DomainError, anchor_mismatch, approval_mismatch, audit_integrity, conflict, forbidden,
-        invalid, is_already_exists, is_missing, precondition_failed,
+        idempotency_conflict, invalid, is_already_exists, is_missing, precondition_failed,
     };
     use anyhow::anyhow;
 
@@ -288,6 +300,10 @@ mod tests {
         assert_eq!(
             DomainError::of(&audit_integrity("bad replay")).map(DomainError::code),
             Some("audit_integrity_failed")
+        );
+        assert_eq!(
+            DomainError::of(&idempotency_conflict("already used")).map(DomainError::code),
+            Some("idempotency_conflict")
         );
         assert_eq!(
             DomainError::of(&invalid("bad field")).map(DomainError::code),

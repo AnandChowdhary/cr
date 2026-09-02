@@ -1,11 +1,13 @@
 use std::{cmp::Ordering, fmt, str::FromStr};
 
 use anyhow::{Context, Result};
+use serde::Serialize;
+use serde_json::{Value as JsonValue, json};
 use yaml_serde::{Mapping, Value};
 
 use crate::error::{DomainError, invalid};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Assignment {
     path: Vec<String>,
     value: Value,
@@ -29,6 +31,71 @@ impl Assignment {
     pub(crate) fn matches(&self, attributes: &Mapping) -> bool {
         get_path(attributes, &self.path) == Some(&self.value)
     }
+
+    /// A lossless JSON-shaped representation used only for request hashing.
+    ///
+    /// YAML values are tagged explicitly because JSON object keys cannot
+    /// distinguish `true` from `"true"` and cannot represent sequence or map
+    /// keys at all. Keeping the path and value separate also avoids depending
+    /// on `Assignment`'s serde representation as part of the durable contract.
+    pub(crate) fn idempotency_value(&self) -> Result<JsonValue> {
+        Ok(json!({
+            "path": self.path,
+            "value": canonical_yaml_value(&self.value)?,
+        }))
+    }
+}
+
+/// Encode every YAML type into an unambiguous, deterministically ordered tree
+/// that serde_json can serialize without treating a YAML map as a JSON object.
+pub(crate) fn canonical_yaml_value(value: &Value) -> Result<JsonValue> {
+    Ok(match value {
+        Value::Null => json!({ "type": "null" }),
+        Value::Bool(value) => json!({ "type": "bool", "value": value }),
+        Value::Number(value) => {
+            let kind = if value.is_i64() {
+                "i64"
+            } else if value.is_u64() {
+                "u64"
+            } else {
+                "f64"
+            };
+            json!({ "type": "number", "kind": kind, "value": value.to_string() })
+        }
+        Value::String(value) => json!({ "type": "string", "value": value }),
+        Value::Sequence(values) => json!({
+            "type": "sequence",
+            "value": values
+                .iter()
+                .map(canonical_yaml_value)
+                .collect::<Result<Vec<_>>>()?,
+        }),
+        Value::Mapping(mapping) => {
+            let mut entries = mapping
+                .iter()
+                .map(|(key, value)| {
+                    let key = canonical_yaml_value(key)?;
+                    let value = canonical_yaml_value(value)?;
+                    let order = serde_json::to_vec(&key)
+                        .context("could not canonicalize a YAML mapping key")?;
+                    Ok((order, key, value))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            json!({
+                "type": "mapping",
+                "value": entries
+                    .into_iter()
+                    .map(|(_, key, value)| json!([key, value]))
+                    .collect::<Vec<_>>(),
+            })
+        }
+        Value::Tagged(tagged) => json!({
+            "type": "tagged",
+            "tag": tagged.tag.to_string(),
+            "value": canonical_yaml_value(&tagged.value)?,
+        }),
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -360,7 +427,8 @@ fn set_path(attributes: &mut Mapping, path: &[String], value: Value) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::{
-        Assignment, FilterExpression, FilterOperator, compare_yaml_values, parse_path, remove_path,
+        Assignment, FilterExpression, FilterOperator, canonical_yaml_value, compare_yaml_values,
+        parse_path, remove_path,
     };
     use std::{cmp::Ordering, str::FromStr};
     use yaml_serde::{Mapping, Value};
@@ -572,6 +640,34 @@ mod tests {
         assert_eq!(
             compare_yaml_values(&Value::Bool(false), &Value::Number(0.into())),
             Ordering::Less
+        );
+    }
+
+    #[test]
+    fn idempotency_yaml_encoding_is_typed_and_orders_composite_keys() {
+        assert_ne!(
+            canonical_yaml_value(&Value::Bool(true)).unwrap(),
+            canonical_yaml_value(&Value::String("true".to_owned())).unwrap()
+        );
+
+        let sequence_key = Value::Sequence(vec![Value::String("part".to_owned())]);
+        let mut first = Mapping::new();
+        first.insert(sequence_key.clone(), Value::Number(1.into()));
+        first.insert(Value::Bool(true), Value::Number(2.into()));
+        let mut second = Mapping::new();
+        second.insert(Value::Bool(true), Value::Number(2.into()));
+        second.insert(sequence_key, Value::Number(1.into()));
+
+        let first = canonical_yaml_value(&Value::Mapping(first)).unwrap();
+        let second = canonical_yaml_value(&Value::Mapping(second)).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first["type"], "mapping");
+        assert!(
+            first["value"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry[0]["type"] == "sequence")
         );
     }
 
