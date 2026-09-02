@@ -627,31 +627,36 @@ pub(crate) fn reveal_sync_stream(
     run_id: &str,
     stored: &[u8],
 ) -> Result<Vec<u8>> {
-    let stored: StoredBlobEnvelope =
-        serde_json::from_slice(stored).map_err(|_| decryption_failed())?;
-    if stored.version != ENVELOPE_VERSION {
-        return Err(decryption_failed());
-    }
-    validate_key_id(&stored.key_id).map_err(|_| decryption_failed())?;
-    let nonce = URL_SAFE_NO_PAD
-        .decode(stored.nonce.as_bytes())
-        .map_err(|_| decryption_failed())?;
-    let ciphertext = URL_SAFE_NO_PAD
-        .decode(stored.ciphertext.as_bytes())
-        .map_err(|_| decryption_failed())?;
-    if nonce.len() != NONCE_LENGTH {
-        return Err(decryption_failed());
-    }
+    let envelope = parse_stored_blob_envelope(stored).ok_or_else(decryption_failed)?;
     let keyring = Keyring::from_environment(false)?;
-    decrypt_bytes(
-        &keyring,
-        &Envelope {
-            key_id: stored.key_id,
-            nonce,
-            ciphertext,
-        },
-        &sync_aad(context, name, run_id),
-    )
+    decrypt_bytes(&keyring, &envelope, &sync_aad(context, name, run_id))
+}
+
+/// Check the public shape of a protected sync stream without opening it.
+///
+/// Lazy context creation uses this together with the run ledger's exact-byte
+/// digest. It cannot authenticate ciphertext without the missing keyring, but
+/// it can refuse to treat arbitrary or orphaned JSON as evidence that a
+/// database context already owns durable protected bytes.
+pub(crate) fn protected_sync_stream_is_well_formed(stored: &[u8]) -> bool {
+    parse_stored_blob_envelope(stored).is_some()
+}
+
+fn parse_stored_blob_envelope(stored: &[u8]) -> Option<Envelope> {
+    let stored: StoredBlobEnvelope = serde_json::from_slice(stored).ok()?;
+    if stored.version != ENVELOPE_VERSION || validate_key_id(&stored.key_id).is_err() {
+        return None;
+    }
+    let nonce = URL_SAFE_NO_PAD.decode(stored.nonce.as_bytes()).ok()?;
+    let ciphertext = URL_SAFE_NO_PAD.decode(stored.ciphertext.as_bytes()).ok()?;
+    if nonce.len() != NONCE_LENGTH || ciphertext.len() < 16 {
+        return None;
+    }
+    Some(Envelope {
+        key_id: stored.key_id,
+        nonce,
+        ciphertext,
+    })
 }
 
 fn collect_fields(

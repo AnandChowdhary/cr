@@ -50,6 +50,14 @@ fn command(database: &TestDatabase) -> Command {
     command
 }
 
+fn fault_command(database: &FaultDatabase) -> Command {
+    let mut command = database.command();
+    command
+        .env("CR_ENCRYPTION_ACTIVE_KEY", "old")
+        .env("CR_ENCRYPTION_KEYS", format!(r#"{{"old":"{OLD_KEY}"}}"#));
+    command
+}
+
 fn write_schema(database: &TestDatabase) {
     fs::write(database.root.join(".cr/schemas/accounts.json"), schema()).unwrap();
 }
@@ -1116,6 +1124,7 @@ set -eu
 test -z "${CR_ENCRYPTION_ACTIVE_KEY+x}"
 test -z "${CR_ENCRYPTION_KEYS+x}"
 printf '%s\n' '{"type":"upsert","collection":"accounts","id":"one","front_matter":{"stage":"lead","contact":{"token":"sync-ledger-secret"}},"markdown":"sync ledger body"}'
+printf '%s\n' '{"type":"checkpoint","state":{"cursor":"secret-checkpoint-value"}}'
 "#,
     )
     .unwrap();
@@ -1141,10 +1150,45 @@ printf '%s\n' '{"type":"upsert","collection":"accounts","id":"one","front_matter
     database.restore(&interruption, "accounts", "one", Point::RecordReplaced);
     let stream = fs::read_to_string(database.root().join(".cr/sync/runs/protected.jsonl")).unwrap();
     assert!(stream.contains("\"ciphertext\""));
+    let ledger_path = database.root().join(".cr/sync/runs/protected.json");
+    let original_ledger = fs::read(&ledger_path).unwrap();
+    let ledger: Value = serde_json::from_slice(&original_ledger).unwrap();
+    assert_eq!(ledger["version"], 3);
+    assert_eq!(ledger["checkpoint_after"]["recorded"], true);
+    assert!(
+        ledger["checkpoint_after"]["digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert!(ledger["checkpoint_after"].get("state").is_none());
     assert_tree_omits(
         &database.root().join(".cr/sync"),
-        &["sync-ledger-secret", "sync ledger body"],
+        &[
+            "sync-ledger-secret",
+            "sync ledger body",
+            "secret-checkpoint-value",
+        ],
     );
+
+    // The authenticated stream is the source of the actual checkpoint value;
+    // its public ledger commitment must agree before recovery applies work.
+    let mut forged_ledger: Value = serde_json::from_slice(&original_ledger).unwrap();
+    forged_ledger["checkpoint_after"]["digest"] =
+        Value::String(format!("sha256:{}", "0".repeat(64)));
+    fs::write(
+        &ledger_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&forged_ledger).unwrap()
+        ),
+    )
+    .unwrap();
+    let mismatch =
+        run_failure(fault_command(&database).args(["sync", "recover", "protected", "--json"]));
+    assert!(mismatch.contains("checkpoint metadata does not match its operation stream"));
+    assert!(!mismatch.contains("secret-checkpoint-value"));
+    fs::write(&ledger_path, &original_ledger).unwrap();
 
     run_success(
         database
@@ -1176,6 +1220,106 @@ printf '%s\n' '{"type":"upsert","collection":"accounts","id":"one","front_matter
         recovered["attributes"]["contact"]["token"],
         "sync-ledger-secret"
     );
+    assert_eq!(
+        json(database.command().args(["sync", "state", "protected"]))["cursor"],
+        "secret-checkpoint-value"
+    );
+}
+
+#[test]
+fn a_pre_mutation_protected_sync_run_prevents_context_regeneration() {
+    let database = FaultDatabase::new("encrypted-sync-context-guard");
+    fs::write(database.root().join(".cr/schemas/accounts.json"), schema()).unwrap();
+    fs::create_dir_all(database.root().join("scripts")).unwrap();
+    fs::write(
+        database.root().join("scripts/protected.sh"),
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' '{"type":"upsert","collection":"accounts","id":"one","front_matter":{"stage":"lead","contact":{"token":"context-bound-secret"}}}'
+"#,
+    )
+    .unwrap();
+    run_success(database.command().args([
+        "sync",
+        "create",
+        "protected",
+        "--",
+        "sh",
+        "scripts/protected.sh",
+    ]));
+
+    let original_context = fs::read(database.root().join(".cr/encryption.json")).unwrap();
+    let interruption = database.interrupt_with(
+        "accounts",
+        "one",
+        |command| {
+            command
+                .env("CR_ENCRYPTION_ACTIVE_KEY", "old")
+                .env("CR_ENCRYPTION_KEYS", format!(r#"{{"old":"{OLD_KEY}"}}"#));
+        },
+        &["sync", "run", "protected"],
+    );
+    // This is the reachable crash window after the stream and ledger became
+    // durable but before the first mutation wrote its pending event.
+    database.restore(&interruption, "accounts", "one", Point::PendingWritten);
+    database.clear_pending();
+    assert!(!database.root().join("records/accounts/one.md").exists());
+    assert_eq!(database.head_sequence(), 0);
+
+    fs::remove_file(database.root().join(".cr/encryption.json")).unwrap();
+    let refused = run_failure(fault_command(&database).args([
+        "create",
+        "accounts",
+        "two",
+        "--set",
+        "stage=lead",
+        "--set",
+        "contact.token=another-secret",
+    ]));
+    assert!(refused.contains("missing for an interrupted protected sync run"));
+    assert!(!database.root().join(".cr/encryption.json").exists());
+    assert!(!refused.contains("context-bound-secret"));
+
+    fs::write(
+        database.root().join(".cr/encryption.json"),
+        original_context,
+    )
+    .unwrap();
+    run_success(fault_command(&database).args(["sync", "recover", "protected"]));
+    assert_eq!(
+        json(fault_command(&database).args(["get", "accounts", "one", "--json"]))["attributes"]["contact"]
+            ["token"],
+        "context-bound-secret"
+    );
+}
+
+#[test]
+fn orphaned_or_malformed_sync_markers_do_not_claim_an_encryption_context() {
+    let database = TestDatabase::new("encrypted-sync-context-marker-validation");
+    write_schema(&database);
+    fs::remove_file(database.root.join(".cr/encryption.json")).unwrap();
+    fs::create_dir_all(database.root.join(".cr/sync/runs")).unwrap();
+    fs::write(
+        database.root.join(".cr/sync/runs/orphan.jsonl"),
+        br#"{"version":1,"key_id":"old","nonce":"bad","ciphertext":"bad"}"#,
+    )
+    .unwrap();
+    fs::write(
+        database.root.join(".cr/sync/runs/malformed.json"),
+        b"not a run ledger\n",
+    )
+    .unwrap();
+
+    run_success(command(&database).args([
+        "create",
+        "accounts",
+        "one",
+        "--set",
+        "stage=lead",
+        "--set",
+        "contact.token=first-real-secret",
+    ]));
+    assert!(database.root.join(".cr/encryption.json").exists());
 }
 
 #[test]

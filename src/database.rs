@@ -3423,6 +3423,11 @@ impl Database {
                 "database encryption context is missing for existing protected history",
             ));
         }
+        if self.contains_protected_sync_run()? {
+            return Err(conflict(
+                "database encryption context is missing for an interrupted protected sync run",
+            ));
+        }
 
         let generated = EncryptionContext::generate()?;
         match paths::write_new(

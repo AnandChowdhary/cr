@@ -18,6 +18,8 @@ sync checkpoints, adapter stderr, or plaintext that was audited before
 encryption was enabled. Losing an old key makes every envelope under that
 key—including audit history—unreadable; losing the database context makes all
 protected data unreadable.
+Treat checkpoints and stderr as non-secret operational metadata: never place
+credentials or other confidential values in either surface.
 
 ## Reporting a vulnerability
 

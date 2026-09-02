@@ -123,9 +123,12 @@ path. That prevents moving an envelope between independently initialized
 databases, records, fields, or the body while allowing the complete database
 root to move or be cloned. The context is not a key and is committed with the
 database. An old plaintext database creates it immediately before its first
-encrypted write. If any record or audit event already contains an envelope,
-absence of the context is instead an unrecoverable conflict; CR never guesses
-or regenerates an identity over existing ciphertext.
+encrypted write. If any record, audit event, or keylessly validated protected
+interrupted-sync stream already contains an envelope, absence of the context is
+instead an unrecoverable conflict; CR never guesses or regenerates an identity
+over existing ciphertext. Orphan streams and malformed run markers carry no
+such claim: the ledger identity, exact stream digest, and protected-envelope
+shape must agree before lazy context creation treats a run as protected state.
 Unchanged logical values retain their exact previous envelope, so an unrelated
 field update does not churn ciphertext or the public record version. Equal
 plaintexts written separately do not share nonces or ciphertext.
@@ -549,11 +552,15 @@ head-and-target snapshot, and before the first mutation, `cr` writes
 `.cr/sync/runs/<name>.json`. Streams containing an upsert to an encrypted
 collection use a version-3 authenticated blob bound to the database context,
 sync name, and run ID, so the durable recovery artifact does not expose
-protected plaintext and recovery requires the keyring. Other streams keep the
-version-2 plaintext format. The ledger names the run, its start time, operation
-count, a domain-separated digest of the exact stored stream, the audit head it
-started from, every target's present/absent version at that head, and the
-checkpoints it began with and owes. The stream is written first, so a ledger on
+protected plaintext and recovery requires the keyring. Its ledger retains only
+checkpoint presence and domain-separated canonical-JSON digests; recovery
+derives the after value from the authenticated stream and verifies that digest
+before applying anything. Logical operations and checkpoint JSON therefore
+appear nowhere in plaintext under `.cr/sync/runs/`. Other streams keep the
+version-2 plaintext format, and legacy v1/v2 ledgers retain raw checkpoints for
+compatibility. The ledger also names the run, its start time, operation count,
+a domain-separated digest of the exact stored stream, the audit head it started
+from, and every target's present/absent version at that head. The stream is written first, so a ledger on
 disk always has its operations beside it. Both are removed only after the
 checkpoint has been committed, ledger first, so an interruption while tidying
 up can only leave a stream that claims nothing about committed work and is
@@ -561,6 +568,11 @@ discarded by the next run. A version-1 ledger from an earlier build remains
 recoverable: because it recorded the audit sequence and head but not target
 versions, recovery replays that immutable chain prefix and selects the stream
 targets from the reconstructed state rather than adopting current bytes.
+
+This protection is deliberately scoped to schema-marked record values and the
+interrupted stream that transports them. Durable checkpoints under
+`.cr/sync/state/` and adapter stderr are ordinary operational output and remain
+plaintext; adapters must not place secrets in either one.
 
 A ledger on disk is therefore the single fact that separates "a run finished" from "a run stopped somewhere in the middle". `cr sync run` refuses to start while one is present, which is what stops a stale checkpoint from being silently replayed. `cr sync recover <name>` completes the run by replaying the recorded stream, which is sound rather than merely convenient: `cr-jsonl-v1` guarantees each target appears at most once, an upsert carries the complete record, and deleting a missing record is a no-op, so a replay commits exactly the operations the interrupted run never reached and appends no event for the rest. The events it appends carry the interrupted run's own ID, so the journal shows one run rather than two.
 

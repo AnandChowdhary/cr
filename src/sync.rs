@@ -26,7 +26,7 @@ use crate::{
     RecordPrecondition,
     audit::record_hash,
     database::validate_component,
-    encryption::{protect_sync_stream, reveal_sync_stream},
+    encryption::{protect_sync_stream, protected_sync_stream_is_well_formed, reveal_sync_stream},
     error::{conflict, is_missing},
     frontmatter::Document,
     paths::{self, EntryKind},
@@ -50,6 +50,9 @@ const SYNC_RUN_FORMAT_VERSION: u32 = 3;
 /// Distinct from every audit domain so a stream digest can never be confused
 /// with an event, record, or change-set hash.
 const SYNC_STREAM_HASH_DOMAIN: &[u8] = b"cr:sync:stream:v1\0";
+/// Domain separator for canonical JSON checkpoint commitments in protected
+/// run ledgers. The values themselves remain only inside the encrypted stream.
+const SYNC_CHECKPOINT_HASH_DOMAIN: &[u8] = b"cr:sync:checkpoint:v1\0";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
 const MAX_TIMEOUT_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -158,32 +161,72 @@ pub(crate) struct InterruptedSyncRun {
 
 /// One side of a run ledger's checkpoint pair.
 ///
-/// Stored as an explicit flag beside the value rather than as a JSON `null`,
-/// because `null` is itself a checkpoint an adapter may legitimately emit and
-/// "no checkpoint" has to stay distinguishable from "the checkpoint is null".
+/// V1/v2 ledgers retain `state` for compatibility. Protected v3 ledgers store
+/// only `digest`: the after value is recovered from the authenticated stream,
+/// and both sides can be compared with current state without persisting a
+/// second plaintext copy. `recorded` distinguishes no checkpoint from a JSON
+/// `null` checkpoint in both representations.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredCheckpoint {
     #[serde(default)]
     recorded: bool,
-    #[serde(default)]
-    state: JsonValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    digest: Option<String>,
 }
 
 impl StoredCheckpoint {
-    fn new(state: Option<&JsonValue>) -> Self {
+    fn legacy(state: Option<&JsonValue>) -> Self {
         Self {
             recorded: state.is_some(),
-            state: state.cloned().unwrap_or(JsonValue::Null),
+            state: Some(state.cloned().unwrap_or(JsonValue::Null)),
+            digest: None,
         }
     }
 
-    fn value(&self) -> Option<&JsonValue> {
-        self.recorded.then_some(&self.state)
+    fn protected(state: Option<&JsonValue>) -> Result<Self> {
+        Ok(Self {
+            recorded: state.is_some(),
+            state: None,
+            digest: state.map(checkpoint_hash).transpose()?,
+        })
     }
 
-    fn owned(&self) -> Option<JsonValue> {
-        self.value().cloned()
+    fn validate(&self, version: u32) -> Result<()> {
+        if version == SYNC_RUN_FORMAT_VERSION {
+            let valid = self.state.is_none()
+                && self.recorded == self.digest.is_some()
+                && self.digest.as_deref().is_none_or(valid_sha256_digest);
+            if !valid {
+                return Err(conflict(
+                    "protected sync run checkpoint metadata is invalid",
+                ));
+            }
+        } else if self.digest.is_some() {
+            return Err(conflict("legacy sync run checkpoint metadata is invalid"));
+        }
+        Ok(())
+    }
+
+    fn matches(&self, version: u32, state: Option<&JsonValue>) -> Result<bool> {
+        if version == SYNC_RUN_FORMAT_VERSION {
+            if self.recorded != state.is_some() {
+                return Ok(false);
+            }
+            return match (self.digest.as_deref(), state) {
+                (Some(expected), Some(state)) => Ok(expected == checkpoint_hash(state)?),
+                (None, None) => Ok(true),
+                _ => Ok(false),
+            };
+        }
+        Ok(self.legacy_owned() == state.cloned())
+    }
+
+    fn legacy_owned(&self) -> Option<JsonValue> {
+        self.recorded
+            .then(|| self.state.clone().unwrap_or(JsonValue::Null))
     }
 }
 
@@ -576,16 +619,21 @@ impl Database {
                     },
             )
         })?;
-        let (run_version, stored_stream) = if protected_stream {
+        let (run_version, stored_stream, checkpoint_before, checkpoint_after) = if protected_stream
+        {
             let context = self.ensure_encryption_context()?;
             (
                 SYNC_RUN_FORMAT_VERSION,
                 protect_sync_stream(context.id(), name, &run_id, serialized.as_bytes())?,
+                StoredCheckpoint::protected(current_state.as_ref())?,
+                StoredCheckpoint::protected(checkpoint.as_ref())?,
             )
         } else {
             (
                 LEGACY_SYNC_RUN_FORMAT_VERSION,
                 serialized.as_bytes().to_vec(),
+                StoredCheckpoint::legacy(current_state.as_ref()),
+                StoredCheckpoint::legacy(checkpoint.as_ref()),
             )
         };
         self.write_sync_run(
@@ -601,8 +649,8 @@ impl Database {
                 stream_hash: stream_hash(&stored_stream),
                 audit_sequence: snapshot.audit.head.sequence,
                 audit_head: snapshot.audit.head.hash.clone(),
-                checkpoint_before: StoredCheckpoint::new(current_state.as_ref()),
-                checkpoint_after: StoredCheckpoint::new(checkpoint.as_ref()),
+                checkpoint_before,
+                checkpoint_after,
                 target_versions: stored_target_versions(&expected_versions),
             },
             &stored_stream,
@@ -684,6 +732,16 @@ impl Database {
                 stored.run_id
             )));
         }
+        let stream_checkpoint = final_checkpoint(&messages).cloned();
+        if !stored
+            .checkpoint_after
+            .matches(stored.version, stream_checkpoint.as_ref())?
+        {
+            return Err(conflict(format!(
+                "sync '{name}' run {} checkpoint metadata does not match its operation stream",
+                stored.run_id
+            )));
+        }
         preflight_messages(self, &messages)?;
         let snapshot = self
             .sync_recovery_snapshot(&stored, &messages)
@@ -714,13 +772,17 @@ impl Database {
         }
 
         let current_state = self.sync_state(name)?;
-        let expected_state = stored.checkpoint_before.owned();
+        let before_matches = stored
+            .checkpoint_before
+            .matches(stored.version, current_state.as_ref())?;
         // A run interrupted after its checkpoint landed but before its ledger
         // was cleared is already truthful; replaying it must not treat the
         // committed checkpoint as somebody else's edit.
-        let checkpoint_committed =
-            stored.checkpoint_after.recorded && current_state == stored.checkpoint_after.owned();
-        if !checkpoint_committed && current_state != expected_state {
+        let checkpoint_committed = stored.checkpoint_after.recorded
+            && stored
+                .checkpoint_after
+                .matches(stored.version, current_state.as_ref())?;
+        if !checkpoint_committed && !before_matches {
             return Err(conflict(format!(
                 "sync '{name}' checkpoint changed after its interrupted run {} stopped",
                 stored.run_id
@@ -738,7 +800,7 @@ impl Database {
             },
             true,
         )?;
-        if let Some(state) = stored.checkpoint_after.value()
+        if let Some(state) = stream_checkpoint.as_ref()
             && !checkpoint_committed
         {
             summary.checkpoint_updated = self.write_sync_state(name, state, &current_state)?;
@@ -948,21 +1010,69 @@ impl Database {
         };
         let stored: StoredSyncRun = serde_json::from_str(&serialized)
             .with_context(|| format!("the run ledger for sync '{name}' is not valid JSON"))?;
-        if !matches!(
-            stored.version,
-            1 | LEGACY_SYNC_RUN_FORMAT_VERSION | SYNC_RUN_FORMAT_VERSION
-        ) {
-            return Err(conflict(format!(
-                "the run ledger for sync '{name}' uses unsupported format version {}",
-                stored.version
-            )));
-        }
-        if stored.sync != name || stored.run_id.trim().is_empty() {
-            return Err(conflict(format!(
-                "the run ledger for sync '{name}' does not describe this sync"
-            )));
-        }
+        validate_sync_run_ledger(name, &stored)?;
         Ok(Some(stored))
+    }
+
+    /// Whether a complete, keylessly validated protected run pair still owns
+    /// ciphertext under the current database context.
+    ///
+    /// An orphan stream has no durability claim, and arbitrary malformed JSON
+    /// must not block first-time context creation. A v3 ledger is trusted only
+    /// when its public shape is valid, its exact stream digest matches, and
+    /// that stream is itself a well-formed protected envelope.
+    pub(crate) fn contains_protected_sync_run(&self) -> Result<bool> {
+        let entries = paths::list_directory(
+            self.root(),
+            Path::new(SYNC_RUN_DIRECTORY),
+            "the sync run directory",
+        )?
+        .unwrap_or_default();
+        for entry in entries {
+            if !entry.kind.is_file() {
+                continue;
+            }
+            let Some(file) = entry.name.to_str() else {
+                continue;
+            };
+            let path = Path::new(file);
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_component(name, "sync").is_err() {
+                continue;
+            }
+            let Some(serialized) =
+                paths::read_to_string_optional(self.root(), &sync_run_path(name), SYNC_RUN_LABEL)?
+            else {
+                continue;
+            };
+            let Ok(stored) = serde_json::from_str::<StoredSyncRun>(&serialized) else {
+                continue;
+            };
+            if stored.version != SYNC_RUN_FORMAT_VERSION
+                || validate_sync_run_ledger(name, &stored).is_err()
+            {
+                continue;
+            }
+            let Some(stream) = paths::read_optional(
+                self.root(),
+                &sync_stream_path(name),
+                &sync_stream_label(name),
+            )?
+            else {
+                continue;
+            };
+            if stream_hash(&stream) == stored.stream_hash
+                && protected_sync_stream_is_well_formed(&stream)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Derive an interrupted run's committed progress from the audit chain.
@@ -984,7 +1094,9 @@ impl Database {
             operations: stored.operations,
             events_committed: events.committed,
             checkpoint_pending: stored.checkpoint_after.recorded
-                && self.sync_state(name)? != stored.checkpoint_after.owned(),
+                && !stored
+                    .checkpoint_after
+                    .matches(stored.version, self.sync_state(name)?.as_ref())?,
             foreign_events: !events.foreign.is_empty(),
         })
     }
@@ -1113,9 +1225,53 @@ fn sync_stream_label(name: &str) -> String {
     format!("the recorded operations for sync '{name}'")
 }
 
+fn validate_sync_run_ledger(name: &str, stored: &StoredSyncRun) -> Result<()> {
+    if !matches!(
+        stored.version,
+        1 | LEGACY_SYNC_RUN_FORMAT_VERSION | SYNC_RUN_FORMAT_VERSION
+    ) {
+        return Err(conflict(format!(
+            "the run ledger for sync '{name}' uses unsupported format version {}",
+            stored.version
+        )));
+    }
+    if stored.sync != name || stored.run_id.trim().is_empty() {
+        return Err(conflict(format!(
+            "the run ledger for sync '{name}' does not describe this sync"
+        )));
+    }
+    if !valid_sha256_digest(&stored.stream_hash) {
+        return Err(conflict(format!(
+            "the run ledger for sync '{name}' has an invalid stream digest"
+        )));
+    }
+    stored.checkpoint_before.validate(stored.version)?;
+    stored.checkpoint_after.validate(stored.version)?;
+    Ok(())
+}
+
 /// Bind a run ledger to the exact bytes it promised to apply.
 fn stream_hash(stream: &[u8]) -> String {
     crate::audit::digest(SYNC_STREAM_HASH_DOMAIN, stream)
+}
+
+/// Bind a protected run ledger to canonical JSON checkpoint semantics without
+/// storing the value beside its encrypted stream.
+fn checkpoint_hash(state: &JsonValue) -> Result<String> {
+    let serialized = serde_json::to_vec(state).context("could not serialize sync checkpoint")?;
+    Ok(crate::audit::digest(
+        SYNC_CHECKPOINT_HASH_DOMAIN,
+        &serialized,
+    ))
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 /// Every record a parsed stream writes or deletes.
@@ -1564,8 +1720,8 @@ mod tests {
 
     #[test]
     fn a_run_ledger_tells_a_null_checkpoint_apart_from_no_checkpoint() {
-        let ledger = |checkpoint: Option<&JsonValue>| StoredSyncRun {
-            version: SYNC_RUN_FORMAT_VERSION,
+        let ledger = |version, checkpoint: Option<&JsonValue>| StoredSyncRun {
+            version,
             sync: "test".to_owned(),
             run_id: "abc".to_owned(),
             started: "2026-01-01T00:00:00Z".to_owned(),
@@ -1573,24 +1729,46 @@ mod tests {
             stream_hash: stream_hash(b""),
             audit_sequence: 0,
             audit_head: None,
-            checkpoint_before: StoredCheckpoint::default(),
-            checkpoint_after: StoredCheckpoint::new(checkpoint),
+            checkpoint_before: if version == SYNC_RUN_FORMAT_VERSION {
+                StoredCheckpoint::protected(None).unwrap()
+            } else {
+                StoredCheckpoint::legacy(None)
+            },
+            checkpoint_after: if version == SYNC_RUN_FORMAT_VERSION {
+                StoredCheckpoint::protected(checkpoint).unwrap()
+            } else {
+                StoredCheckpoint::legacy(checkpoint)
+            },
             target_versions: Vec::new(),
         };
-        let round_trip = |checkpoint: Option<&JsonValue>| {
-            let serialized = serde_json::to_string(&ledger(checkpoint)).unwrap();
+        let round_trip = |version, checkpoint: Option<&JsonValue>| {
+            let serialized = serde_json::to_string(&ledger(version, checkpoint)).unwrap();
             let parsed: StoredSyncRun = serde_json::from_str(&serialized).unwrap();
-            parsed.checkpoint_after.owned()
+            assert!(
+                parsed
+                    .checkpoint_after
+                    .matches(version, checkpoint)
+                    .unwrap()
+            );
+            serialized
         };
 
         // A checkpoint of `null` is a checkpoint. Recovery has to commit it,
         // and must not confuse it with an adapter that emitted none at all.
-        assert_eq!(round_trip(Some(&JsonValue::Null)), Some(JsonValue::Null));
-        assert_eq!(round_trip(None), None);
-        assert_eq!(
-            round_trip(Some(&serde_json::json!({"cursor": 1}))),
-            Some(serde_json::json!({"cursor": 1}))
-        );
+        for checkpoint in [
+            None,
+            Some(&JsonValue::Null),
+            Some(&serde_json::json!({"cursor": 1})),
+        ] {
+            let legacy = round_trip(LEGACY_SYNC_RUN_FORMAT_VERSION, checkpoint);
+            assert!(legacy.contains("\"state\""));
+            assert!(!legacy.contains("\"digest\""));
+            let protected = round_trip(SYNC_RUN_FORMAT_VERSION, checkpoint);
+            assert!(!protected.contains("\"state\""));
+            if checkpoint.is_some() {
+                assert!(protected.contains("\"digest\""));
+            }
+        }
     }
 
     #[test]

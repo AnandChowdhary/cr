@@ -1438,7 +1438,7 @@ Stdout is reserved for protocol messages. Send diagnostics and progress to stder
 
 - `upsert` creates the record or completely replaces its front matter and Markdown. It is unchanged when the parsed front matter and exact Markdown body already match.
 - `delete` is idempotent: deleting a missing record counts as unchanged.
-- `checkpoint` is optional, must be the final message, and is stored only after all preceding record operations succeed. It is recorded in the run ledger first, so an interrupted run knows which checkpoint it still owes.
+- `checkpoint` is optional, must be the final message, and is stored only after all preceding record operations succeed. For an encrypted interrupted stream the run ledger retains only its presence and digest; recovery obtains the value from the authenticated stream.
 - A run cannot target the same `collection/id` twice. Every message and every upsert schema is preflighted before the first mutation.
 - Output defaults to 16 MiB and 10,000 messages; the command defaults to a 300-second timeout. `sync create` can lower or raise these within the built-in safety bounds.
 
@@ -1454,6 +1454,12 @@ CR_SYNC_HAS_STATE=true|false
 ```
 
 `CR_SYNC_STATE_PATH` is a read-only-by-convention temporary snapshot containing the previous JSON checkpoint or `null`. Read it to choose an incremental cursor, then emit the next checkpoint; do not modify `.cr/sync/state` yourself.
+
+Checkpoint files under `.cr/sync/state/` are ordinary operational state, not
+schema-marked record values, and are not encrypted by record-value encryption.
+Adapter stderr likewise goes directly to the caller's terminal or job log. Do
+not put credentials or other secrets in checkpoints or stderr; use a secret
+manager or the adapter's protected environment instead.
 
 The command is stored as a program plus an exact argument array, not as a shell command string. Shell expansion, pipes, and redirects only happen when you explicitly register a shell such as `sh scripts/import.sh`. Relative executables containing a path separator are resolved from the database root, and other relative arguments are interpreted from that root.
 
@@ -1473,7 +1479,10 @@ target-version snapshot, and the exact operation stream beside it, under
 committed work. A stream that contains an upsert for an encrypted collection is
 stored as one authenticated ciphertext blob (ledger version 3) bound to the
 database context, sync name, and run ID; recovery therefore requires the
-keyring. Unprotected streams retain the plaintext version-2 format. Recovery
+keyring. Its ledger stores checkpoint presence and domain-separated digests,
+not the before or after checkpoint JSON, so neither logical record operations
+nor the stream's checkpoint appear in plaintext under `.cr/sync/runs/`.
+Unprotected streams retain the plaintext version-2 format. Recovery
 also accepts version-1 ledgers written by earlier builds: it reconstructs their
 missing target snapshot by replaying the immutable audit prefix to the head
 recorded in the ledger. An interrupted run is then a durable fact rather than something to infer:
