@@ -60,6 +60,16 @@ thread_local! {
     static VERIFY_CHAIN_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
+#[cfg(test)]
+pub(crate) fn reset_verify_chain_calls() {
+    VERIFY_CHAIN_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn verify_chain_calls() -> usize {
+    VERIFY_CHAIN_CALLS.with(Cell::get)
+}
+
 /// Where the tamper-evident journal lives beneath the database root.
 const SEGMENT_DIRECTORY: &str = ".cr/audit/segments";
 const PENDING_PATH: &str = ".cr/audit/pending.json";
@@ -601,6 +611,7 @@ struct StoredLine {
     payload: Box<RawValue>,
 }
 
+#[derive(Clone)]
 struct ChainState {
     entries: u64,
     head_hash: Option<String>,
@@ -688,6 +699,21 @@ pub(crate) struct AuditedRecordState {
 pub(crate) type AuditedRecordStates = HashMap<(String, String), AuditedRecordState>;
 pub(crate) type VerifiedRecordHashes = HashMap<(String, String), Option<String>>;
 
+/// One fully verified journal generation retained across a locked bulk
+/// reconciliation. The chain cursor advances only through entries this same
+/// snapshot validates and appends, so callers do not need to replay all prior
+/// events between independent records in one `save` operation.
+pub(crate) struct ReconciliationSnapshot {
+    pub states: AuditedRecordStates,
+    chain: ChainState,
+}
+
+impl ReconciliationSnapshot {
+    pub fn sequence(&self) -> u64 {
+        self.chain.entries
+    }
+}
+
 impl<'a> AuditLog<'a> {
     pub fn new(
         root: &'a Path,
@@ -763,8 +789,34 @@ impl<'a> AuditLog<'a> {
         })
     }
 
-    pub fn prepare_reconciled(&self, mutation: ReconciledMutation<'_>) -> Result<PreparedEntry> {
-        let (audited_state, chain) = self.record_state(mutation.collection, mutation.id)?;
+    /// Capture one verified generation for a locked multi-record filesystem
+    /// reconciliation.
+    pub(crate) fn reconciliation_snapshot(&self) -> Result<ReconciliationSnapshot> {
+        let (states, chain) = self.states(false)?;
+        self.verify_legacy_representation_heads(&states)?;
+        Ok(ReconciliationSnapshot { states, chain })
+    }
+
+    /// Prepare one filesystem event against a caller-retained verified
+    /// generation instead of replaying the journal again for this record.
+    pub(crate) fn prepare_reconciled_in(
+        &self,
+        mutation: ReconciledMutation<'_>,
+        snapshot: &ReconciliationSnapshot,
+    ) -> Result<PreparedEntry> {
+        let audited_state = snapshot
+            .states
+            .get(&(mutation.collection.to_owned(), mutation.id.to_owned()))
+            .map(|state| state.hash.clone());
+        self.prepare_reconciled_from_state(mutation, audited_state, snapshot.chain.clone())
+    }
+
+    fn prepare_reconciled_from_state(
+        &self,
+        mutation: ReconciledMutation<'_>,
+        audited_state: Option<Option<String>>,
+        chain: ChainState,
+    ) -> Result<PreparedEntry> {
         let before_hash = mutation.before_hash.map(str::to_owned);
         let expected_state = mutation.had_history.then_some(before_hash.clone());
         if audited_state != expected_state {
@@ -922,7 +974,22 @@ impl<'a> AuditLog<'a> {
         )
     }
 
-    pub fn accept(&self, entry: PreparedEntry, target: &Path) -> Result<AuditEntry> {
+    /// Accept one event while advancing the verified generation held by a
+    /// locked bulk save. Direct filesystem tampering is still checked against
+    /// the exact prepared hash, and the on-disk tail must still match the
+    /// retained chain cursor before the append is published.
+    pub(crate) fn accept_reconciled_in(
+        &self,
+        entry: PreparedEntry,
+        target: &Path,
+        snapshot: &mut ReconciliationSnapshot,
+    ) -> Result<AuditEntry> {
+        let result = self.validate_accepted_entry(&entry, target)?;
+        self.append_in_snapshot(&entry, snapshot)?;
+        Ok(result)
+    }
+
+    fn validate_accepted_entry(&self, entry: &PreparedEntry, target: &Path) -> Result<AuditEntry> {
         let target = target.to_path_buf();
         validate_relative_target(&target)?;
         let expected_target = self
@@ -947,7 +1014,6 @@ impl<'a> AuditLog<'a> {
             hash: entry.hash.clone(),
             payload: entry.parsed.clone(),
         };
-        self.append(&entry)?;
         Ok(result)
     }
 
@@ -1245,6 +1311,22 @@ impl<'a> AuditLog<'a> {
         &self,
         expected_head: Option<&str>,
     ) -> Result<(AuditVerification, VerifiedRecordHashes)> {
+        let (verification, latest) = self.verify_with_record_states(expected_head)?;
+        let latest_hashes = latest
+            .iter()
+            .map(|(record, state)| (record.clone(), state.hash.clone()))
+            .collect::<HashMap<_, _>>();
+        Ok((verification, latest_hashes))
+    }
+
+    /// Verify and retain complete replayed record state from the exact same
+    /// journal generation. Sync staging needs both hashes and authenticated
+    /// encryption ownership for logical reads; returning the replay avoids a
+    /// second full pass for every existing target.
+    pub(crate) fn verify_with_record_states(
+        &self,
+        expected_head: Option<&str>,
+    ) -> Result<(AuditVerification, AuditedRecordStates)> {
         let (latest, state) = self.states(true)?;
         self.verify_legacy_representation_heads(&latest)?;
 
@@ -1276,7 +1358,7 @@ impl<'a> AuditLog<'a> {
                 },
                 anchor,
             },
-            latest_hashes,
+            latest,
         ))
     }
 
@@ -1593,15 +1675,24 @@ impl<'a> AuditLog<'a> {
         // Recheck the complete journal immediately before publishing. Normal
         // mutation preparation already refuses a reused identity, but append
         // is also reached by pending recovery and must be safe on its own.
-        let (_, mut chain) = self.states(false)?;
-        register_idempotency_identity(&mut chain.idempotency_identities, &entry.parsed)?;
+        let (states, chain) = self.states(false)?;
+        let mut snapshot = ReconciliationSnapshot { states, chain };
+        self.append_in_snapshot(entry, &mut snapshot)
+    }
+
+    fn append_in_snapshot(
+        &self,
+        entry: &PreparedEntry,
+        snapshot: &mut ReconciliationSnapshot,
+    ) -> Result<()> {
+        register_idempotency_identity(&mut snapshot.chain.idempotency_identities, &entry.parsed)?;
         let head = self.load_head()?;
-        let expected_sequence = head
-            .as_ref()
-            .map_or(1, |head| head.entry.payload.sequence + 1);
-        let expected_previous = head.as_ref().map(|head| head.entry.hash.as_str());
-        if entry.parsed.sequence != expected_sequence
-            || entry.parsed.previous_hash.as_deref() != expected_previous
+        let disk_sequence = head.as_ref().map_or(0, |head| head.entry.payload.sequence);
+        let disk_hash = head.as_ref().map(|head| head.entry.hash.as_str());
+        if disk_sequence != snapshot.chain.entries
+            || disk_hash != snapshot.chain.head_hash.as_deref()
+            || entry.parsed.sequence != snapshot.chain.entries + 1
+            || entry.parsed.previous_hash != snapshot.chain.head_hash
         {
             bail!("audit event does not extend the current chain head");
         }
@@ -1615,6 +1706,11 @@ impl<'a> AuditLog<'a> {
         if event_hash(entry.payload.as_bytes()) != entry.hash {
             bail!("audit event hash does not match its payload");
         }
+        let result = AuditEntry {
+            hash: entry.hash.clone(),
+            payload: entry.parsed.clone(),
+        };
+        replay_entry(&mut snapshot.states, &result)?;
 
         let line = stored_line(&entry.hash, &entry.payload)?;
         match head {
@@ -1656,7 +1752,10 @@ impl<'a> AuditLog<'a> {
             &entry.hash,
             &entry.parsed.timestamp,
         ))
-        .context("the audit event was committed but the audit anchor could not be updated")
+        .context("the audit event was committed but the audit anchor could not be updated")?;
+        snapshot.chain.entries = entry.parsed.sequence;
+        snapshot.chain.head_hash = Some(entry.hash.clone());
+        Ok(())
     }
 
     fn load_head(&self) -> Result<Option<LoadedHead>> {
@@ -2652,6 +2751,7 @@ mod tests {
         parse_line, record_hash, stored_line,
     };
     use crate::{
+        Assignment, Database,
         attribution::{
             AgentEvidence, Attribution, AuditAgent, AuditAuthorization, AuditIntent,
             AuditIntentPart, AuthorizationMode, IntentAuthor,
@@ -3160,22 +3260,28 @@ mod tests {
         };
         let accepted_raw = accepted.render().unwrap();
         std::fs::write(root.path().join(target), &accepted_raw).unwrap();
+        let mut snapshot = audit.reconciliation_snapshot().unwrap();
         let event = audit
-            .prepare_reconciled(ReconciledMutation {
-                action: AuditAction::Update,
-                collection: "items",
-                id: "one",
-                before_document: Some(&original),
-                after_document: Some(&accepted),
-                before_hash: Some(&record_hash(original_raw.as_bytes())),
-                after_bytes: Some(accepted_raw.as_bytes()),
-                had_history: true,
-                message: None,
-                access: None,
-            })
+            .prepare_reconciled_in(
+                ReconciledMutation {
+                    action: AuditAction::Update,
+                    collection: "items",
+                    id: "one",
+                    before_document: Some(&original),
+                    after_document: Some(&accepted),
+                    before_hash: Some(&record_hash(original_raw.as_bytes())),
+                    after_bytes: Some(accepted_raw.as_bytes()),
+                    had_history: true,
+                    message: None,
+                    access: None,
+                },
+                &snapshot,
+            )
             .unwrap();
         std::fs::write(root.path().join(target), "---\n---\nChanged again\n").unwrap();
-        let error = audit.accept(event, target).unwrap_err();
+        let error = audit
+            .accept_reconciled_in(event, target, &mut snapshot)
+            .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -3255,6 +3361,32 @@ mod tests {
         );
         assert!(history.encryption_transitions.is_empty());
         assert_eq!(verify_calls, 1);
+    }
+
+    #[test]
+    fn bulk_save_preview_and_apply_share_one_verified_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::init(root.path().join("database"))
+            .unwrap()
+            .with_actor("tester@example.com")
+            .unwrap();
+        for id in ["one", "two", "three"] {
+            let assignment: Assignment = format!("value=before-{id}").parse().unwrap();
+            database.create("items", id, &[assignment], "").unwrap();
+            let path = database.root().join(format!("records/items/{id}.md"));
+            let raw = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, raw.replace("before-", "after-")).unwrap();
+        }
+
+        VERIFY_CHAIN_CALLS.with(|calls| calls.set(0));
+        let previews = database.preview_save(&[], true, None).unwrap();
+        assert_eq!(previews.len(), 3);
+        assert_eq!(VERIFY_CHAIN_CALLS.with(Cell::get), 1);
+
+        VERIFY_CHAIN_CALLS.with(|calls| calls.set(0));
+        let entries = database.save(&[], true, None).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(VERIFY_CHAIN_CALLS.with(Cell::get), 1);
     }
 
     #[test]

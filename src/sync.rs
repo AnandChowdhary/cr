@@ -822,14 +822,16 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        let (verification, audited_versions) = audit.verify_with_record_hashes(None)?;
+        let (verification, audited_states) = audit.verify_with_record_states(None)?;
         if &verification.head != expected_head {
             bail!("database audit head changed while the sync command was running");
         }
         let versions = message_targets(messages)
             .into_iter()
             .map(|target| {
-                let version = audited_versions.get(&target).cloned().flatten();
+                let version = audited_states
+                    .get(&target)
+                    .and_then(|state| state.hash.clone());
                 (target, version)
             })
             .collect::<BTreeMap<_, _>>();
@@ -850,7 +852,7 @@ impl Database {
             else {
                 continue;
             };
-            let record = self.get(collection, id)?;
+            let record = self.get_with_audited_states(collection, id, &audited_states)?;
             if &record.version != expected {
                 bail!("database record changed while the sync command was running");
             }
@@ -956,29 +958,25 @@ impl Database {
                     if let Some(version) = expected {
                         let precondition = RecordPrecondition::version(version.to_owned())?
                             .at_audit_sequence(audit_sequence);
-                        match sync_database.get_optional(&collection, &id)? {
-                            Some(record)
-                                if record.attributes == front_matter && record.body == markdown =>
-                            {
-                                sync_database.assert_record_version(
-                                    &collection,
-                                    &id,
-                                    Some(version),
-                                    audit_sequence,
-                                )?;
-                                summary.unchanged += 1;
-                            }
-                            _ => {
-                                sync_database.replace_conditionally(
-                                    &collection,
-                                    &id,
-                                    front_matter,
-                                    &markdown,
-                                    Some(&precondition),
-                                )?;
-                                summary.updated += 1;
-                                audit_sequence += 1;
-                            }
+                        if sync_database.record_matches_logical_at_audit_sequence(
+                            &collection,
+                            &id,
+                            &front_matter,
+                            &markdown,
+                            version,
+                            audit_sequence,
+                        )? {
+                            summary.unchanged += 1;
+                        } else {
+                            sync_database.replace_conditionally(
+                                &collection,
+                                &id,
+                                front_matter,
+                                &markdown,
+                                Some(&precondition),
+                            )?;
+                            summary.updated += 1;
+                            audit_sequence += 1;
                         }
                     } else {
                         sync_database.create_record_at_audit_sequence(
@@ -1731,6 +1729,62 @@ const fn default_max_operations() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_staging_replays_once_and_each_unchanged_apply_read_binds_one_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::init(root.path().join("database"))
+            .unwrap()
+            .with_actor("tester@example.com")
+            .unwrap();
+        let mut messages = Vec::new();
+        for id in ["one", "two", "three"] {
+            let assignment: crate::Assignment = format!("value={id}").parse().unwrap();
+            database.create("items", id, &[assignment], "body").unwrap();
+            let mut front_matter = Mapping::new();
+            front_matter.insert("value".into(), id.into());
+            messages.push(SyncMessage::Upsert {
+                collection: "items".to_owned(),
+                id: id.to_owned(),
+                front_matter,
+                markdown: "body".to_owned(),
+            });
+        }
+        let head = database.audit_head().unwrap();
+
+        crate::audit::reset_verify_chain_calls();
+        let snapshot = database
+            .sync_application_snapshot(&messages, &head)
+            .unwrap();
+        assert_eq!(crate::audit::verify_chain_calls(), 1);
+
+        let definition = SyncDefinition {
+            name: "test".to_owned(),
+            version: SYNC_FORMAT_VERSION,
+            command: vec!["true".to_owned()],
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_operations: DEFAULT_MAX_OPERATIONS,
+            actor: None,
+            agent: None,
+        };
+        crate::audit::reset_verify_chain_calls();
+        let result = database
+            .apply_sync_messages(
+                "test",
+                "run",
+                &definition,
+                messages,
+                SyncExpectedState {
+                    versions: &snapshot.versions,
+                    audit_sequence: snapshot.audit.head.sequence,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(result.unchanged, 3);
+        assert_eq!(crate::audit::verify_chain_calls(), 3);
+    }
 
     #[test]
     fn protocol_rejects_duplicates_and_messages_after_checkpoint() {

@@ -1901,10 +1901,37 @@ impl Database {
     }
 
     pub fn get(&self, collection: &str, id: &str) -> Result<Record> {
+        self.get_with_optional_audited_states(collection, id, None)
+    }
+
+    /// Read one record using replay state already verified under the caller's
+    /// audit lock. Sync staging uses this to bind logical projection and record
+    /// hashes to the same adapter-head snapshot without replaying per target.
+    pub(crate) fn get_with_audited_states(
+        &self,
+        collection: &str,
+        id: &str,
+        audited_states: &AuditedRecordStates,
+    ) -> Result<Record> {
+        self.get_with_optional_audited_states(collection, id, Some(audited_states))
+    }
+
+    fn get_with_optional_audited_states(
+        &self,
+        collection: &str,
+        id: &str,
+        audited_states: Option<&AuditedRecordStates>,
+    ) -> Result<Record> {
         self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
         let path = self.record_path(collection, id)?;
         let raw = self.read_record(collection, id, &path)?;
-        let document = self.parse_logical_record(collection, id, &raw)?;
+        let stored = parse_record(collection, id, &raw)?;
+        let document = match audited_states {
+            Some(states) => {
+                self.reveal_document_with_audited_states(collection, id, &stored, Some(states))?
+            }
+            None => self.reveal_document(collection, id, &stored)?,
+        };
         Ok(record_from_document(
             collection,
             id,
@@ -1983,6 +2010,44 @@ impl Database {
         Err(precondition_failed(format!(
             "record {collection}/{id} changed since the expected version"
         )))
+    }
+
+    /// Compare one sync target's logical value while holding the audit lock
+    /// that proves both its record version and complete journal generation.
+    /// This replaces a read followed by a separate generation assertion, whose
+    /// empty-policy projection otherwise replayed the chain once more and left
+    /// a race window between the two observations.
+    pub(crate) fn record_matches_logical_at_audit_sequence(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        body: &str,
+        expected_version: &str,
+        expected_audit_sequence: u64,
+    ) -> Result<bool> {
+        let precondition = RecordPrecondition::version(expected_version.to_owned())?;
+        let path = self.record_path(collection, id)?;
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let snapshot = audit.reconciliation_snapshot()?;
+        if snapshot.sequence() != expected_audit_sequence {
+            return Err(precondition_failed(
+                "database changed since the expected audit generation",
+            ));
+        }
+        self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
+        let raw = self.read_record_for_mutation(collection, id, &path, Some(&precondition))?;
+        precondition.assert_matches(collection, id, &record_hash(raw.as_bytes()))?;
+        let stored = parse_record(collection, id, &raw)?;
+        let logical = self.reveal_document_with_audited_states(
+            collection,
+            id,
+            &stored,
+            Some(&snapshot.states),
+        )?;
+        Ok(&logical.attributes == attributes && logical.body == body)
     }
 
     pub fn list(&self, collection: &str, filters: &[Assignment]) -> Result<Vec<Record>> {
@@ -2974,8 +3039,8 @@ impl Database {
         if all {
             self.authorize_owner(&AccessResource::Database)?;
         }
-        let states = audit.record_states()?;
-        let changes = self.working_changes_from_states(&states)?;
+        let mut snapshot = audit.reconciliation_snapshot()?;
+        let changes = self.working_changes_from_states(&snapshot.states)?;
         let available: BTreeMap<_, _> = changes
             .into_iter()
             .map(|change| ((change.collection.clone(), change.id.clone()), change))
@@ -3001,7 +3066,7 @@ impl Database {
         for change in &selected_changes {
             reject_users_mutation(&change.collection)?;
             let key = (change.collection.clone(), change.id.clone());
-            let prior = states.get(&key);
+            let prior = snapshot.states.get(&key);
             let before = prior
                 .and_then(|state| state.document.as_ref())
                 .map(Document::from_audit_value)
@@ -3021,7 +3086,7 @@ impl Database {
                     &change.collection,
                     &change.id,
                     document,
-                    Some(&states),
+                    Some(&snapshot.states),
                 )?;
                 self.encryption_policy(&change.collection)?
                     .validate_logical_for_write(&logical, before.as_ref())?;
@@ -3054,19 +3119,25 @@ impl Database {
         // the first one, so `save --all` can never commit a prefix and then
         // return an error while formatting its response.
         for (change, before, after, after_raw, action, decision) in &prepared {
-            let event = audit.prepare_reconciled(ReconciledMutation {
-                action: action.clone(),
-                collection: &change.collection,
-                id: &change.id,
-                before_document: before.as_ref(),
-                after_document: after.as_ref(),
-                before_hash: change.audited_hash.as_deref(),
-                after_bytes: after_raw.as_deref().map(str::as_bytes),
-                had_history: states.contains_key(&(change.collection.clone(), change.id.clone())),
-                message,
-                access: decision.as_ref(),
-            })?;
-            let preview = self.reveal_preview(event.into_preview())?;
+            let event = audit.prepare_reconciled_in(
+                ReconciledMutation {
+                    action: action.clone(),
+                    collection: &change.collection,
+                    id: &change.id,
+                    before_document: before.as_ref(),
+                    after_document: after.as_ref(),
+                    before_hash: change.audited_hash.as_deref(),
+                    after_bytes: after_raw.as_deref().map(str::as_bytes),
+                    had_history: snapshot
+                        .states
+                        .contains_key(&(change.collection.clone(), change.id.clone())),
+                    message,
+                    access: decision.as_ref(),
+                },
+                &snapshot,
+            )?;
+            let preview =
+                self.reveal_preview_with_audited_states(event.into_preview(), &snapshot.states)?;
             if mode == MutationMode::Preview {
                 previews.push(preview);
             } else {
@@ -3081,19 +3152,24 @@ impl Database {
         for ((change, before, after, after_raw, action, decision), changes) in
             prepared.into_iter().zip(projected_changes)
         {
-            let event = audit.prepare_reconciled(ReconciledMutation {
-                action,
-                collection: &change.collection,
-                id: &change.id,
-                before_document: before.as_ref(),
-                after_document: after.as_ref(),
-                before_hash: change.audited_hash.as_deref(),
-                after_bytes: after_raw.as_deref().map(str::as_bytes),
-                had_history: states.contains_key(&(change.collection.clone(), change.id.clone())),
-                message,
-                access: decision.as_ref(),
-            })?;
-            let mut entry = audit.accept(event, &change.path)?;
+            let event = audit.prepare_reconciled_in(
+                ReconciledMutation {
+                    action,
+                    collection: &change.collection,
+                    id: &change.id,
+                    before_document: before.as_ref(),
+                    after_document: after.as_ref(),
+                    before_hash: change.audited_hash.as_deref(),
+                    after_bytes: after_raw.as_deref().map(str::as_bytes),
+                    had_history: snapshot
+                        .states
+                        .contains_key(&(change.collection.clone(), change.id.clone())),
+                    message,
+                    access: decision.as_ref(),
+                },
+                &snapshot,
+            )?;
+            let mut entry = audit.accept_reconciled_in(event, &change.path, &mut snapshot)?;
             entry.payload.changes = changes;
             entries.push(entry);
         }
@@ -3658,9 +3734,21 @@ impl Database {
         Ok(protected.document)
     }
 
-    fn reveal_preview(&self, mut preview: ChangePreview) -> Result<ChangePreview> {
-        let policy = self.encryption_policy(&preview.record.collection)?;
+    fn reveal_preview(&self, preview: ChangePreview) -> Result<ChangePreview> {
         let states = self.audit().record_states()?;
+        self.reveal_preview_with_audited_states(preview, &states)
+    }
+
+    /// Project a preview through storage encryption using one already verified
+    /// replay state. Bulk save prepares every independent preview against the
+    /// same locked journal head, so replaying that head again for each record
+    /// adds no integrity and makes `save --all` quadratic in audit history.
+    fn reveal_preview_with_audited_states(
+        &self,
+        mut preview: ChangePreview,
+        states: &AuditedRecordStates,
+    ) -> Result<ChangePreview> {
+        let policy = self.encryption_policy(&preview.record.collection)?;
         let current = states
             .get(&(preview.record.collection.clone(), preview.record.id.clone()))
             .and_then(|state| state.document.as_ref());
