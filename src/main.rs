@@ -327,6 +327,9 @@ enum Command {
     },
 
     /// Update a record's front matter and optionally its Markdown body.
+    ///
+    /// In `users`, ordinary updates are limited to `profile.*` and the target
+    /// principal's own `name`; lifecycle and access fields stay managed.
     Update {
         collection: String,
         id: String,
@@ -528,29 +531,36 @@ enum UserCommand {
         json: bool,
     },
 
-    /// Update identity fields or application-owned profile data without changing access grants.
+    /// Update permitted identity fields or profile data without changing access grants.
     Update {
+        /// Principal to update. Active principals may update their own name and profile.
         id: String,
 
+        /// Set the display name. Self-service for the target principal; otherwise owner-only.
         #[arg(long)]
         name: Option<String>,
 
+        /// Set the managed email field. Owner-only.
         #[arg(long, conflicts_with = "clear_email")]
         email: Option<String>,
 
+        /// Clear the managed email field. Owner-only.
         #[arg(long, conflicts_with = "email")]
         clear_email: bool,
 
+        /// Set the managed principal kind. Owner-only.
         #[arg(long, value_enum, conflicts_with = "service")]
         kind: Option<UserKindArg>,
 
+        /// Set the managed principal kind to service. Owner-only.
         #[arg(long, conflicts_with = "kind")]
         service: bool,
 
+        /// Set the managed lifecycle status. Owner-only.
         #[arg(long, value_enum)]
         status: Option<UserStatusArg>,
 
-        /// Set an application-owned profile field using KEY=YAML.
+        /// Set profile data using KEY=YAML. Self-service, or allowed by an editor grant.
         #[arg(short = 's', long = "set", value_name = "KEY=YAML")]
         profile: Vec<Assignment>,
 

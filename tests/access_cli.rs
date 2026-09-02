@@ -63,7 +63,7 @@ fn access_init_creates_a_fixed_schema_audited_owner_record() {
             "--set",
             "status=disabled",
         ]))
-        .contains("managed through 'cr user' and 'cr access'")
+        .contains("may change only profile.*")
     );
     run_success(as_principal(&database, OWNER).args(["audit", "verify"]));
 }

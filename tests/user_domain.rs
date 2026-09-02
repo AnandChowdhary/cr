@@ -1,8 +1,8 @@
-use std::fs;
+use std::{fs, str::FromStr};
 
 use cr::{
-    AccessResource, AuditFilter, Database, Role, UserEnsureOutcome, UserKind, UserStatus,
-    UserUpdate,
+    AccessDecisionBasis, AccessResource, Assignment, AuditFilter, Database, Role,
+    UserEnsureOutcome, UserKind, UserStatus, UserUpdate,
 };
 use yaml_serde::{Mapping, Value};
 
@@ -333,4 +333,208 @@ fn restore_uses_audited_authority_and_reproduces_the_exact_policy_file() {
     database.restore_user("manager@example.com").unwrap();
     assert_eq!(fs::read_to_string(&manager_path).unwrap(), original_manager);
     database.audit_verify(None).unwrap();
+}
+
+#[test]
+fn profile_updates_use_ordinary_editor_grants_and_self_service_stays_narrow() {
+    let (_temporary, database) = database("profile-access");
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    for (id, name) in [
+        ("agent@example.com", "Agent"),
+        ("person@example.com", "Person"),
+    ] {
+        database
+            .add_user(id, name, Some(id), UserKind::Human)
+            .unwrap();
+    }
+    database
+        .grant_access(
+            "agent@example.com",
+            AccessResource::collection("users"),
+            Role::Editor,
+        )
+        .unwrap();
+
+    let agent = database.impersonate("agent@example.com").unwrap();
+    agent
+        .update_user(
+            "person@example.com",
+            UserUpdate {
+                profile_assignments: vec![Assignment::from_str("remembered_by=agent").unwrap()],
+                ..UserUpdate::default()
+            },
+        )
+        .unwrap();
+    agent
+        .update(
+            "users",
+            "person@example.com",
+            &[Assignment::from_str("profile.context.team=platform").unwrap()],
+            None,
+        )
+        .unwrap();
+    let mut nested_profile = Mapping::new();
+    nested_profile.insert(
+        Value::String("temporary".into()),
+        Value::Mapping(profile("temporary")),
+    );
+    let mut patch = Mapping::new();
+    patch.insert(
+        Value::String("profile".into()),
+        Value::Mapping(nested_profile),
+    );
+    agent
+        .patch("users", "person@example.com", &patch, &[], None)
+        .unwrap();
+    agent
+        .patch(
+            "users",
+            "person@example.com",
+            &Mapping::new(),
+            &["profile.temporary".into()],
+            None,
+        )
+        .unwrap();
+
+    let person = database.user("person@example.com").unwrap();
+    assert_eq!(person.name, "Person");
+    assert_eq!(
+        person.profile["remembered_by"],
+        Value::String("agent".into())
+    );
+    assert_eq!(
+        person.profile["context"]["team"],
+        Value::String("platform".into())
+    );
+    assert!(person.profile.get("temporary").is_none());
+    let history = database
+        .audit_recent(10, AuditFilter::record("users", "person@example.com"))
+        .unwrap();
+    let access = history[0].payload.access.as_ref().unwrap();
+    assert_eq!(access.principal, "agent@example.com");
+    assert_eq!(access.action, cr::AccessAction::Update);
+    assert_eq!(access.role, Role::Editor);
+    assert_eq!(access.granted_at, AccessResource::collection("users"));
+    assert_eq!(access.basis, AccessDecisionBasis::Grant);
+    assert!(serde_json::to_value(access).unwrap().get("basis").is_none());
+
+    let before = database.user("person@example.com").unwrap();
+    for update in [
+        UserUpdate {
+            name: Some("Owned by agent".into()),
+            profile_assignments: vec![Assignment::from_str("should_not_land=true").unwrap()],
+            ..UserUpdate::default()
+        },
+        UserUpdate {
+            kind: Some(UserKind::Service),
+            ..UserUpdate::default()
+        },
+        UserUpdate {
+            status: Some(UserStatus::Disabled),
+            ..UserUpdate::default()
+        },
+    ] {
+        let error = agent.update_user("person@example.com", update).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot manage_access database"),
+            "{error:#}"
+        );
+    }
+    assert!(
+        agent
+            .update(
+                "users",
+                "person@example.com",
+                &[Assignment::from_str("name=Owned by agent").unwrap()],
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cannot manage_access database")
+    );
+    let mut forbidden_patch = Mapping::new();
+    forbidden_patch.insert(
+        Value::String("status".into()),
+        Value::String("disabled".into()),
+    );
+    assert!(
+        agent
+            .patch("users", "person@example.com", &forbidden_patch, &[], None,)
+            .unwrap_err()
+            .to_string()
+            .contains("only profile.*")
+    );
+    assert_eq!(database.user("person@example.com").unwrap(), before);
+
+    let person = database.impersonate("person@example.com").unwrap();
+    person
+        .update_user(
+            "person@example.com",
+            UserUpdate {
+                name: Some("Preferred name".into()),
+                profile_assignments: vec![Assignment::from_str("timezone=Europe/Paris").unwrap()],
+                ..UserUpdate::default()
+            },
+        )
+        .unwrap();
+    let current = database.user("person@example.com").unwrap();
+    assert_eq!(current.name, "Preferred name");
+    assert_eq!(
+        current.profile["timezone"],
+        Value::String("Europe/Paris".into())
+    );
+    let history = database
+        .audit_recent(1, AuditFilter::record("users", "person@example.com"))
+        .unwrap();
+    let access = history[0].payload.access.as_ref().unwrap();
+    assert_eq!(access.basis, AccessDecisionBasis::SelfService);
+    assert_eq!(
+        serde_json::to_value(access).unwrap()["basis"],
+        "self_service"
+    );
+    assert_eq!(access.role, Role::Editor);
+    assert_eq!(
+        access.granted_at,
+        AccessResource::record("users", "person@example.com")
+    );
+    assert_eq!(
+        access.impersonated_by.as_ref().unwrap().principal,
+        "owner@example.com"
+    );
+
+    let error = person
+        .update_user(
+            "person@example.com",
+            UserUpdate {
+                email: Some(Some("new@example.com".into())),
+                ..UserUpdate::default()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cannot manage_access database"),
+        "{error:#}"
+    );
+
+    database
+        .update_user(
+            "person@example.com",
+            UserUpdate {
+                status: Some(UserStatus::Disabled),
+                ..UserUpdate::default()
+            },
+        )
+        .unwrap();
+    let error = person
+        .update_user(
+            "person@example.com",
+            UserUpdate {
+                profile_assignments: vec![Assignment::from_str("after_disable=true").unwrap()],
+                ..UserUpdate::default()
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("is not active"), "{error:#}");
 }

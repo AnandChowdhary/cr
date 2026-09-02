@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use cr::{
-    AccessResource, Assignment, AuditFilter, Database, Role, UserKind,
+    AccessDecisionBasis, AccessResource, Assignment, AuditFilter, Database, Role, UserKind,
     server::{ServerConfig, router},
 };
 use http_body_util::BodyExt;
@@ -317,4 +317,133 @@ fn rbac_console_requires_an_owner_and_a_loopback_bind() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("owner-only local console"));
+}
+
+#[tokio::test]
+async fn user_profile_patches_follow_editor_grants_and_self_name_updates() {
+    let (_temporary, database) = seeded_database("user-profile-api");
+    database
+        .grant_access(
+            "editor@example.com",
+            AccessResource::collection("users"),
+            Role::Editor,
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let home = request(&app, Method::GET, "/", None, None, &[]).await;
+    let csrf = csrf(home.text()).to_owned();
+    let selected_editor = request(
+        &app,
+        Method::POST,
+        "/perspective",
+        Some(form(&[
+            ("_csrf", &csrf),
+            ("principal", "editor@example.com"),
+        ])),
+        Some("application/x-www-form-urlencoded"),
+        &[],
+    )
+    .await;
+    let editor_cookie = perspective_cookie(&selected_editor);
+
+    let profile = request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/users/records/reader@example.com",
+        Some(json!({ "front_matter": { "profile": { "source": "slack" } } }).to_string()),
+        Some("application/json"),
+        &[("cookie", &editor_cookie)],
+    )
+    .await;
+    assert_eq!(profile.status, StatusCode::OK, "{}", profile.text());
+    assert_eq!(profile.json()["front_matter"]["profile"]["source"], "slack");
+
+    let reserved = request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/users/records/reader@example.com",
+        Some(
+            json!({
+                "front_matter": {
+                    "name": "Editor chose this",
+                    "profile": { "should_not_land": true }
+                }
+            })
+            .to_string(),
+        ),
+        Some("application/json"),
+        &[("cookie", &editor_cookie)],
+    )
+    .await;
+    assert_eq!(reserved.status, StatusCode::FORBIDDEN);
+    assert_eq!(reserved.json()["error"]["code"], "forbidden");
+    assert!(
+        database
+            .user("reader@example.com")
+            .unwrap()
+            .profile
+            .get("should_not_land")
+            .is_none()
+    );
+
+    let selected_reader = request(
+        &app,
+        Method::POST,
+        "/perspective",
+        Some(form(&[
+            ("_csrf", &csrf),
+            ("principal", "reader@example.com"),
+        ])),
+        Some("application/x-www-form-urlencoded"),
+        &[("cookie", &editor_cookie)],
+    )
+    .await;
+    let reader_cookie = perspective_cookie(&selected_reader);
+    let self_update = request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/users/records/reader@example.com",
+        Some(
+            json!({
+                "front_matter": {
+                    "name": "Preferred Reader",
+                    "profile": { "timezone": "Europe/Amsterdam" }
+                }
+            })
+            .to_string(),
+        ),
+        Some("application/json"),
+        &[("cookie", &reader_cookie)],
+    )
+    .await;
+    assert_eq!(self_update.status, StatusCode::OK, "{}", self_update.text());
+
+    let email = request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/users/records/reader@example.com",
+        Some(json!({ "front_matter": { "email": "changed@example.com" } }).to_string()),
+        Some("application/json"),
+        &[("cookie", &reader_cookie)],
+    )
+    .await;
+    assert_eq!(email.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(email.json()["error"]["code"], "validation_failed");
+
+    let reader = database.user("reader@example.com").unwrap();
+    assert_eq!(reader.name, "Preferred Reader");
+    assert_eq!(reader.email.as_deref(), Some("reader@example.com"));
+    assert_eq!(
+        reader.profile["timezone"],
+        yaml_serde::Value::String("Europe/Amsterdam".into())
+    );
+    let history = database
+        .audit_recent(1, AuditFilter::record("users", "reader@example.com"))
+        .unwrap();
+    let access = history[0].payload.access.as_ref().unwrap();
+    assert_eq!(access.basis, AccessDecisionBasis::SelfService);
+    assert_eq!(
+        access.impersonated_by.as_ref().unwrap().principal,
+        "owner@example.com"
+    );
 }

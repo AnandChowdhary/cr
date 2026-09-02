@@ -8,8 +8,12 @@ use serde_json::Value;
 const OWNER: &str = "Harness <harness@example.com>";
 
 fn as_owner(database: &TestDatabase) -> std::process::Command {
+    as_principal(database, OWNER)
+}
+
+fn as_principal(database: &TestDatabase, actor: &str) -> std::process::Command {
     let mut command = database.command();
-    command.env("CR_ACTOR", OWNER);
+    command.env("CR_ACTOR", actor);
     command
 }
 
@@ -161,4 +165,94 @@ fn restore_repairs_a_drifted_managed_user_file() {
     run_success(as_owner(&database).args(["user", "restore", "worker@example.com", "--json"]));
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
     run_success(as_owner(&database).args(["audit", "verify"]));
+}
+
+#[test]
+fn profile_editors_and_principals_can_use_the_ordinary_cli_without_reserved_field_access() {
+    let database = TestDatabase::new("profile-editor-cli");
+    initialize_service_owner(&database);
+    for (id, name) in [
+        ("agent@example.com", "Agent"),
+        ("person@example.com", "Person"),
+    ] {
+        run_success(as_owner(&database).args(["user", "add", id, "--name", name, "--email", id]));
+    }
+    run_success(as_owner(&database).args([
+        "access",
+        "grant",
+        "agent@example.com",
+        "editor",
+        "collection:users",
+    ]));
+
+    run_success(as_principal(&database, "Agent <agent@example.com>").args([
+        "update",
+        "users",
+        "person@example.com",
+        "--set",
+        "profile.source=slack",
+    ]));
+    run_success(as_principal(&database, "Agent <agent@example.com>").args([
+        "user",
+        "update",
+        "person@example.com",
+        "--set",
+        "summary=Works on platform",
+    ]));
+    let denied = run_failure(as_principal(&database, "Agent <agent@example.com>").args([
+        "user",
+        "update",
+        "person@example.com",
+        "--name",
+        "Agent chose this",
+    ]));
+    assert!(denied.contains("cannot manage_access database"), "{denied}");
+    let denied = run_failure(as_principal(&database, "Agent <agent@example.com>").args([
+        "update",
+        "users",
+        "person@example.com",
+        "--set",
+        "status=disabled",
+    ]));
+    assert!(denied.contains("only profile.*"), "{denied}");
+
+    run_success(
+        as_principal(&database, "Person <person@example.com>").args([
+            "user",
+            "update",
+            "person@example.com",
+            "--name",
+            "Preferred Person",
+            "--set",
+            "timezone=Europe/Amsterdam",
+        ]),
+    );
+    run_success(
+        as_principal(&database, "Person <person@example.com>").args([
+            "update",
+            "users",
+            "person@example.com",
+            "--set",
+            "profile.pronouns=they/them",
+        ]),
+    );
+    let denied = run_failure(
+        as_principal(&database, "Person <person@example.com>").args([
+            "user",
+            "update",
+            "person@example.com",
+            "--service",
+        ]),
+    );
+    assert!(denied.contains("cannot manage_access database"), "{denied}");
+
+    let person = json(as_owner(&database).args(["user", "show", "person@example.com", "--json"]));
+    assert_eq!(person["user"]["name"], "Preferred Person");
+    assert_eq!(person["user"]["kind"], "human");
+    assert_eq!(person["user"]["status"], "active");
+    assert_eq!(person["user"]["email"], "person@example.com");
+    assert_eq!(person["user"]["profile"]["source"], "slack");
+    assert_eq!(person["user"]["profile"]["summary"], "Works on platform");
+    assert_eq!(person["user"]["profile"]["timezone"], "Europe/Amsterdam");
+    assert_eq!(person["user"]["profile"]["pronouns"], "they/them");
 }
