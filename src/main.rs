@@ -4,9 +4,10 @@ use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
     AccessAction, AccessResource, AgentEvidence, Assignment, AttributionOverrides, AuditFilter,
-    CheckReport, CheckScope, Database, FilterExpression, Record, Role, SearchQuery, SearchTarget,
-    SortDirection, SyncAttribution, UserEnsureOutcome, UserKind, UserStatus, UserUpdate,
-    ViewLayout, parse_threshold, sort_records_by_field,
+    CheckReport, CheckScope, Database, DomainError, FilterExpression, Record, Role, SearchQuery,
+    SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions, UserEnsureOutcome, UserKind,
+    UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout, parse_threshold,
+    sort_records_by_field,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -503,6 +504,10 @@ enum UserCommand {
         #[arg(short = 's', long = "set", value_name = "KEY=YAML")]
         profile: Vec<Assignment>,
 
+        /// Reuse an ID whose audited latest state is a deletion tombstone.
+        #[arg(long)]
+        reuse_deleted_id: bool,
+
         #[arg(long)]
         json: bool,
     },
@@ -526,6 +531,10 @@ enum UserCommand {
         /// Set an application-owned profile field using KEY=YAML.
         #[arg(short = 's', long = "set", value_name = "KEY=YAML")]
         profile: Vec<Assignment>,
+
+        /// Reuse an ID whose audited latest state is a deletion tombstone.
+        #[arg(long)]
+        reuse_deleted_id: bool,
 
         #[arg(long)]
         json: bool,
@@ -571,6 +580,22 @@ enum UserCommand {
     /// Restore a manually edited user file to its exact latest audited state.
     Restore {
         id: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Delete a principal while retaining its previous state as an audit tombstone.
+    Delete {
+        id: String,
+
+        /// Confirm the destructive operation.
+        #[arg(long)]
+        yes: bool,
+
+        /// Refuse if the principal has participated in history beyond its own user record.
+        #[arg(long)]
+        if_unused: bool,
 
         #[arg(long)]
         json: bool,
@@ -1263,14 +1288,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 kind,
                 service,
                 profile,
+                reuse_deleted_id,
                 json,
             } => {
-                let record = database.add_user_with_profile(
+                let record = database.add_user_with_options(
                     &id,
                     &name,
                     email.as_deref(),
                     selected_user_kind(kind, service),
                     profile_from_assignments(&profile)?,
+                    UserRegistrationOptions { reuse_deleted_id },
                 )?;
                 print_user_record(&record, json)?;
             }
@@ -1281,14 +1308,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 kind,
                 service,
                 profile,
+                reuse_deleted_id,
                 json,
             } => {
-                let outcome = database.ensure_user(
+                let outcome = database.ensure_user_with_options(
                     &id,
                     &name,
                     email.as_deref(),
                     selected_user_kind(kind, service),
                     profile_from_assignments(&profile)?,
+                    UserRegistrationOptions { reuse_deleted_id },
                 )?;
                 let created = outcome == UserEnsureOutcome::Created;
                 if json {
@@ -1343,6 +1372,26 @@ fn run(cli: Cli) -> Result<ExitCode> {
             UserCommand::Restore { id, json } => {
                 let record = database.restore_user(&id)?;
                 print_user_record(&record, json)?;
+            }
+            UserCommand::Delete {
+                id,
+                yes,
+                if_unused,
+                json,
+            } => {
+                if !yes {
+                    return Err(DomainError::Invalid(
+                        "deleting a user requires --yes to confirm the destructive operation"
+                            .to_owned(),
+                    )
+                    .into());
+                }
+                let record = database.delete_user(&id, UserDeleteOptions { if_unused })?;
+                if json {
+                    print_user_record(&record, true)?;
+                } else {
+                    println!("{}", record.reference());
+                }
             }
             UserCommand::List { json } => {
                 let users = database.users()?;

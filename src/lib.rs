@@ -14,8 +14,8 @@ mod views;
 
 pub use access::{
     AccessAction, AccessDecision, AccessDecisionBasis, AccessGrant, AccessIdentity,
-    Resource as AccessResource, Role, USERS_COLLECTION, User, UserEnsureOutcome, UserKind,
-    UserStatus, UserUpdate, principal_id,
+    Resource as AccessResource, Role, USERS_COLLECTION, User, UserDeleteOptions, UserEnsureOutcome,
+    UserKind, UserRegistrationOptions, UserStatus, UserUpdate, principal_id,
 };
 pub use attribution::{
     AgentEvidence, Attribution, AttributionOverrides, AuditAgent, AuditAuthorization, AuditIntent,

@@ -258,11 +258,11 @@ requires an owner. Access remains on the dedicated grant/revoke path. Requests
 that mix fields use the strongest required authorization before anything is
 written, so an editor cannot smuggle a managed-field change beside a profile
 change. Resource-only access checks cannot predict this field-aware boundary;
-the concrete mutation records the decision actually used. `cr user` and `cr
-access` preserve the fixed schema, prevent an access
+the concrete mutation records the decision actually used. `cr user` and
+`cr access` preserve the fixed schema, prevent an access
 manager from minting ownership or another access manager, and prevent removal
 of the final active database owner. Bootstrap accepts an explicit human or
-service kind. User add/ensure/update operations apply profile assignments and
+service kind. User add/ensure/update/delete operations apply lifecycle and
 identity changes inside the same audit lock as the write; update cannot change
 access grants, and ensure is a create-or-exact-match operation rather than a
 read-then-create race. An owner-only restore reconstructs the exact latest
@@ -274,6 +274,30 @@ exact hash of the user record evaluated. Stored grants omit the default `grant`
 basis for format compatibility; the built-in own-record rule writes
 `self_service`. Legacy and bootstrap events omit the object and retain their
 original bytes.
+
+User deletion is a specialized owner-only use of the same audited delete
+protocol as every other record. Authorization, current-policy checks, final
+active-owner protection, the optional unused-history scan, event preparation,
+and removal all occur under the audit lock. The delete event's absent latest
+document is the durable tombstone; its changes and `before_hash` retain the
+prior user and all outgoing grants. `--if-unused` walks the complete verified
+chain rather than a bounded history page. It treats the effective access
+principal, a canonicalized legacy actor, and an explicit impersonating owner as
+participation, excluding only events for that identity's own `users/ID` record.
+
+Add and ensure distinguish a never-seen ID from a tombstone. Reuse defaults to
+refusal and requires the owner-only `--reuse-deleted-id` acknowledgement, after
+which an ordinary create event starts a fresh active definition with no direct
+grants. Ordinary records retain their existing create-after-delete behavior.
+Direct grants to an absent `record:users/ID` are removed from authorization
+evaluation in memory, without mutating the grant holder in a second non-atomic
+event. Such a grant can become applicable after explicit ID reuse, which is why
+operators replacing a real identity should revoke incoming grants first or use
+a new ID. Audit actors and access decisions are historical values rather than
+foreign keys: replay and verification never require a referenced principal to
+remain live. For the same reason, the own-history shortcut now requires a
+current, active, audited user policy; a deleted principal cannot reclaim its old
+ID merely to read the tombstone.
 
 Authorization happens inside `Database`. Mutations evaluate under the audit
 lock before preparing the event; list and search filter records by `read`; a

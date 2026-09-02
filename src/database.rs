@@ -15,8 +15,8 @@ use crate::{
     AuditVerification, SearchQuery,
     access::{
         AccessAction, AccessDecision, AccessIdentity, Resource as AccessResource, Role,
-        USERS_COLLECTION, User, UserEnsureOutcome, UserKind, UserStatus, UserUpdate, display_name,
-        principal_id, users_schema,
+        USERS_COLLECTION, User, UserDeleteOptions, UserEnsureOutcome, UserKind,
+        UserRegistrationOptions, UserStatus, UserUpdate, display_name, principal_id, users_schema,
     },
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     audit::{AuditFilter, AuditLog, AuditMutation, ChangePreview, ReconciledMutation, record_hash},
@@ -120,6 +120,30 @@ struct AccessRequest {
     owner_only: bool,
     user_fields: bool,
     user_name: bool,
+}
+
+struct CreateRequest {
+    mode: MutationMode,
+    access: Option<AccessRequest>,
+    reuse_deleted_user_id: bool,
+}
+
+impl CreateRequest {
+    fn new(mode: MutationMode, access: Option<AccessRequest>) -> Self {
+        Self {
+            mode,
+            access,
+            reuse_deleted_user_id: false,
+        }
+    }
+
+    fn user_registration(access: AccessRequest, options: UserRegistrationOptions) -> Self {
+        Self {
+            mode: MutationMode::Apply,
+            access: Some(access),
+            reuse_deleted_user_id: options.reuse_deleted_id,
+        }
+    }
 }
 
 impl AccessRequest {
@@ -689,12 +713,23 @@ impl Database {
         if !self.access_enabled()? {
             return Ok(None);
         }
-        let Some((user, policy_hash)) = self.user_unchecked_optional(&self.principal)? else {
+        let Some((mut user, policy_hash)) = self.user_unchecked_optional(&self.principal)? else {
             return Err(forbidden(format!(
                 "principal '{}' is not registered in the users collection",
                 self.principal
             )));
         };
+        if user.access.iter().any(|grant| &grant.resource == resource)
+            && let AccessResource::Record { collection, id } = resource
+            && collection == USERS_COLLECTION
+            && !self.user_record_exists_unchecked(id)?
+        {
+            // A record-scoped grant to a deleted principal must not keep
+            // authorizing a resource that no longer exists. Broader grants
+            // still evaluate normally, and explicit ID reuse is the boundary
+            // at which this resource can exist again.
+            user.access.retain(|grant| &grant.resource != resource);
+        }
         user.decision(&self.principal, &self.actor, action, resource, &policy_hash)
             .map(|mut decision| {
                 decision.impersonated_by = self.impersonated_by.clone();
@@ -707,6 +742,13 @@ impl Database {
                     self.principal
                 ))
             })
+    }
+
+    /// Whether a user record has a materialized file, without parsing or
+    /// otherwise revealing its contents before authorization succeeds.
+    fn user_record_exists_unchecked(&self, id: &str) -> Result<bool> {
+        let path = self.record_path(USERS_COLLECTION, id)?;
+        Ok(paths::entry_kind(&self.root, &path, &record_label(USERS_COLLECTION, id))?.is_some())
     }
 
     /// Authorize an ordinary user-field update, including the built-in rule
@@ -840,8 +882,7 @@ impl Database {
             &self.principal,
             user.attributes()?,
             "",
-            MutationMode::Apply,
-            None,
+            CreateRequest::new(MutationMode::Apply, None),
         )?
         .record()
     }
@@ -865,6 +906,26 @@ impl Database {
         email: Option<&str>,
         kind: UserKind,
         profile: Mapping,
+    ) -> Result<Record> {
+        self.add_user_with_options(
+            id,
+            name,
+            email,
+            kind,
+            profile,
+            UserRegistrationOptions::default(),
+        )
+    }
+
+    /// Register a principal with explicit lifecycle options.
+    pub fn add_user_with_options(
+        &self,
+        id: &str,
+        name: &str,
+        email: Option<&str>,
+        kind: UserKind,
+        profile: Mapping,
+        options: UserRegistrationOptions,
     ) -> Result<Record> {
         if !self.access_enabled()? {
             return Err(conflict(
@@ -891,11 +952,10 @@ impl Database {
             id,
             user.attributes()?,
             "",
-            MutationMode::Apply,
-            Some(AccessRequest::new(
-                AccessAction::ManageAccess,
-                AccessResource::Database,
-            )),
+            CreateRequest::user_registration(
+                AccessRequest::new(AccessAction::ManageAccess, AccessResource::Database),
+                options,
+            ),
         )?
         .record()
     }
@@ -914,6 +974,26 @@ impl Database {
         email: Option<&str>,
         kind: UserKind,
         profile: Mapping,
+    ) -> Result<UserEnsureOutcome> {
+        self.ensure_user_with_options(
+            id,
+            name,
+            email,
+            kind,
+            profile,
+            UserRegistrationOptions::default(),
+        )
+    }
+
+    /// Declaratively ensure a principal with explicit lifecycle options.
+    pub fn ensure_user_with_options(
+        &self,
+        id: &str,
+        name: &str,
+        email: Option<&str>,
+        kind: UserKind,
+        profile: Mapping,
+        options: UserRegistrationOptions,
     ) -> Result<UserEnsureOutcome> {
         if !self.access_enabled()? {
             return Err(conflict(
@@ -963,6 +1043,12 @@ impl Database {
             return Err(conflict(format!(
                 "user '{id}' exists but does not match the requested definition"
             )));
+        }
+        if audit.record_is_tombstoned(USERS_COLLECTION, id)? {
+            if !options.reuse_deleted_id {
+                return Err(user_id_tombstoned(id));
+            }
+            self.authorize_owner(&AccessResource::Database)?;
         }
 
         let document = Document {
@@ -1340,11 +1426,13 @@ impl Database {
             id,
             attributes,
             body,
-            MutationMode::Apply,
-            Some(AccessRequest::new(
-                AccessAction::Create,
-                AccessResource::record(collection, id),
-            )),
+            CreateRequest::new(
+                MutationMode::Apply,
+                Some(AccessRequest::new(
+                    AccessAction::Create,
+                    AccessResource::record(collection, id),
+                )),
+            ),
         )?
         .record()
     }
@@ -1367,11 +1455,13 @@ impl Database {
             id,
             attributes,
             body,
-            MutationMode::Preview,
-            Some(AccessRequest::new(
-                AccessAction::Create,
-                AccessResource::record(collection, id),
-            )),
+            CreateRequest::new(
+                MutationMode::Preview,
+                Some(AccessRequest::new(
+                    AccessAction::Create,
+                    AccessResource::record(collection, id),
+                )),
+            ),
         )?
         .preview()
     }
@@ -1382,9 +1472,13 @@ impl Database {
         id: &str,
         attributes: Mapping,
         body: &str,
-        mode: MutationMode,
-        access: Option<AccessRequest>,
+        request: CreateRequest,
     ) -> Result<MutationOutcome> {
+        let CreateRequest {
+            mode,
+            access,
+            reuse_deleted_user_id,
+        } = request;
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
         let audit = self.audit();
@@ -1416,6 +1510,14 @@ impl Database {
             .flatten();
         if paths::entry_kind(&self.root, &path, &label)?.is_some() {
             return Err(DomainError::record_exists(collection, id).into());
+        }
+        let tombstoned =
+            collection == USERS_COLLECTION && audit.record_is_tombstoned(collection, id)?;
+        if tombstoned {
+            if !reuse_deleted_user_id {
+                return Err(user_id_tombstoned(id));
+            }
+            self.authorize_owner(&AccessResource::Database)?;
         }
         let document = Document {
             attributes,
@@ -1977,15 +2079,47 @@ impl Database {
 
     pub fn delete(&self, collection: &str, id: &str) -> Result<Record> {
         reject_users_mutation(collection)?;
-        self.run_delete(collection, id, MutationMode::Apply)?
-            .record()
+        self.run_delete(
+            collection,
+            id,
+            MutationMode::Apply,
+            AccessRequest::new(AccessAction::Delete, AccessResource::record(collection, id)),
+            false,
+        )?
+        .record()
     }
 
     /// Compute what `delete` would record, without deleting anything.
     pub fn preview_delete(&self, collection: &str, id: &str) -> Result<ChangePreview> {
         reject_users_mutation(collection)?;
-        self.run_delete(collection, id, MutationMode::Preview)?
-            .preview()
+        self.run_delete(
+            collection,
+            id,
+            MutationMode::Preview,
+            AccessRequest::new(AccessAction::Delete, AccessResource::record(collection, id)),
+            false,
+        )?
+        .preview()
+    }
+
+    /// Delete a registered principal while retaining its complete prior state
+    /// in the audit tombstone.
+    pub fn delete_user(&self, id: &str, options: UserDeleteOptions) -> Result<Record> {
+        validate_component(id, "user")?;
+        let canonical = principal_id(id)?;
+        if canonical != id {
+            return Err(invalid(format!(
+                "user ID '{id}' is not canonical; use '{canonical}'"
+            )));
+        }
+        self.run_delete(
+            USERS_COLLECTION,
+            id,
+            MutationMode::Apply,
+            AccessRequest::owner(AccessResource::Database),
+            options.if_unused,
+        )?
+        .record()
     }
 
     fn run_delete(
@@ -1993,6 +2127,8 @@ impl Database {
         collection: &str,
         id: &str,
         mode: MutationMode,
+        access: AccessRequest,
+        if_unused: bool,
     ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -2001,12 +2137,31 @@ impl Database {
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
         }
-        let decision = self.authorize(
-            AccessAction::Delete,
-            &AccessResource::record(collection, id),
-        )?;
+        if access.action == AccessAction::ManageAccess {
+            self.assert_current_principal_policy(&audit)?;
+        }
+        let decision = if access.owner_only {
+            self.authorize_owner(&access.resource)?
+        } else {
+            self.authorize(access.action, &access.resource)?
+        };
         let before_raw = self.read_record(collection, id, &path)?;
         let document = parse_record(collection, id, &before_raw)?;
+        if collection == USERS_COLLECTION {
+            audit.assert_current(collection, id, before_raw.as_bytes())?;
+            let user = User::from_attributes(&document.attributes)?;
+            if user.status == UserStatus::Active
+                && user.is_database_owner()
+                && !self.has_database_owner_other_than(id)?
+            {
+                return Err(conflict("cannot delete the final active database owner"));
+            }
+            if if_unused && audit.principal_has_external_history(id)? {
+                return Err(conflict(format!(
+                    "user '{id}' has been used as an audited principal; omit --if-unused to delete it explicitly"
+                )));
+            }
+        }
         let event = audit.prepare(AuditMutation {
             action: AuditAction::Delete,
             collection,
@@ -2207,7 +2362,21 @@ impl Database {
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         match (filter.collection, filter.id) {
-            (Some(USERS_COLLECTION), Some(id)) if id == self.principal => {}
+            (Some(USERS_COLLECTION), Some(id)) if id == self.principal => {
+                let Some((user, _)) = self.user_unchecked_optional(&self.principal)? else {
+                    return Err(forbidden(format!(
+                        "principal '{}' is not registered in the users collection",
+                        self.principal
+                    )));
+                };
+                if user.status != UserStatus::Active {
+                    return Err(forbidden(format!(
+                        "principal '{}' is not active",
+                        self.principal
+                    )));
+                }
+                self.assert_current_principal_policy(&audit)?;
+            }
             (Some(USERS_COLLECTION), _) => {
                 self.authorize(AccessAction::ReadAccess, &AccessResource::Database)?;
             }
@@ -2723,6 +2892,12 @@ fn validate_users_field_patch(
         ));
     }
     Ok(Some(includes_name))
+}
+
+fn user_id_tombstoned(id: &str) -> anyhow::Error {
+    conflict(format!(
+        "user ID '{id}' was previously deleted; pass --reuse-deleted-id to reuse its audit identity"
+    ))
 }
 
 fn validate_schema_instance(

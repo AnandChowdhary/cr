@@ -256,3 +256,120 @@ fn profile_editors_and_principals_can_use_the_ordinary_cli_without_reserved_fiel
     assert_eq!(person["user"]["profile"]["timezone"], "Europe/Amsterdam");
     assert_eq!(person["user"]["profile"]["pronouns"], "they/them");
 }
+
+#[test]
+fn delete_confirmation_unused_checks_and_tombstone_reuse_are_first_class_cli_contracts() {
+    let database = TestDatabase::new("user-delete-cli");
+    initialize_service_owner(&database);
+    for (id, name) in [
+        ("unused@example.com", "Unused"),
+        ("used@example.com", "Used"),
+    ] {
+        run_success(as_owner(&database).args(["user", "add", id, "--name", name, "--email", id]));
+    }
+
+    let help = run_success(as_owner(&database).args(["user", "delete", "--help"]));
+    assert!(help.contains("--yes"));
+    assert!(help.contains("--if-unused"));
+    let add_help = run_success(as_owner(&database).args(["user", "add", "--help"]));
+    assert!(add_help.contains("--reuse-deleted-id"));
+    let ensure_help = run_success(as_owner(&database).args(["user", "ensure", "--help"]));
+    assert!(ensure_help.contains("--reuse-deleted-id"));
+
+    let missing_confirmation = run_failure(as_owner(&database).args([
+        "--json-errors",
+        "user",
+        "delete",
+        "unused@example.com",
+        "--if-unused",
+    ]));
+    let error: Value = serde_json::from_str(&missing_confirmation).unwrap();
+    assert_eq!(error["error"]["code"], "validation_failed");
+    assert!(
+        database
+            .root()
+            .join("records/users/unused@example.com.md")
+            .exists()
+    );
+
+    let deleted = json(as_owner(&database).args([
+        "user",
+        "delete",
+        "unused@example.com",
+        "--yes",
+        "--if-unused",
+        "--json",
+    ]));
+    assert_eq!(deleted["attributes"]["name"], "Unused");
+    assert!(
+        !database
+            .root()
+            .join("records/users/unused@example.com.md")
+            .exists()
+    );
+
+    let add_error = run_failure(as_owner(&database).args([
+        "--json-errors",
+        "user",
+        "add",
+        "unused@example.com",
+        "--name",
+        "Replacement",
+    ]));
+    let error: Value = serde_json::from_str(&add_error).unwrap();
+    assert_eq!(error["error"]["code"], "conflict");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("previously deleted")
+    );
+    run_success(as_owner(&database).args([
+        "user",
+        "ensure",
+        "unused@example.com",
+        "--name",
+        "Replacement",
+        "--reuse-deleted-id",
+    ]));
+    let replacement =
+        json(as_owner(&database).args(["user", "show", "unused@example.com", "--json"]));
+    assert_eq!(replacement["user"]["name"], "Replacement");
+    assert!(replacement["user"].get("access").is_none());
+
+    run_success(as_owner(&database).args([
+        "access",
+        "grant",
+        "used@example.com",
+        "editor",
+        "collection:deals",
+    ]));
+    run_success(as_owner(&database).args(["create", "deals", "one"]));
+    run_success(as_owner(&database).args([
+        "--as",
+        "used@example.com",
+        "update",
+        "deals",
+        "one",
+        "--set",
+        "stage=won",
+    ]));
+    let used_error = run_failure(as_owner(&database).args([
+        "--json-errors",
+        "user",
+        "delete",
+        "used@example.com",
+        "--yes",
+        "--if-unused",
+    ]));
+    let error: Value = serde_json::from_str(&used_error).unwrap();
+    assert_eq!(error["error"]["code"], "conflict");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("used as an audited principal")
+    );
+    run_success(as_owner(&database).args(["user", "delete", "used@example.com", "--yes"]));
+    run_success(as_owner(&database).args(["audit", "verify"]));
+}

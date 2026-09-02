@@ -183,6 +183,7 @@ below. Use the dedicated commands for lifecycle and policy changes:
 cr user add maria@example.com --name Maria --email maria@example.com --set role=CEO
 cr user ensure nightly@example.com --name Nightly --service --set queue=default
 cr user update maria@example.com --name 'Maria Garcia' --set team=leadership
+cr user delete nightly@example.com --yes --if-unused
 cr access grant maria@example.com editor collection:deals
 cr access grant assistant@example.com editor collection:users
 cr update users maria@example.com --set profile.last_seen=2026-09-02
@@ -211,6 +212,24 @@ audit lock while preserving access grants and the stable ID. If somebody edits
 a managed user Markdown file directly, `user restore ID` reproduces its exact
 latest audited state so `audit verify` can become clean again. Only an audited
 database owner may restore policy files.
+
+`user delete ID --yes` is also owner-only. It removes the materialized user and
+its grants, while the ordinary audited delete event retains the complete prior
+state as the ID's tombstone. The final active database owner cannot be deleted.
+`--if-unused` adds a conservative cleanup guard: CR scans the complete verified
+chain and refuses if that identity was an effective actor or recorded
+impersonator anywhere except its own `users/ID` lifecycle. Omitting the flag is
+the explicit way to delete a historically used, non-final principal.
+
+A tombstoned user ID is not an ordinary missing ID. `user add` and `user ensure`
+refuse to reuse it unless an owner passes `--reuse-deleted-id`, because reuse
+joins both real-world identities under one permanent audit history. The fresh
+user starts active with no grants; historical grants in its deleted state are
+not restored. A direct `record:users/ID` grant held by another user is ignored
+while the target is absent. Explicit reuse makes that record resource exist
+again, so revoke such incoming grants first when the replacement is a different
+person. Historical event actor strings and access decisions remain valid audit
+evidence after deletion and continue to verify without a live user record.
 
 Resources are written as `database`, `collection:NAME`, or
 `record:COLLECTION/ID`. Database grants inherit into every collection and
@@ -1780,12 +1799,13 @@ cr access grant USER ROLE RESOURCE
 cr access revoke USER RESOURCE
 
 cr user add ID --name NAME [--email EMAIL] [--kind human|service | --service]
-            [--set KEY=YAML]... [--json]
+            [--set KEY=YAML]... [--reuse-deleted-id] [--json]
 cr user ensure ID --name NAME [--email EMAIL] [--kind human|service | --service]
-               [--set KEY=YAML]... [--json]
+               [--set KEY=YAML]... [--reuse-deleted-id] [--json]
 cr user update ID [--name NAME] [--email EMAIL | --clear-email]
                [--kind human|service | --service] [--status active|disabled]
                [--set KEY=YAML]... [--json]
+cr user delete ID --yes [--if-unused] [--json]
 cr user restore ID [--json]
 cr user list [--json]
 cr user show [ID] [--json]
