@@ -597,8 +597,12 @@ fn a_damaged_journal_is_reported_without_hiding_the_rest_of_the_database() {
     // Nothing could be reconciled, so no reconciliation findings are invented.
     assert!(run.findings("record_content_mismatch").is_empty());
     assert!(run.findings("missing_record").is_empty());
-    // The data-model checks still ran.
-    assert_eq!(run.findings("dangling_link").len(), 1);
+    // With no trustworthy replay state, an empty-policy record cannot be
+    // projected safely: its mutable syntax cannot prove it was never
+    // protected. The record is still enumerated, but relation checks wait
+    // until ownership can be verified instead of inspecting its values.
+    assert!(run.findings("dangling_link").is_empty());
+    assert_eq!(run.findings("unreadable_record").len(), 1);
 }
 
 #[test]

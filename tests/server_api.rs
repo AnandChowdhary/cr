@@ -962,7 +962,59 @@ async fn raw_document_reads_fail_closed_after_marker_removal_but_keep_legacy_col
         "{}",
         String::from_utf8_lossy(&created.stderr)
     );
+    let created_then_deleted = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["--database"])
+        .arg(database.root())
+        .args([
+            "--actor",
+            "api-reviewer@example.com",
+            "create",
+            "secrets",
+            "two",
+            "--set",
+            "token=deleted-http-private-token",
+        ])
+        .env("CR_ENCRYPTION_ACTIVE_KEY", "old")
+        .env(
+            "CR_ENCRYPTION_KEYS",
+            r#"{"old":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        created_then_deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created_then_deleted.stderr)
+    );
+    let deleted = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["--database"])
+        .arg(database.root())
+        .args([
+            "--actor",
+            "api-reviewer@example.com",
+            "delete",
+            "secrets",
+            "two",
+            "--yes",
+        ])
+        .env("CR_ENCRYPTION_ACTIVE_KEY", "old")
+        .env(
+            "CR_ENCRYPTION_KEYS",
+            r#"{"old":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
     fs::write(&schema_path, r#"{"type":"object"}"#).unwrap();
+    fs::write(
+        database.root().join("records/secrets/two.md"),
+        "---\ntoken: resurrected-http-value\n---\nmanual resurrection\n",
+    )
+    .unwrap();
 
     let legacy_raw = "---\n$cr_encryption:\n  version: 1\n  fields:\n  - - optional\n    - token\n  body: false\ntitle: Legacy\n---\nordinary body\n";
     fs::create_dir_all(database.root().join("records/notes")).unwrap();
@@ -990,17 +1042,24 @@ async fn raw_document_reads_fail_closed_after_marker_removal_but_keep_legacy_col
     assert!(!protected.text().contains("$cr_encrypted"));
     assert!(!protected.text().contains("ciphertext"));
 
-    // The mutable manifest is not the authority. Removing it while leaving
-    // the envelope in place must still fail every logical projection because
-    // verified history records that CR owns this stored shape.
+    // Neither mutable syntax is authoritative. Removing the manifest and the
+    // envelope wrapper must still fail every logical projection because
+    // verified history records that CR owns this storage lifecycle.
     let raw = fs::read_to_string(&record_path).unwrap();
     let raw = raw.strip_prefix("---\n").unwrap();
     let (front_matter, body) = raw.split_once("---\n").unwrap();
     let mut front_matter: yaml_serde::Value = yaml_serde::from_str(front_matter).unwrap();
-    front_matter
+    let front_matter = front_matter.as_mapping_mut().unwrap();
+    front_matter.remove(yaml_serde::Value::String("$cr_encryption".into()));
+    let token = front_matter
+        .get_mut(yaml_serde::Value::String("token".into()))
+        .unwrap();
+    let envelope_fields = token
         .as_mapping_mut()
         .unwrap()
-        .remove(yaml_serde::Value::String("$cr_encryption".into()));
+        .remove(yaml_serde::Value::String("$cr_encrypted".into()))
+        .unwrap();
+    *token = envelope_fields;
     let serialized = yaml_serde::to_string(&front_matter).unwrap();
     let serialized = serialized.strip_prefix("---\n").unwrap_or(&serialized);
     fs::write(&record_path, format!("---\n{serialized}---\n{body}")).unwrap();
@@ -1009,13 +1068,22 @@ async fn raw_document_reads_fail_closed_after_marker_removal_but_keep_legacy_col
         "/api/v1/collections/secrets/records/one",
         "/api/v1/collections/secrets/records/one/fields/token",
         "/api/v1/collections/secrets/records/one/document",
+        "/api/v1/collections/secrets/records/two",
+        "/api/v1/collections/secrets/records/two/fields/token",
+        "/api/v1/collections/secrets/records/two/document",
         "/api/v1/collections/secrets/records?limit=10",
         "/api/v1/search?q=private&collection=secrets&limit=10",
     ] {
         let response = request(&app, Method::GET, uri, None, &[]).await;
         assert_eq!(response.status, StatusCode::CONFLICT, "{uri}");
         assert_eq!(response.json()["error"]["code"], "conflict", "{uri}");
-        for private in ["http-private-token", "$cr_encrypted", "ciphertext", "nonce"] {
+        for private in [
+            "http-private-token",
+            "resurrected-http-value",
+            "$cr_encrypted",
+            "ciphertext",
+            "nonce",
+        ] {
             assert!(
                 !response.text().contains(private),
                 "{uri} exposed {private}: {}",
@@ -1026,7 +1094,13 @@ async fn raw_document_reads_fail_closed_after_marker_removal_but_keep_legacy_col
 
     let view = request(&app, Method::GET, "/secrets", None, &[]).await;
     assert_eq!(view.status, StatusCode::CONFLICT);
-    for private in ["http-private-token", "$cr_encrypted", "ciphertext", "nonce"] {
+    for private in [
+        "http-private-token",
+        "resurrected-http-value",
+        "$cr_encrypted",
+        "ciphertext",
+        "nonce",
+    ] {
         assert!(!view.text().contains(private));
     }
 
@@ -1052,7 +1126,20 @@ async fn raw_document_reads_fail_closed_after_marker_removal_but_keep_legacy_col
                         .contains("stored protected data is no longer declared")
             })
     );
-    for private in ["http-private-token", "$cr_encrypted", "ciphertext", "nonce"] {
+    assert!(
+        check.json()["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| { finding["kind"] == "unreadable_record" && finding["id"] == "two" })
+    );
+    for private in [
+        "http-private-token",
+        "resurrected-http-value",
+        "$cr_encrypted",
+        "ciphertext",
+        "nonce",
+    ] {
         assert!(!check.text().contains(private));
     }
 

@@ -1005,6 +1005,24 @@ ordinary body
             .command()
             .args(["delete", "accounts", "legacy", "--yes"]),
     );
+
+    // An ordinary tombstone carries no protected-storage ownership. A dirty
+    // materialization at the same ID therefore remains ordinary while the
+    // collection still has no encryption policy.
+    let path = database.root.join("records/accounts/legacy.md");
+    fs::write(
+        &path,
+        "---\nstage: resurrected-ordinary\n---\nordinary resurrection\n",
+    )
+    .unwrap();
+    let resurrected = json(
+        database
+            .command()
+            .args(["get", "accounts", "legacy", "--json"]),
+    );
+    assert_eq!(resurrected["attributes"]["stage"], "resurrected-ordinary");
+    fs::remove_file(path).unwrap();
+
     write_schema(&database);
 
     // The collection now marks this logical path, but both historical states
@@ -1024,6 +1042,47 @@ ordinary body
         "ordinary"
     );
     assert!(!database.root.join(".cr/encryption.json").exists());
+}
+
+#[test]
+fn a_manifest_without_owned_envelopes_does_not_claim_its_lifecycle() {
+    let database = TestDatabase::new("encrypted-empty-manifest-lifecycle");
+    fs::remove_file(database.root.join(".cr/encryption.json")).unwrap();
+    fs::create_dir_all(database.root.join("records/notes")).unwrap();
+    let path = database.root.join("records/notes/legacy.md");
+    fs::write(
+        &path,
+        r#"---
+$cr_encryption:
+  version: 1
+  fields:
+    - [optional, token]
+  body: false
+title: Legacy
+---
+ordinary body
+"#,
+    )
+    .unwrap();
+    run_success(database.command().args(["audit", "baseline"]));
+    run_success(
+        database
+            .command()
+            .args(["delete", "notes", "legacy", "--yes"]),
+    );
+
+    fs::write(
+        &path,
+        "---\ntitle: Dirty resurrection\n---\nordinary body\n",
+    )
+    .unwrap();
+    let resurrected = json(
+        database
+            .command()
+            .args(["get", "notes", "legacy", "--json"]),
+    );
+    assert_eq!(resurrected["attributes"]["title"], "Dirty resurrection");
+    assert_eq!(resurrected["body"], "ordinary body\n");
 }
 
 #[test]
@@ -1133,14 +1192,26 @@ fn audited_ownership_survives_manual_schema_and_manifest_removal_on_every_read()
     .unwrap();
     let path = database.root.join("records/accounts/one.md");
     let raw = fs::read_to_string(&path).unwrap();
-    let (mut attributes, body) = split_document(&raw);
-    attributes
+    let (mut attributes, _) = split_document(&raw);
+    let attributes = attributes.as_mapping_mut().unwrap();
+    attributes.remove(yaml_serde::Value::String("$cr_encryption".into()));
+    let contact = attributes
+        .get_mut(yaml_serde::Value::String("contact".into()))
+        .unwrap()
+        .as_mapping_mut()
+        .unwrap();
+    let token = contact
+        .get_mut(yaml_serde::Value::String("token".into()))
+        .unwrap();
+    let envelope_fields = token
         .as_mapping_mut()
         .unwrap()
-        .remove(yaml_serde::Value::String("$cr_encryption".into()));
+        .remove(yaml_serde::Value::String("$cr_encrypted".into()))
+        .unwrap();
+    *token = envelope_fields;
     let yaml = yaml_serde::to_string(&attributes).unwrap();
     let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
-    fs::write(&path, format!("---\n{yaml}---\n{body}")).unwrap();
+    fs::write(&path, format!("---\n{yaml}---\nstripped body wrapper\n")).unwrap();
 
     for arguments in [
         vec!["get", "accounts", "one", "--json"],
@@ -1223,6 +1294,100 @@ fn audited_ownership_survives_manual_schema_and_manifest_removal_on_every_read()
     ] {
         assert!(!check.contains(private), "check exposed {private}: {check}");
     }
+}
+
+#[test]
+fn protected_tombstone_blocks_dirty_resurrection_but_an_audited_create_resets_ownership() {
+    let database = TestDatabase::new("encrypted-protected-tombstone-ownership");
+    write_schema(&database);
+    run_success(command(&database).args([
+        "create",
+        "accounts",
+        "one",
+        "--set",
+        "stage=lead",
+        "--set",
+        "contact.token=deleted-private-token",
+        "--body",
+        "deleted private body",
+    ]));
+    run_success(command(&database).args(["delete", "accounts", "one", "--yes"]));
+    fs::write(
+        database.root.join(".cr/schemas/accounts.json"),
+        r#"{
+  "type": "object",
+  "properties": {
+    "stage": { "type": "string" },
+    "contact": {
+      "type": "object",
+      "properties": { "token": { "type": "string" } }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    let path = database.root.join("records/accounts/one.md");
+    fs::write(
+        &path,
+        "---\nstage: manual-resurrection\ncontact:\n  token: ordinary-looking\n---\nmanual body\n",
+    )
+    .unwrap();
+    for arguments in [
+        vec!["get", "accounts", "one", "--json"],
+        vec!["get", "accounts", "one"],
+        vec!["get", "accounts", "one", "--field", "contact.token"],
+        vec!["list", "accounts", "--json"],
+        vec![
+            "search",
+            "manual-resurrection",
+            "--collection",
+            "accounts",
+            "--json",
+        ],
+    ] {
+        let error = run_failure(database.command().args(arguments));
+        assert!(error.contains("stored protected data is no longer declared"));
+        assert!(!error.contains("manual-resurrection"));
+        assert!(!error.contains("ordinary-looking"));
+    }
+    let check = database
+        .command()
+        .args(["check", "--collection", "accounts", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(check.status.code(), Some(2));
+    let check = String::from_utf8(check.stdout).unwrap();
+    assert!(check.contains("stored protected data is no longer declared"));
+    assert!(!check.contains("manual-resurrection"));
+    assert!(!check.contains("ordinary-looking"));
+
+    // Removing the unaudited file and creating a new ordinary lifecycle
+    // through cr is an authenticated reset, not a permanent ID quarantine.
+    fs::remove_file(&path).unwrap();
+    run_success(database.command().args([
+        "create",
+        "accounts",
+        "one",
+        "--set",
+        "stage=fresh",
+        "--set",
+        "contact.token=ordinary-lifecycle",
+        "--body",
+        "ordinary body",
+    ]));
+    let fresh = json(
+        database
+            .command()
+            .args(["get", "accounts", "one", "--json"]),
+    );
+    assert_eq!(fresh["attributes"]["stage"], "fresh");
+    assert_eq!(
+        fresh["attributes"]["contact"]["token"],
+        "ordinary-lifecycle"
+    );
+    assert_eq!(fresh["body"], "ordinary body");
+    run_success(database.command().args(["audit", "verify"]));
 }
 
 #[test]

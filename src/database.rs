@@ -31,7 +31,7 @@ use crate::{
     encryption::{
         CONTEXT_LABEL, CONTEXT_PATH, EncryptionContext, EncryptionPolicy,
         EncryptionStorageMetadata, audit_document_encryption_metadata,
-        document_has_encrypted_storage, document_has_envelope_candidate,
+        document_has_encrypted_storage,
     },
     error::{
         DomainError, conflict, forbidden, invalid, is_already_exists, is_missing,
@@ -3017,7 +3017,12 @@ impl Database {
                 .map(|raw| parse_record(&change.collection, &change.id, raw))
                 .transpose()?;
             if let Some(document) = &after {
-                let logical = self.reveal_document(&change.collection, &change.id, document)?;
+                let logical = self.reveal_document_with_audited_states(
+                    &change.collection,
+                    &change.id,
+                    document,
+                    Some(&states),
+                )?;
                 self.encryption_policy(&change.collection)?
                     .validate_logical_for_write(&logical, before.as_ref())?;
                 self.validate(&change.collection, &logical.attributes)?;
@@ -3231,15 +3236,21 @@ impl Database {
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         let decision = self.authorize_owner(&AccessResource::Database)?;
+        let states = audit.record_states()?;
         let mut added = 0;
 
         for (collection, id, path) in self.record_files()? {
-            if audit.has_history(&collection, &id)? {
+            if states.contains_key(&(collection.clone(), id.clone())) {
                 continue;
             }
             let raw = self.read_record(&collection, &id, &path)?;
             let document = parse_record(&collection, &id, &raw)?;
-            let logical = self.reveal_document(&collection, &id, &document)?;
+            let logical = self.reveal_document_with_audited_states(
+                &collection,
+                &id,
+                &document,
+                Some(&states),
+            )?;
             self.validate(&collection, &logical.attributes)?;
             let event = audit.prepare(AuditMutation {
                 action: AuditAction::Baseline,
@@ -3533,7 +3544,7 @@ impl Database {
         policy: &EncryptionPolicy,
         audited_states: &mut Option<AuditedRecordStates>,
     ) -> Result<Document> {
-        if needs_audited_encryption_ownership(policy, stored) && audited_states.is_none() {
+        if needs_audited_encryption_ownership(policy) && audited_states.is_none() {
             *audited_states = Some(self.audit().record_states()?);
         }
         self.reveal_document_with_policy(collection, id, stored, policy, audited_states.as_ref())
@@ -3547,11 +3558,11 @@ impl Database {
         policy: &EncryptionPolicy,
         audited_states: Option<&AuditedRecordStates>,
     ) -> Result<Document> {
-        if needs_audited_encryption_ownership(policy, stored) {
+        if needs_audited_encryption_ownership(policy) {
             let states = audited_states.ok_or_else(|| {
                 conflict("protected storage ownership could not be verified from audit history")
             })?;
-            if audited_record_has_encrypted_storage(states, collection, id) {
+            if audited_record_owns_protected_storage(states, collection, id) {
                 return Err(conflict(
                     "stored protected data is no longer declared by the collection schema",
                 ));
@@ -4163,25 +4174,22 @@ fn changes_encryption_metadata(changes: &[AuditChange]) -> Vec<EncryptionStorage
         .collect()
 }
 
-/// Envelope-shaped storage without a current or stored manifest is ambiguous
-/// by syntax alone. Only verified history may decide that CR, rather than the
-/// application, owns it.
-fn needs_audited_encryption_ownership(policy: &EncryptionPolicy, stored: &Document) -> bool {
+/// When a schema currently declares no encryption, verified lifecycle state
+/// must decide whether a materialized record is nevertheless protected. The
+/// mutable record syntax cannot safely short-circuit that decision: both the
+/// manifest and envelope wrapper can be removed or malformed together.
+fn needs_audited_encryption_ownership(policy: &EncryptionPolicy) -> bool {
     policy.is_empty()
-        && !document_has_encrypted_storage(stored)
-        && document_has_envelope_candidate(stored)
 }
 
-fn audited_record_has_encrypted_storage(
+fn audited_record_owns_protected_storage(
     states: &AuditedRecordStates,
     collection: &str,
     id: &str,
 ) -> bool {
     states
         .get(&(collection.to_owned(), id.to_owned()))
-        .and_then(|state| state.document.as_ref())
-        .and_then(audit_document_encryption_metadata)
-        .is_some_and(|metadata| metadata.has_envelopes)
+        .is_some_and(|state| state.protected_storage_owned)
 }
 
 /// Decide whether one historical event may be projected through the current

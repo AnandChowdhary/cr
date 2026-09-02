@@ -672,6 +672,13 @@ struct PayloadMutation<'a> {
 pub(crate) struct AuditedRecordState {
     pub hash: Option<String>,
     pub document: Option<Value>,
+    /// Whether the terminal audited lifecycle owns protected storage.
+    ///
+    /// Present states derive this from their authenticated manifest. A
+    /// tombstone inherits the deleted state's ownership so copying a stripped
+    /// ciphertext file back into place cannot make it ordinary. A later
+    /// audited create starts a new lifecycle and derives ownership afresh.
+    pub protected_storage_owned: bool,
     /// The newest event could not prove its exact representation because it
     /// predates v3. When the materialized file still matches its hash, replay
     /// uses that file as the missing witness and checks its semantics too.
@@ -841,10 +848,6 @@ impl<'a> AuditLog<'a> {
             parsed: payload,
             change_digest,
         })
-    }
-
-    pub fn has_history(&self, collection: &str, id: &str) -> Result<bool> {
-        Ok(self.record_state(collection, id)?.0.is_some())
     }
 
     pub fn assert_current(&self, collection: &str, id: &str, contents: &[u8]) -> Result<()> {
@@ -2269,6 +2272,7 @@ fn replay_entry(latest: &mut AuditedRecordStates, entry: &AuditEntry) -> Result<
     let state = latest.entry(key).or_insert_with(|| AuditedRecordState {
         hash: None,
         document: None,
+        protected_storage_owned: false,
         legacy_representation_gap: None,
     });
     if state.hash != entry.payload.before_hash {
@@ -2295,6 +2299,10 @@ fn replay_entry(latest: &mut AuditedRecordStates, entry: &AuditEntry) -> Result<
         Some(sequence)
     };
     verify_idempotency_result(entry, before_document.as_ref(), state.document.as_ref())?;
+    if let Some(document) = state.document.as_ref() {
+        state.protected_storage_owned = audit_document_encryption_metadata(document)
+            .is_some_and(|metadata| metadata.has_envelopes);
+    }
     state.hash = entry.payload.after_hash.clone();
     Ok(())
 }

@@ -1330,6 +1330,20 @@ enabling the marker, then import it into a newly encrypted record or database.
 That boundary is deliberate—an in-place audit event would preserve the old
 plaintext in history and falsely imply migration had removed it.
 
+When the current schema declares no encryption, logical reads still consult
+verified audit lifecycle state before trusting the mutable record bytes. A
+present audited state owns protected storage only when its authenticated
+manifest owns an actual envelope; deletion carries that ownership into the
+tombstone, and a later audited ordinary create resets it. This prevents
+removing or deforming both the manifest and envelope syntax—or copying a
+stripped file back after deletion—from turning protected storage into ordinary
+output. Standalone envelope-shaped application data and manifests whose
+optional protected locations are all absent remain ordinary. The tradeoff is
+fail-closed recovery: if audit history is corrupt or cannot be verified, CR
+cannot prove that an empty-policy record is unprotected, so logical reads and
+`check` report a redacted unreadable/conflict result until the history is
+repaired. Healthy databases retain the same transparent logical UX.
+
 Direct filesystem edits remain possible for unprotected values as long as the
 envelopes and manifest are preserved; `cr save` refuses plaintext substituted
 at a protected path. `cr get` renders encrypted records as canonical plaintext

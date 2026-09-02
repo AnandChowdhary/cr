@@ -148,10 +148,23 @@ unrelated managed updates and direct saves may preserve the exact prior legacy
 value, but they may not add or change it; removing it is the supported one-way
 migration. No value is grandfathered under a nonempty encryption policy or when
 a valid manifest owns an actual field or body envelope. For reads under an
-empty policy, the name is classified as CR metadata only when such an envelope
-exists. A manifest whose optional protected paths are all absent contains no
-protected payload and therefore does not make the record unreadable after a
-schema change.
+empty policy, current syntax is not the ownership authority: verified replay
+tracks terminal lifecycle ownership. Each present audited state derives
+ownership from an authenticated manifest that owns at least one actual field or
+body envelope; a deletion inherits that bit, while a later audited ordinary
+create (or an initial baseline) derives it afresh and can reset it. A standalone
+envelope-shaped application value and a manifest whose optional protected paths
+are all absent therefore remain ordinary, including across an ordinary
+tombstone. Conversely, stripping or deforming both mutable wrappers, or
+resurrecting a file after a protected deletion, cannot erase ownership.
+
+This makes trustworthy replay part of empty-policy projection. If the journal
+is corrupt or otherwise unverifiable, CR cannot distinguish stripped protected
+storage from ordinary bytes, so it refuses to project those records until the
+history is repaired. `get`, raw reads, list/search/views, REST, and `check` use
+the same redacted refusal and never serialize the candidate document or
+envelope metadata. Bulk readers replay once and reuse one ownership-state map;
+healthy databases keep the normal transparent logical interface.
 
 Validation happens before protection; filtering and search happen after
 revelation. Audit preparation receives stored documents, so its hashes and
