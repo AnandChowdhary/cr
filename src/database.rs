@@ -24,14 +24,14 @@ use crate::{
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     audit::{
         AuditEncryptionTransition, AuditFilter, AuditHistory, AuditIdempotency,
-        AuditIdempotencyResult, AuditLog, AuditMutation, ChangePreview, ReconciledMutation,
-        record_hash,
+        AuditIdempotencyResult, AuditLog, AuditMutation, AuditedRecordStates, ChangePreview,
+        ReconciledMutation, record_hash,
     },
     check::{CheckReport, CheckScope},
     encryption::{
         CONTEXT_LABEL, CONTEXT_PATH, EncryptionContext, EncryptionPolicy,
         EncryptionStorageMetadata, audit_document_encryption_metadata,
-        document_has_encrypted_storage,
+        document_has_encrypted_storage, document_has_envelope_candidate,
     },
     error::{
         DomainError, conflict, forbidden, invalid, is_already_exists, is_missing,
@@ -1933,18 +1933,21 @@ impl Database {
         let stored_raw = self.read_record(collection, id, &path)?;
         let version = record_hash(stored_raw.as_bytes());
         let policy = self.encryption_policy(collection)?;
+        let stored = parse_record(collection, id, &stored_raw)?;
+        let mut audited_states = None;
+        let document = self.reveal_document_with_policy_cached(
+            collection,
+            id,
+            &stored,
+            &policy,
+            &mut audited_states,
+        )?;
         if policy.is_empty() {
-            // Empty policy normally means exact bytes can pass straight
-            // through. Still parse and classify the stored document first: a
-            // removed marker must not turn a valid CR manifest and its
-            // envelopes into a raw ciphertext export. `reveal` preserves
-            // ordinary legacy `$cr_encryption` application values, including
-            // exact-looking manifests that own no envelope.
-            let stored = parse_record(collection, id, &stored_raw)?;
-            policy.reveal(None, collection, id, &stored)?;
+            // Empty policy normally means exact bytes pass straight through.
+            // Classification above first rejects either a surviving manifest
+            // or audited ownership of a manifest that a direct edit removed.
             return Ok((stored_raw, version));
         }
-        let document = self.parse_logical_record(collection, id, &stored_raw)?;
         Ok((document.render()?, version))
     }
 
@@ -1983,6 +1986,16 @@ impl Database {
     }
 
     pub fn list(&self, collection: &str, filters: &[Assignment]) -> Result<Vec<Record>> {
+        let mut audited_states = None;
+        self.list_with_audited_cache(collection, filters, &mut audited_states)
+    }
+
+    fn list_with_audited_cache(
+        &self,
+        collection: &str,
+        filters: &[Assignment],
+        audited_states: &mut Option<AuditedRecordStates>,
+    ) -> Result<Vec<Record>> {
         validate_component(collection, "collection")?;
         let directory = self.config.data_dir.join(collection);
         let label = collection_label(collection);
@@ -2018,7 +2031,12 @@ impl Database {
                 Some((|| {
                     let path = directory.join(format!("{id}.md"));
                     let raw = self.read_record(collection, &id, &path)?;
-                    let document = self.parse_logical_record(collection, &id, &raw)?;
+                    let document = self.parse_logical_record_with_audited_cache(
+                        collection,
+                        &id,
+                        &raw,
+                        audited_states,
+                    )?;
                     Ok(record_from_document(
                         collection,
                         &id,
@@ -2056,8 +2074,9 @@ impl Database {
         };
 
         let mut matches = Vec::new();
+        let mut audited_states = None;
         for collection in collections {
-            for record in self.list(&collection, filters)? {
+            for record in self.list_with_audited_cache(&collection, filters, &mut audited_states)? {
                 let raw_document = Document {
                     attributes: record.attributes.clone(),
                     body: record.body.clone(),
@@ -3485,6 +3504,59 @@ impl Database {
         stored: &Document,
     ) -> Result<Document> {
         let policy = self.encryption_policy(collection)?;
+        let mut audited_states = None;
+        self.reveal_document_with_policy_cached(
+            collection,
+            id,
+            stored,
+            &policy,
+            &mut audited_states,
+        )
+    }
+
+    pub(crate) fn reveal_document_with_audited_states(
+        &self,
+        collection: &str,
+        id: &str,
+        stored: &Document,
+        audited_states: Option<&AuditedRecordStates>,
+    ) -> Result<Document> {
+        let policy = self.encryption_policy(collection)?;
+        self.reveal_document_with_policy(collection, id, stored, &policy, audited_states)
+    }
+
+    fn reveal_document_with_policy_cached(
+        &self,
+        collection: &str,
+        id: &str,
+        stored: &Document,
+        policy: &EncryptionPolicy,
+        audited_states: &mut Option<AuditedRecordStates>,
+    ) -> Result<Document> {
+        if needs_audited_encryption_ownership(policy, stored) && audited_states.is_none() {
+            *audited_states = Some(self.audit().record_states()?);
+        }
+        self.reveal_document_with_policy(collection, id, stored, policy, audited_states.as_ref())
+    }
+
+    fn reveal_document_with_policy(
+        &self,
+        collection: &str,
+        id: &str,
+        stored: &Document,
+        policy: &EncryptionPolicy,
+        audited_states: Option<&AuditedRecordStates>,
+    ) -> Result<Document> {
+        if needs_audited_encryption_ownership(policy, stored) {
+            let states = audited_states.ok_or_else(|| {
+                conflict("protected storage ownership could not be verified from audit history")
+            })?;
+            if audited_record_has_encrypted_storage(states, collection, id) {
+                return Err(conflict(
+                    "stored protected data is no longer declared by the collection schema",
+                ));
+            }
+        }
         let context = if policy.is_empty() {
             None
         } else {
@@ -3499,8 +3571,20 @@ impl Database {
     }
 
     fn parse_logical_record(&self, collection: &str, id: &str, raw: &str) -> Result<Document> {
+        let mut audited_states = None;
+        self.parse_logical_record_with_audited_cache(collection, id, raw, &mut audited_states)
+    }
+
+    fn parse_logical_record_with_audited_cache(
+        &self,
+        collection: &str,
+        id: &str,
+        raw: &str,
+        audited_states: &mut Option<AuditedRecordStates>,
+    ) -> Result<Document> {
         let stored = parse_record(collection, id, raw)?;
-        self.reveal_document(collection, id, &stored)
+        let policy = self.encryption_policy(collection)?;
+        self.reveal_document_with_policy_cached(collection, id, &stored, &policy, audited_states)
     }
 
     fn protect_document(
@@ -4077,6 +4161,27 @@ fn changes_encryption_metadata(changes: &[AuditChange]) -> Vec<EncryptionStorage
         })
         .flatten()
         .collect()
+}
+
+/// Envelope-shaped storage without a current or stored manifest is ambiguous
+/// by syntax alone. Only verified history may decide that CR, rather than the
+/// application, owns it.
+fn needs_audited_encryption_ownership(policy: &EncryptionPolicy, stored: &Document) -> bool {
+    policy.is_empty()
+        && !document_has_encrypted_storage(stored)
+        && document_has_envelope_candidate(stored)
+}
+
+fn audited_record_has_encrypted_storage(
+    states: &AuditedRecordStates,
+    collection: &str,
+    id: &str,
+) -> bool {
+    states
+        .get(&(collection.to_owned(), id.to_owned()))
+        .and_then(|state| state.document.as_ref())
+        .and_then(audit_document_encryption_metadata)
+        .is_some_and(|metadata| metadata.has_envelopes)
 }
 
 /// Decide whether one historical event may be projected through the current

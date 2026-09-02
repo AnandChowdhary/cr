@@ -525,6 +525,29 @@ pub(crate) fn document_has_encrypted_storage(document: &Document) -> bool {
         .is_some_and(|manifest| manifest_has_envelopes(document, manifest))
 }
 
+/// Whether a stored document contains CR envelope syntax, independent of a
+/// mutable manifest or current schema policy.
+///
+/// Envelope syntax alone never establishes ownership: applications may store
+/// the same shape deliberately. Read paths use this only as a cheap signal to
+/// consult verified audit history, which makes the ownership decision.
+pub(crate) fn document_has_envelope_candidate(document: &Document) -> bool {
+    fn mapping_has_candidate(values: &Mapping) -> bool {
+        values.contains_key(Value::String(ENVELOPE_KEY.to_owned()))
+            || values.values().any(value_has_candidate)
+    }
+
+    fn value_has_candidate(value: &Value) -> bool {
+        match value {
+            Value::Sequence(values) => values.iter().any(value_has_candidate),
+            Value::Mapping(values) => mapping_has_candidate(values),
+            _ => false,
+        }
+    }
+
+    mapping_has_candidate(&document.attributes) || document.body.starts_with("cr-encrypted:")
+}
+
 fn parse_storage_manifest(value: &Value) -> Option<(Vec<Vec<String>>, bool)> {
     let Value::Mapping(manifest) = value else {
         return None;

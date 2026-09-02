@@ -1494,6 +1494,17 @@ impl<'a> AuditLog<'a> {
         Ok(states)
     }
 
+    /// Replay the chain once while also enforcing approval bindings.
+    ///
+    /// `cr check` needs both guarantees and the resulting state map. Keeping
+    /// them in one pass avoids replaying the complete journal once for
+    /// approval verification and again for record reconciliation.
+    pub(crate) fn record_states_with_approvals(&self) -> Result<AuditedRecordStates> {
+        let (states, _) = self.states(true)?;
+        self.verify_legacy_representation_heads(&states)?;
+        Ok(states)
+    }
+
     /// Whether the latest audited state for this record is a deletion.
     pub(crate) fn record_is_tombstoned(&self, collection: &str, id: &str) -> Result<bool> {
         self.record_state(collection, id)
@@ -1529,17 +1540,6 @@ impl<'a> AuditLog<'a> {
             Ok(())
         })?;
         Ok(used)
-    }
-
-    /// Replay the chain checking every stored change set against the approval
-    /// recorded beside it, discarding the replayed state.
-    ///
-    /// `cr check` needs this branch of [`Self::verify`] without the
-    /// record reconciliation that `verify` performs in the same pass, because
-    /// it reconciles records itself and reports every divergence instead of
-    /// failing on the first.
-    pub fn verify_approvals(&self) -> Result<()> {
-        self.states(true).map(|_| ())
     }
 
     /// Replay the chain into per-record state.

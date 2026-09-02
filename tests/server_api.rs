@@ -968,6 +968,7 @@ async fn raw_document_reads_fail_closed_after_marker_removal_but_keep_legacy_col
     fs::create_dir_all(database.root().join("records/notes")).unwrap();
     fs::write(database.root().join("records/notes/legacy.md"), legacy_raw).unwrap();
 
+    let record_path = database.root().join("records/secrets/one.md");
     let app = router(database, ServerConfig::default()).unwrap();
     let protected = request(
         &app,
@@ -988,6 +989,72 @@ async fn raw_document_reads_fail_closed_after_marker_removal_but_keep_legacy_col
     assert!(!protected.text().contains("http-private-token"));
     assert!(!protected.text().contains("$cr_encrypted"));
     assert!(!protected.text().contains("ciphertext"));
+
+    // The mutable manifest is not the authority. Removing it while leaving
+    // the envelope in place must still fail every logical projection because
+    // verified history records that CR owns this stored shape.
+    let raw = fs::read_to_string(&record_path).unwrap();
+    let raw = raw.strip_prefix("---\n").unwrap();
+    let (front_matter, body) = raw.split_once("---\n").unwrap();
+    let mut front_matter: yaml_serde::Value = yaml_serde::from_str(front_matter).unwrap();
+    front_matter
+        .as_mapping_mut()
+        .unwrap()
+        .remove(yaml_serde::Value::String("$cr_encryption".into()));
+    let serialized = yaml_serde::to_string(&front_matter).unwrap();
+    let serialized = serialized.strip_prefix("---\n").unwrap_or(&serialized);
+    fs::write(&record_path, format!("---\n{serialized}---\n{body}")).unwrap();
+
+    for uri in [
+        "/api/v1/collections/secrets/records/one",
+        "/api/v1/collections/secrets/records/one/fields/token",
+        "/api/v1/collections/secrets/records/one/document",
+        "/api/v1/collections/secrets/records?limit=10",
+        "/api/v1/search?q=private&collection=secrets&limit=10",
+    ] {
+        let response = request(&app, Method::GET, uri, None, &[]).await;
+        assert_eq!(response.status, StatusCode::CONFLICT, "{uri}");
+        assert_eq!(response.json()["error"]["code"], "conflict", "{uri}");
+        for private in ["http-private-token", "$cr_encrypted", "ciphertext", "nonce"] {
+            assert!(
+                !response.text().contains(private),
+                "{uri} exposed {private}: {}",
+                response.text()
+            );
+        }
+    }
+
+    let view = request(&app, Method::GET, "/secrets", None, &[]).await;
+    assert_eq!(view.status, StatusCode::CONFLICT);
+    for private in ["http-private-token", "$cr_encrypted", "ciphertext", "nonce"] {
+        assert!(!view.text().contains(private));
+    }
+
+    let check = request(
+        &app,
+        Method::GET,
+        "/api/v1/check?collection=secrets&limit=100",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(check.status, StatusCode::OK);
+    assert!(
+        check.json()["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["kind"] == "unreadable_record"
+                    && finding["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("stored protected data is no longer declared")
+            })
+    );
+    for private in ["http-private-token", "$cr_encrypted", "ciphertext", "nonce"] {
+        assert!(!check.text().contains(private));
+    }
 
     let legacy = request(
         &app,

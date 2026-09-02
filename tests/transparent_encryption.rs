@@ -13,7 +13,7 @@ use common::{
     fault::{FaultDatabase, Point},
     run_failure, run_success,
 };
-use cr::{Database, DomainError};
+use cr::{Database, DomainError, SearchQuery, SearchTarget};
 use serde_json::Value;
 
 const OLD_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -1100,6 +1100,129 @@ fn removing_schema_markers_does_not_expose_envelopes_as_ordinary_data() {
         run_failure(command(&database).args(["audit", "log", "accounts", "one", "--json"]));
     assert!(history.contains("stored protected history is no longer declared"));
     assert!(!history.contains("still-secret"));
+}
+
+#[test]
+fn audited_ownership_survives_manual_schema_and_manifest_removal_on_every_read() {
+    let database = TestDatabase::new("encrypted-audited-ownership");
+    write_schema(&database);
+    run_success(command(&database).args([
+        "create",
+        "accounts",
+        "one",
+        "--set",
+        "stage=lead",
+        "--set",
+        "contact.token=history-owned-secret",
+        "--body",
+        "history-owned body",
+    ]));
+    fs::write(
+        database.root.join(".cr/schemas/accounts.json"),
+        r#"{
+  "type": "object",
+  "properties": {
+    "stage": { "type": "string" },
+    "contact": {
+      "type": "object",
+      "properties": { "token": { "type": "string" } }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+    let path = database.root.join("records/accounts/one.md");
+    let raw = fs::read_to_string(&path).unwrap();
+    let (mut attributes, body) = split_document(&raw);
+    attributes
+        .as_mapping_mut()
+        .unwrap()
+        .remove(yaml_serde::Value::String("$cr_encryption".into()));
+    let yaml = yaml_serde::to_string(&attributes).unwrap();
+    let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
+    fs::write(&path, format!("---\n{yaml}---\n{body}")).unwrap();
+
+    for arguments in [
+        vec!["get", "accounts", "one", "--json"],
+        vec!["get", "accounts", "one"],
+        vec!["get", "accounts", "one", "--field", "contact.token"],
+        vec!["list", "accounts", "--json"],
+        vec![
+            "search",
+            "history-owned",
+            "--collection",
+            "accounts",
+            "--json",
+        ],
+    ] {
+        let error = run_failure(database.command().args(arguments));
+        assert!(error.contains("stored protected data is no longer declared"));
+        for private in [
+            "history-owned-secret",
+            "$cr_encrypted",
+            "ciphertext",
+            "nonce",
+        ] {
+            assert!(
+                !error.contains(private),
+                "read error exposed {private}: {error}"
+            );
+        }
+    }
+
+    let library = Database::discover(Some(&database.root)).unwrap();
+    let query = SearchQuery::new("history-owned", SearchTarget::Document, false, false).unwrap();
+    for error in [
+        library.get("accounts", "one").unwrap_err(),
+        library.read_raw("accounts", "one").unwrap_err(),
+        library.list("accounts", &[]).unwrap_err(),
+        library.search(Some("accounts"), &[], &query).unwrap_err(),
+    ] {
+        assert_eq!(
+            DomainError::of(&error).map(DomainError::code),
+            Some("conflict")
+        );
+        let error = format!("{error:#}");
+        assert!(error.contains("stored protected data is no longer declared"));
+        for private in [
+            "history-owned-secret",
+            "$cr_encrypted",
+            "ciphertext",
+            "nonce",
+        ] {
+            assert!(!error.contains(private));
+        }
+    }
+
+    let check = database
+        .command()
+        .args(["check", "--collection", "accounts", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(check.status.code(), Some(2));
+    let check = String::from_utf8(check.stdout).unwrap();
+    let report: Value = serde_json::from_str(&check).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["kind"] == "unreadable_record"
+                    && finding["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("stored protected data is no longer declared")
+            })
+    );
+    for private in [
+        "history-owned-secret",
+        "$cr_encrypted",
+        "ciphertext",
+        "nonce",
+    ] {
+        assert!(!check.contains(private), "check exposed {private}: {check}");
+    }
 }
 
 #[test]

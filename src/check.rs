@@ -346,6 +346,29 @@ pub(crate) fn run(database: &Database, scope: &CheckScope) -> Result<CheckReport
         return Err(unknown_collection(collection, &audit)?);
     }
 
+    // Replay history before projecting any record values. Besides supplying
+    // reconciliation state, this is the authenticated ownership source for a
+    // ciphertext envelope whose mutable on-disk manifest was removed. Keep
+    // the result for every record so the expensive audit pass is database-wide
+    // once, rather than once per suspicious record.
+    let audited_states = match audit.record_states_with_approvals() {
+        Err(error) => {
+            // Approval is checked in event order before replaying that event's
+            // result. Keep its distinct diagnosis instead of immediately
+            // relabeling the same forged change set as generic replay damage.
+            if matches!(
+                DomainError::of(&error),
+                Some(DomainError::ApprovalMismatch(_))
+            ) {
+                findings.push(approval_finding(&error));
+            } else {
+                findings.push(chain_finding(&error));
+            }
+            None
+        }
+        Ok(states) => Some(states),
+    };
+
     // Phase two, bounded by scope and expensive: read, hash, parse, and
     // validate every selected record.
     let mut scanned: BTreeMap<(String, String), ScannedRecord> = BTreeMap::new();
@@ -366,6 +389,7 @@ pub(crate) fn run(database: &Database, scope: &CheckScope) -> Result<CheckReport
             collection,
             id,
             index.symlinked.contains(&(collection.clone(), id.clone())),
+            audited_states.as_ref(),
             &mut findings,
         )?;
         scanned.insert((collection.clone(), id.clone()), record);
@@ -380,30 +404,10 @@ pub(crate) fn run(database: &Database, scope: &CheckScope) -> Result<CheckReport
     }
     mark_blocked(&mut scanned, &findings);
 
-    // Phase three: reconcile against the journal, or explain why we cannot.
-    let audited_records = match audit.verify_approvals() {
-        Err(error) => {
-            // Approval is checked in event order before replaying that event's
-            // result. Keep its distinct diagnosis instead of immediately
-            // relabeling the same forged change set as generic replay damage.
-            if matches!(
-                DomainError::of(&error),
-                Some(DomainError::ApprovalMismatch(_))
-            ) {
-                findings.push(approval_finding(&error));
-            } else {
-                findings.push(chain_finding(&error));
-            }
-            0
-        }
-        Ok(()) => match audit.record_states() {
-            Ok(states) => reconcile(&states, &scanned, selected.as_deref(), &mut findings),
-            Err(error) => {
-                findings.push(chain_finding(&error));
-                0
-            }
-        },
-    };
+    // Phase three: reconcile against the already replayed journal.
+    let audited_records = audited_states.as_ref().map_or(0, |states| {
+        reconcile(states, &scanned, selected.as_deref(), &mut findings)
+    });
 
     // Database-wide, and therefore reported under `--collection` too: a
     // half-applied import is not a property of one collection.
@@ -558,6 +562,7 @@ fn scan_record(
     collection: &str,
     id: &str,
     special: bool,
+    audited_states: Option<&crate::audit::AuditedRecordStates>,
     findings: &mut Vec<Finding>,
 ) -> Result<ScannedRecord> {
     let mut record = ScannedRecord {
@@ -629,7 +634,12 @@ fn scan_record(
         record.blocked = true;
         return Ok(record);
     }
-    let document = match database.reveal_document(collection, id, &stored_document) {
+    let document = match database.reveal_document_with_audited_states(
+        collection,
+        id,
+        &stored_document,
+        audited_states,
+    ) {
         Ok(document) => document,
         Err(error) => {
             findings.push(Finding::record(
