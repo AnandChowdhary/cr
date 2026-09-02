@@ -1,8 +1,9 @@
 use std::{fs, str::FromStr};
 
 use cr::{
-    AccessDecisionBasis, AccessResource, Assignment, AuditFilter, Database, Role,
-    UserEnsureOutcome, UserKind, UserStatus, UserUpdate,
+    AccessAction, AccessDecisionBasis, AccessResource, Assignment, AuditAction, AuditFilter,
+    Database, Role, UserDeleteOptions, UserEnsureOutcome, UserKind, UserRegistrationOptions,
+    UserStatus, UserUpdate,
 };
 use yaml_serde::{Mapping, Value};
 
@@ -537,4 +538,397 @@ fn profile_updates_use_ordinary_editor_grants_and_self_service_stays_narrow() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("is not active"), "{error:#}");
+}
+
+#[test]
+fn user_deletion_is_owner_only_audited_and_keeps_absent_user_grants_inert() {
+    let (_temporary, database) = database("delete-user");
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    for (id, name) in [
+        ("target@example.com", "Target"),
+        ("observer@example.com", "Observer"),
+        ("probe@example.com", "Probe"),
+        ("scoped-owner@example.com", "Scoped owner"),
+    ] {
+        database
+            .add_user(id, name, Some(id), UserKind::Human)
+            .unwrap();
+    }
+    database
+        .grant_access(
+            "target@example.com",
+            AccessResource::collection("deals"),
+            Role::Editor,
+        )
+        .unwrap();
+    database
+        .grant_access(
+            "observer@example.com",
+            AccessResource::record("users", "target@example.com"),
+            Role::Viewer,
+        )
+        .unwrap();
+    database
+        .grant_access(
+            "scoped-owner@example.com",
+            AccessResource::record("users", "target@example.com"),
+            Role::Owner,
+        )
+        .unwrap();
+
+    let error = database
+        .delete_user("owner@example.com", UserDeleteOptions::default())
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot delete the final active database owner")
+    );
+
+    let scoped_owner = database.impersonate("scoped-owner@example.com").unwrap();
+    let error = scoped_owner
+        .delete_user("target@example.com", UserDeleteOptions::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("cannot manage_access database"));
+
+    // Authorization must not reveal whether an inaccessible target is
+    // missing, valid, or malformed. In particular, the stale-grant check must
+    // not parse a target unless the caller actually holds that exact grant.
+    let probe = database.impersonate("probe@example.com").unwrap();
+    for id in ["target@example.com", "missing@example.com"] {
+        let error = probe.get("users", id).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("cannot read record:users/{id}")),
+            "{error:#}"
+        );
+    }
+    let target_path = database.root().join("records/users/target@example.com.md");
+    let target_policy = fs::read_to_string(&target_path).unwrap();
+    fs::write(
+        &target_path,
+        target_policy.replace("status: active", "status: malformed"),
+    )
+    .unwrap();
+    let error = probe.get("users", "target@example.com").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot read record:users/target@example.com"),
+        "{error:#}"
+    );
+    database.restore_user("target@example.com").unwrap();
+
+    let target_policy = fs::read_to_string(&target_path).unwrap();
+    fs::write(
+        &target_path,
+        target_policy.replace("name: Target", "name: Drifted target"),
+    )
+    .unwrap();
+    let error = database
+        .delete_user("target@example.com", UserDeleteOptions::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("latest audited state"));
+    database.restore_user("target@example.com").unwrap();
+
+    let deleted_principal = database.impersonate("target@example.com").unwrap();
+    let deleted = database
+        .delete_user("target@example.com", UserDeleteOptions::default())
+        .unwrap();
+    let deleted_user = cr::User::from_attributes(&deleted.attributes).unwrap();
+    assert_eq!(deleted_user.access.len(), 1);
+    assert_eq!(deleted_user.access[0].role, Role::Editor);
+    assert!(
+        !database
+            .root()
+            .join("records/users/target@example.com.md")
+            .exists()
+    );
+
+    let history = database
+        .audit_recent(10, AuditFilter::record("users", "target@example.com"))
+        .unwrap();
+    assert_eq!(history[0].payload.action, AuditAction::Delete);
+    assert!(history[0].payload.before_hash.is_some());
+    assert!(history[0].payload.after_hash.is_none());
+    assert_eq!(
+        history[0].payload.access.as_ref().unwrap().role,
+        Role::Owner
+    );
+    database.audit_verify(None).unwrap();
+
+    let observer = database.impersonate("observer@example.com").unwrap();
+    assert!(
+        !observer
+            .access_allowed(
+                AccessAction::Read,
+                &AccessResource::record("users", "target@example.com"),
+            )
+            .unwrap()
+    );
+    assert!(
+        database
+            .user("observer@example.com")
+            .unwrap()
+            .access
+            .iter()
+            .any(|grant| grant.resource == AccessResource::record("users", "target@example.com"))
+    );
+
+    let error = deleted_principal
+        .audit_recent(10, AuditFilter::record("users", "target@example.com"))
+        .unwrap_err();
+    assert!(error.to_string().contains("is not registered"), "{error:#}");
+    assert!(database.restore_user("target@example.com").is_err());
+
+    database
+        .grant_access(
+            "scoped-owner@example.com",
+            AccessResource::Database,
+            Role::Owner,
+        )
+        .unwrap();
+    let surviving_owner = database.impersonate("scoped-owner@example.com").unwrap();
+    database
+        .delete_user("owner@example.com", UserDeleteOptions::default())
+        .unwrap();
+    surviving_owner.audit_verify(None).unwrap();
+}
+
+#[test]
+fn user_tombstones_block_implicit_reuse_and_explicit_reuse_starts_without_old_grants() {
+    let (_temporary, database) = database("reuse-user");
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    database
+        .add_user(
+            "person@example.com",
+            "First person",
+            Some("person@example.com"),
+            UserKind::Human,
+        )
+        .unwrap();
+    database
+        .grant_access(
+            "person@example.com",
+            AccessResource::Database,
+            Role::AccessManager,
+        )
+        .unwrap();
+    database
+        .delete_user("person@example.com", UserDeleteOptions::default())
+        .unwrap();
+
+    let error = database
+        .add_user(
+            "person@example.com",
+            "Second person",
+            Some("person@example.com"),
+            UserKind::Human,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("previously deleted"));
+    let error = database
+        .ensure_user(
+            "person@example.com",
+            "Second person",
+            Some("person@example.com"),
+            UserKind::Human,
+            Mapping::new(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("previously deleted"));
+
+    database
+        .add_user(
+            "manager@example.com",
+            "Manager",
+            Some("manager@example.com"),
+            UserKind::Human,
+        )
+        .unwrap();
+    database
+        .grant_access(
+            "manager@example.com",
+            AccessResource::Database,
+            Role::AccessManager,
+        )
+        .unwrap();
+    let manager = database.impersonate("manager@example.com").unwrap();
+    let error = manager
+        .add_user_with_options(
+            "person@example.com",
+            "Second person",
+            Some("person@example.com"),
+            UserKind::Human,
+            Mapping::new(),
+            UserRegistrationOptions {
+                reuse_deleted_id: true,
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("must be an owner of database"));
+
+    database
+        .add_user_with_options(
+            "person@example.com",
+            "Second person",
+            Some("person@example.com"),
+            UserKind::Human,
+            profile("new generation"),
+            UserRegistrationOptions {
+                reuse_deleted_id: true,
+            },
+        )
+        .unwrap();
+    let second = database.user("person@example.com").unwrap();
+    assert_eq!(second.name, "Second person");
+    assert_eq!(
+        second.profile["role"],
+        Value::String("new generation".into())
+    );
+    assert!(second.access.is_empty());
+
+    let history = database
+        .audit_recent(10, AuditFilter::record("users", "person@example.com"))
+        .unwrap();
+    assert_eq!(history[0].payload.action, AuditAction::Create);
+    assert_eq!(history[1].payload.action, AuditAction::Delete);
+    assert_eq!(history.last().unwrap().payload.action, AuditAction::Create);
+    database.audit_verify(None).unwrap();
+
+    database
+        .delete_user("person@example.com", UserDeleteOptions::default())
+        .unwrap();
+    let first = database.clone();
+    let second = database.clone();
+    let first = std::thread::spawn(move || {
+        first.ensure_user_with_options(
+            "person@example.com",
+            "Third person",
+            Some("person@example.com"),
+            UserKind::Service,
+            Mapping::new(),
+            UserRegistrationOptions {
+                reuse_deleted_id: true,
+            },
+        )
+    });
+    let second = std::thread::spawn(move || {
+        second.ensure_user_with_options(
+            "person@example.com",
+            "Third person",
+            Some("person@example.com"),
+            UserKind::Service,
+            Mapping::new(),
+            UserRegistrationOptions {
+                reuse_deleted_id: true,
+            },
+        )
+    });
+    let outcomes = [
+        first.join().unwrap().unwrap(),
+        second.join().unwrap().unwrap(),
+    ];
+    assert!(outcomes.contains(&UserEnsureOutcome::Created));
+    assert!(outcomes.contains(&UserEnsureOutcome::Unchanged));
+    assert_eq!(
+        database
+            .ensure_user(
+                "person@example.com",
+                "Third person",
+                Some("person@example.com"),
+                UserKind::Service,
+                Mapping::new(),
+            )
+            .unwrap(),
+        UserEnsureOutcome::Unchanged
+    );
+}
+
+#[test]
+fn if_unused_scans_the_complete_actor_history_but_excludes_own_user_events() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("unused-user");
+    let legacy = Database::init(&root)
+        .unwrap()
+        .with_actor("Legacy <USED@EXAMPLE.COM>")
+        .unwrap();
+    legacy.create("notes", "legacy", &[], "").unwrap();
+    let database = legacy.with_actor(OWNER).unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    for (id, name) in [
+        ("used@example.com", "Used"),
+        ("unused@example.com", "Unused"),
+        ("operator@example.com", "Operator"),
+        ("delegate@example.com", "Delegate"),
+    ] {
+        database
+            .add_user(id, name, Some(id), UserKind::Human)
+            .unwrap();
+    }
+
+    let unused = database.impersonate("unused@example.com").unwrap();
+    unused
+        .update_user(
+            "unused@example.com",
+            UserUpdate {
+                name: Some("Unused renamed itself".into()),
+                ..UserUpdate::default()
+            },
+        )
+        .unwrap();
+    database
+        .delete_user("unused@example.com", UserDeleteOptions { if_unused: true })
+        .unwrap();
+
+    let error = database
+        .delete_user("used@example.com", UserDeleteOptions { if_unused: true })
+        .unwrap_err();
+    assert!(error.to_string().contains("used as an audited principal"));
+    database
+        .delete_user("used@example.com", UserDeleteOptions::default())
+        .unwrap();
+
+    database
+        .grant_access(
+            "operator@example.com",
+            AccessResource::Database,
+            Role::Owner,
+        )
+        .unwrap();
+    database
+        .grant_access(
+            "delegate@example.com",
+            AccessResource::collection("notes"),
+            Role::Editor,
+        )
+        .unwrap();
+    let operator = database.impersonate("operator@example.com").unwrap();
+    let delegated = operator.impersonate("delegate@example.com").unwrap();
+    delegated
+        .update(
+            "notes",
+            "legacy",
+            &[Assignment::from_str("delegated=true").unwrap()],
+            None,
+        )
+        .unwrap();
+    let error = database
+        .delete_user(
+            "operator@example.com",
+            UserDeleteOptions { if_unused: true },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("used as an audited principal"));
+    database
+        .delete_user("operator@example.com", UserDeleteOptions::default())
+        .unwrap();
+    database.audit_verify(None).unwrap();
 }

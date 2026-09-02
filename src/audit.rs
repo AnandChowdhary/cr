@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
-    access::AccessDecision,
+    access::{AccessDecision, USERS_COLLECTION, principal_id},
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     database::{
         CollectionEntry, RECORDS_LABEL, collection_directory_name, collection_entry, record_label,
@@ -1165,6 +1165,43 @@ impl<'a> AuditLog<'a> {
 
     pub fn record_states(&self) -> Result<AuditedRecordStates> {
         self.states(false).map(|(states, _)| states)
+    }
+
+    /// Whether the latest audited state for this record is a deletion.
+    pub(crate) fn record_is_tombstoned(&self, collection: &str, id: &str) -> Result<bool> {
+        self.record_state(collection, id)
+            .map(|(state, _)| state == Some(None))
+    }
+
+    /// Whether this principal participated in an event outside its own user
+    /// lifecycle. The complete verified chain is examined; a page or recent
+    /// history limit can never make an identity appear unused.
+    pub(crate) fn principal_has_external_history(&self, principal: &str) -> Result<bool> {
+        let mut used = false;
+        self.verify_chain(|entry, _| {
+            let access = entry.payload.access.as_ref();
+            let actor_matches = access.map_or_else(
+                || {
+                    principal_id(&entry.payload.actor)
+                        .ok()
+                        .is_some_and(|actor| actor == principal)
+                },
+                |decision| {
+                    decision.principal == principal
+                        || decision
+                            .impersonated_by
+                            .as_ref()
+                            .is_some_and(|identity| identity.principal == principal)
+                },
+            );
+            let is_own_user_event = entry.payload.record.collection == USERS_COLLECTION
+                && entry.payload.record.id == principal;
+            if actor_matches && !is_own_user_event {
+                used = true;
+            }
+            Ok(())
+        })?;
+        Ok(used)
     }
 
     /// Replay the chain checking every stored change set against the approval

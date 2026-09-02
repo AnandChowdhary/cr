@@ -256,6 +256,23 @@ pub enum UserEnsureOutcome {
     Unchanged,
 }
 
+/// Controls the exceptional reuse of an audited, deleted principal ID.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UserRegistrationOptions {
+    /// Allow a fresh user generation to be created over a delete tombstone.
+    ///
+    /// This deliberately joins both generations under one audit identity.
+    pub reuse_deleted_id: bool,
+}
+
+/// Safety checks applied when deleting a registered principal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UserDeleteOptions {
+    /// Refuse deletion once this identity has participated in any event other
+    /// than changes to its own user record.
+    pub if_unused: bool,
+}
+
 /// Whether a principal is a person or unattended software.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
