@@ -23,8 +23,9 @@ use crate::{
     },
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     audit::{
-        AuditEncryptionTransition, AuditFilter, AuditIdempotency, AuditIdempotencyResult, AuditLog,
-        AuditMutation, ChangePreview, ReconciledMutation, record_hash,
+        AuditEncryptionTransition, AuditFilter, AuditHistory, AuditIdempotency,
+        AuditIdempotencyResult, AuditLog, AuditMutation, ChangePreview, ReconciledMutation,
+        record_hash,
     },
     check::{CheckReport, CheckScope},
     encryption::{
@@ -3112,7 +3113,7 @@ impl Database {
             }
             (None, None) => {
                 if self.owner_access_allowed(&AccessResource::Database)? {
-                    return self.reveal_audit_entries(audit.recent(limit, filter)?);
+                    return self.reveal_audit_history(audit.recent_history(limit, filter)?);
                 }
                 let Some((user, policy_hash)) = self.user_unchecked_optional(&self.principal)?
                 else {
@@ -3121,7 +3122,7 @@ impl Database {
                         self.principal
                     )));
                 };
-                let entries = audit.recent_where(limit, filter, |entry| {
+                let history = audit.recent_history_where(limit, filter, |entry| {
                     if entry.payload.record.collection == USERS_COLLECTION {
                         if entry.payload.record.id == self.principal {
                             return Ok(true);
@@ -3149,11 +3150,11 @@ impl Database {
                         )
                         .is_some())
                 })?;
-                return self.reveal_audit_entries(entries);
+                return self.reveal_audit_history(history);
             }
             (None, Some(_)) => unreachable!(),
         }
-        self.reveal_audit_entries(audit.recent(limit, filter)?)
+        self.reveal_audit_history(audit.recent_history(limit, filter)?)
     }
 
     pub fn audit_head(&self) -> Result<AuditHead> {
@@ -3570,8 +3571,11 @@ impl Database {
         Ok(preview)
     }
 
-    fn reveal_audit_entries(&self, mut entries: Vec<AuditEntry>) -> Result<Vec<AuditEntry>> {
-        let transitions = self.audit().encryption_storage_transitions()?;
+    fn reveal_audit_history(&self, history: AuditHistory) -> Result<Vec<AuditEntry>> {
+        let AuditHistory {
+            mut entries,
+            encryption_transitions: transitions,
+        } = history;
         // Preflight every selected event before decrypting any of them. The
         // response is built in memory and already all-or-nothing, but this also
         // keeps plaintext out of the working projection when a later selected

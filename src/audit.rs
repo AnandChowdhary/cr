@@ -1,10 +1,13 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     ffi::OsStr,
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
+
+#[cfg(test)]
+use std::cell::Cell;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -39,6 +42,22 @@ impl AuditEncryptionTransition {
     pub fn metadata(&self) -> impl Iterator<Item = &EncryptionStorageMetadata> {
         self.before.iter().chain(self.after.iter())
     }
+
+    fn is_empty(&self) -> bool {
+        self.before.is_none() && self.after.is_none()
+    }
+}
+
+/// Recent entries and the exact historical storage meaning established while
+/// replaying the same verified chain that selected them.
+pub(crate) struct AuditHistory {
+    pub entries: Vec<AuditEntry>,
+    pub encryption_transitions: HashMap<u64, AuditEncryptionTransition>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static VERIFY_CHAIN_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Where the tamper-evident journal lives beneath the database root.
@@ -1028,6 +1047,16 @@ impl<'a> AuditLog<'a> {
         self.recent_where(limit, filter, |_| Ok(true))
     }
 
+    /// Select recent history while reconstructing its exact encryption
+    /// metadata in the same forward verification and semantic replay.
+    pub(crate) fn recent_history(
+        &self,
+        limit: usize,
+        filter: AuditFilter<'_>,
+    ) -> Result<AuditHistory> {
+        self.recent_history_where(limit, filter, |_| Ok(true))
+    }
+
     /// Find the committed result for one fully scoped retry identity.
     ///
     /// Callers hold the audit lock. `verify_chain` both validates every event
@@ -1105,6 +1134,44 @@ impl<'a> AuditLog<'a> {
         Ok(result)
     }
 
+    /// The history equivalent of [`Self::recent_where`], with manifest
+    /// transitions produced by the same verified replay rather than a second
+    /// full journal scan.
+    ///
+    /// Entries are encountered oldest-first because semantic replay is
+    /// forward-only. A bounded deque retains the newest visible matches and is
+    /// reversed at the end, preserving the public newest-first order and the
+    /// rule that inaccessible entries do not consume `limit`.
+    pub(crate) fn recent_history_where(
+        &self,
+        limit: usize,
+        filter: AuditFilter<'_>,
+        mut visible: impl FnMut(&AuditEntry) -> Result<bool>,
+    ) -> Result<AuditHistory> {
+        let mut entries = VecDeque::new();
+        let mut encryption_transitions = HashMap::new();
+        self.replay_encryption_chain(|entry, _, transition| {
+            if !transition.is_empty() {
+                encryption_transitions.insert(entry.payload.sequence, transition);
+            }
+            if !filter.matches(&entry.payload) || !visible(entry)? {
+                return Ok(());
+            }
+            // `recent_where` historically treats zero as unbounded. Public
+            // CLI and HTTP limits are positive, but preserve the domain API's
+            // established behavior here.
+            if limit > 0 && entries.len() == limit {
+                entries.pop_front();
+            }
+            entries.push_back(entry.clone());
+            Ok(())
+        })?;
+        Ok(AuditHistory {
+            entries: entries.into_iter().rev().collect(),
+            encryption_transitions,
+        })
+    }
+
     pub fn head(&self) -> Result<AuditHead> {
         let state = self.verify_chain(|_, _| Ok(()))?;
         Ok(AuditHead {
@@ -1120,27 +1187,10 @@ impl<'a> AuditLog<'a> {
     pub(crate) fn encryption_storage_transitions(
         &self,
     ) -> Result<HashMap<u64, AuditEncryptionTransition>> {
-        let mut latest = AuditedRecordStates::new();
         let mut transitions = HashMap::new();
-        self.verify_chain(|entry, _| {
-            let key = (
-                entry.payload.record.collection.clone(),
-                entry.payload.record.id.clone(),
-            );
-            let before = latest
-                .get(&key)
-                .and_then(|state| state.document.as_ref())
-                .and_then(audit_document_encryption_metadata);
-            replay_entry(&mut latest, entry)?;
-            let after = latest
-                .get(&key)
-                .and_then(|state| state.document.as_ref())
-                .and_then(audit_document_encryption_metadata);
-            if before.is_some() || after.is_some() {
-                transitions.insert(
-                    entry.payload.sequence,
-                    AuditEncryptionTransition { before, after },
-                );
+        self.replay_encryption_chain(|entry, _, transition| {
+            if !transition.is_empty() {
+                transitions.insert(entry.payload.sequence, transition);
             }
             Ok(())
         })?;
@@ -1509,6 +1559,33 @@ impl<'a> AuditLog<'a> {
         Ok((latest, chain))
     }
 
+    /// Verify and semantically replay the complete chain once, exposing the
+    /// exact manifest ownership immediately around every event to a caller
+    /// that needs a derived projection.
+    fn replay_encryption_chain<F>(&self, mut visitor: F) -> Result<ChainState>
+    where
+        F: FnMut(&AuditEntry, &str, AuditEncryptionTransition) -> Result<()>,
+    {
+        let mut latest = AuditedRecordStates::new();
+        let chain = self.verify_chain(|entry, payload| {
+            let key = (
+                entry.payload.record.collection.clone(),
+                entry.payload.record.id.clone(),
+            );
+            let before = latest
+                .get(&key)
+                .and_then(|state| state.document.as_ref())
+                .and_then(audit_document_encryption_metadata);
+            replay_entry(&mut latest, entry)?;
+            let after = latest
+                .get(&key)
+                .and_then(|state| state.document.as_ref())
+                .and_then(audit_document_encryption_metadata);
+            visitor(entry, payload, AuditEncryptionTransition { before, after })
+        })?;
+        Ok(chain)
+    }
+
     fn append(&self, entry: &PreparedEntry) -> Result<()> {
         // Recheck the complete journal immediately before publishing. Normal
         // mutation preparation already refuses a reused identity, but append
@@ -1618,6 +1695,8 @@ impl<'a> AuditLog<'a> {
     where
         F: FnMut(&AuditEntry, &str) -> Result<()>,
     {
+        #[cfg(test)]
+        VERIFY_CHAIN_CALLS.with(|calls| calls.set(calls.get() + 1));
         let paths = self.segment_paths()?;
         let mut expected_sequence = 1;
         let mut previous_hash: Option<String> = None;
@@ -2558,10 +2637,11 @@ pub(crate) fn digest(domain: &[u8], contents: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditAction, AuditChange, AuditFilter, AuditIdempotency, AuditIdempotencyResult, AuditLog,
-        AuditMutation, AuditPayload, AuditRecord, AuditSource, CHANGE_SET_HASH_DOMAIN,
-        PENDING_PATH, PendingMutation, PreparedEntry, ReconciledMutation, apply_changes,
-        change_set_hash, diff_documents, digest, event_hash, parse_line, record_hash, stored_line,
+        AuditAction, AuditChange, AuditEntry, AuditFilter, AuditIdempotency,
+        AuditIdempotencyResult, AuditLog, AuditMutation, AuditPayload, AuditRecord, AuditSource,
+        CHANGE_SET_HASH_DOMAIN, PENDING_PATH, PendingMutation, PreparedEntry, ReconciledMutation,
+        VERIFY_CHAIN_CALLS, apply_changes, change_set_hash, diff_documents, digest, event_hash,
+        parse_line, record_hash, stored_line,
     };
     use crate::{
         attribution::{
@@ -2572,6 +2652,7 @@ mod tests {
         frontmatter::Document,
         paths,
     };
+    use std::cell::Cell;
 
     /// One audit event written by `cr` at `0ca95fb`, before `agent`,
     /// `authorization`, and `intent` existed, copied verbatim out of
@@ -3093,6 +3174,79 @@ mod tests {
                 .contains("changed while it was being saved")
         );
         assert_eq!(audit.head().unwrap().sequence, 1);
+    }
+
+    #[test]
+    fn history_selection_and_manifest_replay_share_one_forward_verification() {
+        let root = tempfile::tempdir().unwrap();
+        let attribution = Attribution::default();
+        let audit = AuditLog::new(
+            root.path(),
+            Path::new("records"),
+            2,
+            1024 * 1024,
+            "tester",
+            &attribution,
+        );
+        let _lock = audit.lock().unwrap();
+        for (collection, id) in [
+            ("items", "one"),
+            ("other", "two"),
+            ("items", "three"),
+            ("items", "four"),
+            ("other", "five"),
+            ("items", "six"),
+        ] {
+            let document = Document {
+                attributes: Mapping::new(),
+                body: format!("{collection}/{id}\n"),
+            };
+            let rendered = document.render().unwrap();
+            let target = PathBuf::from(format!("records/{collection}/{id}.md"));
+            let entry = audit
+                .prepare(AuditMutation {
+                    action: AuditAction::Create,
+                    collection,
+                    id,
+                    before_document: None,
+                    after_document: Some(&document),
+                    before_bytes: None,
+                    after_bytes: Some(rendered.as_bytes()),
+                    source: AuditSource::Cli,
+                    message: None,
+                    access: None,
+                    idempotency: None,
+                })
+                .unwrap();
+            audit
+                .commit(entry, &target, || {
+                    paths::write_new(root.path(), &target, rendered.as_bytes(), "the record")
+                })
+                .unwrap();
+        }
+
+        let filter = || AuditFilter {
+            collection: Some("items"),
+            ..AuditFilter::all()
+        };
+        let visible = |entry: &AuditEntry| Ok(entry.payload.sequence != 4);
+        let expected = audit.recent_where(2, filter(), visible).unwrap();
+
+        VERIFY_CHAIN_CALLS.with(|calls| calls.set(0));
+        let history = audit.recent_history_where(2, filter(), visible).unwrap();
+        let verify_calls = VERIFY_CHAIN_CALLS.with(Cell::get);
+
+        assert_eq!(history.entries, expected);
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .map(|entry| entry.payload.sequence)
+                .collect::<Vec<_>>(),
+            [6, 3]
+        );
+        assert!(history.encryption_transitions.is_empty());
+        assert_eq!(verify_calls, 1);
     }
 
     #[test]
