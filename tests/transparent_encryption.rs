@@ -13,6 +13,7 @@ use common::{
     fault::{FaultDatabase, Point},
     run_failure, run_success,
 };
+use cr::{Database, DomainError};
 use serde_json::Value;
 
 const OLD_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -787,6 +788,18 @@ fn encryption_manifest_name_is_reserved_for_writes_but_legacy_data_remains_reada
         legacy["attributes"]["$cr_encryption"],
         "legacy-application-value"
     );
+    let exact = fs::read_to_string(database.root.join("records/notes/legacy.md")).unwrap();
+    assert_eq!(
+        Database::discover(Some(&database.root))
+            .unwrap()
+            .read_raw("notes", "legacy")
+            .unwrap(),
+        exact
+    );
+    assert_eq!(
+        run_success(database.command().args(["get", "notes", "legacy"])),
+        exact
+    );
 
     // An exact-looking manifest with only absent optional locations does not
     // prove that ciphertext exists and must not make a legacy record unreadable.
@@ -801,6 +814,19 @@ fn encryption_manifest_name_is_reserved_for_writes_but_legacy_data_remains_reada
             .args(["get", "notes", "empty-manifest", "--json"]),
     );
     assert_eq!(empty["attributes"]["title"], "Legacy");
+    let empty_exact =
+        fs::read_to_string(database.root.join("records/notes/empty-manifest.md")).unwrap();
+    assert_eq!(
+        Database::discover(Some(&database.root))
+            .unwrap()
+            .read_raw("notes", "empty-manifest")
+            .unwrap(),
+        empty_exact
+    );
+    assert_eq!(
+        run_success(database.command().args(["get", "notes", "empty-manifest"])),
+        empty_exact
+    );
 }
 
 #[test]
@@ -1023,6 +1049,24 @@ fn removing_schema_markers_does_not_expose_envelopes_as_ordinary_data() {
     let error = run_failure(command(&database).args(["get", "accounts", "one", "--json"]));
     assert!(error.contains("stored protected data is no longer declared"));
     assert!(!error.contains("still-secret"));
+    let raw_cli = run_failure(command(&database).args(["get", "accounts", "one"]));
+    assert!(raw_cli.contains("stored protected data is no longer declared"));
+    assert!(!raw_cli.contains("still-secret"));
+    assert!(!raw_cli.contains("$cr_encrypted"));
+    assert!(!raw_cli.contains("ciphertext"));
+    let raw_library = Database::discover(Some(&database.root))
+        .unwrap()
+        .read_raw("accounts", "one")
+        .unwrap_err();
+    assert_eq!(
+        DomainError::of(&raw_library).map(DomainError::code),
+        Some("conflict")
+    );
+    let raw_library = format!("{raw_library:#}");
+    assert!(raw_library.contains("stored protected data is no longer declared"));
+    assert!(!raw_library.contains("still-secret"));
+    assert!(!raw_library.contains("$cr_encrypted"));
+    assert!(!raw_library.contains("ciphertext"));
     let update = run_failure(command(&database).args([
         "update",
         "accounts",

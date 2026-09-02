@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, process::Command};
 
 use axum::{
     Router,
@@ -921,6 +921,84 @@ async fn boolean_collection_schemas_keep_http_and_openapi_semantics() {
             Value::Bool(expected)
         );
     }
+}
+
+#[tokio::test]
+async fn raw_document_reads_fail_closed_after_marker_removal_but_keep_legacy_collisions() {
+    let (_temporary, database) = test_database("server-raw-encryption-boundary");
+    let schema_path = database.root().join(".cr/schemas/secrets.json");
+    fs::write(
+        &schema_path,
+        r#"{
+  "type": "object",
+  "properties": {
+    "token": { "type": "string", "x-cr-encrypted": true }
+  },
+  "required": ["token"]
+}"#,
+    )
+    .unwrap();
+    let created = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["--database"])
+        .arg(database.root())
+        .args([
+            "--actor",
+            "api-reviewer@example.com",
+            "create",
+            "secrets",
+            "one",
+            "--set",
+            "token=http-private-token",
+        ])
+        .env("CR_ENCRYPTION_ACTIVE_KEY", "old")
+        .env(
+            "CR_ENCRYPTION_KEYS",
+            r#"{"old":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    fs::write(&schema_path, r#"{"type":"object"}"#).unwrap();
+
+    let legacy_raw = "---\n$cr_encryption:\n  version: 1\n  fields:\n  - - optional\n    - token\n  body: false\ntitle: Legacy\n---\nordinary body\n";
+    fs::create_dir_all(database.root().join("records/notes")).unwrap();
+    fs::write(database.root().join("records/notes/legacy.md"), legacy_raw).unwrap();
+
+    let app = router(database, ServerConfig::default()).unwrap();
+    let protected = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/secrets/records/one/document",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(protected.status, StatusCode::CONFLICT);
+    assert_eq!(protected.json()["error"]["code"], "conflict");
+    assert!(
+        protected.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stored protected data is no longer declared")
+    );
+    assert!(!protected.text().contains("http-private-token"));
+    assert!(!protected.text().contains("$cr_encrypted"));
+    assert!(!protected.text().contains("ciphertext"));
+
+    let legacy = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/notes/records/legacy/document",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(legacy.status, StatusCode::OK);
+    assert_eq!(legacy.text(), legacy_raw);
 }
 
 #[tokio::test]

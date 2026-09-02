@@ -1932,7 +1932,16 @@ impl Database {
         let path = self.record_path(collection, id)?;
         let stored_raw = self.read_record(collection, id, &path)?;
         let version = record_hash(stored_raw.as_bytes());
-        if self.encryption_policy(collection)?.is_empty() {
+        let policy = self.encryption_policy(collection)?;
+        if policy.is_empty() {
+            // Empty policy normally means exact bytes can pass straight
+            // through. Still parse and classify the stored document first: a
+            // removed marker must not turn a valid CR manifest and its
+            // envelopes into a raw ciphertext export. `reveal` preserves
+            // ordinary legacy `$cr_encryption` application values, including
+            // exact-looking manifests that own no envelope.
+            let stored = parse_record(collection, id, &stored_raw)?;
+            policy.reveal(None, collection, id, &stored)?;
             return Ok((stored_raw, version));
         }
         let document = self.parse_logical_record(collection, id, &stored_raw)?;
