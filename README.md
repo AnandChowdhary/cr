@@ -175,25 +175,33 @@ service shorthand.
 
 The first user becomes the database owner. Its record is ordinary readable
 Markdown at `records/users/jane@example.com.md`, but its schema and mutation
-surface are owned by CR: generic `create`, `update`, `save`, and `delete`
-commands cannot change `users`. Use the dedicated commands instead:
+surface are owned by CR: generic `create`, `save`, and `delete` commands cannot
+change `users`, and generic `update` is restricted to the safe fields described
+below. Use the dedicated commands for lifecycle and policy changes:
 
 ```sh
 cr user add maria@example.com --name Maria --email maria@example.com --set role=CEO
 cr user ensure nightly@example.com --name Nightly --service --set queue=default
 cr user update maria@example.com --name 'Maria Garcia' --set team=leadership
 cr access grant maria@example.com editor collection:deals
+cr access grant assistant@example.com editor collection:users
+cr update users maria@example.com --set profile.last_seen=2026-09-02
 cr access grant maria@example.com viewer record:deals/sensitive-renewal
 cr access check update record:deals/acme-renewal
 cr access revoke maria@example.com record:deals/sensitive-renewal
 ```
 
-`name`, `email`, `kind`, `status`, and `access` remain CR-owned and validated.
-Application identity data belongs under the open `profile` namespace; each
-`--set` applies a dotted path within that namespace. This is enough for many
-integrations to use `users` as their principal and people registry without
-adding a parallel table, while applications that also model people who can
-never act may still keep those records separately.
+`email`, `kind`, `status`, and `access` remain CR-owned and validated. A user's
+`name` remains validated and owner-managed for other users, while an active
+principal may change its own name without a grant. Application identity data
+belongs under the open `profile` namespace; each `user --set` applies a dotted
+path within that namespace. An `editor` grant on `collection:users` lets an
+integration update `profile.*` through ordinary `update` and REST `PATCH`
+operations, but does not open any managed field. Active principals may update
+their own `profile.*` without a grant. This is enough for many integrations to
+use `users` as their principal and people registry without adding a parallel
+table, while applications that also model people who can never act may still
+keep those records separately.
 
 `user ensure` is the declarative, race-safe bootstrap command: it creates a
 missing principal, exits successfully without writing another event when the
@@ -219,8 +227,13 @@ accidentally narrowed by a more specific grant.
 
 User records carry their direct `access` grants, so every policy change is a
 normal versioned audit event. A permitted record mutation stores the principal,
-effective role, grant scope, and hash of the user policy that allowed it.
-`cr access check ACTION RESOURCE` explains the same decision without writing.
+effective role, grant scope, decision basis, and hash of the user policy that
+allowed it. The basis is normally a stored grant; a self name/profile update is
+marked `self_service` explicitly.
+`cr access check ACTION RESOURCE` explains the stored resource-level decision
+without writing. The additional `users` field boundary is evaluated when a
+concrete mutation supplies its fields; a self-service mutation records that
+separate basis in its event.
 
 The principal and audit actor are normally one user-facing identity. Once RBAC
 is enabled, `--actor` may repeat that principal but cannot impersonate another

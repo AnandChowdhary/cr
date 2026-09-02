@@ -17,6 +17,15 @@ impl Assignment {
         set_path(attributes, &self.path, self.value.clone())
     }
 
+    /// Whether this assignment targets a child of one top-level namespace.
+    pub(crate) fn targets_nested(&self, namespace: &str) -> bool {
+        self.path.len() > 1 && self.path.first().is_some_and(|part| part == namespace)
+    }
+
+    pub(crate) fn targets_field(&self, field: &str) -> bool {
+        self.path.len() == 1 && self.path.first().is_some_and(|part| part == field)
+    }
+
     pub(crate) fn matches(&self, attributes: &Mapping) -> bool {
         get_path(attributes, &self.path) == Some(&self.value)
     }

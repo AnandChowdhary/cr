@@ -118,6 +118,8 @@ struct AccessRequest {
     action: AccessAction,
     resource: AccessResource,
     owner_only: bool,
+    user_fields: bool,
+    user_name: bool,
 }
 
 impl AccessRequest {
@@ -126,6 +128,8 @@ impl AccessRequest {
             action,
             resource,
             owner_only: false,
+            user_fields: false,
+            user_name: false,
         }
     }
 
@@ -134,6 +138,18 @@ impl AccessRequest {
             action: AccessAction::ManageAccess,
             resource,
             owner_only: true,
+            user_fields: false,
+            user_name: false,
+        }
+    }
+
+    fn user_fields(id: &str, user_name: bool) -> Self {
+        Self {
+            action: AccessAction::Update,
+            resource: AccessResource::record(USERS_COLLECTION, id),
+            owner_only: false,
+            user_fields: true,
+            user_name,
         }
     }
 }
@@ -693,6 +709,34 @@ impl Database {
             })
     }
 
+    /// Authorize an ordinary user-field update, including the built-in rule
+    /// that lets an active principal maintain its own name and profile.
+    fn authorize_user_field_update(&self, id: &str) -> Result<Option<AccessDecision>> {
+        if !self.access_enabled()? {
+            return Ok(None);
+        }
+        let resource = AccessResource::record(USERS_COLLECTION, id);
+        if id != self.principal {
+            return self.authorize(AccessAction::Update, &resource);
+        }
+        let Some((user, policy_hash)) = self.user_unchecked_optional(&self.principal)? else {
+            return Err(forbidden(format!(
+                "principal '{}' is not registered in the users collection",
+                self.principal
+            )));
+        };
+        if user.status != UserStatus::Active {
+            return Err(forbidden(format!(
+                "principal '{}' is not active",
+                self.principal
+            )));
+        }
+        let mut decision =
+            AccessDecision::self_service(&self.principal, &self.actor, resource, &policy_hash);
+        decision.impersonated_by = self.impersonated_by.clone();
+        Ok(Some(decision))
+    }
+
     fn can_access(&self, action: AccessAction, resource: &AccessResource) -> Result<bool> {
         match self.authorize(action, resource) {
             Ok(_) => Ok(true),
@@ -952,9 +996,11 @@ impl Database {
 
     /// Update the non-access portion of a registered principal.
     ///
-    /// Privileged users require a database owner to edit, and disabling the
-    /// final active database owner is refused. The stable user ID is never
-    /// renamed when `email` changes.
+    /// Managed identity fields require a database owner, and disabling the
+    /// final active database owner is refused. Profile-only updates follow
+    /// ordinary editor grants, while active principals may maintain their own
+    /// name and profile. The stable user ID is never renamed when `email`
+    /// changes.
     pub fn update_user(&self, id: &str, update: UserUpdate) -> Result<Record> {
         if update.is_empty() {
             return Err(invalid("user update must change at least one field"));
@@ -973,18 +1019,17 @@ impl Database {
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         self.assert_current_principal_policy(&audit)?;
-        let ordinary_decision =
-            self.authorize(AccessAction::ManageAccess, &AccessResource::Database)?;
+        let decision =
+            if (id == self.principal && update.is_self_service()) || update.is_profile_only() {
+                self.authorize_user_field_update(id)?
+            } else {
+                self.authorize_owner(&AccessResource::Database)?
+            };
 
         let before_raw = self.read_record(USERS_COLLECTION, id, &path)?;
         audit.assert_current(USERS_COLLECTION, id, before_raw.as_bytes())?;
         let before = parse_record(USERS_COLLECTION, id, &before_raw)?;
         let before_user = User::from_attributes(&before.attributes)?;
-        let decision = if before_user.has_privileged_grant() {
-            self.authorize_owner(&AccessResource::Database)?
-        } else {
-            ordinary_decision
-        };
 
         let mut after_user = before_user.clone();
         update.apply(&mut after_user)?;
@@ -1612,13 +1657,17 @@ impl Database {
         assignments: &[Assignment],
         body: Option<&str>,
     ) -> Result<Record> {
-        reject_users_mutation(collection)?;
+        let user_fields = validate_users_field_update(collection, assignments, body)?;
         self.run_update(
             collection,
             id,
             update_with(assignments, body),
             MutationMode::Apply,
-            AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
+            if let Some(includes_name) = user_fields {
+                AccessRequest::user_fields(id, includes_name)
+            } else {
+                AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id))
+            },
         )?
         .record()
     }
@@ -1631,13 +1680,17 @@ impl Database {
         assignments: &[Assignment],
         body: Option<&str>,
     ) -> Result<ChangePreview> {
-        reject_users_mutation(collection)?;
+        let user_fields = validate_users_field_update(collection, assignments, body)?;
         self.run_update(
             collection,
             id,
             update_with(assignments, body),
             MutationMode::Preview,
-            AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
+            if let Some(includes_name) = user_fields {
+                AccessRequest::user_fields(id, includes_name)
+            } else {
+                AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id))
+            },
         )?
         .preview()
     }
@@ -1650,7 +1703,6 @@ impl Database {
         remove: &[String],
         body: Option<&str>,
     ) -> Result<Record> {
-        reject_users_mutation(collection)?;
         self.run_patch(
             collection,
             id,
@@ -1671,7 +1723,6 @@ impl Database {
         remove: &[String],
         body: Option<&str>,
     ) -> Result<ChangePreview> {
-        reject_users_mutation(collection)?;
         self.run_patch(
             collection,
             id,
@@ -1692,6 +1743,7 @@ impl Database {
         body: Option<&str>,
         mode: MutationMode,
     ) -> Result<MutationOutcome> {
+        let user_fields = validate_users_field_patch(collection, attributes, remove, body)?;
         if attributes.is_empty() && remove.is_empty() && body.is_none() {
             return Err(invalid("patch must change front matter or Markdown"));
         }
@@ -1715,7 +1767,11 @@ impl Database {
                 Ok(())
             },
             mode,
-            AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
+            if let Some(includes_name) = user_fields {
+                AccessRequest::user_fields(id, includes_name)
+            } else {
+                AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id))
+            },
         )
     }
 
@@ -1760,11 +1816,15 @@ impl Database {
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
         }
-        if access.action == AccessAction::ManageAccess {
+        if access.action == AccessAction::ManageAccess || access.user_fields {
             self.assert_current_principal_policy(&audit)?;
         }
         let decision = if access.owner_only {
             self.authorize_owner(&access.resource)?
+        } else if access.user_fields && access.user_name && id != self.principal {
+            self.authorize_owner(&AccessResource::Database)?
+        } else if access.user_fields {
+            self.authorize_user_field_update(id)?
         } else {
             self.authorize(access.action, &access.resource)?
         };
@@ -1772,6 +1832,9 @@ impl Database {
         let before = parse_record(collection, id, &before_raw)?;
         let mut document = before.clone();
         mutate(&mut document)?;
+        if collection == USERS_COLLECTION {
+            document.attributes = User::from_attributes(&document.attributes)?.attributes()?;
+        }
         self.validate(collection, &document.attributes)?;
         let rendered = document.render()?;
         let event = audit.prepare(AuditMutation {
@@ -2604,6 +2667,62 @@ fn reject_users_mutation(collection: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Classify the ordinary user update surface without opening reserved fields.
+fn validate_users_field_update(
+    collection: &str,
+    assignments: &[Assignment],
+    body: Option<&str>,
+) -> Result<Option<bool>> {
+    if collection != USERS_COLLECTION {
+        return Ok(None);
+    }
+    let includes_name = assignments
+        .iter()
+        .any(|assignment| assignment.targets_field("name"));
+    if body.is_some()
+        || assignments.is_empty()
+        || assignments.iter().any(|assignment| {
+            !assignment.targets_nested("profile") && !assignment.targets_field("name")
+        })
+    {
+        return Err(invalid(
+            "ordinary users updates may change only profile.* and the target's name; email, kind, status, access, and Markdown stay on managed commands",
+        ));
+    }
+    Ok(Some(includes_name))
+}
+
+/// Classify REST-style user patches without opening reserved fields.
+fn validate_users_field_patch(
+    collection: &str,
+    attributes: &Mapping,
+    remove: &[String],
+    body: Option<&str>,
+) -> Result<Option<bool>> {
+    if collection != USERS_COLLECTION {
+        return Ok(None);
+    }
+    let includes_name = attributes
+        .keys()
+        .any(|key| matches!(key, Value::String(key) if key == "name"));
+    let attributes_are_allowed = attributes.iter().all(|(key, value)| {
+        matches!((key, value), (Value::String(key), Value::Mapping(_)) if key == "profile")
+            || matches!((key, value), (Value::String(key), Value::String(_)) if key == "name")
+    });
+    let removes_are_profile = remove.iter().try_fold(true, |allowed, raw| {
+        let path = parse_path(raw)?;
+        Ok::<_, anyhow::Error>(
+            allowed && path.len() > 1 && path.first().is_some_and(|part| part == "profile"),
+        )
+    })?;
+    if body.is_some() || !attributes_are_allowed || !removes_are_profile {
+        return Err(invalid(
+            "ordinary users patches may change only profile.* and the target's name; email, kind, status, access, and Markdown stay on managed commands",
+        ));
+    }
+    Ok(Some(includes_name))
 }
 
 fn validate_schema_instance(

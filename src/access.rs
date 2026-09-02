@@ -177,13 +177,6 @@ impl User {
             .iter()
             .any(|grant| grant.resource == Resource::Database && grant.role == Role::Owner)
     }
-
-    /// Whether this policy contains a role that only an owner may administer.
-    pub(crate) fn has_privileged_grant(&self) -> bool {
-        self.access
-            .iter()
-            .any(|grant| matches!(grant.role, Role::Owner | Role::AccessManager))
-    }
 }
 
 /// The mutable, non-access portion of a user record.
@@ -234,6 +227,25 @@ impl UserUpdate {
             assignment.apply(&mut user.profile)?;
         }
         Ok(())
+    }
+
+    /// Whether this update changes only application-owned profile data.
+    pub(crate) fn is_profile_only(&self) -> bool {
+        self.name.is_none()
+            && self.email.is_none()
+            && self.kind.is_none()
+            && self.status.is_none()
+            && (self.profile.is_some() || !self.profile_assignments.is_empty())
+    }
+
+    /// Whether the target principal may apply this update to itself.
+    pub(crate) fn is_self_service(&self) -> bool {
+        self.email.is_none()
+            && self.kind.is_none()
+            && self.status.is_none()
+            && (self.name.is_some()
+                || self.profile.is_some()
+                || !self.profile_assignments.is_empty())
     }
 }
 
@@ -521,7 +533,26 @@ pub struct AccessDecision {
     pub resource: Resource,
     pub role: Role,
     pub granted_at: Resource,
+    /// Whether permission came from a stored grant or the built-in rule that
+    /// lets an active principal maintain its own name and profile.
+    #[serde(default, skip_serializing_if = "AccessDecisionBasis::is_grant")]
+    pub basis: AccessDecisionBasis,
     pub policy_hash: String,
+}
+
+/// Why an access decision was allowed.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessDecisionBasis {
+    #[default]
+    Grant,
+    SelfService,
+}
+
+impl AccessDecisionBasis {
+    fn is_grant(&self) -> bool {
+        *self == Self::Grant
+    }
 }
 
 impl AccessDecision {
@@ -541,6 +572,26 @@ impl AccessDecision {
             resource: resource.clone(),
             role: grant.role,
             granted_at: grant.resource.clone(),
+            basis: AccessDecisionBasis::Grant,
+            policy_hash: policy_hash.to_owned(),
+        }
+    }
+
+    pub(crate) fn self_service(
+        principal: &str,
+        display: &str,
+        resource: Resource,
+        policy_hash: &str,
+    ) -> Self {
+        Self {
+            principal: principal.to_owned(),
+            display: display.to_owned(),
+            impersonated_by: None,
+            action: AccessAction::Update,
+            granted_at: resource.clone(),
+            resource,
+            role: Role::Editor,
+            basis: AccessDecisionBasis::SelfService,
             policy_hash: policy_hash.to_owned(),
         }
     }

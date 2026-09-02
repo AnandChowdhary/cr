@@ -249,8 +249,17 @@ silently strip an owner's recovery authority.
 
 The users collection is the policy store as well as the principal registry.
 That makes a policy version an ordinary audited user-record version rather than
-a second configuration history. Generic record mutations cannot target
-`users`; `cr user` and `cr access` preserve the fixed schema, prevent an access
+a second configuration history. Generic create, full replacement, save, and
+delete mutations cannot target `users`. Partial update and patch are deliberately
+field-aware: an ordinary `editor` decision may change only `profile.*`; an
+active principal may change its own `name` and `profile.*` without a stored
+grant; and changing another user's name or any user's email, kind, or status
+requires an owner. Access remains on the dedicated grant/revoke path. Requests
+that mix fields use the strongest required authorization before anything is
+written, so an editor cannot smuggle a managed-field change beside a profile
+change. Resource-only access checks cannot predict this field-aware boundary;
+the concrete mutation records the decision actually used. `cr user` and `cr
+access` preserve the fixed schema, prevent an access
 manager from minting ownership or another access manager, and prevent removal
 of the final active database owner. Bootstrap accepts an explicit human or
 service kind. User add/ensure/update operations apply profile assignments and
@@ -260,9 +269,11 @@ read-then-create race. An owner-only restore reconstructs the exact latest
 audited user bytes after a direct edit, without appending a fictional policy
 change. Each allowed data mutation stores an
 optional access decision beside the event: principal, display identity,
-action, target resource, effective role, grant scope, and the exact hash of the
-user record evaluated. Legacy and bootstrap events omit the object and retain
-their original bytes.
+action, target resource, effective role, grant scope, decision basis, and the
+exact hash of the user record evaluated. Stored grants omit the default `grant`
+basis for format compatibility; the built-in own-record rule writes
+`self_service`. Legacy and bootstrap events omit the object and retain their
+original bytes.
 
 Authorization happens inside `Database`. Mutations evaluate under the audit
 lock before preparing the event; list and search filter records by `read`; a
