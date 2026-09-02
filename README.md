@@ -19,7 +19,7 @@
 
 | Own the source | Model what you need |
 | --- | --- |
-| Each record is a readable Markdown file. Direct edits are first-class and reviewed with `cr status` and `cr save`. | Collections and typed YAML fields are arbitrary, with optional JSON Schema validation and relationships. |
+| Each record is a readable Markdown file by default. Direct edits are first-class; collections that need confidentiality can opt specific values into encrypted storage. | Collections and typed YAML fields are arbitrary, with optional JSON Schema validation and relationships. |
 | **Query everywhere** | **Trust the history** |
 | Filter, compare, sort, search, and page through the same data from the CLI, REST API, tables, or Kanban boards. | Every accepted create, update, link, move, direct edit, sync, and delete extends a tamper-evident audit chain. |
 
@@ -90,6 +90,7 @@ The new directory contains:
 my-database/
 ├── .cr/
 │   ├── audit/
+│   ├── encryption.json
 │   ├── schemas/
 │   ├── sync/
 │   ├── syncs/
@@ -99,6 +100,9 @@ my-database/
 
 - `records/` contains your Markdown records.
 - `.cr/audit/` contains the audit journal.
+- `.cr/encryption.json` is a portable, non-secret database identity used to
+  bind protected ciphertext to this database. Keep it with every clone and
+  backup.
 - `.cr/schemas/` can contain optional validation rules.
 - `.cr/syncs/` contains versioned external sync definitions; `.cr/sync/` holds their checkpoints and locks.
 - `.cr/views/` contains optional saved web views.
@@ -1253,11 +1257,102 @@ For example, `.cr/schemas/applications.json` can restrict ATS stages:
 
 Schemas validate front matter. The record ID, collection, path, and Markdown body remain separate. Creates, updates, links, direct `save` operations, and sync upserts validate before extending the audit journal.
 
+### Encrypt selected values at rest
+
+Encryption is opt-in and schema-directed. Put `x-cr-encrypted: true` on a
+property to encrypt that complete value, or put `x-cr-encrypted-body: true` on
+the schema root to encrypt the Markdown body:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "x-cr-encrypted-body": true,
+  "properties": {
+    "name": { "type": "string" },
+    "credentials": {
+      "type": "object",
+      "properties": {
+        "api_token": {
+          "type": "string",
+          "x-cr-encrypted": true
+        }
+      }
+    }
+  }
+}
+```
+
+The schema still describes plaintext. `create`, `get`, `list`, `search`,
+`update`, sync, REST, and the local app accept and return the same logical
+values as an unencrypted collection. Schema validation, filters, and search run
+over decrypted values in memory. The Markdown file and audit change values use
+versioned XChaCha20-Poly1305 envelopes instead, with a fresh random nonce and
+authenticated context binding the collection, record ID, logical field path,
+purpose, format version, and the random database identity stored in
+`.cr/encryption.json`. Moving or cloning the complete database does not
+invalidate that context, but copying an envelope into an independently
+initialized database fails authentication even when both databases use the
+same keyring. Losing the context file makes existing ciphertext unreadable; it
+is not a secret and belongs in Git and backups. Databases created by an older
+version receive one immediately before their first encrypted write, but CR
+never regenerates it when protected records or history already exist.
+`audit verify` checks stored ciphertext hashes without
+keys; `audit log` needs the keys because it renders logical values.
+
+Keys stay outside the database and its Git history. Configure an active key for
+writes and a JSON keyring for reads:
+
+```sh
+key=$(openssl rand 32 | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+export CR_ENCRYPTION_ACTIVE_KEY=primary
+export CR_ENCRYPTION_KEYS="{\"primary\":\"$key\"}"
+```
+
+Each value must be an unpadded base64url encoding of exactly 32 random bytes.
+Key IDs are stored with envelopes, so rotation means adding the old and new
+keys to the keyring and selecting the new ID as active. New or changed protected
+values use the active key; unchanged values keep their existing envelope.
+Retain every old key needed to read audit history.
+
+The stored front matter also carries a reserved `$cr_encryption` manifest. New
+writes reserve that name even in unencrypted collections, while old
+unencrypted records that used it as ordinary data remain readable unless its
+declared locations actually contain CR envelopes. The manifest
+prevents removing or moving schema markers from silently exposing ciphertext as
+ordinary application data. Existing plaintext does not become protected merely
+because a marker was added: reads and `audit baseline` fail with an explicit
+migration-required conflict. Export the plaintext before enabling the marker,
+then import it into a newly encrypted record or database. That boundary is
+deliberate—an in-place audit event would preserve the old plaintext in history
+and falsely imply migration had removed it.
+
+Direct filesystem edits remain possible for unprotected values as long as the
+envelopes and manifest are preserved; `cr save` refuses plaintext substituted
+at a protected path. `cr get` renders encrypted records as canonical plaintext
+Markdown, while unencrypted records retain their historical exact-byte output.
+Preview approval is explicitly unavailable when a change needs fresh
+ciphertext: reproducing the same preview digest would otherwise require nonce
+reuse, deterministic encryption, or a larger stateful approval protocol.
+
+This is at-rest confidentiality, not selective erasure. A process with the
+keyring sees plaintext, filesystem paths and record identities remain visible,
+and one retained key may decrypt many historical values. Per-record key
+destruction, retention windows, redaction policy, and audited key management
+remain roadmap work. The reserved `users` policy collection cannot opt its
+authorization-critical fields into encryption.
+
+Audit history returned by the CLI, REST API, and local app is a logical
+projection: protected values in `changes` are decrypted for the caller. The
+event `hash` and any `authorization.approved_changes` digest still commit to the
+exact stored ciphertext bytes, so they cannot be recomputed by serializing that
+plaintext projection. `audit verify` always verifies the stored representation.
+
 ## Import data with sync adapters
 
 A sync adapter is an ordinary executable: a shell script, Python program, compiled Rust binary, or any other local command. It fetches or computes data and writes one JSON object per line to stdout. `cr` owns the database writes, schema validation, audit events, checkpoints, limits, and overlap protection.
 
-This subprocess boundary is intentionally simpler than an in-process Rust plugin ABI. Adapters can use any language or SDK, fail without crashing `cr`, and evolve independently. They are still trusted local programs: they inherit your environment and can access the filesystem, network, and external services with your operating-system permissions.
+This subprocess boundary is intentionally simpler than an in-process Rust plugin ABI. Adapters can use any language or SDK, fail without crashing `cr`, and evolve independently. They are still trusted local programs: they inherit your environment except for `CR_ENCRYPTION_ACTIVE_KEY` and `CR_ENCRYPTION_KEYS`, and can access the filesystem, network, and external services with your operating-system permissions. The keyring is needed by CR's storage boundary, never by the plaintext adapter protocol.
 
 ### A Notion meeting-notes adapter
 
@@ -1358,7 +1453,18 @@ Do not have an unattended adapter write `records/` directly. If it does, the sec
 
 Record operations are preflighted together but committed as sequential audited single-record mutations, not one all-or-nothing multi-record transaction. A durable-write failure midway through application therefore still leaves earlier operations committed. What it can no longer do is leave that fact unrecorded.
 
-Before the first mutation `cr` writes a version-2 run ledger containing that head-bound target-version snapshot, and the exact operation stream beside it, under `.cr/sync/runs/`, and removes both only once the checkpoint agrees with the committed work. Recovery also accepts version-1 ledgers written by earlier builds: it reconstructs their missing target snapshot by replaying the immutable audit prefix to the head recorded in the ledger. An interrupted run is then a durable fact rather than something to infer:
+Adapter stdout is captured in bounded memory, not a temporary file, so a hard
+crash during fetch cannot orphan a plaintext protocol stream under `.cr/`.
+Before the first mutation `cr` writes a run ledger containing that head-bound
+target-version snapshot, and the exact operation stream beside it, under
+`.cr/sync/runs/`, and removes both only once the checkpoint agrees with the
+committed work. A stream that contains an upsert for an encrypted collection is
+stored as one authenticated ciphertext blob (ledger version 3) bound to the
+database context, sync name, and run ID; recovery therefore requires the
+keyring. Unprotected streams retain the plaintext version-2 format. Recovery
+also accepts version-1 ledgers written by earlier builds: it reconstructs their
+missing target snapshot by replaying the immutable audit prefix to the head
+recorded in the ledger. An interrupted run is then a durable fact rather than something to infer:
 
 ```sh
 cr sync recover notion-meeting --check          # report an interrupted run, change nothing
@@ -2080,7 +2186,7 @@ Prefer changing the adapter to emit `upsert` or `delete` messages so future runs
 
 ## Backups and sensitive data
 
-Back up the whole database directory, not only `records/`. The `.cr/audit/` directory is necessary to verify history and reconcile direct edits, while `.cr/syncs/` and `.cr/sync/state/` are needed to resume configured incremental imports. Include `.cr-audit-head.json`, and prefer a backup that keeps history—a Git remote rather than a mirror of the current directory—because a backup taken after a tamper is a copy of the tamper, while a history is a record of when it appeared.
+Back up the whole database directory, not only `records/`. The `.cr/audit/` directory is necessary to verify history and reconcile direct edits, `.cr/encryption.json` is necessary to decrypt protected data, and `.cr/syncs/` plus `.cr/sync/state/` are needed to resume configured incremental imports. Include `.cr-audit-head.json`, and prefer a backup that keeps history—a Git remote rather than a mirror of the current directory—because a backup taken after a tamper is a copy of the tamper, while a history is a record of when it appeared.
 
 CRM and ATS records often contain personal or confidential information. Apply appropriate filesystem permissions, disk encryption, backup retention, and access controls.
 

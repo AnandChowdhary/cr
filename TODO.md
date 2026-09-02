@@ -258,6 +258,7 @@ Priorities:
 
 - [ ] **P1 — Audit retention, redaction, and encryption policy.**
   Define how regulated or deleted personal data is protected while preserving useful integrity guarantees.
+  **Partially addressed and deliberately left open.** Collection schemas may now mark complete front-matter values and the Markdown body for transparent XChaCha20-Poly1305 storage. Keys remain external; envelopes carry key IDs for rotation; fresh nonces and portable database/coordinate-bound AAD prevent equality leakage and envelope swapping; records, audit snapshots, audit diffs, pending mutations, and durable protected sync streams contain ciphertext while CLI, REST, serve, validation, filtering, search, and user-facing history operate on plaintext. A stored manifest makes marker removal fail closed, pre-existing plaintext is refused rather than laundered through an audit migration that would keep the plaintext forever, and adapters neither inherit the keyring nor stage plaintext stdout on disk. `audit verify` remains keyless because it verifies the stored ciphertext representation. This solves at-rest confidentiality only. Retention windows, redaction semantics, per-record/data-encryption keys and selective key destruction, an auditable key-provider interface, protected backup policy, and a stateful approval-plan protocol for fresh encrypted changes remain open.
 
 - [ ] **P2 — Backup and restore commands.**
   Capture records, configuration, schemas, audit segments, and external checkpoint metadata; verify a restored database before activation.

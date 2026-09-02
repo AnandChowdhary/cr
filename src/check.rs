@@ -611,7 +611,7 @@ fn scan_record(
         ));
         return Ok(record);
     };
-    let document = match Document::parse(&text) {
+    let stored_document = match Document::parse(&text) {
         Ok(document) => document,
         Err(error) => {
             findings.push(Finding::record(
@@ -624,14 +624,50 @@ fn scan_record(
             return Ok(record);
         }
     };
+    let schema_state = validators.get(database, collection, findings)?;
+    if matches!(schema_state, SchemaState::Unusable) {
+        record.blocked = true;
+        return Ok(record);
+    }
+    let document = match database.reveal_document(collection, id, &stored_document) {
+        Ok(document) => document,
+        Err(error) => {
+            findings.push(Finding::record(
+                FindingKind::UnreadableRecord,
+                Severity::Error,
+                collection,
+                id,
+                format!(
+                    "record {collection}/{id} has unreadable protected data: {}",
+                    safe(&error)
+                ),
+            ));
+            return Ok(record);
+        }
+    };
 
-    match validators.get(database, collection, findings)? {
+    match schema_state {
         SchemaState::Absent => {}
-        SchemaState::Unusable => record.blocked = true,
+        SchemaState::Unusable => unreachable!("returned above"),
         SchemaState::Ready(validator) => {
             let instance = serde_json::to_value(&document.attributes);
             match instance {
                 Ok(instance) => {
+                    if database.collection_uses_encryption(collection)?
+                        && !validator.is_valid(&instance)
+                    {
+                        findings.push(Finding::record(
+                            FindingKind::SchemaViolation,
+                            Severity::Error,
+                            collection,
+                            id,
+                            format!(
+                                "record {collection}/{id} does not match the schema for collection '{collection}' (protected values redacted)"
+                            ),
+                        ));
+                        record.attributes = Some(document.attributes);
+                        return Ok(record);
+                    }
                     for error in validator.iter_errors(&instance) {
                         let mut finding = Finding::record(
                             FindingKind::SchemaViolation,
@@ -977,6 +1013,13 @@ fn compile_schema(
     };
     if let Err(error) = jsonschema::meta::validate(&schema) {
         findings.extend(unusable(format!("it is not a valid JSON Schema: {error}")));
+        return Ok(None);
+    }
+    if let Err(error) = database.collection_uses_encryption(collection) {
+        findings.extend(unusable(format!(
+            "its encryption annotations are invalid: {}",
+            safe(&error)
+        )));
         return Ok(None);
     }
     match jsonschema::validator_for(&schema) {

@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use yaml_serde::{Mapping, Value};
 
 use crate::{
-    AnchorReport, Assignment, AuditAction, AuditAnchor, AuditEntry, AuditHead, AuditSource,
-    AuditVerification, SearchQuery,
+    AnchorReport, Assignment, AuditAction, AuditAnchor, AuditChange, AuditEntry, AuditHead,
+    AuditSource, AuditVerification, SearchQuery,
     access::{
         AccessAction, AccessDecision, AccessIdentity, Resource as AccessResource, Role,
         USERS_COLLECTION, User, UserDeleteOptions, UserEnsureOutcome, UserKind,
@@ -26,6 +26,10 @@ use crate::{
         ChangePreview, ReconciledMutation, record_hash,
     },
     check::{CheckReport, CheckScope},
+    encryption::{
+        CONTEXT_LABEL, CONTEXT_PATH, EncryptionContext, EncryptionPolicy,
+        document_has_encrypted_storage,
+    },
     error::{
         DomainError, conflict, forbidden, invalid, is_already_exists, is_missing,
         precondition_failed,
@@ -492,6 +496,14 @@ impl Database {
         ] {
             paths::create_directory_all(&root, Path::new(relative), label)?;
         }
+
+        let encryption_context = EncryptionContext::generate()?;
+        paths::write_new(
+            &root,
+            Path::new(CONTEXT_PATH),
+            &encryption_context.render()?,
+            CONTEXT_LABEL,
+        )?;
 
         let database = Self {
             root,
@@ -1836,7 +1848,8 @@ impl Database {
             body: body.to_owned(),
         };
         self.validate(collection, &document.attributes)?;
-        let rendered = document.render()?;
+        let stored = self.protect_document(collection, id, &document, None, mode)?;
+        let rendered = stored.render()?;
         let record = record_from_document(
             collection,
             id,
@@ -1850,7 +1863,7 @@ impl Database {
             collection,
             id,
             before_document: None,
-            after_document: Some(&document),
+            after_document: Some(&stored),
             before_bytes: None,
             after_bytes: Some(rendered.as_bytes()),
             source: self.source.clone(),
@@ -1859,7 +1872,9 @@ impl Database {
             idempotency: idempotency.as_ref(),
         })?;
         if mode == MutationMode::Preview {
-            return Ok(MutationOutcome::Previewed(event.into_preview()));
+            return Ok(MutationOutcome::Previewed(
+                self.reveal_preview(event.into_preview())?,
+            ));
         }
         audit.commit(event, &path, || {
             paths::write_new(&self.root, &path, rendered.as_bytes(), &label).map_err(|error| {
@@ -1877,7 +1892,7 @@ impl Database {
         self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
         let path = self.record_path(collection, id)?;
         let raw = self.read_record(collection, id, &path)?;
-        let document = parse_record(collection, id, &raw)?;
+        let document = self.parse_logical_record(collection, id, &raw)?;
         Ok(record_from_document(
             collection,
             id,
@@ -1903,9 +1918,13 @@ impl Database {
     pub fn read_raw_versioned(&self, collection: &str, id: &str) -> Result<(String, String)> {
         self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
         let path = self.record_path(collection, id)?;
-        let raw = self.read_record(collection, id, &path)?;
-        let version = record_hash(raw.as_bytes());
-        Ok((raw, version))
+        let stored_raw = self.read_record(collection, id, &path)?;
+        let version = record_hash(stored_raw.as_bytes());
+        if self.encryption_policy(collection)?.is_empty() {
+            return Ok((stored_raw, version));
+        }
+        let document = self.parse_logical_record(collection, id, &stored_raw)?;
+        Ok((document.render()?, version))
     }
 
     /// Assert one target state while holding the same audit lock as writers.
@@ -1978,7 +1997,7 @@ impl Database {
                 Some((|| {
                     let path = directory.join(format!("{id}.md"));
                     let raw = self.read_record(collection, &id, &path)?;
-                    let document = parse_record(collection, &id, &raw)?;
+                    let document = self.parse_logical_record(collection, &id, &raw)?;
                     Ok(record_from_document(
                         collection,
                         &id,
@@ -2018,7 +2037,11 @@ impl Database {
         let mut matches = Vec::new();
         for collection in collections {
             for record in self.list(&collection, filters)? {
-                let raw_document = self.read_record(&collection, &record.id, &record.path)?;
+                let raw_document = Document {
+                    attributes: record.attributes.clone(),
+                    body: record.body.clone(),
+                }
+                .render()?;
                 if query.matches(&record, &raw_document)? {
                     matches.push(record);
                 }
@@ -2085,6 +2108,11 @@ impl Database {
                 anyhow!("{error}").context(DomainError::Invalid(format!(
                     "invalid JSON Schema for collection '{name}'"
                 )))
+            })?;
+            EncryptionPolicy::from_schema(Some(&schema)).with_context(|| {
+                DomainError::Invalid(format!(
+                    "invalid encryption annotations for collection '{name}'"
+                ))
             })?;
             models.insert(name, Some(schema));
         }
@@ -2444,14 +2472,17 @@ impl Database {
         if let Some(precondition) = precondition {
             precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
         }
-        let before = parse_record(collection, id, &before_raw)?;
+        let before_stored = parse_record(collection, id, &before_raw)?;
+        let before = self.reveal_document(collection, id, &before_stored)?;
         let mut document = before.clone();
         mutate(&mut document)?;
         if collection == USERS_COLLECTION {
             document.attributes = User::from_attributes(&document.attributes)?.attributes()?;
         }
         self.validate(collection, &document.attributes)?;
-        let rendered = document.render()?;
+        let after_stored =
+            self.protect_document(collection, id, &document, Some(&before_stored), mode)?;
+        let rendered = after_stored.render()?;
         let record = record_from_document(
             collection,
             id,
@@ -2464,8 +2495,8 @@ impl Database {
             action: AuditAction::Update,
             collection,
             id,
-            before_document: Some(&before),
-            after_document: Some(&document),
+            before_document: Some(&before_stored),
+            after_document: Some(&after_stored),
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: Some(rendered.as_bytes()),
             source: self.source.clone(),
@@ -2474,7 +2505,9 @@ impl Database {
             idempotency: idempotency.as_ref(),
         })?;
         if mode == MutationMode::Preview {
-            return Ok(MutationOutcome::Previewed(event.into_preview()));
+            return Ok(MutationOutcome::Previewed(
+                self.reveal_preview(event.into_preview())?,
+            ));
         }
         audit.commit(event, &path, || {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
@@ -2610,7 +2643,7 @@ impl Database {
                     error
                 }
             })?;
-        parse_record(target_collection, target_id, &target_raw)?;
+        self.parse_logical_record(target_collection, target_id, &target_raw)?;
         audit.assert_current(target_collection, target_id, target_raw.as_bytes())?;
 
         let path = self.record_path(collection, id)?;
@@ -2619,7 +2652,8 @@ impl Database {
         if let Some(precondition) = precondition {
             precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
         }
-        let before = parse_record(collection, id, &before_raw)?;
+        let before_stored = parse_record(collection, id, &before_raw)?;
+        let before = self.reveal_document(collection, id, &before_stored)?;
         let mut document = before.clone();
         let relations = mapping_field(&mut document.attributes, "relations")?;
         let targets = sequence_field(relations, relation)?;
@@ -2630,7 +2664,9 @@ impl Database {
         }
 
         self.validate(collection, &document.attributes)?;
-        let rendered = document.render()?;
+        let after_stored =
+            self.protect_document(collection, id, &document, Some(&before_stored), mode)?;
+        let rendered = after_stored.render()?;
         let record = record_from_document(
             collection,
             id,
@@ -2643,8 +2679,8 @@ impl Database {
             action: AuditAction::Link,
             collection,
             id,
-            before_document: Some(&before),
-            after_document: Some(&document),
+            before_document: Some(&before_stored),
+            after_document: Some(&after_stored),
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: Some(rendered.as_bytes()),
             source: self.source.clone(),
@@ -2653,7 +2689,9 @@ impl Database {
             idempotency: idempotency.as_ref(),
         })?;
         if mode == MutationMode::Preview {
-            return Ok(MutationOutcome::Previewed(event.into_preview()));
+            return Ok(MutationOutcome::Previewed(
+                self.reveal_preview(event.into_preview())?,
+            ));
         }
         audit.commit(event, &path, || {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
@@ -2773,7 +2811,8 @@ impl Database {
         if let Some(precondition) = precondition {
             precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
         }
-        let document = parse_record(collection, id, &before_raw)?;
+        let stored_document = parse_record(collection, id, &before_raw)?;
+        let document = self.reveal_document(collection, id, &stored_document)?;
         if collection == USERS_COLLECTION {
             audit.assert_current(collection, id, before_raw.as_bytes())?;
             let user = User::from_attributes(&document.attributes)?;
@@ -2801,7 +2840,7 @@ impl Database {
             action: AuditAction::Delete,
             collection,
             id,
-            before_document: Some(&document),
+            before_document: Some(&stored_document),
             after_document: None,
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: None,
@@ -2811,7 +2850,9 @@ impl Database {
             idempotency: idempotency.as_ref(),
         })?;
         if mode == MutationMode::Preview {
-            return Ok(MutationOutcome::Previewed(event.into_preview()));
+            return Ok(MutationOutcome::Previewed(
+                self.reveal_preview(event.into_preview())?,
+            ));
         }
         audit.commit(event, &path, || {
             paths::remove_file(&self.root, &path, &label)
@@ -2936,7 +2977,10 @@ impl Database {
                 .map(|raw| parse_record(&change.collection, &change.id, raw))
                 .transpose()?;
             if let Some(document) = &after {
-                self.validate(&change.collection, &document.attributes)?;
+                let logical = self.reveal_document(&change.collection, &change.id, document)?;
+                self.encryption_policy(&change.collection)?
+                    .validate_logical_for_write(&logical)?;
+                self.validate(&change.collection, &logical.attributes)?;
             }
             let action = match change.status {
                 WorkingChangeKind::Added => AuditAction::Create,
@@ -2958,9 +3002,40 @@ impl Database {
             prepared.push((change, before, after, after_raw, action, decision));
         }
 
-        let mut entries = Vec::with_capacity(prepared.len());
         let mut previews = Vec::with_capacity(prepared.len());
-        for (change, before, after, after_raw, action, decision) in prepared {
+        let mut projected_changes = Vec::with_capacity(prepared.len());
+        // Projection can require decryption keys or reject stale schema
+        // metadata. Prove every selected event is displayable before accepting
+        // the first one, so `save --all` can never commit a prefix and then
+        // return an error while formatting its response.
+        for (change, before, after, after_raw, action, decision) in &prepared {
+            let event = audit.prepare_reconciled(ReconciledMutation {
+                action: action.clone(),
+                collection: &change.collection,
+                id: &change.id,
+                before_document: before.as_ref(),
+                after_document: after.as_ref(),
+                before_hash: change.audited_hash.as_deref(),
+                after_bytes: after_raw.as_deref().map(str::as_bytes),
+                had_history: states.contains_key(&(change.collection.clone(), change.id.clone())),
+                message,
+                access: decision.as_ref(),
+            })?;
+            let preview = self.reveal_preview(event.into_preview())?;
+            if mode == MutationMode::Preview {
+                previews.push(preview);
+            } else {
+                projected_changes.push(preview.changes);
+            }
+        }
+        if mode == MutationMode::Preview {
+            return Ok((Vec::new(), previews));
+        }
+
+        let mut entries = Vec::with_capacity(prepared.len());
+        for ((change, before, after, after_raw, action, decision), changes) in
+            prepared.into_iter().zip(projected_changes)
+        {
             let event = audit.prepare_reconciled(ReconciledMutation {
                 action,
                 collection: &change.collection,
@@ -2973,11 +3048,9 @@ impl Database {
                 message,
                 access: decision.as_ref(),
             })?;
-            if mode == MutationMode::Preview {
-                previews.push(event.into_preview());
-                continue;
-            }
-            entries.push(audit.accept(event, &change.path)?);
+            let mut entry = audit.accept(event, &change.path)?;
+            entry.payload.changes = changes;
+            entries.push(entry);
         }
         Ok((entries, previews))
     }
@@ -3028,7 +3101,7 @@ impl Database {
             }
             (None, None) => {
                 if self.owner_access_allowed(&AccessResource::Database)? {
-                    return audit.recent(limit, filter);
+                    return self.reveal_audit_entries(audit.recent(limit, filter)?);
                 }
                 let Some((user, policy_hash)) = self.user_unchecked_optional(&self.principal)?
                 else {
@@ -3037,7 +3110,7 @@ impl Database {
                         self.principal
                     )));
                 };
-                return audit.recent_where(limit, filter, |entry| {
+                let entries = audit.recent_where(limit, filter, |entry| {
                     if entry.payload.record.collection == USERS_COLLECTION {
                         if entry.payload.record.id == self.principal {
                             return Ok(true);
@@ -3064,11 +3137,12 @@ impl Database {
                             &policy_hash,
                         )
                         .is_some())
-                });
+                })?;
+                return self.reveal_audit_entries(entries);
             }
             (None, Some(_)) => unreachable!(),
         }
-        audit.recent(limit, filter)
+        self.reveal_audit_entries(audit.recent(limit, filter)?)
     }
 
     pub fn audit_head(&self) -> Result<AuditHead> {
@@ -3125,6 +3199,8 @@ impl Database {
             }
             let raw = self.read_record(&collection, &id, &path)?;
             let document = parse_record(&collection, &id, &raw)?;
+            let logical = self.reveal_document(&collection, &id, &document)?;
+            self.validate(&collection, &logical.attributes)?;
             let event = audit.prepare(AuditMutation {
                 action: AuditAction::Baseline,
                 collection: &collection,
@@ -3250,17 +3326,39 @@ impl Database {
     fn validate(&self, collection: &str, attributes: &Mapping) -> Result<()> {
         if collection == USERS_COLLECTION {
             let schema = users_schema();
-            validate_schema_instance(collection, attributes, &schema, "the built-in users schema")?;
+            validate_schema_instance(
+                collection,
+                attributes,
+                &schema,
+                "the built-in users schema",
+                false,
+            )?;
             User::from_attributes(attributes)?;
             return Ok(());
+        }
+        let Some(schema) = self.collection_schema(collection)? else {
+            return Ok(());
+        };
+        let redact_values = !EncryptionPolicy::from_schema(Some(&schema))?.is_empty();
+        validate_schema_instance(
+            collection,
+            attributes,
+            &schema,
+            &schema_label(collection),
+            redact_values,
+        )
+    }
+
+    fn collection_schema(&self, collection: &str) -> Result<Option<serde_json::Value>> {
+        if collection == USERS_COLLECTION {
+            return Ok(Some(users_schema()));
         }
         let schema_path = Path::new(SCHEMA_DIRECTORY).join(format!("{collection}.json"));
         let label = schema_label(collection);
         let Some(serialized) = paths::read_to_string_optional(&self.root, &schema_path, &label)?
         else {
-            return Ok(());
+            return Ok(None);
         };
-
         let unusable = || {
             DomainError::Invalid(format!(
                 "collection '{collection}' has an unusable JSON Schema"
@@ -3272,7 +3370,259 @@ impl Database {
         jsonschema::meta::validate(&schema)
             .map_err(|error| anyhow!("invalid JSON Schema for {label}: {error}"))
             .with_context(unusable)?;
-        validate_schema_instance(collection, attributes, &schema, &label)
+        EncryptionPolicy::from_schema(Some(&schema)).with_context(unusable)?;
+        Ok(Some(schema))
+    }
+
+    fn encryption_policy(&self, collection: &str) -> Result<EncryptionPolicy> {
+        let schema = self.collection_schema(collection)?;
+        EncryptionPolicy::from_schema(schema.as_ref())
+    }
+
+    pub(crate) fn encryption_context_optional(&self) -> Result<Option<EncryptionContext>> {
+        paths::read_to_string_optional(&self.root, Path::new(CONTEXT_PATH), CONTEXT_LABEL)?
+            .map(|serialized| EncryptionContext::parse(&serialized))
+            .transpose()
+    }
+
+    pub(crate) fn encryption_context_required(&self) -> Result<EncryptionContext> {
+        self.encryption_context_optional()?
+            .ok_or_else(|| conflict("database encryption context is missing for protected data"))
+    }
+
+    /// Create the portable context for a database initialized before encrypted
+    /// storage existed, but only while there is no ciphertext that could have
+    /// belonged to a different missing context.
+    pub(crate) fn ensure_encryption_context(&self) -> Result<EncryptionContext> {
+        if let Some(context) = self.encryption_context_optional()? {
+            return Ok(context);
+        }
+        for (collection, id, path) in self.record_files()? {
+            let raw = self.read_record(&collection, &id, &path)?;
+            let document = parse_record(&collection, &id, &raw)?;
+            if document_has_encrypted_storage(&document) {
+                return Err(conflict(
+                    "database encryption context is missing for existing protected data",
+                ));
+            }
+        }
+        if self.audit().contains_protected_storage()? {
+            return Err(conflict(
+                "database encryption context is missing for existing protected history",
+            ));
+        }
+
+        let generated = EncryptionContext::generate()?;
+        match paths::write_new(
+            &self.root,
+            Path::new(CONTEXT_PATH),
+            &generated.render()?,
+            CONTEXT_LABEL,
+        ) {
+            Ok(()) => Ok(generated),
+            Err(error) if is_already_exists(&error) => self
+                .encryption_context_optional()?
+                .context("database encryption context appeared but could not be read"),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn collection_uses_encryption(&self, collection: &str) -> Result<bool> {
+        Ok(!self.encryption_policy(collection)?.is_empty())
+    }
+
+    pub(crate) fn stored_record_matches_logical(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        body: &str,
+        version: &str,
+    ) -> Result<bool> {
+        let path = self.record_path(collection, id)?;
+        let Some(raw) =
+            paths::read_to_string_optional(&self.root, &path, &record_label(collection, id))?
+        else {
+            return Ok(false);
+        };
+        if record_hash(raw.as_bytes()) != version {
+            return Ok(false);
+        }
+        let logical = self.parse_logical_record(collection, id, &raw)?;
+        Ok(&logical.attributes == attributes && logical.body == body)
+    }
+
+    pub(crate) fn reveal_document(
+        &self,
+        collection: &str,
+        id: &str,
+        stored: &Document,
+    ) -> Result<Document> {
+        let policy = self.encryption_policy(collection)?;
+        let context = if policy.is_empty() {
+            None
+        } else {
+            self.encryption_context_optional()?
+        };
+        policy.reveal(
+            context.as_ref().map(EncryptionContext::id),
+            collection,
+            id,
+            stored,
+        )
+    }
+
+    fn parse_logical_record(&self, collection: &str, id: &str, raw: &str) -> Result<Document> {
+        let stored = parse_record(collection, id, raw)?;
+        self.reveal_document(collection, id, &stored)
+    }
+
+    fn protect_document(
+        &self,
+        collection: &str,
+        id: &str,
+        logical: &Document,
+        previous_stored: Option<&Document>,
+        mode: MutationMode,
+    ) -> Result<Document> {
+        let policy = self.encryption_policy(collection)?;
+        if previous_stored.is_none() && policy.would_encrypt_on_create(logical) {
+            if mode == MutationMode::Preview {
+                return Err(invalid(
+                    "preview approval is unavailable when protected values would receive fresh encryption",
+                ));
+            }
+            if self
+                .attribution
+                .authorization
+                .as_ref()
+                .is_some_and(|authorization| authorization.approved_changes.is_some())
+            {
+                return Err(invalid(
+                    "--approved-changes cannot bind a mutation that creates fresh encrypted values",
+                ));
+            }
+        }
+        let context = if policy.is_empty() {
+            None
+        } else if mode == MutationMode::Apply {
+            Some(self.ensure_encryption_context()?)
+        } else {
+            self.encryption_context_optional()?
+        };
+        let protected = policy.protect(
+            context.as_ref().map(EncryptionContext::id),
+            collection,
+            id,
+            logical,
+            previous_stored,
+        )?;
+        if protected.encrypted_new_value {
+            if mode == MutationMode::Preview {
+                return Err(invalid(
+                    "preview approval is unavailable when protected values would receive fresh encryption",
+                ));
+            }
+            if self
+                .attribution
+                .authorization
+                .as_ref()
+                .is_some_and(|authorization| authorization.approved_changes.is_some())
+            {
+                return Err(invalid(
+                    "--approved-changes cannot bind a mutation that creates fresh encrypted values",
+                ));
+            }
+        }
+        Ok(protected.document)
+    }
+
+    fn reveal_preview(&self, mut preview: ChangePreview) -> Result<ChangePreview> {
+        let policy = self.encryption_policy(&preview.record.collection)?;
+        let states = self.audit().record_states()?;
+        let current = states
+            .get(&(preview.record.collection.clone(), preview.record.id.clone()))
+            .and_then(|state| state.document.as_ref());
+        let manifest_owned_storage = if policy.is_empty() {
+            current.is_some_and(crate::encryption::audit_document_has_encrypted_storage)
+                || changes_have_manifest_owned_storage(&preview.changes)
+        } else {
+            current.is_some_and(crate::encryption::audit_document_has_encryption_manifest)
+                || changes_have_encryption_manifest(&preview.changes)
+        };
+        self.reveal_changes(
+            &preview.record.collection,
+            &preview.record.id,
+            &mut preview.changes,
+            manifest_owned_storage,
+        )?;
+        Ok(preview)
+    }
+
+    fn reveal_audit_entries(&self, mut entries: Vec<AuditEntry>) -> Result<Vec<AuditEntry>> {
+        let protected_sequences = self.audit().protected_storage_sequences()?;
+        let manifest_sequences = self.audit().encryption_manifest_sequences()?;
+        for entry in &mut entries {
+            let policy = self.encryption_policy(&entry.payload.record.collection)?;
+            let manifest_owned_storage = if policy.is_empty() {
+                protected_sequences.contains(&entry.payload.sequence)
+            } else {
+                manifest_sequences.contains(&entry.payload.sequence)
+            };
+            self.reveal_changes(
+                &entry.payload.record.collection,
+                &entry.payload.record.id,
+                &mut entry.payload.changes,
+                manifest_owned_storage,
+            )?;
+        }
+        Ok(entries)
+    }
+
+    fn reveal_changes(
+        &self,
+        collection: &str,
+        id: &str,
+        changes: &mut [AuditChange],
+        manifest_owned_storage: bool,
+    ) -> Result<()> {
+        let policy = self.encryption_policy(collection)?;
+        if policy.is_empty() {
+            if manifest_owned_storage {
+                return Err(conflict(
+                    "stored protected history is no longer declared by the collection schema",
+                ));
+            }
+            return Ok(());
+        }
+        // A current schema cannot retroactively assign storage meaning to old
+        // history. Only the manifest in that event's reconstructed document
+        // state owns envelope-shaped values; everything else remains ordinary
+        // application data and needs neither a context nor a keyring.
+        if !manifest_owned_storage {
+            return Ok(());
+        }
+        let context = self.encryption_context_optional()?;
+        let context = context.as_ref().map(EncryptionContext::id);
+        for change in changes {
+            match change {
+                AuditChange::Add { path, after } => {
+                    policy.reveal_audit_value(context, collection, id, path, after)?;
+                }
+                AuditChange::Remove { path, before } => {
+                    policy.reveal_audit_value(context, collection, id, path, before)?;
+                }
+                AuditChange::Replace {
+                    path,
+                    before,
+                    after,
+                } => {
+                    policy.reveal_audit_value(context, collection, id, path, before)?;
+                    policy.reveal_audit_value(context, collection, id, path, after)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn record_files(&self) -> Result<Vec<(String, String, PathBuf)>> {
@@ -3608,11 +3958,17 @@ fn validate_schema_instance(
     attributes: &Mapping,
     schema: &serde_json::Value,
     label: &str,
+    redact_values: bool,
 ) -> Result<()> {
     let validator = jsonschema::validator_for(schema)
         .map_err(|error| anyhow!("could not compile {label}: {error}"))?;
     let instance = serde_json::to_value(attributes)
         .context("front matter cannot be represented as JSON for schema validation")?;
+    if redact_values && !validator.is_valid(&instance) {
+        return Err(invalid(format!(
+            "record does not match schema for collection '{collection}' (protected values redacted)"
+        )));
+    }
     let errors: Vec<_> = validator
         .iter_errors(&instance)
         .map(|error| format!("- {error}"))
@@ -3624,6 +3980,36 @@ fn validate_schema_instance(
         )));
     }
     Ok(())
+}
+
+fn changes_have_manifest_owned_storage(changes: &[AuditChange]) -> bool {
+    changes_have_storage(
+        changes,
+        crate::encryption::audit_document_has_encrypted_storage,
+    )
+}
+
+fn changes_have_encryption_manifest(changes: &[AuditChange]) -> bool {
+    changes_have_storage(
+        changes,
+        crate::encryption::audit_document_has_encryption_manifest,
+    )
+}
+
+fn changes_have_storage(
+    changes: &[AuditChange],
+    owns_storage: fn(&serde_json::Value) -> bool,
+) -> bool {
+    changes.iter().any(|change| match change {
+        AuditChange::Add { path, after } if path.is_empty() => owns_storage(after),
+        AuditChange::Remove { path, before } if path.is_empty() => owns_storage(before),
+        AuditChange::Replace {
+            path,
+            before,
+            after,
+        } if path.is_empty() => owns_storage(before) || owns_storage(after),
+        _ => false,
+    })
 }
 
 /// What one entry of a collection's directory is, as far as records go.

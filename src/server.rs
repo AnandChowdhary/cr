@@ -2381,7 +2381,7 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
             "type": "object",
             "required": ["hash", "version", "sequence", "timestamp", "actor", "source", "action", "record", "changes", "before_hash", "after_hash", "previous_hash"],
             "properties": {
-                "hash": { "type": "string" },
+                "hash": { "type": "string", "description": "Hash of the exact stored audit payload. For encrypted collections, changes, snapshots, and idempotency results are logical plaintext projections while this hash still commits to stored ciphertext and cannot be recomputed from the response." },
                 "version": { "type": "integer", "minimum": 1, "maximum": 3 },
                 "sequence": { "type": "integer", "minimum": 1 },
                 "timestamp": { "type": "string", "format": "date-time" },
@@ -2389,10 +2389,10 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "source": { "enum": ["cli", "api", "filesystem", "sync"] },
                 "action": { "enum": ["baseline", "create", "update", "link", "delete"] },
                 "record": { "type": "object" },
-                "changes": { "type": "array", "items": { "type": "object" } },
+                "changes": { "type": "array", "description": "Logical audit changes. Protected values are decrypted for authorized history reads; hash and authorization.approved_changes still commit to the stored ciphertext representation.", "items": { "type": "object" } },
                 "after_snapshot": {
                     "type": "object",
-                    "description": "Versioned exact Markdown witness used when semantic replay cannot reproduce the stored bytes.",
+                    "description": "Versioned exact Markdown witness. Protected content is decrypted in authorized history responses while the stored journal retains ciphertext.",
                     "required": ["version", "markdown"],
                     "properties": {
                         "version": { "const": 1 },

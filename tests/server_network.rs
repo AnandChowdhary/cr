@@ -121,6 +121,92 @@ fn installed_style_server_handles_real_http_requests() {
     );
 }
 
+#[test]
+fn real_http_server_keeps_encryption_transparent() {
+    let temporary = tempfile::tempdir().unwrap();
+    let database = temporary.path().join("encrypted-network-server");
+    run_success(Command::new(binary()).args(["init"]).arg(&database));
+    std::fs::write(
+        database.join(".cr/schemas/accounts.json"),
+        r#"{
+  "type": "object",
+  "x-cr-encrypted-body": true,
+  "properties": {
+    "token": { "type": "string", "x-cr-encrypted": true }
+  }
+}"#,
+    )
+    .unwrap();
+
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let child = Command::new(binary())
+        .args(["--database"])
+        .arg(&database)
+        .args(["serve", "--bind", &address.to_string()])
+        .env("CR_API_TOKEN", "network-secret")
+        .env("CR_ENCRYPTION_ACTIVE_KEY", "primary")
+        .env(
+            "CR_ENCRYPTION_KEYS",
+            r#"{"primary":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard(child);
+    wait_until_ready(&mut server.0, address);
+    let headers = [
+        ("Authorization", "Bearer network-secret"),
+        ("Content-Type", "application/json"),
+    ];
+    let created = http_request(
+        address,
+        "POST",
+        "/api/v1/collections/accounts/records",
+        &headers,
+        Some(
+            &json!({
+                "id": "acme",
+                "front_matter": { "token": "api-secret" },
+                "markdown": "API private notes"
+            })
+            .to_string(),
+        ),
+    );
+    assert_eq!(created.0, 201, "{}", created.1);
+    let created: Value = serde_json::from_str(&created.1).unwrap();
+    assert_eq!(created["front_matter"]["token"], "api-secret");
+    assert_eq!(created["markdown"], "API private notes");
+
+    let stored = std::fs::read_to_string(database.join("records/accounts/acme.md")).unwrap();
+    assert!(!stored.contains("api-secret"));
+    assert!(!stored.contains("API private notes"));
+    let fetched = http_request(
+        address,
+        "GET",
+        "/api/v1/collections/accounts/records/acme",
+        &[("Authorization", "Bearer network-secret")],
+        None,
+    );
+    assert_eq!(fetched.0, 200, "{}", fetched.1);
+    let fetched: Value = serde_json::from_str(&fetched.1).unwrap();
+    assert_eq!(fetched["front_matter"]["token"], "api-secret");
+    assert_eq!(fetched["markdown"], "API private notes");
+
+    let audit = http_request(
+        address,
+        "GET",
+        "/api/v1/audit/log?collection=accounts&id=acme",
+        &[("Authorization", "Bearer network-secret")],
+        None,
+    );
+    assert_eq!(audit.0, 200, "{}", audit.1);
+    assert!(audit.1.contains("api-secret"));
+    assert!(audit.1.contains("API private notes"));
+}
+
 fn wait_until_ready(child: &mut Child, address: SocketAddr) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

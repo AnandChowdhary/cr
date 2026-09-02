@@ -58,6 +58,7 @@ database-root/
 ├── .cr-audit-head.json    # the audit anchor, committed to version control
 ├── .cr/
 │   ├── config.yaml        # optional overrides
+│   ├── encryption.json    # portable non-secret AEAD context
 │   ├── audit/
 │   │   ├── lock
 │   │   └── segments/
@@ -93,6 +94,86 @@ database-root/
 - A collection schema is optional and validates only its front matter.
 - A saved view is an optional versioned query/display definition. Collections also receive automatic views without a file.
 - A saved sync is an optional versioned command definition. Its mutable JSON checkpoint and advisory lock are stored separately from configuration, as is the ledger of a run that has started applying records and not yet finished.
+
+### Transparent encrypted storage
+
+Encryption sits between the logical `Document` used by database operations and
+the stored `Document` rendered to Markdown. A property schema annotated with
+`x-cr-encrypted: true` is one encryption unit, regardless of whether its value
+is a scalar, object, or array. The root annotation `x-cr-encrypted-body: true`
+makes the complete Markdown body another unit. The fixed `users` schema has no
+annotations, so principal identity and policy evaluation never depend on an
+optional data key.
+
+The field representation is an exact one-key YAML mapping named
+`$cr_encrypted`; its inner mapping contains `version`, `key_id`, `nonce`, and
+`ciphertext`. The body uses the same fields in a `cr-encrypted:v1:` textual
+envelope. A reserved `$cr_encryption` front-matter manifest records the complete
+declared field-path set, body flag, and format version. Logical reads remove the
+manifest. Its purpose is not key discovery—the envelope already has a key ID—but
+schema/storage agreement: removing or moving an annotation cannot make an
+envelope appear as ordinary user data. Envelope syntax is interpreted only at
+manifested, schema-protected paths.
+
+XChaCha20-Poly1305 receives a new 192-bit OS-random nonce for every new or
+changed protected value. Its AAD is a length-delimited encoding under the
+`cr:encryption:xchacha20poly1305:v1` domain of the portable random database
+context in `.cr/encryption.json`, collection, record ID, purpose, and logical
+path. That prevents moving an envelope between independently initialized
+databases, records, fields, or the body while allowing the complete database
+root to move or be cloned. The context is not a key and is committed with the
+database. An old plaintext database creates it immediately before its first
+encrypted write. If any record or audit event already contains an envelope,
+absence of the context is instead an unrecoverable conflict; CR never guesses
+or regenerates an identity over existing ciphertext.
+Unchanged logical values retain their exact previous envelope, so an unrelated
+field update does not churn ciphertext or the public record version. Equal
+plaintexts written separately do not share nonces or ciphertext.
+
+`CR_ENCRYPTION_KEYS` is an external JSON keyring of IDs to 32-byte unpadded
+base64url keys; `CR_ENCRYPTION_ACTIVE_KEY` selects the key for writes. The key
+ID is authenticated inside the envelope and retained old keys decrypt history.
+The database, audit journal, pending mutation, sync ledger, and server logs
+never store key material. Decoded keys and their encoded configuration copies
+are zeroized when their short-lived keyring is dropped. Missing, malformed,
+unknown-key, and authentication failures are typed, redacted refusals.
+
+`$cr_encryption` is reserved on every new logical write, including writes to
+unencrypted collections. Backward-compatible reads do not reject a legacy
+ordinary field merely because it has that name: with no encryption policy it
+is classified as CR metadata only when an exact manifest points at a valid
+field or body envelope. A manifest whose optional protected paths are all
+absent contains no protected payload and therefore does not make the record
+unreadable after a schema change.
+
+Validation happens before protection; filtering and search happen after
+revelation. Audit preparation receives stored documents, so its hashes and
+replay state remain exact ciphertext and `audit verify` needs no key. Audit
+diffing treats an envelope as an atomic logical value rather than recursively
+showing nonce/ciphertext internals. Authorized history reads reveal full root
+snapshots and protected values inside changed parent subtrees in memory.
+That response is a logical projection: `changes` may contain plaintext while
+the returned `hash` and `authorization.approved_changes` still commit to the
+stored ciphertext bytes. A caller cannot recompute those commitments by
+serializing the projection; verification always reads the journal itself.
+
+Fresh encryption and the existing preview-approval protocol have incompatible
+statelessness. A preview digest covers exact audit-change bytes, but a second
+application must use a different random nonce and therefore different bytes.
+CR refuses previews and approved-change binding when a mutation would create a
+new envelope. It does not derive nonces from plaintext or reusable client
+tokens merely to stabilize a digest. Supporting that combination requires a
+separate authenticated plan protocol that carries already-generated envelopes
+and binds them to the complete logical request and preconditions.
+
+Adding encryption annotations to stored plaintext also fails closed. An
+in-place conversion event would copy the prior plaintext into append-only
+history, and rewriting history would violate the audit contract; the honest v1
+migration is export before enabling the annotation and import into a newly
+encrypted identity/database. This feature therefore provides at-rest
+confidentiality, not retention or selective erasure. Per-record data keys,
+destruction policy, backup integration, and redaction semantics are separate
+future work.
 
 ### What a record is
 
@@ -432,7 +513,7 @@ The HTTP route always answers `200` on a successful run, including when it found
 
 `.cr/syncs/<name>.yaml` stores format version 1, an exact command argument array, timeout, output-byte limit, message-count limit, and optional audit actor. Sync names are single path components. The configuration is intentionally data rather than executable shell text; `sh -c` or a script file must be explicit when shell interpretation is wanted.
 
-`cr sync run` takes a nonblocking per-sync lock, then verifies that records and audit history are clean. It starts the adapter in the database root with stdin closed, stdout redirected to a bounded temporary file, stderr inherited for job logs, and a random run ID. A previous checkpoint is copied into a temporary JSON input so the adapter cannot mutate the committed cursor in place. On POSIX, the adapter receives its own process group so timeouts and output violations terminate descendants as well as the immediate child.
+`cr sync run` takes a nonblocking per-sync lock, then verifies that records and audit history are clean. It starts the adapter in the database root with stdin closed, stdout captured in bounded memory, stderr inherited for job logs, both encryption environment variables removed, and a random run ID. A previous checkpoint is copied into a temporary JSON input so the adapter cannot mutate the committed cursor in place. On POSIX, the adapter receives its own process group so timeouts and output violations terminate descendants as well as the immediate child.
 
 The `cr-jsonl-v1` stream has three internally tagged messages:
 
@@ -450,7 +531,25 @@ This is not a multi-record transaction, and it deliberately does not pretend to 
 
 Rollback is not available and is not attempted. The journal is append-only, so unwinding a prefix would mean deleting events, and forward-only compensation — appending inverse mutations — would replace one true history with a longer, more confusing one for no gain over simply finishing the run. Advancing the checkpoint per record is not available either: the protocol's checkpoint is a single opaque adapter value emitted once at the end, and `cr` cannot invent an intermediate cursor an adapter never described.
 
-What is available is making the run itself durable. After preflight and the locked head-and-target snapshot, and before the first mutation, `cr` writes `.cr/sync/runs/<name>.jsonl` — the adapter's exact validated stream — and then `.cr/sync/runs/<name>.json`, a version-2 ledger naming the run, its start time, its operation count, a domain-separated digest of that stream, the audit head it started from, every target's present/absent version at that head, and the checkpoints it began with and owes. The stream is written first, so a ledger on disk always has its operations beside it. Both are removed only after the checkpoint has been committed, ledger first, so an interruption while tidying up can only leave a stream that claims nothing about committed work and is discarded by the next run. A version-1 ledger from an earlier build remains recoverable: because it recorded the audit sequence and head but not target versions, recovery replays that immutable chain prefix and selects the stream targets from the reconstructed state rather than adopting current bytes.
+What is available is making the run itself durable. No plaintext stdout staging
+file exists to survive a hard crash. After preflight and the locked
+head-and-target snapshot, and before the first mutation, `cr` writes
+`.cr/sync/runs/<name>.jsonl` — the adapter's exact validated stream — and then
+`.cr/sync/runs/<name>.json`. Streams containing an upsert to an encrypted
+collection use a version-3 authenticated blob bound to the database context,
+sync name, and run ID, so the durable recovery artifact does not expose
+protected plaintext and recovery requires the keyring. Other streams keep the
+version-2 plaintext format. The ledger names the run, its start time, operation
+count, a domain-separated digest of the exact stored stream, the audit head it
+started from, every target's present/absent version at that head, and the
+checkpoints it began with and owes. The stream is written first, so a ledger on
+disk always has its operations beside it. Both are removed only after the
+checkpoint has been committed, ledger first, so an interruption while tidying
+up can only leave a stream that claims nothing about committed work and is
+discarded by the next run. A version-1 ledger from an earlier build remains
+recoverable: because it recorded the audit sequence and head but not target
+versions, recovery replays that immutable chain prefix and selects the stream
+targets from the reconstructed state rather than adopting current bytes.
 
 A ledger on disk is therefore the single fact that separates "a run finished" from "a run stopped somewhere in the middle". `cr sync run` refuses to start while one is present, which is what stops a stale checkpoint from being silently replayed. `cr sync recover <name>` completes the run by replaying the recorded stream, which is sound rather than merely convenient: `cr-jsonl-v1` guarantees each target appears at most once, an upsert carries the complete record, and deleting a missing record is a no-op, so a replay commits exactly the operations the interrupted run never reached and appends no event for the rest. The events it appends carry the interrupted run's own ID, so the journal shows one run rather than two.
 
@@ -458,7 +557,13 @@ Progress is never counted into the ledger as the run proceeds. `cr sync recover 
 
 Two limits remain. If the original failure is still present, recovery reproduces it and leaves the ledger in place; that is a truthful stuck state, not a repaired one, and it needs a person. And remote side effects an adapter performed occur outside the database entirely, so a replay can re-drive them: an adapter that also writes to a remote service must use that service's idempotency controls.
 
-Adapters are trusted local executables, not a sandbox. They inherit the caller's environment—including secrets—and operating-system access to files, processes, network services, and external APIs. Limits constrain runtime, protocol output, and message count, but not CPU, memory, network traffic, stderr volume, or platform-specific child behavior. The scheduler and service account remain part of the deployment security boundary.
+Adapters are trusted local executables, not a sandbox. They inherit the
+caller's environment except for `CR_ENCRYPTION_ACTIVE_KEY` and
+`CR_ENCRYPTION_KEYS`, plus operating-system access to files, processes, network
+services, and external APIs. Limits constrain runtime, protocol output, and
+message count, but not CPU, memory, network traffic, stderr volume, or
+platform-specific child behavior. The scheduler and service account remain
+part of the deployment security boundary.
 
 ### Threat boundary
 

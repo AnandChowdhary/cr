@@ -277,6 +277,9 @@ pub struct AuditIdempotencyResult {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AuditEntry {
+    /// Hash of the exact stored payload. User-facing history may project
+    /// protected `changes` to plaintext, so reserializing this returned value
+    /// is not a way to recompute the hash; verification reads stored bytes.
     pub hash: String,
     #[serde(flatten)]
     pub payload: AuditPayload,
@@ -1094,6 +1097,85 @@ impl<'a> AuditLog<'a> {
             sequence: state.entries,
             hash: state.head_hash,
         })
+    }
+
+    /// Sequences whose verified, reconstructed record state contains actual
+    /// manifest-owned ciphertext immediately before or after the event.
+    ///
+    /// Looking for envelope syntax recursively is not enough: an unencrypted
+    /// application may legitimately store an object with the same keys. The
+    /// manifest in the complete reconstructed document is the ownership proof.
+    pub(crate) fn protected_storage_sequences(&self) -> Result<BTreeSet<u64>> {
+        self.storage_sequences(crate::encryption::audit_document_has_encrypted_storage)
+    }
+
+    /// Sequences carrying an exact CR manifest, even when every optional
+    /// protected value is absent. Current encryption policies use this to
+    /// remove storage metadata from logical history without inventing
+    /// ownership from standalone envelope syntax.
+    pub(crate) fn encryption_manifest_sequences(&self) -> Result<BTreeSet<u64>> {
+        self.storage_sequences(crate::encryption::audit_document_has_encryption_manifest)
+    }
+
+    fn storage_sequences(&self, owns_storage: fn(&Value) -> bool) -> Result<BTreeSet<u64>> {
+        let mut latest = AuditedRecordStates::new();
+        let mut protected = BTreeSet::new();
+        self.verify_chain(|entry, _| {
+            let key = (
+                entry.payload.record.collection.clone(),
+                entry.payload.record.id.clone(),
+            );
+            let had_history = latest.contains_key(&key);
+            let state = latest.entry(key).or_insert_with(|| AuditedRecordState {
+                hash: None,
+                document: None,
+                legacy_representation_gap: None,
+            });
+            if state.hash != entry.payload.before_hash {
+                bail!(
+                    "audit record-state chain is broken at sequence {}",
+                    entry.payload.sequence
+                );
+            }
+            if !had_history
+                && !matches!(
+                    entry.payload.action,
+                    AuditAction::Create | AuditAction::Baseline
+                )
+            {
+                bail!(
+                    "audit record history begins with an invalid action at sequence {}",
+                    entry.payload.sequence
+                );
+            }
+            let before = state.document.as_ref().is_some_and(owns_storage);
+            apply_changes(&mut state.document, &entry.payload.changes).with_context(|| {
+                format!(
+                    "audit changes are inconsistent at sequence {}",
+                    entry.payload.sequence
+                )
+            })?;
+            if state.document.is_some() != entry.payload.after_hash.is_some() {
+                bail!(
+                    "audit record state is inconsistent at sequence {}",
+                    entry.payload.sequence
+                );
+            }
+            state.hash = entry.payload.after_hash.clone();
+            let after = state.document.as_ref().is_some_and(owns_storage);
+            if before || after {
+                protected.insert(entry.payload.sequence);
+            }
+            Ok(())
+        })?;
+        Ok(protected)
+    }
+
+    /// Whether verified history contains any manifest-owned ciphertext. Used
+    /// before lazily creating a context for a database initialized by an older
+    /// CR version, including when the encrypted record was later deleted.
+    pub(crate) fn contains_protected_storage(&self) -> Result<bool> {
+        Ok(!self.protected_storage_sequences()?.is_empty())
     }
 
     /// Replay the chain, reconcile it with the records, and check the head.
@@ -2292,15 +2374,36 @@ fn diff_documents(before: Option<&Value>, after: Option<&Value>) -> Vec<AuditCha
         }],
         (Some(before), Some(after)) => {
             let mut changes = Vec::new();
-            diff_value("", before, after, &mut changes);
+            let protected_paths = crate::encryption::audit_document_encrypted_pointers(before)
+                .into_iter()
+                .chain(crate::encryption::audit_document_encrypted_pointers(after))
+                .collect();
+            diff_value("", before, after, &protected_paths, &mut changes);
             changes
         }
         (None, None) => Vec::new(),
     }
 }
 
-fn diff_value(path: &str, before: &Value, after: &Value, changes: &mut Vec<AuditChange>) {
+fn diff_value(
+    path: &str,
+    before: &Value,
+    after: &Value,
+    protected_paths: &BTreeSet<String>,
+    changes: &mut Vec<AuditChange>,
+) {
     if before == after {
+        return;
+    }
+    // An encrypted envelope is one logical value. Expanding its key ID, nonce,
+    // and ciphertext would expose storage mechanics as user fields and would
+    // prevent the database layer from revealing the logical audit value.
+    if protected_paths.contains(path) {
+        changes.push(AuditChange::Replace {
+            path: path.to_owned(),
+            before: before.clone(),
+            after: after.clone(),
+        });
         return;
     }
     if let (Value::Object(before), Value::Object(after)) = (before, after) {
@@ -2308,7 +2411,9 @@ fn diff_value(path: &str, before: &Value, after: &Value, changes: &mut Vec<Audit
         for key in keys {
             let child_path = format!("{path}/{}", escape_pointer(&key));
             match (before.get(&key), after.get(&key)) {
-                (Some(before), Some(after)) => diff_value(&child_path, before, after, changes),
+                (Some(before), Some(after)) => {
+                    diff_value(&child_path, before, after, protected_paths, changes);
+                }
                 (Some(before), None) => changes.push(AuditChange::Remove {
                     path: child_path,
                     before: before.clone(),

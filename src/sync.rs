@@ -1,9 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::Write,
+    fs::File,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -22,6 +26,7 @@ use crate::{
     RecordPrecondition,
     audit::record_hash,
     database::validate_component,
+    encryption::{protect_sync_stream, reveal_sync_stream},
     error::{conflict, is_missing},
     frontmatter::Document,
     paths::{self, EntryKind},
@@ -38,7 +43,8 @@ const SYNC_DIRECTORY_LABEL: &str = "the sync directory";
 const SYNC_WORK_LABEL: &str = "the sync working directory";
 const SYNC_RUN_LABEL: &str = "the sync run ledger";
 const SYNC_FORMAT_VERSION: u32 = 1;
-const SYNC_RUN_FORMAT_VERSION: u32 = 2;
+const LEGACY_SYNC_RUN_FORMAT_VERSION: u32 = 2;
+const SYNC_RUN_FORMAT_VERSION: u32 = 3;
 /// Domain separator for the digest binding a run ledger to its recorded stream.
 ///
 /// Distinct from every audit domain so a stream digest can never be confused
@@ -454,8 +460,6 @@ impl Database {
         )?
         .path()
         .to_path_buf();
-        let output = NamedTempFile::new_in(&sync_directory)
-            .context("could not create temporary sync output")?;
         let mut state_input = NamedTempFile::new_in(&sync_directory)
             .context("could not create temporary sync state input")?;
         let current_state = self.sync_state(name)?;
@@ -478,12 +482,13 @@ impl Database {
             .args(&definition.command[1..])
             .current_dir(self.root())
             .stdin(Stdio::null())
-            .stdout(Stdio::from(
-                output
-                    .reopen()
-                    .context("could not open temporary sync output")?,
-            ))
+            .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            // Adapters exchange logical plaintext with CR but never perform
+            // storage encryption themselves. Do not hand an arbitrary adapter
+            // the database keyring merely because the parent process has it.
+            .env_remove("CR_ENCRYPTION_ACTIVE_KEY")
+            .env_remove("CR_ENCRYPTION_KEYS")
             .env("CR_DATABASE_ROOT", self.root())
             .env("CR_SYNC_NAME", name)
             .env("CR_SYNC_RUN_ID", &run_id)
@@ -502,19 +507,45 @@ impl Database {
         let mut child = command
             .spawn()
             .with_context(|| format!("could not start sync '{name}'"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("sync adapter stdout was not captured")?;
+        let output_exceeded = Arc::new(AtomicBool::new(false));
+        let output_reader = capture_sync_output(
+            stdout,
+            definition.max_output_bytes,
+            Arc::clone(&output_exceeded),
+        );
         let status = wait_for_sync(
             &mut child,
             name,
             Duration::from_secs(definition.timeout_seconds),
-            output.path(),
+            &output_exceeded,
             definition.max_output_bytes,
-        )?;
+        );
+        if status.is_err() {
+            stop_child(&mut child);
+        }
+        let output = output_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("sync '{name}' output reader stopped unexpectedly"))?
+            .with_context(|| format!("could not read sync '{name}' output"))?;
+        let status = status?;
+        if output.len() as u64 > definition.max_output_bytes {
+            bail!(
+                "sync '{name}' output exceeded {} bytes",
+                definition.max_output_bytes
+            );
+        }
         if !status.success() {
             bail!("sync '{name}' exited unsuccessfully ({status})");
         }
 
-        let serialized = fs::read_to_string(output.path())
-            .with_context(|| format!("sync '{name}' output is not valid UTF-8"))?;
+        let serialized = zeroize::Zeroizing::new(
+            String::from_utf8(output)
+                .with_context(|| format!("sync '{name}' output is not valid UTF-8"))?,
+        );
         let messages = parse_messages(name, &serialized, definition.max_operations)?;
         preflight_messages(self, &messages)?;
         let _application_lock = self.acquire_sync_application_lock()?;
@@ -534,24 +565,47 @@ impl Database {
         // first mutation, so from here on an interrupted run is a fact on disk
         // rather than something only the audit chain hints at.
         let checkpoint = final_checkpoint(&messages).cloned();
+        let protected_stream = messages.iter().try_fold(false, |protected, message| {
+            Ok::<_, anyhow::Error>(
+                protected
+                    || match message {
+                        SyncMessage::Upsert { collection, .. } => {
+                            self.collection_uses_encryption(collection)?
+                        }
+                        SyncMessage::Delete { .. } | SyncMessage::Checkpoint { .. } => false,
+                    },
+            )
+        })?;
+        let (run_version, stored_stream) = if protected_stream {
+            let context = self.ensure_encryption_context()?;
+            (
+                SYNC_RUN_FORMAT_VERSION,
+                protect_sync_stream(context.id(), name, &run_id, serialized.as_bytes())?,
+            )
+        } else {
+            (
+                LEGACY_SYNC_RUN_FORMAT_VERSION,
+                serialized.as_bytes().to_vec(),
+            )
+        };
         self.write_sync_run(
             name,
             &StoredSyncRun {
-                version: SYNC_RUN_FORMAT_VERSION,
+                version: run_version,
                 sync: name.to_owned(),
                 run_id: run_id.clone(),
                 started: OffsetDateTime::now_utc()
                     .format(&Rfc3339)
                     .context("could not format sync run timestamp")?,
                 operations: messages.len(),
-                stream_hash: stream_hash(serialized.as_bytes()),
+                stream_hash: stream_hash(&stored_stream),
                 audit_sequence: snapshot.audit.head.sequence,
                 audit_head: snapshot.audit.head.hash.clone(),
                 checkpoint_before: StoredCheckpoint::new(current_state.as_ref()),
                 checkpoint_after: StoredCheckpoint::new(checkpoint.as_ref()),
                 target_versions: stored_target_versions(&expected_versions),
             },
-            serialized.as_bytes(),
+            &stored_stream,
         )?;
 
         let mut summary = self.apply_sync_messages(
@@ -590,7 +644,7 @@ impl Database {
             return Ok(None);
         };
         let _application_lock = self.acquire_sync_application_lock()?;
-        let serialized = paths::read_to_string(
+        let stored_stream = paths::read(
             self.root(),
             &sync_stream_path(name),
             &sync_stream_label(name),
@@ -605,12 +659,24 @@ impl Database {
                 error
             }
         })?;
-        if stream_hash(serialized.as_bytes()) != stored.stream_hash {
+        if stream_hash(&stored_stream) != stored.stream_hash {
             return Err(conflict(format!(
                 "the recorded operations of sync '{name}' run {} do not match its run ledger",
                 stored.run_id
             )));
         }
+        let plaintext = if stored.version == SYNC_RUN_FORMAT_VERSION {
+            let context = self.encryption_context_required()?;
+            reveal_sync_stream(context.id(), name, &stored.run_id, &stored_stream)?
+        } else {
+            stored_stream
+        };
+        let serialized = zeroize::Zeroizing::new(String::from_utf8(plaintext).map_err(|_| {
+            conflict(format!(
+                "the recorded operations of sync '{name}' run {} are not valid UTF-8",
+                stored.run_id
+            ))
+        })?);
         let messages = parse_messages(name, &serialized, definition.max_operations)?;
         if messages.len() != stored.operations {
             return Err(conflict(format!(
@@ -623,7 +689,7 @@ impl Database {
             .sync_recovery_snapshot(&stored, &messages)
             .context("database must be clean before an interrupted sync run can be completed")?;
         let mut expected_versions = snapshot.expected_versions;
-        validate_sync_run_events(&stored, &messages, &snapshot.run_events)?;
+        validate_sync_run_events(self, &stored, &messages, &snapshot.run_events)?;
         for (target, state) in &snapshot.run_events.own_states {
             let Some(expected) = expected_versions.get_mut(target) else {
                 return Err(conflict(format!(
@@ -736,7 +802,9 @@ impl Database {
                     (target, version)
                 })
                 .collect(),
-            SYNC_RUN_FORMAT_VERSION => stored_target_version_map(stored, messages)?,
+            LEGACY_SYNC_RUN_FORMAT_VERSION | SYNC_RUN_FORMAT_VERSION => {
+                stored_target_version_map(stored, messages)?
+            }
             _ => unreachable!("read_sync_run rejects unsupported ledger versions"),
         };
         let appended = appended_sync_events(stored, &verification)?;
@@ -879,7 +947,10 @@ impl Database {
         };
         let stored: StoredSyncRun = serde_json::from_str(&serialized)
             .with_context(|| format!("the run ledger for sync '{name}' is not valid JSON"))?;
-        if !matches!(stored.version, 1 | SYNC_RUN_FORMAT_VERSION) {
+        if !matches!(
+            stored.version,
+            1 | LEGACY_SYNC_RUN_FORMAT_VERSION | SYNC_RUN_FORMAT_VERSION
+        ) {
             return Err(conflict(format!(
                 "the run ledger for sync '{name}' uses unsupported format version {}",
                 stored.version
@@ -1119,6 +1190,7 @@ fn classify_sync_run_events(
 }
 
 fn validate_sync_run_events(
+    database: &Database,
     stored: &StoredSyncRun,
     messages: &[SyncMessage],
     events: &SyncRunEvents,
@@ -1147,13 +1219,26 @@ fn validate_sync_run_events(
                 markdown,
                 ..
             } => {
-                let rendered = Document {
-                    attributes: front_matter.clone(),
-                    body: markdown.clone(),
-                }
-                .render()?;
-                matches!(state.action, AuditAction::Create | AuditAction::Update)
-                    && state.version.as_deref() == Some(record_hash(rendered.as_bytes()).as_str())
+                let version_matches = match state.version.as_deref() {
+                    Some(version) if database.collection_uses_encryption(collection)? => database
+                        .stored_record_matches_logical(
+                        collection,
+                        id,
+                        front_matter,
+                        markdown,
+                        version,
+                    )?,
+                    Some(version) => {
+                        let rendered = Document {
+                            attributes: front_matter.clone(),
+                            body: markdown.clone(),
+                        }
+                        .render()?;
+                        version == record_hash(rendered.as_bytes())
+                    }
+                    None => false,
+                };
+                matches!(state.action, AuditAction::Create | AuditAction::Update) && version_matches
             }
             SyncMessage::Delete { .. } => {
                 state.action == AuditAction::Delete && state.version.is_none()
@@ -1345,16 +1430,12 @@ fn wait_for_sync(
     child: &mut Child,
     name: &str,
     timeout: Duration,
-    output_path: &Path,
+    output_exceeded: &AtomicBool,
     max_output_bytes: u64,
 ) -> Result<ExitStatus> {
     let started = Instant::now();
     loop {
-        if fs::metadata(output_path)
-            .with_context(|| format!("could not inspect sync '{name}' output"))?
-            .len()
-            > max_output_bytes
-        {
+        if output_exceeded.load(Ordering::Relaxed) {
             stop_child(child);
             bail!("sync '{name}' output exceeded {max_output_bytes} bytes");
         }
@@ -1362,13 +1443,6 @@ fn wait_for_sync(
             .try_wait()
             .with_context(|| format!("could not wait for sync '{name}'"))?
         {
-            if fs::metadata(output_path)
-                .with_context(|| format!("could not inspect sync '{name}' output"))?
-                .len()
-                > max_output_bytes
-            {
-                bail!("sync '{name}' output exceeded {max_output_bytes} bytes");
-            }
             return Ok(status);
         }
         if started.elapsed() >= timeout {
@@ -1380,6 +1454,36 @@ fn wait_for_sync(
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn capture_sync_output(
+    mut stdout: impl Read + Send + 'static,
+    max_output_bytes: u64,
+    exceeded: Arc<AtomicBool>,
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let limit =
+            usize::try_from(max_output_bytes).expect("validated sync output bound fits in memory");
+        let retained_limit = limit.saturating_add(1);
+        let mut retained = Vec::with_capacity(retained_limit.min(64 * 1024));
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let read = stdout.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            if retained.len() < retained_limit {
+                let keep = read.min(retained_limit - retained.len());
+                retained.extend_from_slice(&buffer[..keep]);
+            }
+            if retained.len() > limit {
+                exceeded.store(true, Ordering::Relaxed);
+            }
+            // Continue draining after the bound is crossed so the adapter
+            // cannot deadlock on a full pipe before the parent kills it.
+        }
+        Ok(retained)
+    })
 }
 
 fn stop_child(child: &mut Child) {

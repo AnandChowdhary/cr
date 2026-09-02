@@ -181,11 +181,25 @@ impl FaultDatabase {
     /// append, leaving the database exactly as a crash between the record
     /// write and the journal append would.
     pub fn interrupt(&self, collection: &str, id: &str, arguments: &[&str]) -> Interruption {
+        self.interrupt_with(collection, id, |_| {}, arguments)
+    }
+
+    /// The configured form of [`Self::interrupt`], for mutations that need
+    /// process-local environment such as an external encryption keyring.
+    pub fn interrupt_with(
+        &self,
+        collection: &str,
+        id: &str,
+        configure: impl FnOnce(&mut Command),
+        arguments: &[&str],
+    ) -> Interruption {
         let previous_sequence = self.head_sequence();
         let before = self.read_record(collection, id);
         let blocked = self.block_next_segment(previous_sequence + 1);
 
-        let stderr = run_failure(self.command().args(arguments));
+        let mut command = self.command();
+        configure(&mut command);
+        let stderr = run_failure(command.args(arguments));
 
         let pending = self
             .read_pending()

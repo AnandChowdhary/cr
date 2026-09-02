@@ -5,6 +5,20 @@ change extends a tamper-evident audit chain. Anything that breaks that claim —
 or that lets a request read or write outside the database root — is a security
 issue, not a bug report.
 
+Collections may opt selected values into encrypted storage. Those values use
+XChaCha20-Poly1305 and environment-provided keys; key material must not be
+committed beside the database. Protected record values, bodies, audit history,
+pending mutations, and interrupted-sync streams are ciphertext at rest.
+`.cr/encryption.json` is a non-secret portable database identity, must be kept
+with clones and backups, and prevents ciphertext swaps between independently
+initialized databases. Sync adapters do not inherit the storage keyring and
+their bounded stdout is held in memory. Encryption does not protect a running
+`cr` process that has the keyring, record identities and paths, unmarked values,
+sync checkpoints, adapter stderr, or plaintext that was audited before
+encryption was enabled. Losing an old key makes every envelope under that
+key—including audit history—unreadable; losing the database context makes all
+protected data unreadable.
+
 ## Reporting a vulnerability
 
 Please report privately. **Do not open a public issue.**

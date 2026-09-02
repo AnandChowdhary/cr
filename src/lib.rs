@@ -3,6 +3,7 @@ mod attribution;
 mod audit;
 mod check;
 mod database;
+mod encryption;
 mod error;
 mod frontmatter;
 mod paths;
