@@ -1226,6 +1226,171 @@ fn save_preflights_every_decrypted_projection_before_committing_any_event() {
     );
 }
 
+fn interrupt_legacy_plaintext_sync(database: &TestDatabase, name: &str, final_collection: &str) {
+    fs::create_dir_all(database.root.join("scripts")).unwrap();
+    fs::create_dir_all(database.root.join("records")).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' '{{"type":"upsert","collection":"notes","id":"first","front_matter":{{"n":1}},"markdown":"first"}}'
+printf '%s\n' '{{"type":"upsert","collection":"blocked","id":"second","front_matter":{{"n":2}},"markdown":"second"}}'
+printf '%s\n' '{{"type":"upsert","collection":"{final_collection}","id":"one","front_matter":{{"stage":"lead","contact":{{"token":"legacy-stream-secret"}}}},"markdown":"legacy stream body"}}'
+printf '%s\n' '{{"type":"checkpoint","state":{{"cursor":"legacy-checkpoint-secret"}}}}'
+"#
+    );
+    let script_path = format!("scripts/{name}.sh");
+    fs::write(database.root.join(&script_path), script).unwrap();
+    fs::write(database.root.join("records/blocked"), "blocked\n").unwrap();
+    run_success(
+        database
+            .command()
+            .args(["sync", "create", name, "--", "sh", &script_path]),
+    );
+    run_failure(database.command().args(["sync", "run", name]));
+    assert!(database.root.join("records/notes/first.md").exists());
+    assert!(
+        fs::read_to_string(database.root.join(format!(".cr/sync/runs/{name}.jsonl")))
+            .unwrap()
+            .contains("legacy-stream-secret")
+    );
+}
+
+#[test]
+fn legacy_plaintext_sync_recovery_refuses_values_now_governed_by_encryption() {
+    for version in [1, 2] {
+        let database = TestDatabase::new(&format!("encrypted-legacy-sync-v{version}"));
+        let name = format!("legacy-v{version}");
+        interrupt_legacy_plaintext_sync(&database, &name, "accounts");
+        let ledger_path = database.root.join(format!(".cr/sync/runs/{name}.json"));
+        if version == 1 {
+            let mut ledger: Value =
+                serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+            ledger["version"] = Value::from(1);
+            ledger.as_object_mut().unwrap().remove("target_versions");
+            fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+        }
+        write_schema(&database);
+        fs::remove_file(database.root.join("records/blocked")).unwrap();
+        let stream_path = database.root.join(format!(".cr/sync/runs/{name}.jsonl"));
+        let stream_before = fs::read(&stream_path).unwrap();
+        let ledger_before = fs::read(&ledger_path).unwrap();
+        let head_before = json(database.command().args(["audit", "head", "--json"]));
+
+        let error = run_failure(database.command().args(["sync", "recover", &name]));
+        assert!(
+            error.contains("plaintext operation stream is incompatible with the current protected storage policy"),
+            "{error}"
+        );
+        for secret in [
+            "legacy-stream-secret",
+            "legacy stream body",
+            "legacy-checkpoint-secret",
+        ] {
+            assert!(!error.contains(secret), "error exposed {secret}: {error}");
+        }
+        assert_eq!(fs::read(&stream_path).unwrap(), stream_before);
+        assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before);
+        assert!(!database.root.join("records/accounts/one.md").exists());
+        assert_eq!(
+            json(database.command().args(["audit", "head", "--json"])),
+            head_before
+        );
+        run_success(database.command().args(["audit", "verify"]));
+    }
+}
+
+#[test]
+fn legacy_plaintext_sync_recovery_remains_compatible_when_its_targets_are_unprotected() {
+    let database = TestDatabase::new("encrypted-unrelated-legacy-sync");
+    interrupt_legacy_plaintext_sync(&database, "legacy", "notes");
+    write_schema(&database);
+    fs::remove_file(database.root.join("records/blocked")).unwrap();
+
+    let recovered = json(
+        database
+            .command()
+            .args(["sync", "recover", "legacy", "--json"]),
+    );
+    assert_eq!(recovered["resumed"], true);
+    assert_eq!(recovered["created"], 2);
+    assert_eq!(recovered["unchanged"], 1);
+    assert_eq!(
+        json(database.command().args(["sync", "state", "legacy"]))["cursor"],
+        "legacy-checkpoint-secret"
+    );
+    run_success(database.command().args(["audit", "verify"]));
+}
+
+#[test]
+fn marker_removal_refuses_sync_upsert_before_staging_its_plaintext_stream() {
+    let database = TestDatabase::new("encrypted-sync-marker-removal-staging");
+    write_schema(&database);
+    run_success(command(&database).args([
+        "create",
+        "accounts",
+        "one",
+        "--set",
+        "stage=lead",
+        "--set",
+        "contact.token=original-protected-secret",
+        "--body",
+        "original protected body",
+    ]));
+    let stored_before = stored_document(&database, "one");
+    let head_before = json(database.command().args(["audit", "head", "--json"]));
+    fs::write(
+        database.root.join(".cr/schemas/accounts.json"),
+        r#"{"type":"object"}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(database.root.join("scripts")).unwrap();
+    fs::write(
+        database.root.join("scripts/stale.sh"),
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' '{"type":"upsert","collection":"accounts","id":"one","front_matter":{"stage":"lead","contact":{"token":"adapter-plaintext-secret"}},"markdown":"adapter plaintext body"}'
+printf '%s\n' '{"type":"checkpoint","state":{"cursor":"adapter-checkpoint-secret"}}'
+"#,
+    )
+    .unwrap();
+    run_success(database.command().args([
+        "sync",
+        "create",
+        "stale",
+        "--",
+        "sh",
+        "scripts/stale.sh",
+    ]));
+
+    let error = run_failure(database.command().args(["sync", "run", "stale"]));
+    assert!(
+        error.contains("stored protected data is no longer declared by the collection schema"),
+        "{error}"
+    );
+    for secret in [
+        "adapter-plaintext-secret",
+        "adapter plaintext body",
+        "adapter-checkpoint-secret",
+    ] {
+        assert!(!error.contains(secret), "error exposed {secret}: {error}");
+    }
+    assert_eq!(stored_document(&database, "one"), stored_before);
+    assert_eq!(
+        json(database.command().args(["audit", "head", "--json"])),
+        head_before
+    );
+    assert!(!database.root.join(".cr/sync/runs/stale.json").exists());
+    assert!(!database.root.join(".cr/sync/runs/stale.jsonl").exists());
+    assert_tree_omits(
+        &database.root.join(".cr"),
+        &[
+            "adapter-plaintext-secret",
+            "adapter plaintext body",
+            "adapter-checkpoint-secret",
+        ],
+    );
+}
+
 #[test]
 fn interrupted_protected_sync_persists_only_authenticated_ciphertext_and_recovers() {
     let database = FaultDatabase::new("encrypted-sync-ledger");

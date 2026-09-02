@@ -608,17 +608,7 @@ impl Database {
         // first mutation, so from here on an interrupted run is a fact on disk
         // rather than something only the audit chain hints at.
         let checkpoint = final_checkpoint(&messages).cloned();
-        let protected_stream = messages.iter().try_fold(false, |protected, message| {
-            Ok::<_, anyhow::Error>(
-                protected
-                    || match message {
-                        SyncMessage::Upsert { collection, .. } => {
-                            self.collection_uses_encryption(collection)?
-                        }
-                        SyncMessage::Delete { .. } | SyncMessage::Checkpoint { .. } => false,
-                    },
-            )
-        })?;
+        let protected_stream = self.sync_stream_requires_protection(&messages)?;
         let (run_version, stored_stream, checkpoint_before, checkpoint_after) = if protected_stream
         {
             let context = self.ensure_encryption_context()?;
@@ -732,6 +722,14 @@ impl Database {
                 stored.run_id
             )));
         }
+        if stored.version != SYNC_RUN_FORMAT_VERSION
+            && self.sync_stream_requires_protection(&messages)?
+        {
+            return Err(conflict(format!(
+                "sync '{name}' run {} cannot be recovered because its plaintext operation stream is incompatible with the current protected storage policy",
+                stored.run_id
+            )));
+        }
         let stream_checkpoint = final_checkpoint(&messages).cloned();
         if !stored
             .checkpoint_after
@@ -834,7 +832,29 @@ impl Database {
                 let version = audited_versions.get(&target).cloned().flatten();
                 (target, version)
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        // An upsert of an existing record eventually needs its logical state
+        // to distinguish an exact no-op from a replacement. Do that read while
+        // the same lock still binds the record bytes to the verified audit
+        // snapshot, before the adapter's plaintext stream becomes durable.
+        // In particular, a schema marker removal must fail on the stale,
+        // manifest-owned ciphertext here rather than first writing a v2 stream
+        // and discovering the mismatch during apply.
+        for message in messages {
+            let SyncMessage::Upsert { collection, id, .. } = message else {
+                continue;
+            };
+            let Some(expected) = versions
+                .get(&(collection.clone(), id.clone()))
+                .and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            let record = self.get(collection, id)?;
+            if &record.version != expected {
+                bail!("database record changed while the sync command was running");
+            }
+        }
         Ok(SyncApplicationSnapshot {
             audit: verification,
             versions,
@@ -998,6 +1018,25 @@ impl Database {
             }
         }
         Ok(summary)
+    }
+
+    /// Whether this logical protocol stream must be stored as one protected
+    /// blob under the schemas that are active now.
+    ///
+    /// The checkpoint shares the stream's storage boundary. Even when an
+    /// encrypted field is optional and absent from one upsert, a collection
+    /// with a nonempty policy makes the complete stream protected so its
+    /// checkpoint and any later schema interpretation cannot remain plaintext.
+    fn sync_stream_requires_protection(&self, messages: &[SyncMessage]) -> Result<bool> {
+        messages.iter().try_fold(false, |protected, message| {
+            Ok(protected
+                || match message {
+                    SyncMessage::Upsert { collection, .. } => {
+                        self.collection_uses_encryption(collection)?
+                    }
+                    SyncMessage::Delete { .. } | SyncMessage::Checkpoint { .. } => false,
+                })
+        })
     }
 
     /// Read the run ledger, refusing one that does not describe this sync.
