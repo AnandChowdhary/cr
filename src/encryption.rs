@@ -144,9 +144,16 @@ impl EncryptionPolicy {
         let Some(schema) = schema else {
             return Ok(Self::default());
         };
+        // JSON Schema itself may be an object or a boolean. Boolean schemas
+        // have nowhere to carry CR annotations, so both compile to the empty
+        // storage policy; the ordinary validator still gives `true` and
+        // `false` their accept-all/reject-all meanings.
+        if schema.is_boolean() {
+            return Ok(Self::default());
+        }
         let object = schema
             .as_object()
-            .context("collection JSON Schema must be an object")?;
+            .context("collection JSON Schema must be an object or boolean")?;
         let body = extension_bool(object.get(BODY_EXTENSION), BODY_EXTENSION)?;
         let mut fields = Vec::new();
         collect_fields(schema, &mut Vec::new(), &mut fields, false)?;
@@ -202,7 +209,7 @@ impl EncryptionPolicy {
         logical: &Document,
         previous_stored: Option<&Document>,
     ) -> Result<ProtectedDocument> {
-        self.validate_logical_for_write(logical)?;
+        self.validate_logical_for_write(logical, previous_stored)?;
         if self.is_empty() {
             return Ok(ProtectedDocument {
                 document: logical.clone(),
@@ -346,11 +353,39 @@ impl EncryptionPolicy {
         Ok(logical)
     }
 
-    pub fn validate_logical_for_write(&self, logical: &Document) -> Result<()> {
-        if logical
-            .attributes
-            .contains_key(Value::String(MANIFEST_KEY.to_owned()))
-        {
+    pub fn validate_logical_for_write(
+        &self,
+        logical: &Document,
+        previous_stored: Option<&Document>,
+    ) -> Result<()> {
+        let key = Value::String(MANIFEST_KEY.to_owned());
+        let Some(current) = logical.attributes.get(&key) else {
+            // Removing an ordinary legacy collision is allowed, but deleting
+            // a real storage manifest after its schema marker moved would
+            // expose the remaining envelopes as application data.
+            if self.is_empty()
+                && previous_stored
+                    .and_then(|previous| {
+                        previous
+                            .attributes
+                            .get(&key)
+                            .map(|manifest| (previous, manifest))
+                    })
+                    .is_some_and(|(previous, manifest)| manifest_has_envelopes(previous, manifest))
+            {
+                return Err(conflict(
+                    "stored protected data is no longer declared by the collection schema",
+                ));
+            }
+            return Ok(());
+        };
+        let unchanged_legacy_collision = self.is_empty()
+            && previous_stored
+                .and_then(|previous| previous.attributes.get(&key).map(|value| (previous, value)))
+                .is_some_and(|(previous, prior)| {
+                    prior == current && !manifest_has_envelopes(previous, prior)
+                });
+        if !unchanged_legacy_collision {
             return Err(invalid(format!(
                 "front matter field '{MANIFEST_KEY}' is reserved"
             )));
@@ -1165,6 +1200,17 @@ mod tests {
         let policy = EncryptionPolicy::from_schema(Some(&schema)).unwrap();
         assert!(policy.protects_body());
         assert_eq!(policy.field_paths(), &[vec!["contact", "token"]]);
+    }
+
+    #[test]
+    fn boolean_json_schemas_have_no_encryption_policy() {
+        for schema in [JsonValue::Bool(true), JsonValue::Bool(false)] {
+            assert!(
+                EncryptionPolicy::from_schema(Some(&schema))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

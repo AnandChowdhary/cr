@@ -140,6 +140,15 @@ fn encrypted_fields_and_body_are_plaintext_at_every_cr_read_boundary() {
         "Private account notes\n",
     ]));
 
+    let reserved = run_failure(command(&database).args([
+        "update",
+        "accounts",
+        "acme",
+        "--set",
+        "$cr_encryption=application-value",
+    ]));
+    assert!(reserved.contains("front matter field '$cr_encryption' is reserved"));
+
     let stored = stored_document(&database, "acme");
     assert!(stored.contains("$cr_encrypted"));
     assert!(stored.contains("cr-encrypted:v1:old:"));
@@ -795,6 +804,82 @@ fn encryption_manifest_name_is_reserved_for_writes_but_legacy_data_remains_reada
 }
 
 #[test]
+fn unchanged_legacy_manifest_collision_survives_updates_and_save_until_removed() {
+    let database = TestDatabase::new("encrypted-manifest-collision-updates");
+    fs::create_dir_all(database.root.join("records/notes")).unwrap();
+    let path = database.root.join("records/notes/legacy.md");
+    fs::write(
+        &path,
+        "---\n$cr_encryption: legacy-application-value\ntitle: Before\n---\noriginal body\n",
+    )
+    .unwrap();
+    run_success(database.command().args(["audit", "baseline"]));
+
+    // An unrelated managed update carries the exact grandfathered value.
+    run_success(
+        database
+            .command()
+            .args(["update", "notes", "legacy", "--set", "title=After"]),
+    );
+    let updated = json(
+        database
+            .command()
+            .args(["get", "notes", "legacy", "--json"]),
+    );
+    assert_eq!(updated["attributes"]["title"], "After");
+    assert_eq!(
+        updated["attributes"]["$cr_encryption"],
+        "legacy-application-value"
+    );
+
+    // Adding or changing the reserved value is not grandfathered.
+    let changed = run_failure(database.command().args([
+        "update",
+        "notes",
+        "legacy",
+        "--set",
+        "$cr_encryption=changed",
+    ]));
+    assert!(changed.contains("front matter field '$cr_encryption' is reserved"));
+    run_success(database.command().args(["create", "notes", "plain"]));
+    let added = run_failure(database.command().args([
+        "update",
+        "notes",
+        "plain",
+        "--set",
+        "$cr_encryption=added",
+    ]));
+    assert!(added.contains("front matter field '$cr_encryption' is reserved"));
+
+    // Direct-save reconciliation has the same compatibility boundary.
+    let unrelated_edit = fs::read_to_string(&path)
+        .unwrap()
+        .replace("original body", "edited body");
+    fs::write(&path, unrelated_edit).unwrap();
+    run_success(database.command().args(["save", "notes/legacy"]));
+
+    let changed_collision = fs::read_to_string(&path)
+        .unwrap()
+        .replace("legacy-application-value", "directly-changed");
+    fs::write(&path, changed_collision).unwrap();
+    let rejected = run_failure(database.command().args(["save", "notes/legacy"]));
+    assert!(rejected.contains("front matter field '$cr_encryption' is reserved"));
+
+    // Removing the legacy field is an allowed one-way migration.
+    let removed = fs::read_to_string(&path)
+        .unwrap()
+        .replace("$cr_encryption: directly-changed\n", "");
+    fs::write(&path, removed).unwrap();
+    run_success(database.command().args(["save", "notes/legacy"]));
+    let migrated = json(
+        database
+            .command()
+            .args(["get", "notes", "legacy", "--json"]),
+    );
+    assert!(migrated["attributes"].get("$cr_encryption").is_none());
+}
+
+#[test]
 fn standalone_envelope_shaped_application_data_stays_ordinary_in_history_and_migration() {
     let database = TestDatabase::new("encrypted-envelope-shaped-legacy-data");
     fs::remove_file(database.root.join(".cr/encryption.json")).unwrap();
@@ -938,6 +1023,35 @@ fn removing_schema_markers_does_not_expose_envelopes_as_ordinary_data() {
     let error = run_failure(command(&database).args(["get", "accounts", "one", "--json"]));
     assert!(error.contains("stored protected data is no longer declared"));
     assert!(!error.contains("still-secret"));
+    let update = run_failure(command(&database).args([
+        "update",
+        "accounts",
+        "one",
+        "--set",
+        "stage=customer",
+    ]));
+    assert!(update.contains("stored protected data is no longer declared"));
+    assert!(!update.contains("still-secret"));
+    let path = database.root.join("records/accounts/one.md");
+    let direct_edit = fs::read_to_string(&path)
+        .unwrap()
+        .replace("stage: lead", "stage: customer");
+    fs::write(&path, direct_edit).unwrap();
+    let save = run_failure(command(&database).args(["save", "accounts/one"]));
+    assert!(save.contains("stored protected data is no longer declared"));
+    assert!(!save.contains("still-secret"));
+    let raw = fs::read_to_string(&path).unwrap();
+    let (mut attributes, body) = split_document(&raw);
+    attributes
+        .as_mapping_mut()
+        .unwrap()
+        .remove(yaml_serde::Value::String("$cr_encryption".into()));
+    let yaml = yaml_serde::to_string(&attributes).unwrap();
+    let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
+    fs::write(&path, format!("---\n{yaml}---\n{body}")).unwrap();
+    let removed_manifest = run_failure(command(&database).args(["save", "accounts/one"]));
+    assert!(removed_manifest.contains("stored protected data is no longer declared"));
+    assert!(!removed_manifest.contains("still-secret"));
     let history =
         run_failure(command(&database).args(["audit", "log", "accounts", "one", "--json"]));
     assert!(history.contains("stored protected history is no longer declared"));

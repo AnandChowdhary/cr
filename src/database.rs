@@ -2991,7 +2991,7 @@ impl Database {
             if let Some(document) = &after {
                 let logical = self.reveal_document(&change.collection, &change.id, document)?;
                 self.encryption_policy(&change.collection)?
-                    .validate_logical_for_write(&logical)?;
+                    .validate_logical_for_write(&logical, before.as_ref())?;
                 self.validate(&change.collection, &logical.attributes)?;
             }
             let action = match change.status {

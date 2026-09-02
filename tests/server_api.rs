@@ -856,6 +856,74 @@ async fn concurrent_http_patches_are_serialized_without_losing_fields() {
 }
 
 #[tokio::test]
+async fn boolean_collection_schemas_keep_http_and_openapi_semantics() {
+    let (_temporary, database) = test_database("server-boolean-schemas");
+    fs::write(database.root().join(".cr/schemas/open.json"), "true\n").unwrap();
+    fs::write(database.root().join(".cr/schemas/closed.json"), "false\n").unwrap();
+    let app = router(database, ServerConfig::default()).unwrap();
+
+    let accepted = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/open/records",
+        json!({ "id": "accepted", "front_matter": { "anything": [1, true] } }),
+        &[],
+    )
+    .await;
+    assert_eq!(accepted.status, StatusCode::CREATED);
+
+    let rejected = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/closed/records",
+        json!({ "id": "rejected", "front_matter": {} }),
+        &[],
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(rejected.json()["error"]["code"], "validation_failed");
+
+    let collections = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections?limit=100",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(collections.status, StatusCode::OK);
+    let collections = collections.json();
+    assert!(
+        collections["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["name"] == "open" && model["schema"] == Value::Bool(true))
+    );
+    assert!(
+        collections["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["name"] == "closed" && model["schema"] == Value::Bool(false))
+    );
+
+    let openapi = request(&app, Method::GET, "/openapi.json", None, &[])
+        .await
+        .json();
+    for (collection, expected) in [("open", true), ("closed", false)] {
+        let reference = openapi["x-cr-collection-schemas"][collection]
+            .as_str()
+            .unwrap();
+        let component = reference.rsplit('/').next().unwrap();
+        assert_eq!(
+            openapi["components"]["schemas"][component],
+            Value::Bool(expected)
+        );
+    }
+}
+
+#[tokio::test]
 async fn openapi_authentication_and_http_errors_are_structured() {
     let (_temporary, database) = test_database("server-openapi");
     fs::write(

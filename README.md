@@ -1317,16 +1317,18 @@ values use the active key; unchanged values keep their existing envelope.
 Retain every old key needed to read audit history.
 
 The stored front matter also carries a reserved `$cr_encryption` manifest. New
-writes reserve that name even in unencrypted collections, while old
-unencrypted records that used it as ordinary data remain readable unless its
-declared locations actually contain CR envelopes. The manifest
-prevents removing or moving schema markers from silently exposing ciphertext as
-ordinary application data. Existing plaintext does not become protected merely
-because a marker was added: reads and `audit baseline` fail with an explicit
-migration-required conflict. Export the plaintext before enabling the marker,
-then import it into a newly encrypted record or database. That boundary is
-deliberate—an in-place audit event would preserve the old plaintext in history
-and falsely imply migration had removed it.
+writes reserve that name even in unencrypted collections. With no encryption
+policy, an unrelated managed update or direct `save` may preserve an unchanged
+legacy application value under that name; adding or changing it is rejected,
+and removing it is allowed. This grandfathering never applies under an
+encryption policy or when a valid manifest owns actual CR envelopes. The
+manifest prevents removing or moving schema markers from silently exposing
+ciphertext as ordinary application data. Existing plaintext does not become
+protected merely because a marker was added: reads and `audit baseline` fail
+with an explicit migration-required conflict. Export the plaintext before
+enabling the marker, then import it into a newly encrypted record or database.
+That boundary is deliberate—an in-place audit event would preserve the old
+plaintext in history and falsely imply migration had removed it.
 
 Direct filesystem edits remain possible for unprotected values as long as the
 envelopes and manifest are preserved; `cr save` refuses plaintext substituted

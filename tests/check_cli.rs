@@ -279,6 +279,24 @@ fn records_written_before_a_schema_existed_are_reported_against_it() {
 }
 
 #[test]
+fn a_false_boolean_schema_is_a_rejecting_schema_not_an_unusable_one() {
+    let database = TestDatabase::new("check-false-boolean-schema");
+    run_success(
+        database
+            .command()
+            .args(["create", "closed", "legacy", "--set", "value=1"]),
+    );
+    fs::write(database.root.join(".cr/schemas/closed.json"), "false\n").unwrap();
+
+    let run = check(&database.root, &["--json"]);
+    assert_eq!(run.status, FOUND_PROBLEMS);
+    assert!(run.findings("unusable_schema").is_empty(), "{}", run.stdout);
+    let finding = run.one("schema_violation");
+    assert_eq!(finding["collection"], "closed");
+    assert_eq!(finding["id"], "legacy");
+}
+
+#[test]
 fn an_unusable_schema_is_reported_once_rather_than_once_per_record() {
     let database = seeded();
     run_success(database.command().args([

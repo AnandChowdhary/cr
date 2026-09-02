@@ -143,11 +143,15 @@ unknown-key, and authentication failures are typed, redacted refusals.
 
 `$cr_encryption` is reserved on every new logical write, including writes to
 unencrypted collections. Backward-compatible reads do not reject a legacy
-ordinary field merely because it has that name: with no encryption policy it
-is classified as CR metadata only when an exact manifest points at a valid
-field or body envelope. A manifest whose optional protected paths are all
-absent contains no protected payload and therefore does not make the record
-unreadable after a schema change.
+ordinary field merely because it has that name. With no encryption policy,
+unrelated managed updates and direct saves may preserve the exact prior legacy
+value, but they may not add or change it; removing it is the supported one-way
+migration. No value is grandfathered under a nonempty encryption policy or when
+a valid manifest owns an actual field or body envelope. For reads under an
+empty policy, the name is classified as CR metadata only when such an envelope
+exists. A manifest whose optional protected paths are all absent contains no
+protected payload and therefore does not make the record unreadable after a
+schema change.
 
 Validation happens before protection; filtering and search happen after
 revelation. Audit preparation receives stored documents, so its hashes and

@@ -3,7 +3,50 @@ mod common;
 use std::{fs, process::Command};
 
 use common::{command_for, run_failure, run_success};
+use cr::Database;
 use serde_json::Value;
+
+#[test]
+fn boolean_json_schemas_keep_their_standard_validation_semantics() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("boolean-schemas");
+    run_success(
+        Command::new(env!("CARGO_BIN_EXE_cr"))
+            .arg("init")
+            .arg(&root),
+    );
+    fs::write(root.join(".cr/schemas/open.json"), "true\n").unwrap();
+    fs::write(root.join(".cr/schemas/closed.json"), "false\n").unwrap();
+
+    run_success(command_for(&root).args([
+        "create",
+        "open",
+        "one",
+        "--set",
+        "any.shape=[1, true, null]",
+    ]));
+    let listed: Value = serde_json::from_str(&run_success(
+        command_for(&root).args(["list", "open", "--json"]),
+    ))
+    .unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+
+    let rejected =
+        run_failure(command_for(&root).args(["create", "closed", "one", "--set", "anything=1"]));
+    assert!(rejected.contains("does not match schema for collection 'closed'"));
+    assert!(!root.join("records/closed/one.md").exists());
+
+    let models = Database::discover(Some(&root))
+        .unwrap()
+        .collection_models()
+        .unwrap();
+    assert!(models.iter().any(|model| {
+        model.name == "open" && model.schema.as_ref() == Some(&Value::Bool(true))
+    }));
+    assert!(models.iter().any(|model| {
+        model.name == "closed" && model.schema.as_ref() == Some(&Value::Bool(false))
+    }));
+}
 
 #[test]
 fn create_query_update_and_link_records() {
