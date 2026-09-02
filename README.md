@@ -382,9 +382,44 @@ over is an error, not a silent truncation.
 `-m/--message` also now works on `create`, `update`, `link`, and `delete`, not
 only `save`. It keeps its existing meaning: a short note about the change.
 
+### Keep a read-modify-write from overwriting a newer record
+
+Every single-record read has a `version`: `sha256:` plus SHA-256 over the bytes
+`cr:record:v1\0` followed by the exact stored Markdown bytes, including front
+matter formatting and body text. The domain prefix prevents a record version
+from being confused with an audit event or change-set digest. `cr get --json`
+prints it. Pass that value back when a CLI mutation was calculated from a prior read:
+
+```sh
+version=$(cr get deals acme-renewal --json | jq -r .version)
+cr update deals acme-renewal --set status=won \
+  --expected-record-hash "$version"
+```
+
+`update`, `link`, and `delete` accept `--expected-record-hash`. A competing
+write makes the command fail with the typed `precondition_failed` code; a
+malformed hash is `validation_failed`. The comparison is made after acquiring
+the same audit lock that guards the write, so another process cannot change the
+record between checking the version and committing it.
+
+REST record reads return the same value in the JSON `version` field and as a
+strong `ETag`, including exact-document reads. Send that ETag as `If-Match` on a
+conditional `PATCH`, `DELETE`, or link request. `PUT` replaces the complete
+front matter and Markdown document and therefore requires `If-Match`; omitting
+it returns `428 precondition_required`, while a stale or weak validator returns
+`412 precondition_failed`. Atomic `PATCH` remains safe and unconditional when
+the header is omitted: its merge is calculated from the current record while
+the lock is held, rather than from a client-supplied whole document.
+
+The server-rendered editor and delete form carry the record version in a hidden
+field automatically. Leaving an old form open can no longer overwrite or
+delete a record changed in another tab; the stale submission returns 412 and
+creates no audit event.
+
 ### Approve a change set before it is written
 
-Everything above is asserted. This is the one thing `cr` checks.
+Actor and agent attribution are asserted. The preview digest is a separate
+value `cr` can check against the change it is about to record.
 
 `--preview` computes the change set a mutation would record and prints a digest
 over it, without writing anything — no record change, no audit event, no pending
@@ -449,7 +484,7 @@ curl -X PATCH 'http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renew
 ```
 
 `--preview` works on `create`, `update`, `link`, `delete`, and `save`, and
-`preview=true` on `POST`/`PATCH`/`DELETE` records, `POST` links, and `POST
+`preview=true` on `POST`/`PUT`/`PATCH`/`DELETE` records, `POST` links, and `POST
 /api/v1/save`. `cr delete --preview` does not need `--yes`, because it deletes
 nothing.
 
@@ -1232,13 +1267,13 @@ The command is stored as a program plus an exact argument array, not as a shell 
 
 ### Failure, direct writes, and external effects
 
-The database must pass `audit verify` before an adapter starts and again after it exits. A timeout, nonzero exit, invalid JSON, output-limit violation, duplicate target, schema error, or dirty database prevents all emitted operations and checkpoint changes. Only one run of a named sync can execute at once.
+The database must pass `audit verify` before an adapter starts and again after it exits. During the second verification, `cr` holds the audit lock and captures every stream target as absent or at its exact record version at that same audit head. Every later replacement, deletion, creation, and idempotent no-op conditionally requires both that target state and the audit sequence produced by the preceding sync operation. An ordinary CLI or API write anywhere in the database therefore stops the remaining stream rather than letting stale adapter output overwrite it; the sequence guard also catches an edit that restores byte-identical target contents, which necessarily has the same public record hash. A timeout, nonzero exit, invalid JSON, output-limit violation, duplicate target, schema error, or dirty database prevents all emitted operations and checkpoint changes. Only one run of a named sync can execute at once.
 
 Do not have an unattended adapter write `records/` directly. If it does, the second verification rejects its protocol output and leaves the direct file edit visible in `cr status`; a person can review it with the normal selective `cr save` flow. This is what keeps sync automation from silently accepting unrelated manual edits or tampering.
 
 Record operations are preflighted together but committed as sequential audited single-record mutations, not one all-or-nothing multi-record transaction. A durable-write failure midway through application therefore still leaves earlier operations committed. What it can no longer do is leave that fact unrecorded.
 
-Before the first mutation `cr` writes a run ledger, and the exact operation stream beside it, under `.cr/sync/runs/`, and removes both only once the checkpoint agrees with the committed work. An interrupted run is then a durable fact rather than something to infer:
+Before the first mutation `cr` writes a version-2 run ledger containing that head-bound target-version snapshot, and the exact operation stream beside it, under `.cr/sync/runs/`, and removes both only once the checkpoint agrees with the committed work. Recovery also accepts version-1 ledgers written by earlier builds: it reconstructs their missing target snapshot by replaying the immutable audit prefix to the head recorded in the ledger. An interrupted run is then a durable fact rather than something to infer:
 
 ```sh
 cr sync recover notion-meeting --check          # report an interrupted run, change nothing
@@ -1248,7 +1283,7 @@ cr sync recover notion-meeting                  # complete it
 
 `cr sync run` refuses to start while a ledger is present, so a stale checkpoint can never be silently replayed from the beginning. `cr sync recover` completes the interrupted run by replaying its recorded stream. That is roll-forward, never rollback: the audit chain is append-only and nothing already committed is ever unwound. It is sound because the protocol stream is idempotent — a target appears at most once, an upsert carries the whole record, and deleting a missing record is a no-op — so the replay commits only the operations the interrupted run never reached and appends no event for the rest. The events it commits carry the original run's ID, so the audit log shows one run rather than two.
 
-Recovery refuses, rather than guessing, when a record the run still has to write changed after the run stopped, or when the recorded stream no longer matches its ledger. An unrelated record changing in the meantime is reported by `--check` but does not block completion. If the original failure is still present, recovery fails the same way and leaves the ledger intact, so the run stays completable once the cause is fixed.
+Recovery refuses, rather than guessing, when a record the run still has to write changed after the run stopped, or when the recorded stream no longer matches its ledger. It recognizes committed progress only when an event has both `source: sync` and the run's message, then verifies that the event's target, action, and resulting record hash match the recorded stream. It captures that history and the current audit sequence under one lock and checks the sequence again inside every remaining mutation lock, so a writer racing after the scan — including an edit-and-restore ABA — is refused. An unrelated record changed before that recovery snapshot is reported by `--check` but does not block completion. If the original failure is still present, recovery fails the same way and leaves the ledger intact, so the run stays completable once the cause is fixed.
 
 An adapter may also perform external effects, such as creating a calendar event or sending a message. `cr` cannot roll those effects back if a later record operation fails. Use the remote service's idempotency keys, design the adapter to retry safely, and emit the checkpoint only for work that can be resumed.
 
@@ -1596,13 +1631,16 @@ Fetch one record:
 curl http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal
 ```
 
-The response includes the identity, relative path, typed front matter, and Markdown body:
+The response includes the identity, relative path, domain-separated exact-byte
+version, typed front matter, and Markdown body. Its `ETag` header is the quoted
+form of `version`:
 
 ```json
 {
   "collection": "deals",
   "id": "acme-renewal",
   "path": "records/deals/acme-renewal.md",
+  "version": "sha256:3d8d9a6f…",
   "front_matter": {
     "name": "Acme renewal",
     "status": "won",
@@ -1633,6 +1671,22 @@ curl -X PATCH http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewa
     "markdown": "Closed-won notes."
   }'
 ```
+
+Replace a complete document only with the ETag from a prior read:
+
+```sh
+etag=$(curl -sD - http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal \
+  -o /dev/null | awk 'tolower($1) == "etag:" { print $2 }' | tr -d '\r')
+curl -X PUT http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal \
+  -H 'Content-Type: application/json' \
+  -H "If-Match: $etag" \
+  -d '{"front_matter":{"status":"won"},"markdown":"Closed-won notes."}'
+```
+
+`If-Match` also accepts a comma-separated list of strong CR record ETags or
+`*`. Weak validators never match. Conditional previews check the same version
+without writing, and `X-CR-Approved-Changes` remains an independent guard over
+the resulting audit change set.
 
 Create a relation or delete a record:
 

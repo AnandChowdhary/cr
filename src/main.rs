@@ -4,10 +4,10 @@ use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
     AccessAction, AccessResource, AgentEvidence, Assignment, AttributionOverrides, AuditFilter,
-    CheckReport, CheckScope, Database, DomainError, FilterExpression, Record, Role, SearchQuery,
-    SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions, UserEnsureOutcome, UserKind,
-    UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout, parse_threshold,
-    sort_records_by_field,
+    CheckReport, CheckScope, Database, DomainError, FilterExpression, Record, RecordPrecondition,
+    Role, SearchQuery, SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions,
+    UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout,
+    parse_threshold, sort_records_by_field,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -343,6 +343,10 @@ enum Command {
         #[arg(long)]
         body: Option<String>,
 
+        /// Refuse unless the record still has this sha256 version from `cr get --json`.
+        #[arg(long, value_name = "SHA256")]
+        expected_record_hash: Option<String>,
+
         /// Explain why this record is being updated.
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
@@ -366,6 +370,10 @@ enum Command {
         relation: String,
         target_collection: String,
         target_id: String,
+
+        /// Refuse unless the source record still has this sha256 version from `cr get --json`.
+        #[arg(long, value_name = "SHA256")]
+        expected_record_hash: Option<String>,
 
         /// Explain why this relation is being added.
         #[arg(short = 'm', long, value_name = "MESSAGE")]
@@ -451,6 +459,10 @@ enum Command {
     Delete {
         collection: String,
         id: String,
+
+        /// Refuse unless the record still has this sha256 version from `cr get --json`.
+        #[arg(long, value_name = "SHA256")]
+        expected_record_hash: Option<String>,
 
         /// Confirm the destructive operation. Not needed with --preview, which deletes nothing.
         #[arg(long)]
@@ -1486,6 +1498,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             id,
             assignments,
             body,
+            expected_record_hash,
             message,
             preview,
             json,
@@ -1495,12 +1508,26 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 bail!("provide at least one --set or --body value");
             }
             let database = attributed(database, &attribution, message.as_deref())?;
+            let precondition = expected_record_hash
+                .map(RecordPrecondition::version)
+                .transpose()?;
             if preview {
-                let preview =
-                    database.preview_update(&collection, &id, &assignments, body.as_deref())?;
+                let preview = database.preview_update_conditionally(
+                    &collection,
+                    &id,
+                    &assignments,
+                    body.as_deref(),
+                    precondition.as_ref(),
+                )?;
                 print_preview(&preview, json)?;
             } else {
-                let record = database.update(&collection, &id, &assignments, body.as_deref())?;
+                let record = database.update_conditionally(
+                    &collection,
+                    &id,
+                    &assignments,
+                    body.as_deref(),
+                    precondition.as_ref(),
+                )?;
                 println!("{}", record.reference());
             }
         }
@@ -1510,24 +1537,35 @@ fn run(cli: Cli) -> Result<ExitCode> {
             relation,
             target_collection,
             target_id,
+            expected_record_hash,
             message,
             preview,
             json,
             attribution,
         } => {
             let database = attributed(database, &attribution, message.as_deref())?;
+            let precondition = expected_record_hash
+                .map(RecordPrecondition::version)
+                .transpose()?;
             if preview {
-                let preview = database.preview_link(
+                let preview = database.preview_link_conditionally(
                     &collection,
                     &id,
                     &relation,
                     &target_collection,
                     &target_id,
+                    precondition.as_ref(),
                 )?;
                 print_preview(&preview, json)?;
             } else {
-                let record =
-                    database.link(&collection, &id, &relation, &target_collection, &target_id)?;
+                let record = database.link_conditionally(
+                    &collection,
+                    &id,
+                    &relation,
+                    &target_collection,
+                    &target_id,
+                    precondition.as_ref(),
+                )?;
                 println!("{}", record.reference());
             }
         }
@@ -1629,6 +1667,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Delete {
             collection,
             id,
+            expected_record_hash,
             yes,
             message,
             preview,
@@ -1636,14 +1675,22 @@ fn run(cli: Cli) -> Result<ExitCode> {
             attribution,
         } => {
             let database = attributed(database, &attribution, message.as_deref())?;
+            let precondition = expected_record_hash
+                .map(RecordPrecondition::version)
+                .transpose()?;
             if preview {
-                let preview = database.preview_delete(&collection, &id)?;
+                let preview = database.preview_delete_conditionally(
+                    &collection,
+                    &id,
+                    precondition.as_ref(),
+                )?;
                 print_preview(&preview, json)?;
             } else {
                 if !yes {
                     bail!("deleting a record requires --yes to confirm the destructive operation");
                 }
-                let record = database.delete(&collection, &id)?;
+                let record =
+                    database.delete_conditionally(&collection, &id, precondition.as_ref())?;
                 println!("{}", record.reference());
             }
         }

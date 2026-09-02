@@ -59,6 +59,73 @@ fn concurrent_single_record_updates_never_publish_a_torn_file() {
 }
 
 #[test]
+fn two_conditional_writers_from_one_version_allow_exactly_one_commit() {
+    let database = TestDatabase::new("conditional-update-race");
+    run_success(
+        database
+            .command()
+            .args(["create", "items", "shared", "--set", "winner=none"]),
+    );
+    let fetched: Value = serde_json::from_str(&run_success(
+        database
+            .command()
+            .args(["get", "items", "shared", "--json"]),
+    ))
+    .unwrap();
+    let version = fetched["version"].as_str().unwrap().to_owned();
+
+    let mut children = Vec::new();
+    for winner in ["one", "two"] {
+        let assignment = format!("winner={winner}");
+        children.push(
+            database
+                .command()
+                .args([
+                    "--json-errors",
+                    "update",
+                    "items",
+                    "shared",
+                    "--set",
+                    &assignment,
+                    "--expected-record-hash",
+                    &version,
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+
+    let outputs = children
+        .into_iter()
+        .map(|child| child.wait_with_output().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| output.status.success())
+            .count(),
+        1
+    );
+    let stale = outputs
+        .iter()
+        .find(|output| !output.status.success())
+        .expect("one stale writer");
+    let stale: Value = serde_json::from_slice(&stale.stderr).unwrap();
+    assert_eq!(stale["error"]["code"], "precondition_failed");
+
+    let log: Value = serde_json::from_str(&run_success(
+        database
+            .command()
+            .args(["audit", "log", "items", "shared", "--json"]),
+    ))
+    .unwrap();
+    assert_eq!(log.as_array().unwrap().len(), 2);
+    run_success(database.command().args(["audit", "verify"]));
+}
+
+#[test]
 fn concurrent_saves_of_distinct_manual_edits_serialize_into_one_valid_chain() {
     let database = TestDatabase::new("concurrent-saves");
     for id in ["one", "two"] {

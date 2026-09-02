@@ -30,8 +30,8 @@ pub use check::{
     CheckReport, CheckScope, CheckSummary, Finding, FindingKind, Severity, parse_threshold,
 };
 pub use database::{
-    CollectionModel, Database, Record, SortDirection, WorkingChange, WorkingChangeKind,
-    sort_records_by_field,
+    CollectionModel, Database, Record, RecordPrecondition, SortDirection, WorkingChange,
+    WorkingChangeKind, sort_records_by_field,
 };
 pub use error::DomainError;
 pub use search::{SearchQuery, SearchTarget};

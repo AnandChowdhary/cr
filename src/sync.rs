@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -18,9 +18,12 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use yaml_serde::Mapping;
 
 use crate::{
-    AuditFilter, AuditSource, AuditVerification, Database,
+    AuditAction, AuditEntry, AuditFilter, AuditHead, AuditSource, AuditVerification, Database,
+    RecordPrecondition,
+    audit::record_hash,
     database::validate_component,
     error::{conflict, is_missing},
+    frontmatter::Document,
     paths::{self, EntryKind},
 };
 
@@ -35,7 +38,7 @@ const SYNC_DIRECTORY_LABEL: &str = "the sync directory";
 const SYNC_WORK_LABEL: &str = "the sync working directory";
 const SYNC_RUN_LABEL: &str = "the sync run ledger";
 const SYNC_FORMAT_VERSION: u32 = 1;
-const SYNC_RUN_FORMAT_VERSION: u32 = 1;
+const SYNC_RUN_FORMAT_VERSION: u32 = 2;
 /// Domain separator for the digest binding a run ledger to its recorded stream.
 ///
 /// Distinct from every audit domain so a stream digest can never be confused
@@ -200,6 +203,49 @@ struct StoredSyncRun {
     checkpoint_before: StoredCheckpoint,
     #[serde(default)]
     checkpoint_after: StoredCheckpoint,
+    /// Target states captured under the audit lock at `audit_head`.
+    ///
+    /// Recovery reuses these rather than observing a newer record and calling
+    /// that the expected state. That keeps the replay anchored to the exact
+    /// database state against which the adapter output began applying.
+    #[serde(default)]
+    target_versions: Vec<StoredTargetVersion>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredTargetVersion {
+    collection: String,
+    id: String,
+    /// Absent means the target did not exist at the recorded audit head.
+    version: Option<String>,
+}
+
+struct SyncApplicationSnapshot {
+    audit: AuditVerification,
+    versions: BTreeMap<(String, String), Option<String>>,
+}
+
+struct SyncRunEvents {
+    committed: u64,
+    own_states: BTreeMap<(String, String), SyncOwnedState>,
+    foreign: BTreeSet<(String, String)>,
+}
+
+struct SyncOwnedState {
+    action: AuditAction,
+    version: Option<String>,
+}
+
+struct SyncRecoverySnapshot {
+    audit: AuditVerification,
+    expected_versions: BTreeMap<(String, String), Option<String>>,
+    run_events: SyncRunEvents,
+}
+
+struct SyncExpectedState<'a> {
+    versions: &'a BTreeMap<(String, String), Option<String>>,
+    audit_sequence: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,12 +518,10 @@ impl Database {
         let messages = parse_messages(name, &serialized, definition.max_operations)?;
         preflight_messages(self, &messages)?;
         let _application_lock = self.acquire_sync_application_lock()?;
-        let current_audit = self
-            .audit_verify(None)
+        let snapshot = self
+            .sync_application_snapshot(&messages, &starting_audit.head)
             .context("database changed while the sync command was running")?;
-        if current_audit.head != starting_audit.head {
-            bail!("database audit head changed while the sync command was running");
-        }
+        let expected_versions = snapshot.versions;
         if messages
             .iter()
             .any(|message| matches!(message, SyncMessage::Checkpoint { .. }))
@@ -501,15 +545,26 @@ impl Database {
                     .context("could not format sync run timestamp")?,
                 operations: messages.len(),
                 stream_hash: stream_hash(serialized.as_bytes()),
-                audit_sequence: current_audit.head.sequence,
-                audit_head: current_audit.head.hash.clone(),
+                audit_sequence: snapshot.audit.head.sequence,
+                audit_head: snapshot.audit.head.hash.clone(),
                 checkpoint_before: StoredCheckpoint::new(current_state.as_ref()),
                 checkpoint_after: StoredCheckpoint::new(checkpoint.as_ref()),
+                target_versions: stored_target_versions(&expected_versions),
             },
             serialized.as_bytes(),
         )?;
 
-        let mut summary = self.apply_sync_messages(name, &run_id, &definition, messages, false)?;
+        let mut summary = self.apply_sync_messages(
+            name,
+            &run_id,
+            &definition,
+            messages,
+            SyncExpectedState {
+                versions: &expected_versions,
+                audit_sequence: snapshot.audit.head.sequence,
+            },
+            false,
+        )?;
         if let Some(state) = checkpoint {
             summary.checkpoint_updated = self.write_sync_state(name, &state, &current_state)?;
         }
@@ -535,18 +590,6 @@ impl Database {
             return Ok(None);
         };
         let _application_lock = self.acquire_sync_application_lock()?;
-        let audit = self
-            .audit_verify(None)
-            .context("database must be clean before an interrupted sync run can be completed")?;
-        let (_, foreign) = self.sync_run_events(&stored, &audit)?;
-        if audit.head.sequence == stored.audit_sequence && audit.head.hash != stored.audit_head {
-            return Err(conflict(format!(
-                "sync '{name}' cannot complete its interrupted run {} because audit history \
-                 changed after it stopped",
-                stored.run_id
-            )));
-        }
-
         let serialized = paths::read_to_string(
             self.root(),
             &sync_stream_path(name),
@@ -576,10 +619,27 @@ impl Database {
             )));
         }
         preflight_messages(self, &messages)?;
+        let snapshot = self
+            .sync_recovery_snapshot(&stored, &messages)
+            .context("database must be clean before an interrupted sync run can be completed")?;
+        let mut expected_versions = snapshot.expected_versions;
+        validate_sync_run_events(&stored, &messages, &snapshot.run_events)?;
+        for (target, state) in &snapshot.run_events.own_states {
+            let Some(expected) = expected_versions.get_mut(target) else {
+                return Err(conflict(format!(
+                    "sync '{name}' run {} recorded a mutation outside its operation stream",
+                    stored.run_id
+                )));
+            };
+            *expected = state.version.clone();
+        }
         // An unrelated commit while the run was wedged is fine; a commit to a
         // record this run still has to write is not, because completing the run
         // would silently overwrite it.
-        if let Some((collection, id)) = message_targets(&messages).intersection(&foreign).next() {
+        if let Some((collection, id)) = message_targets(&messages)
+            .intersection(&snapshot.run_events.foreign)
+            .next()
+        {
             return Err(conflict(format!(
                 "sync '{name}' cannot complete its interrupted run {} because record \
                  {collection}/{id} changed after it stopped",
@@ -601,8 +661,17 @@ impl Database {
             )));
         }
 
-        let mut summary =
-            self.apply_sync_messages(name, &stored.run_id, &definition, messages, true)?;
+        let mut summary = self.apply_sync_messages(
+            name,
+            &stored.run_id,
+            &definition,
+            messages,
+            SyncExpectedState {
+                versions: &expected_versions,
+                audit_sequence: snapshot.audit.head.sequence,
+            },
+            true,
+        )?;
         if let Some(state) = stored.checkpoint_after.value()
             && !checkpoint_committed
         {
@@ -612,12 +681,86 @@ impl Database {
         Ok(Some(summary))
     }
 
+    /// Capture every target state and the audit head in one lock scope.
+    ///
+    /// The adapter ran against `expected_head`. Reading versions only after
+    /// releasing the audit lock would let an ordinary writer land between the
+    /// head comparison and this snapshot, turning that newer state into the
+    /// sync's expected state. Persisting this map in the run ledger also gives
+    /// recovery the original comparison point rather than a fresh, stale read.
+    fn sync_application_snapshot(
+        &self,
+        messages: &[SyncMessage],
+        expected_head: &AuditHead,
+    ) -> Result<SyncApplicationSnapshot> {
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let (verification, audited_versions) = audit.verify_with_record_hashes(None)?;
+        if &verification.head != expected_head {
+            bail!("database audit head changed while the sync command was running");
+        }
+        let versions = message_targets(messages)
+            .into_iter()
+            .map(|target| {
+                let version = audited_versions.get(&target).cloned().flatten();
+                (target, version)
+            })
+            .collect();
+        Ok(SyncApplicationSnapshot {
+            audit: verification,
+            versions,
+        })
+    }
+
+    /// Read recovery history, its audit generation, and legacy target state in
+    /// one audit-lock scope. A writer that lands after this snapshot changes
+    /// the generation and is rejected by the first replayed operation, even if
+    /// it restores byte-identical target contents.
+    fn sync_recovery_snapshot(
+        &self,
+        stored: &StoredSyncRun,
+        messages: &[SyncMessage],
+    ) -> Result<SyncRecoverySnapshot> {
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let (verification, _) = audit.verify_with_record_hashes(None)?;
+        let recorded_versions =
+            audit.record_hashes_at(stored.audit_sequence, stored.audit_head.as_deref())?;
+        let expected_versions = match stored.version {
+            1 => message_targets(messages)
+                .into_iter()
+                .map(|target| {
+                    let version = recorded_versions.get(&target).cloned().flatten();
+                    (target, version)
+                })
+                .collect(),
+            SYNC_RUN_FORMAT_VERSION => stored_target_version_map(stored, messages)?,
+            _ => unreachable!("read_sync_run rejects unsupported ledger versions"),
+        };
+        let appended = appended_sync_events(stored, &verification)?;
+        let limit = usize::try_from(appended).context("audit history is too long to inspect")?;
+        let entries = if limit == 0 {
+            Vec::new()
+        } else {
+            audit.recent(limit, AuditFilter::all())?
+        };
+        let run_events = classify_sync_run_events(stored, &verification, entries)?;
+        Ok(SyncRecoverySnapshot {
+            audit: verification,
+            expected_versions,
+            run_events,
+        })
+    }
+
     fn apply_sync_messages(
         &self,
         name: &str,
         run_id: &str,
         definition: &SyncDefinition,
         messages: Vec<SyncMessage>,
+        expected: SyncExpectedState<'_>,
         resumed: bool,
     ) -> Result<SyncRunSummary> {
         let mut sync_database = self
@@ -649,6 +792,7 @@ impl Database {
             checkpoint_updated: false,
             resumed,
         };
+        let mut audit_sequence = expected.audit_sequence;
         for message in messages {
             match message {
                 SyncMessage::Upsert {
@@ -656,26 +800,66 @@ impl Database {
                     id,
                     front_matter,
                     markdown,
-                } => match sync_database.get_optional(&collection, &id)? {
-                    Some(record)
-                        if record.attributes == front_matter && record.body == markdown =>
-                    {
-                        summary.unchanged += 1;
-                    }
-                    Some(_) => {
-                        sync_database.replace(&collection, &id, front_matter, &markdown)?;
-                        summary.updated += 1;
-                    }
-                    None => {
-                        sync_database.create_record(&collection, &id, front_matter, &markdown)?;
-                        summary.created += 1;
-                    }
-                },
-                SyncMessage::Delete { collection, id } => {
-                    if sync_database.get_optional(&collection, &id)?.is_some() {
-                        sync_database.delete(&collection, &id)?;
-                        summary.deleted += 1;
+                } => {
+                    let expected = expected_sync_target(expected.versions, &collection, &id)?;
+                    if let Some(version) = expected {
+                        let precondition = RecordPrecondition::version(version.to_owned())?
+                            .at_audit_sequence(audit_sequence);
+                        match sync_database.get_optional(&collection, &id)? {
+                            Some(record)
+                                if record.attributes == front_matter && record.body == markdown =>
+                            {
+                                sync_database.assert_record_version(
+                                    &collection,
+                                    &id,
+                                    Some(version),
+                                    audit_sequence,
+                                )?;
+                                summary.unchanged += 1;
+                            }
+                            _ => {
+                                sync_database.replace_conditionally(
+                                    &collection,
+                                    &id,
+                                    front_matter,
+                                    &markdown,
+                                    Some(&precondition),
+                                )?;
+                                summary.updated += 1;
+                                audit_sequence += 1;
+                            }
+                        }
                     } else {
+                        sync_database.create_record_at_audit_sequence(
+                            &collection,
+                            &id,
+                            front_matter,
+                            &markdown,
+                            audit_sequence,
+                        )?;
+                        summary.created += 1;
+                        audit_sequence += 1;
+                    }
+                }
+                SyncMessage::Delete { collection, id } => {
+                    let expected = expected_sync_target(expected.versions, &collection, &id)?;
+                    if let Some(version) = expected {
+                        let precondition = RecordPrecondition::version(version.to_owned())?
+                            .at_audit_sequence(audit_sequence);
+                        sync_database.delete_conditionally(
+                            &collection,
+                            &id,
+                            Some(&precondition),
+                        )?;
+                        summary.deleted += 1;
+                        audit_sequence += 1;
+                    } else {
+                        sync_database.assert_record_version(
+                            &collection,
+                            &id,
+                            None,
+                            audit_sequence,
+                        )?;
                         summary.unchanged += 1;
                     }
                 }
@@ -695,7 +879,7 @@ impl Database {
         };
         let stored: StoredSyncRun = serde_json::from_str(&serialized)
             .with_context(|| format!("the run ledger for sync '{name}' is not valid JSON"))?;
-        if stored.version != SYNC_RUN_FORMAT_VERSION {
+        if !matches!(stored.version, 1 | SYNC_RUN_FORMAT_VERSION) {
             return Err(conflict(format!(
                 "the run ledger for sync '{name}' uses unsupported format version {}",
                 stored.version
@@ -720,16 +904,16 @@ impl Database {
         audit: &AuditVerification,
     ) -> Result<SyncRunLedger> {
         let name = stored.sync.as_str();
-        let (events_committed, foreign) = self.sync_run_events(stored, audit)?;
+        let events = self.sync_run_events(stored, audit)?;
         Ok(SyncRunLedger {
             name: name.to_owned(),
             run_id: stored.run_id.clone(),
             started: stored.started.clone(),
             operations: stored.operations,
-            events_committed,
+            events_committed: events.committed,
             checkpoint_pending: stored.checkpoint_after.recorded
                 && self.sync_state(name)? != stored.checkpoint_after.owned(),
-            foreign_events: !foreign.is_empty(),
+            foreign_events: !events.foreign.is_empty(),
         })
     }
 
@@ -739,33 +923,15 @@ impl Database {
         &self,
         stored: &StoredSyncRun,
         audit: &AuditVerification,
-    ) -> Result<(u64, BTreeSet<(String, String)>)> {
-        let name = stored.sync.as_str();
-        if audit.head.sequence < stored.audit_sequence {
-            return Err(conflict(format!(
-                "sync '{name}' recorded run {} against audit history that no longer exists",
-                stored.run_id
-            )));
-        }
-        let appended = audit.head.sequence - stored.audit_sequence;
+    ) -> Result<SyncRunEvents> {
+        let appended = appended_sync_events(stored, audit)?;
         let limit = usize::try_from(appended).context("audit history is too long to inspect")?;
-        let expected = format!("sync:{name} run:{}", stored.run_id);
-        let mut events_committed = 0;
-        let mut foreign = BTreeSet::new();
-        for entry in self.audit_recent(limit, AuditFilter::all())? {
-            if entry.payload.sequence <= stored.audit_sequence {
-                continue;
-            }
-            if entry.payload.message.as_deref() == Some(expected.as_str()) {
-                events_committed += 1;
-            } else {
-                foreign.insert((
-                    entry.payload.record.collection.clone(),
-                    entry.payload.record.id.clone(),
-                ));
-            }
-        }
-        Ok((events_committed, foreign))
+        let entries = if limit == 0 {
+            Vec::new()
+        } else {
+            self.audit_recent(limit, AuditFilter::all())?
+        };
+        classify_sync_run_events(stored, audit, entries)
     }
 
     /// Make an in-flight run durable: the stream first, then the ledger that
@@ -891,6 +1057,183 @@ fn message_targets(messages: &[SyncMessage]) -> BTreeSet<(String, String)> {
             SyncMessage::Checkpoint { .. } => None,
         })
         .collect()
+}
+
+fn appended_sync_events(stored: &StoredSyncRun, audit: &AuditVerification) -> Result<u64> {
+    if audit.head.sequence < stored.audit_sequence {
+        return Err(conflict(format!(
+            "sync '{}' recorded run {} against audit history that no longer exists",
+            stored.sync, stored.run_id
+        )));
+    }
+    Ok(audit.head.sequence - stored.audit_sequence)
+}
+
+fn classify_sync_run_events(
+    stored: &StoredSyncRun,
+    audit: &AuditVerification,
+    entries: Vec<AuditEntry>,
+) -> Result<SyncRunEvents> {
+    let expected = format!("sync:{} run:{}", stored.sync, stored.run_id);
+    let mut events_committed = 0;
+    let mut own_states = BTreeMap::new();
+    let mut foreign = BTreeSet::new();
+    for entry in entries {
+        if entry.payload.sequence <= stored.audit_sequence
+            || entry.payload.sequence > audit.head.sequence
+        {
+            continue;
+        }
+        let target = (
+            entry.payload.record.collection.clone(),
+            entry.payload.record.id.clone(),
+        );
+        if entry.payload.source == AuditSource::Sync
+            && entry.payload.message.as_deref() == Some(expected.as_str())
+        {
+            events_committed += 1;
+            if own_states
+                .insert(
+                    target,
+                    SyncOwnedState {
+                        action: entry.payload.action,
+                        version: entry.payload.after_hash,
+                    },
+                )
+                .is_some()
+            {
+                return Err(conflict(format!(
+                    "sync '{}' run {} recorded more than one mutation for one target",
+                    stored.sync, stored.run_id
+                )));
+            }
+        } else {
+            foreign.insert(target);
+        }
+    }
+    Ok(SyncRunEvents {
+        committed: events_committed,
+        own_states,
+        foreign,
+    })
+}
+
+fn validate_sync_run_events(
+    stored: &StoredSyncRun,
+    messages: &[SyncMessage],
+    events: &SyncRunEvents,
+) -> Result<()> {
+    for ((collection, id), state) in &events.own_states {
+        let Some(message) = messages.iter().find(|message| match message {
+            SyncMessage::Upsert {
+                collection: candidate_collection,
+                id: candidate_id,
+                ..
+            }
+            | SyncMessage::Delete {
+                collection: candidate_collection,
+                id: candidate_id,
+            } => candidate_collection == collection && candidate_id == id,
+            SyncMessage::Checkpoint { .. } => false,
+        }) else {
+            return Err(conflict(format!(
+                "sync '{}' run {} recorded a mutation outside its operation stream",
+                stored.sync, stored.run_id
+            )));
+        };
+        let valid = match message {
+            SyncMessage::Upsert {
+                front_matter,
+                markdown,
+                ..
+            } => {
+                let rendered = Document {
+                    attributes: front_matter.clone(),
+                    body: markdown.clone(),
+                }
+                .render()?;
+                matches!(state.action, AuditAction::Create | AuditAction::Update)
+                    && state.version.as_deref() == Some(record_hash(rendered.as_bytes()).as_str())
+            }
+            SyncMessage::Delete { .. } => {
+                state.action == AuditAction::Delete && state.version.is_none()
+            }
+            SyncMessage::Checkpoint { .. } => false,
+        };
+        if !valid {
+            return Err(conflict(format!(
+                "sync '{}' run {} audit progress does not match its operation stream",
+                stored.sync, stored.run_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn stored_target_versions(
+    versions: &BTreeMap<(String, String), Option<String>>,
+) -> Vec<StoredTargetVersion> {
+    versions
+        .iter()
+        .map(|((collection, id), version)| StoredTargetVersion {
+            collection: collection.clone(),
+            id: id.clone(),
+            version: version.clone(),
+        })
+        .collect()
+}
+
+fn stored_target_version_map(
+    stored: &StoredSyncRun,
+    messages: &[SyncMessage],
+) -> Result<BTreeMap<(String, String), Option<String>>> {
+    let mut versions = BTreeMap::new();
+    for target in &stored.target_versions {
+        validate_component(&target.collection, "collection")?;
+        validate_component(&target.id, "id")?;
+        if let Some(version) = &target.version {
+            RecordPrecondition::version(version.clone()).map_err(|_| {
+                conflict(format!(
+                    "sync '{}' run {} recorded an invalid target version",
+                    stored.sync, stored.run_id
+                ))
+            })?;
+        }
+        if versions
+            .insert(
+                (target.collection.clone(), target.id.clone()),
+                target.version.clone(),
+            )
+            .is_some()
+        {
+            return Err(conflict(format!(
+                "sync '{}' run {} recorded one target more than once",
+                stored.sync, stored.run_id
+            )));
+        }
+    }
+    if versions.keys().cloned().collect::<BTreeSet<_>>() != message_targets(messages) {
+        return Err(conflict(format!(
+            "sync '{}' run {} target versions do not match its operation stream",
+            stored.sync, stored.run_id
+        )));
+    }
+    Ok(versions)
+}
+
+fn expected_sync_target<'a>(
+    versions: &'a BTreeMap<(String, String), Option<String>>,
+    collection: &str,
+    id: &str,
+) -> Result<Option<&'a str>> {
+    versions
+        .get(&(collection.to_owned(), id.to_owned()))
+        .map(|version| version.as_deref())
+        .ok_or_else(|| {
+            conflict(format!(
+                "sync operation for {collection}/{id} has no recorded target version"
+            ))
+        })
 }
 
 /// The checkpoint a parsed stream ends with, which the protocol guarantees is
@@ -1127,6 +1470,7 @@ mod tests {
             audit_head: None,
             checkpoint_before: StoredCheckpoint::default(),
             checkpoint_after: StoredCheckpoint::new(checkpoint),
+            target_versions: Vec::new(),
         };
         let round_trip = |checkpoint: Option<&JsonValue>| {
             let serialized = serde_json::to_string(&ledger(checkpoint)).unwrap();

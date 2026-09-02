@@ -21,7 +21,10 @@ use crate::{
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     audit::{AuditFilter, AuditLog, AuditMutation, ChangePreview, ReconciledMutation, record_hash},
     check::{CheckReport, CheckScope},
-    error::{DomainError, conflict, forbidden, invalid, is_already_exists, is_missing},
+    error::{
+        DomainError, conflict, forbidden, invalid, is_already_exists, is_missing,
+        precondition_failed,
+    },
     frontmatter::Document,
     paths,
     sync::{SYNC_DEFINITION_DIRECTORY, SYNC_LOCK_DIRECTORY, SYNC_STATE_DIRECTORY},
@@ -126,6 +129,7 @@ struct CreateRequest {
     mode: MutationMode,
     access: Option<AccessRequest>,
     reuse_deleted_user_id: bool,
+    expected_audit_sequence: Option<u64>,
 }
 
 impl CreateRequest {
@@ -134,6 +138,7 @@ impl CreateRequest {
             mode,
             access,
             reuse_deleted_user_id: false,
+            expected_audit_sequence: None,
         }
     }
 
@@ -142,7 +147,13 @@ impl CreateRequest {
             mode: MutationMode::Apply,
             access: Some(access),
             reuse_deleted_user_id: options.reuse_deleted_id,
+            expected_audit_sequence: None,
         }
+    }
+
+    fn at_audit_sequence(mut self, sequence: u64) -> Self {
+        self.expected_audit_sequence = Some(sequence);
+        self
     }
 }
 
@@ -218,8 +229,97 @@ pub struct Record {
     pub collection: String,
     pub id: String,
     pub path: PathBuf,
+    /// `sha256:` plus SHA-256 of `b"cr:record:v1\0" || stored_markdown_bytes`.
+    ///
+    /// The domain prefix keeps record digests distinct from audit event and
+    /// change-set digests. This is the authoritative record version used by
+    /// conditional writes and emitted as a strong HTTP ETag.
+    pub version: String,
     pub attributes: Mapping,
     pub body: String,
+}
+
+/// A condition that an existing record must satisfy before it is mutated.
+///
+/// The comparison is performed only after the mutation has acquired the
+/// database-wide audit lock and read the current bytes. A list represents the
+/// strong validators in an HTTP `If-Match` field; [`Self::any_current`] builds
+/// its `*` form.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordPrecondition {
+    versions: Option<Vec<String>>,
+    expected_audit_sequence: Option<u64>,
+}
+
+impl RecordPrecondition {
+    /// Require one exact record hash, as used by the CLI.
+    pub fn version(version: impl Into<String>) -> Result<Self> {
+        let version = version.into();
+        validate_record_version(&version)?;
+        Ok(Self {
+            versions: Some(vec![version]),
+            expected_audit_sequence: None,
+        })
+    }
+
+    /// Require any one of several exact record hashes, as used by `If-Match`.
+    pub fn versions(versions: impl IntoIterator<Item = String>) -> Result<Self> {
+        let versions = versions.into_iter().collect::<Vec<_>>();
+        for version in &versions {
+            validate_record_version(version)?;
+        }
+        Ok(Self {
+            versions: Some(versions),
+            expected_audit_sequence: None,
+        })
+    }
+
+    /// Require that the mutation target currently exists, as for `If-Match: *`.
+    pub fn any_current() -> Self {
+        Self {
+            versions: None,
+            expected_audit_sequence: None,
+        }
+    }
+
+    /// Bind an internal sync condition to the complete audit generation.
+    ///
+    /// Record hashes deliberately identify bytes, so an edit followed by an
+    /// exact restoration is the same public ETag. Sync additionally needs to
+    /// know that no audited writer ran after its head-bound snapshot.
+    pub(crate) fn at_audit_sequence(mut self, sequence: u64) -> Self {
+        self.expected_audit_sequence = Some(sequence);
+        self
+    }
+
+    fn assert_audit_sequence(&self, audit: &AuditLog<'_>) -> Result<()> {
+        if let Some(expected) = self.expected_audit_sequence {
+            assert_audit_sequence(audit, expected)?;
+        }
+        Ok(())
+    }
+
+    fn assert_matches(&self, collection: &str, id: &str, current: &str) -> Result<()> {
+        if self
+            .versions
+            .as_ref()
+            .is_none_or(|versions| versions.iter().any(|version| version == current))
+        {
+            return Ok(());
+        }
+        Err(precondition_failed(format!(
+            "record {collection}/{id} changed since the expected version"
+        )))
+    }
+}
+
+fn assert_audit_sequence(audit: &AuditLog<'_>, expected: u64) -> Result<()> {
+    if audit.head()?.sequence == expected {
+        return Ok(());
+    }
+    Err(precondition_failed(
+        "database changed since the expected audit generation",
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -1154,7 +1254,13 @@ impl Database {
         audit.commit(event, &path, || {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
         })?;
-        Ok(record_from_document(USERS_COLLECTION, id, path, after))
+        Ok(record_from_document(
+            USERS_COLLECTION,
+            id,
+            path,
+            after,
+            record_hash(rendered.as_bytes()),
+        ))
     }
 
     /// Restore a manually drifted user file to the exact latest audited bytes.
@@ -1232,7 +1338,13 @@ impl Database {
         if record_hash(restored.as_bytes()) != state.1 {
             bail!("restoring record users/{id} did not reproduce its audited state");
         }
-        Ok(record_from_document(USERS_COLLECTION, id, path, document))
+        Ok(record_from_document(
+            USERS_COLLECTION,
+            id,
+            path,
+            document,
+            record_hash(rendered.as_bytes()),
+        ))
     }
 
     /// Read one registered user. Everyone may inspect their own effective
@@ -1284,6 +1396,7 @@ impl Database {
             },
             MutationMode::Apply,
             access,
+            None,
         )?
         .record()
     }
@@ -1326,6 +1439,7 @@ impl Database {
             },
             MutationMode::Apply,
             access,
+            None,
         )?
         .record()
     }
@@ -1437,6 +1551,38 @@ impl Database {
         .record()
     }
 
+    /// Create a sync target only if the complete audited database is still at
+    /// the generation against which the adapter output was accepted.
+    pub(crate) fn create_record_at_audit_sequence(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: Mapping,
+        body: &str,
+        expected_audit_sequence: u64,
+    ) -> Result<Record> {
+        if collection == USERS_COLLECTION {
+            return Err(invalid(
+                "the users collection is managed through 'cr user' and 'cr access'",
+            ));
+        }
+        self.run_create(
+            collection,
+            id,
+            attributes,
+            body,
+            CreateRequest::new(
+                MutationMode::Apply,
+                Some(AccessRequest::new(
+                    AccessAction::Create,
+                    AccessResource::record(collection, id),
+                )),
+            )
+            .at_audit_sequence(expected_audit_sequence),
+        )?
+        .record()
+    }
+
     /// Compute what `create_record` would record, without creating anything.
     pub fn preview_create_record(
         &self,
@@ -1478,6 +1624,7 @@ impl Database {
             mode,
             access,
             reuse_deleted_user_id,
+            expected_audit_sequence,
         } = request;
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -1485,6 +1632,9 @@ impl Database {
         let _lock = audit.lock()?;
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
+        }
+        if let Some(expected) = expected_audit_sequence {
+            assert_audit_sequence(&audit, expected)?;
         }
         if access.is_none() && self.access_enabled()? {
             return Err(conflict(
@@ -1550,15 +1700,26 @@ impl Database {
             })
         })?;
         Ok(MutationOutcome::Applied(record_from_document(
-            collection, id, path, document,
+            collection,
+            id,
+            path,
+            document,
+            record_hash(rendered.as_bytes()),
         )))
     }
 
     pub fn get(&self, collection: &str, id: &str) -> Result<Record> {
         self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
         let path = self.record_path(collection, id)?;
-        let document = self.read_document(collection, id, &path)?;
-        Ok(record_from_document(collection, id, path, document))
+        let raw = self.read_record(collection, id, &path)?;
+        let document = parse_record(collection, id, &raw)?;
+        Ok(record_from_document(
+            collection,
+            id,
+            path,
+            document,
+            record_hash(raw.as_bytes()),
+        ))
     }
 
     pub fn get_optional(&self, collection: &str, id: &str) -> Result<Option<Record>> {
@@ -1570,9 +1731,50 @@ impl Database {
     }
 
     pub fn read_raw(&self, collection: &str, id: &str) -> Result<String> {
+        self.read_raw_versioned(collection, id).map(|(raw, _)| raw)
+    }
+
+    /// Read the exact document bytes and the version derived from that same read.
+    pub fn read_raw_versioned(&self, collection: &str, id: &str) -> Result<(String, String)> {
         self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
         let path = self.record_path(collection, id)?;
-        self.read_record(collection, id, &path)
+        let raw = self.read_record(collection, id, &path)?;
+        let version = record_hash(raw.as_bytes());
+        Ok((raw, version))
+    }
+
+    /// Assert one target state while holding the same audit lock as writers.
+    ///
+    /// Sync uses this for idempotent operations that need no audit event: an
+    /// exact upsert that is already present, or a delete whose target was
+    /// already absent at the run's recorded audit head. The complete audit
+    /// generation is checked in the same lock scope, so byte-identical ABA
+    /// changes and unrelated audited writers cannot race the comparison.
+    pub(crate) fn assert_record_version(
+        &self,
+        collection: &str,
+        id: &str,
+        expected: Option<&str>,
+        expected_audit_sequence: u64,
+    ) -> Result<()> {
+        let precondition = expected.map(RecordPrecondition::version).transpose()?;
+        let path = self.record_path(collection, id)?;
+        let label = record_label(collection, id);
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        assert_audit_sequence(&audit, expected_audit_sequence)?;
+        self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
+        if let Some(precondition) = precondition {
+            let raw = self.read_record_for_mutation(collection, id, &path, Some(&precondition))?;
+            return precondition.assert_matches(collection, id, &record_hash(raw.as_bytes()));
+        }
+        if paths::entry_kind(&self.root, &path, &label)?.is_none() {
+            return Ok(());
+        }
+        Err(precondition_failed(format!(
+            "record {collection}/{id} changed since the expected version"
+        )))
     }
 
     pub fn list(&self, collection: &str, filters: &[Assignment]) -> Result<Vec<Record>> {
@@ -1610,8 +1812,15 @@ impl Database {
                 }
                 Some((|| {
                     let path = directory.join(format!("{id}.md"));
-                    let document = self.read_document(collection, &id, &path)?;
-                    Ok(record_from_document(collection, &id, path, document))
+                    let raw = self.read_record(collection, &id, &path)?;
+                    let document = parse_record(collection, &id, &raw)?;
+                    Ok(record_from_document(
+                        collection,
+                        &id,
+                        path,
+                        document,
+                        record_hash(raw.as_bytes()),
+                    ))
                 })())
             })
             .filter(|record: &Result<Record>| {
@@ -1759,6 +1968,18 @@ impl Database {
         assignments: &[Assignment],
         body: Option<&str>,
     ) -> Result<Record> {
+        self.update_conditionally(collection, id, assignments, body, None)
+    }
+
+    /// Update a record, optionally requiring its exact current version.
+    pub fn update_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        assignments: &[Assignment],
+        body: Option<&str>,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
         let user_fields = validate_users_field_update(collection, assignments, body)?;
         self.run_update(
             collection,
@@ -1770,6 +1991,7 @@ impl Database {
             } else {
                 AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id))
             },
+            precondition,
         )?
         .record()
     }
@@ -1782,6 +2004,18 @@ impl Database {
         assignments: &[Assignment],
         body: Option<&str>,
     ) -> Result<ChangePreview> {
+        self.preview_update_conditionally(collection, id, assignments, body, None)
+    }
+
+    /// Preview an update against an optional exact current version.
+    pub fn preview_update_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        assignments: &[Assignment],
+        body: Option<&str>,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
         let user_fields = validate_users_field_update(collection, assignments, body)?;
         self.run_update(
             collection,
@@ -1793,6 +2027,7 @@ impl Database {
             } else {
                 AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id))
             },
+            precondition,
         )?
         .preview()
     }
@@ -1805,6 +2040,19 @@ impl Database {
         remove: &[String],
         body: Option<&str>,
     ) -> Result<Record> {
+        self.patch_conditionally(collection, id, attributes, remove, body, None)
+    }
+
+    /// Atomically merge a patch, optionally requiring an exact current version.
+    pub fn patch_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        remove: &[String],
+        body: Option<&str>,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
         self.run_patch(
             collection,
             id,
@@ -1812,6 +2060,7 @@ impl Database {
             remove,
             body,
             MutationMode::Apply,
+            precondition,
         )?
         .record()
     }
@@ -1825,6 +2074,19 @@ impl Database {
         remove: &[String],
         body: Option<&str>,
     ) -> Result<ChangePreview> {
+        self.preview_patch_conditionally(collection, id, attributes, remove, body, None)
+    }
+
+    /// Preview an atomic patch against an optional exact current version.
+    pub fn preview_patch_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        remove: &[String],
+        body: Option<&str>,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
         self.run_patch(
             collection,
             id,
@@ -1832,10 +2094,12 @@ impl Database {
             remove,
             body,
             MutationMode::Preview,
+            precondition,
         )?
         .preview()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_patch(
         &self,
         collection: &str,
@@ -1844,6 +2108,7 @@ impl Database {
         remove: &[String],
         body: Option<&str>,
         mode: MutationMode,
+        precondition: Option<&RecordPrecondition>,
     ) -> Result<MutationOutcome> {
         let user_fields = validate_users_field_patch(collection, attributes, remove, body)?;
         if attributes.is_empty() && remove.is_empty() && body.is_none() {
@@ -1874,6 +2139,7 @@ impl Database {
             } else {
                 AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id))
             },
+            precondition,
         )
     }
 
@@ -1888,6 +2154,18 @@ impl Database {
         attributes: Mapping,
         body: &str,
     ) -> Result<Record> {
+        self.replace_conditionally(collection, id, attributes, body, None)
+    }
+
+    /// Replace a complete document under an exact-version precondition.
+    pub fn replace_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: Mapping,
+        body: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
         reject_users_mutation(collection)?;
         self.run_update(
             collection,
@@ -1899,8 +2177,34 @@ impl Database {
             },
             MutationMode::Apply,
             AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
+            precondition,
         )?
         .record()
+    }
+
+    /// Preview a complete-document replacement under a version precondition.
+    pub fn preview_replace_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: Mapping,
+        body: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
+        reject_users_mutation(collection)?;
+        self.run_update(
+            collection,
+            id,
+            |document| {
+                document.attributes = attributes;
+                document.body = body.to_owned();
+                Ok(())
+            },
+            MutationMode::Preview,
+            AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
+            precondition,
+        )?
+        .preview()
     }
 
     fn run_update(
@@ -1910,6 +2214,7 @@ impl Database {
         mutate: impl FnOnce(&mut Document) -> Result<()>,
         mode: MutationMode,
         access: AccessRequest,
+        precondition: Option<&RecordPrecondition>,
     ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -1917,6 +2222,9 @@ impl Database {
         let _lock = audit.lock()?;
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
+        }
+        if let Some(precondition) = precondition {
+            precondition.assert_audit_sequence(&audit)?;
         }
         if access.action == AccessAction::ManageAccess || access.user_fields {
             self.assert_current_principal_policy(&audit)?;
@@ -1930,7 +2238,10 @@ impl Database {
         } else {
             self.authorize(access.action, &access.resource)?
         };
-        let before_raw = self.read_record(collection, id, &path)?;
+        let before_raw = self.read_record_for_mutation(collection, id, &path, precondition)?;
+        if let Some(precondition) = precondition {
+            precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
+        }
         let before = parse_record(collection, id, &before_raw)?;
         let mut document = before.clone();
         mutate(&mut document)?;
@@ -1958,7 +2269,11 @@ impl Database {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
         })?;
         Ok(MutationOutcome::Applied(record_from_document(
-            collection, id, path, document,
+            collection,
+            id,
+            path,
+            document,
+            record_hash(rendered.as_bytes()),
         )))
     }
 
@@ -1970,6 +2285,19 @@ impl Database {
         target_collection: &str,
         target_id: &str,
     ) -> Result<Record> {
+        self.link_conditionally(collection, id, relation, target_collection, target_id, None)
+    }
+
+    /// Add a relation, optionally requiring the source record's exact version.
+    pub fn link_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        relation: &str,
+        target_collection: &str,
+        target_id: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
         reject_users_mutation(collection)?;
         self.run_link(
             collection,
@@ -1978,6 +2306,7 @@ impl Database {
             target_collection,
             target_id,
             MutationMode::Apply,
+            precondition,
         )?
         .record()
     }
@@ -1991,6 +2320,26 @@ impl Database {
         target_collection: &str,
         target_id: &str,
     ) -> Result<ChangePreview> {
+        self.preview_link_conditionally(
+            collection,
+            id,
+            relation,
+            target_collection,
+            target_id,
+            None,
+        )
+    }
+
+    /// Preview a relation against an optional source-record version.
+    pub fn preview_link_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        relation: &str,
+        target_collection: &str,
+        target_id: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
         reject_users_mutation(collection)?;
         self.run_link(
             collection,
@@ -1999,10 +2348,12 @@ impl Database {
             target_collection,
             target_id,
             MutationMode::Preview,
+            precondition,
         )?
         .preview()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_link(
         &self,
         collection: &str,
@@ -2011,12 +2362,16 @@ impl Database {
         target_collection: &str,
         target_id: &str,
         mode: MutationMode,
+        precondition: Option<&RecordPrecondition>,
     ) -> Result<MutationOutcome> {
         validate_component(relation, "relation")?;
         let audit = self.audit();
         let _lock = audit.lock()?;
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
+        }
+        if let Some(precondition) = precondition {
+            precondition.assert_audit_sequence(&audit)?;
         }
         let decision =
             self.authorize(AccessAction::Link, &AccessResource::record(collection, id))?;
@@ -2041,7 +2396,10 @@ impl Database {
 
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
-        let before_raw = self.read_record(collection, id, &path)?;
+        let before_raw = self.read_record_for_mutation(collection, id, &path, precondition)?;
+        if let Some(precondition) = precondition {
+            precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
+        }
         let before = parse_record(collection, id, &before_raw)?;
         let mut document = before.clone();
         let relations = mapping_field(&mut document.attributes, "relations")?;
@@ -2073,11 +2431,25 @@ impl Database {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
         })?;
         Ok(MutationOutcome::Applied(record_from_document(
-            collection, id, path, document,
+            collection,
+            id,
+            path,
+            document,
+            record_hash(rendered.as_bytes()),
         )))
     }
 
     pub fn delete(&self, collection: &str, id: &str) -> Result<Record> {
+        self.delete_conditionally(collection, id, None)
+    }
+
+    /// Delete a record, optionally requiring its exact current version.
+    pub fn delete_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
         reject_users_mutation(collection)?;
         self.run_delete(
             collection,
@@ -2085,12 +2457,23 @@ impl Database {
             MutationMode::Apply,
             AccessRequest::new(AccessAction::Delete, AccessResource::record(collection, id)),
             false,
+            precondition,
         )?
         .record()
     }
 
     /// Compute what `delete` would record, without deleting anything.
     pub fn preview_delete(&self, collection: &str, id: &str) -> Result<ChangePreview> {
+        self.preview_delete_conditionally(collection, id, None)
+    }
+
+    /// Preview a deletion against an optional exact current version.
+    pub fn preview_delete_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
         reject_users_mutation(collection)?;
         self.run_delete(
             collection,
@@ -2098,6 +2481,7 @@ impl Database {
             MutationMode::Preview,
             AccessRequest::new(AccessAction::Delete, AccessResource::record(collection, id)),
             false,
+            precondition,
         )?
         .preview()
     }
@@ -2118,6 +2502,7 @@ impl Database {
             MutationMode::Apply,
             AccessRequest::owner(AccessResource::Database),
             options.if_unused,
+            None,
         )?
         .record()
     }
@@ -2129,6 +2514,7 @@ impl Database {
         mode: MutationMode,
         access: AccessRequest,
         if_unused: bool,
+        precondition: Option<&RecordPrecondition>,
     ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -2136,6 +2522,9 @@ impl Database {
         let _lock = audit.lock()?;
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
+        }
+        if let Some(precondition) = precondition {
+            precondition.assert_audit_sequence(&audit)?;
         }
         if access.action == AccessAction::ManageAccess {
             self.assert_current_principal_policy(&audit)?;
@@ -2145,7 +2534,10 @@ impl Database {
         } else {
             self.authorize(access.action, &access.resource)?
         };
-        let before_raw = self.read_record(collection, id, &path)?;
+        let before_raw = self.read_record_for_mutation(collection, id, &path, precondition)?;
+        if let Some(precondition) = precondition {
+            precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
+        }
         let document = parse_record(collection, id, &before_raw)?;
         if collection == USERS_COLLECTION {
             audit.assert_current(collection, id, before_raw.as_bytes())?;
@@ -2181,7 +2573,11 @@ impl Database {
             paths::remove_file(&self.root, &path, &label)
         })?;
         Ok(MutationOutcome::Applied(record_from_document(
-            collection, id, path, document,
+            collection,
+            id,
+            path,
+            document,
+            record_hash(before_raw.as_bytes()),
         )))
     }
 
@@ -2588,9 +2984,28 @@ impl Database {
         })
     }
 
-    fn read_document(&self, collection: &str, id: &str, path: &Path) -> Result<Document> {
-        let input = self.read_record(collection, id, path)?;
-        parse_record(collection, id, &input)
+    /// Read an existing mutation target without turning a failed conditional
+    /// write into an ordinary not-found response. `If-Match` is false when no
+    /// current representation exists, so an expected version maps that state
+    /// to the same typed precondition failure as a changed representation.
+    fn read_record_for_mutation(
+        &self,
+        collection: &str,
+        id: &str,
+        path: &Path,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<String> {
+        self.read_record(collection, id, path).map_err(|error| {
+            if precondition.is_some()
+                && matches!(DomainError::of(&error), Some(DomainError::NotFound(_)))
+            {
+                precondition_failed(format!(
+                    "record {collection}/{id} changed since the expected version"
+                ))
+            } else {
+                error
+            }
+        })
     }
 
     fn validate(&self, collection: &str, attributes: &Mapping) -> Result<()> {
@@ -2813,14 +3228,37 @@ fn relation_value(collection: &str, id: &str) -> Value {
     Value::Mapping(reference)
 }
 
-fn record_from_document(collection: &str, id: &str, path: PathBuf, document: Document) -> Record {
+fn record_from_document(
+    collection: &str,
+    id: &str,
+    path: PathBuf,
+    document: Document,
+    version: String,
+) -> Record {
     Record {
         collection: collection.to_owned(),
         id: id.to_owned(),
         path,
+        version,
         attributes: document.attributes,
         body: document.body,
     }
+}
+
+fn validate_record_version(version: &str) -> Result<()> {
+    let digest = version.strip_prefix("sha256:").ok_or_else(|| {
+        invalid("record version must use the form sha256: followed by 64 lowercase hex digits")
+    })?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid(
+            "record version must use the form sha256: followed by 64 lowercase hex digits",
+        ));
+    }
+    Ok(())
 }
 
 /// Parse a stored record, naming it by collection and ID rather than by path.

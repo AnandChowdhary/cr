@@ -421,6 +421,183 @@ async fn rest_crud_search_relations_audit_and_pagination_share_database_semantic
 }
 
 #[tokio::test]
+async fn record_etags_guard_conditional_and_whole_document_writes() {
+    let (_temporary, database) = test_database("server-etags");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let uri = "/api/v1/collections/items/records/one";
+
+    let created = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        json!({
+            "id": "one",
+            "front_matter": { "stage": "open", "obsolete": true },
+            "markdown": "First"
+        }),
+        &[],
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let first_version = created.json()["version"].as_str().unwrap().to_owned();
+    let first_etag = created.headers[header::ETAG].to_str().unwrap().to_owned();
+    assert_eq!(first_etag, format!("\"{first_version}\""));
+
+    let fetched = request(&app, Method::GET, uri, None, &[]).await;
+    assert_eq!(fetched.headers[header::ETAG], first_etag);
+    assert_eq!(fetched.json()["version"], first_version);
+
+    let patched = json_request(
+        &app,
+        Method::PATCH,
+        uri,
+        json!({ "front_matter": { "owner": "ada" } }),
+        &[("if-match", &first_etag)],
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK);
+    let second_version = patched.json()["version"].as_str().unwrap().to_owned();
+    let second_etag = patched.headers[header::ETAG].to_str().unwrap().to_owned();
+    assert_ne!(second_version, first_version);
+
+    let stale = json_request(
+        &app,
+        Method::PATCH,
+        uri,
+        json!({ "front_matter": { "stage": "lost" } }),
+        &[("if-match", &first_etag)],
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(stale.json()["error"]["code"], "precondition_failed");
+    assert!(
+        !stale
+            .text()
+            .contains(database.root().to_string_lossy().as_ref())
+    );
+
+    let missing = json_request(
+        &app,
+        Method::PUT,
+        uri,
+        json!({ "front_matter": { "stage": "won" }, "markdown": "Won" }),
+        &[],
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::PRECONDITION_REQUIRED);
+    assert_eq!(missing.json()["error"]["code"], "precondition_required");
+
+    let replacement = json!({ "front_matter": { "stage": "won" }, "markdown": "Won" });
+    let preview = json_request(
+        &app,
+        Method::PUT,
+        &format!("{uri}?preview=true"),
+        replacement.clone(),
+        &[("if-match", &second_etag)],
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK);
+    assert_eq!(preview.json()["preview"], true);
+    let approved = preview.json()["digest"].as_str().unwrap().to_owned();
+    assert_eq!(database.get("items", "one").unwrap().body, "First");
+
+    let replaced = json_request(
+        &app,
+        Method::PUT,
+        uri,
+        replacement,
+        &[
+            ("if-match", &second_etag),
+            ("x-cr-authorization", "interactive"),
+            ("x-cr-approved-changes", &approved),
+        ],
+    )
+    .await;
+    assert_eq!(replaced.status, StatusCode::OK);
+    assert_eq!(replaced.json()["front_matter"], json!({ "stage": "won" }));
+    assert_eq!(replaced.json()["markdown"], "Won");
+    assert!(replaced.json()["front_matter"].get("owner").is_none());
+    assert!(replaced.json()["front_matter"].get("obsolete").is_none());
+    assert_ne!(replaced.headers[header::ETAG], second_etag);
+
+    let weak = json_request(
+        &app,
+        Method::PATCH,
+        uri,
+        json!({ "front_matter": { "stage": "weak" } }),
+        &[(
+            "if-match",
+            &format!("W/{}", replaced.headers[header::ETAG].to_str().unwrap()),
+        )],
+    )
+    .await;
+    assert_eq!(weak.status, StatusCode::PRECONDITION_FAILED);
+
+    for opaque in [r#""xyzzy""#, r#"W/"xyzzy""#, r#""foo,bar""#] {
+        let nonmatching = json_request(
+            &app,
+            Method::PATCH,
+            uri,
+            json!({ "front_matter": { "stage": "opaque" } }),
+            &[("if-match", opaque)],
+        )
+        .await;
+        assert_eq!(
+            nonmatching.status,
+            StatusCode::PRECONDITION_FAILED,
+            "valid opaque entity tag {opaque} must be evaluated, not rejected"
+        );
+        assert_eq!(nonmatching.json()["error"]["code"], "precondition_failed");
+    }
+
+    for invalid in ["*, *", r#"*, "xyzzy""#] {
+        let malformed = json_request(
+            &app,
+            Method::PATCH,
+            uri,
+            json!({ "front_matter": { "stage": "invalid" } }),
+            &[("if-match", invalid)],
+        )
+        .await;
+        assert_eq!(malformed.status, StatusCode::BAD_REQUEST);
+        assert_eq!(malformed.json()["error"]["code"], "invalid_if_match");
+    }
+    let repeated_wildcard = json_request(
+        &app,
+        Method::PATCH,
+        uri,
+        json!({ "front_matter": { "stage": "invalid" } }),
+        &[("if-match", "*"), ("if-match", "*")],
+    )
+    .await;
+    assert_eq!(repeated_wildcard.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        repeated_wildcard.json()["error"]["code"],
+        "invalid_if_match"
+    );
+
+    let absent = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/items/records/missing",
+        json!({ "front_matter": { "stage": "new" } }),
+        &[("if-match", "*")],
+    )
+    .await;
+    assert_eq!(absent.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(absent.json()["error"]["code"], "precondition_failed");
+
+    let log = database
+        .audit_recent(10, cr::AuditFilter::record("items", "one"))
+        .unwrap();
+    assert_eq!(
+        log.len(),
+        3,
+        "stale and missing preconditions write no audit event"
+    );
+}
+
+#[tokio::test]
 async fn direct_edits_status_save_and_baseline_are_available_over_http() {
     let (_temporary, database) = test_database("server-direct-edits");
     let app = router(database.clone(), ServerConfig::default()).unwrap();
@@ -598,6 +775,64 @@ async fn openapi_authentication_and_http_errors_are_structured() {
     let openapi = openapi.json();
     assert_eq!(openapi["openapi"], "3.1.1");
     assert_local_schema_references_resolve(&openapi, &openapi);
+    assert_eq!(
+        openapi["components"]["schemas"]["RecordSummary"]["properties"]["version"]["pattern"],
+        "^sha256:[0-9a-f]{64}$"
+    );
+    assert!(
+        openapi["components"]["schemas"]["RecordSummary"]["properties"]["version"]["description"]
+            .as_str()
+            .unwrap()
+            .contains(r"cr:record:v1\0")
+    );
+    assert_eq!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["put"]["operationId"],
+        "replaceRecord"
+    );
+    let put_parameters =
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["put"]["parameters"]
+            .as_array()
+            .unwrap();
+    let if_match = put_parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "If-Match")
+        .expect("PUT documents If-Match");
+    assert_eq!(if_match["required"], true);
+    assert!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["put"]
+            ["responses"]["200"]["headers"]["ETag"]
+            .is_object()
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["put"]
+            ["responses"]["412"]
+            .is_object()
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["put"]
+            ["responses"]["428"]
+            .is_object()
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["patch"]
+            ["responses"]["412"]
+            .is_object()
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["patch"]["responses"]
+            .get("428")
+            .is_none()
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections"]["get"]["responses"]
+            .get("412")
+            .is_none()
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections"]["get"]["responses"]
+            .get("428")
+            .is_none()
+    );
     assert!(
         openapi["components"]["schemas"]["AuditEntry"]["properties"]["source"]["enum"]
             .as_array()
@@ -849,6 +1084,30 @@ async fn every_public_error_mapping_is_typed_redacted_and_correlated() {
             Method::PATCH,
             "/api/v1/collections/deals/records/stale".to_owned(),
             Some(json!({ "front_matter": { "status": "won" } }).to_string()),
+            vec![authorization],
+        ),
+        (
+            "stale record precondition",
+            StatusCode::PRECONDITION_FAILED,
+            "precondition_failed",
+            Method::PATCH,
+            "/api/v1/collections/deals/records/alpha".to_owned(),
+            Some(json!({ "front_matter": { "status": "won" } }).to_string()),
+            vec![
+                authorization,
+                (
+                    "if-match",
+                    "\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"",
+                ),
+            ],
+        ),
+        (
+            "missing whole replacement precondition",
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition_required",
+            Method::PUT,
+            "/api/v1/collections/deals/records/alpha".to_owned(),
+            Some(json!({ "front_matter": {}, "markdown": "replacement" }).to_string()),
             vec![authorization],
         ),
         (

@@ -571,6 +571,7 @@ pub(crate) struct AuditedRecordState {
 }
 
 pub(crate) type AuditedRecordStates = HashMap<(String, String), AuditedRecordState>;
+pub(crate) type VerifiedRecordHashes = HashMap<(String, String), Option<String>>;
 
 impl<'a> AuditLog<'a> {
     pub fn new(
@@ -959,6 +960,19 @@ impl<'a> AuditLog<'a> {
     /// Ordering matters. The chain is replayed first, so a damaged journal is
     /// reported as a damaged journal and never as an anchor problem.
     pub fn verify(&self, expected_head: Option<&str>) -> Result<AuditVerification> {
+        self.verify_with_record_hashes(expected_head)
+            .map(|(verification, _)| verification)
+    }
+
+    /// Verify and retain the replayed record hashes from that exact head.
+    ///
+    /// Sync uses this while holding the audit lock so every target condition
+    /// comes from the same state as the head comparison. The public verifier
+    /// keeps its existing response shape and discards this internal map.
+    pub(crate) fn verify_with_record_hashes(
+        &self,
+        expected_head: Option<&str>,
+    ) -> Result<(AuditVerification, VerifiedRecordHashes)> {
         let (latest, state) = self.states(true)?;
 
         let anchor = match expected_head {
@@ -977,17 +991,58 @@ impl<'a> AuditLog<'a> {
         let latest_hashes = latest
             .iter()
             .map(|(record, state)| (record.clone(), state.hash.clone()))
-            .collect();
+            .collect::<HashMap<_, _>>();
         self.verify_records(&latest_hashes)?;
-        Ok(AuditVerification {
-            entries: state.entries,
-            records_checked: latest.len(),
-            head: AuditHead {
-                sequence: state.entries,
-                hash: state.head_hash,
+        Ok((
+            AuditVerification {
+                entries: state.entries,
+                records_checked: latest.len(),
+                head: AuditHead {
+                    sequence: state.entries,
+                    hash: state.head_hash,
+                },
+                anchor,
             },
-            anchor,
-        })
+            latest_hashes,
+        ))
+    }
+
+    /// Reconstruct record hashes at one historical chain head.
+    ///
+    /// Version-1 sync ledgers recorded the head but not their target hashes.
+    /// Replaying the immutable prefix lets recovery upgrade those ledgers
+    /// safely instead of adopting whatever record bytes happen to exist now.
+    pub(crate) fn record_hashes_at(
+        &self,
+        sequence: u64,
+        expected_head: Option<&str>,
+    ) -> Result<VerifiedRecordHashes> {
+        let mut hashes = VerifiedRecordHashes::new();
+        let mut head_at_sequence = None;
+        let chain = self.verify_chain(|entry, _| {
+            if entry.payload.sequence <= sequence {
+                hashes.insert(
+                    (
+                        entry.payload.record.collection.clone(),
+                        entry.payload.record.id.clone(),
+                    ),
+                    entry.payload.after_hash.clone(),
+                );
+            }
+            if entry.payload.sequence == sequence {
+                head_at_sequence = Some(entry.hash.clone());
+            }
+            Ok(())
+        })?;
+        if chain.entries < sequence
+            || head_at_sequence.as_deref() != expected_head
+            || (sequence == 0 && expected_head.is_some())
+        {
+            return Err(conflict(
+                "sync run ledger does not match the audit head it recorded",
+            ));
+        }
+        Ok(hashes)
     }
 
     /// Read the anchor and judge it against a freshly replayed chain.
@@ -1890,6 +1945,11 @@ fn event_hash(payload: &[u8]) -> String {
     digest(EVENT_HASH_DOMAIN, payload)
 }
 
+/// The stable record version: SHA-256 over the record domain followed by the
+/// exact stored Markdown bytes.
+///
+/// Keeping the existing `cr:record:v1\0` domain is part of audit compatibility:
+/// these values are stored as every event's `before_hash` and `after_hash`.
 pub(crate) fn record_hash(contents: &[u8]) -> String {
     digest(RECORD_HASH_DOMAIN, contents)
 }
@@ -2270,6 +2330,18 @@ mod tests {
         assert_eq!(event_hash(b"payload"), event_hash(b"payload"));
         assert_ne!(event_hash(b"payload"), event_hash(b"changed"));
         assert!(event_hash(b"payload").starts_with("sha256:"));
+    }
+
+    #[test]
+    fn record_versions_have_a_stable_domain_separated_vector() {
+        assert_eq!(
+            record_hash(b"hello\n"),
+            "sha256:3ad3d01bb32674f985458c4db5e1cf0a48fc031cf6d83ec99331af03d33a7f5a"
+        );
+        assert_ne!(
+            record_hash(b"hello\n"),
+            "sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+        );
     }
 
     #[test]
