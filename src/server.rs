@@ -764,6 +764,7 @@ impl ApiError {
             DomainError::AlreadyExists(_)
             | DomainError::Conflict(_)
             | DomainError::ApprovalMismatch(_)
+            | DomainError::AuditIntegrity(_)
             | DomainError::AnchorMismatch(_) => StatusCode::CONFLICT,
             DomainError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             DomainError::Forbidden(_) => StatusCode::FORBIDDEN,
@@ -2376,9 +2377,10 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
         },
         "AuditEntry": {
             "type": "object",
-            "required": ["hash", "sequence", "timestamp", "actor", "source", "action", "record", "changes"],
+            "required": ["hash", "version", "sequence", "timestamp", "actor", "source", "action", "record", "changes", "before_hash", "after_hash", "previous_hash"],
             "properties": {
                 "hash": { "type": "string" },
+                "version": { "type": "integer", "minimum": 1, "maximum": 3 },
                 "sequence": { "type": "integer", "minimum": 1 },
                 "timestamp": { "type": "string", "format": "date-time" },
                 "actor": { "type": "string" },
@@ -2386,6 +2388,19 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "action": { "enum": ["baseline", "create", "update", "link", "delete"] },
                 "record": { "type": "object" },
                 "changes": { "type": "array", "items": { "type": "object" } },
+                "after_snapshot": {
+                    "type": "object",
+                    "description": "Versioned exact Markdown witness used when semantic replay cannot reproduce the stored bytes.",
+                    "required": ["version", "markdown"],
+                    "properties": {
+                        "version": { "const": 1 },
+                        "markdown": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                "before_hash": { "type": ["string", "null"] },
+                "after_hash": { "type": ["string", "null"] },
+                "previous_hash": { "type": ["string", "null"] },
                 "agent": { "$ref": "#/components/schemas/AuditAgent" },
                 "authorization": { "$ref": "#/components/schemas/AuditAuthorization" },
                 "intent": { "$ref": "#/components/schemas/AuditIntent" },
@@ -6567,6 +6582,13 @@ mod tests {
                 DomainError::Invalid("field path cannot be empty".to_owned()),
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation_failed",
+            ),
+            (
+                DomainError::AuditIntegrity(
+                    "audit replay is inconsistent at sequence 2".to_owned(),
+                ),
+                StatusCode::CONFLICT,
+                "audit_integrity_failed",
             ),
         ];
 

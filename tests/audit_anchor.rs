@@ -1,12 +1,13 @@
 //! The audit anchor: what it catches, what it does not, and how it tells a
 //! lagging anchor apart from a rewritten journal.
 //!
-//! The newest event in the journal is pinned by nothing —
-//! `audit_corruption.rs::a_forged_head_event_is_accepted_by_verification_and_caught_only_by_a_checkpoint`
-//! is the specification for why this file exists. The anchor closes that gap
+//! The newest event in the journal is pinned by nothing. Record-state replay
+//! now catches a forged result, but
+//! `audit_corruption.rs::a_forged_head_actor_still_needs_an_external_checkpoint`
+//! specifies the non-state metadata gap this file still closes. It does so
 //! *only* to the extent that the anchor itself is held somewhere the forger
 //! cannot reach, which in practice means committed and pushed to Git. Every
-//! test here is written so that it says which of the two it is proving.
+//! test here is written so that it says which boundary it is proving.
 //!
 //! The distinction the whole design turns on is stale versus tampered. An
 //! anchor may legitimately lag — a crash between appending the event and
@@ -78,8 +79,7 @@ fn forge_head_event(database: &TestDatabase) {
     let forged = event
         .payload
         .replacen("\"actor\":\"alice\"", "\"actor\":\"mallory\"", 1)
-        .replacen("reviewed and approved", "rubber stamped", 1)
-        .replacen("\"after\":\"hired\"", "\"after\":\"never happened\"", 1);
+        .replacen("reviewed and approved", "rubber stamped", 1);
     assert_ne!(forged, event.payload, "the seed must contain those values");
     stored[index] = chain::stored_line(&chain::event_hash(&forged), &forged)
         .trim_end()
@@ -112,13 +112,11 @@ fn findings_of(report: &Value, kind: &str) -> Vec<Value> {
 
 /// The head event is forged and re-hashed, and the anchor is left alone.
 ///
-/// This is the adversarial case. Before the anchor existed, every assertion in
-/// the specification test held: `audit verify` reported the database clean,
-/// `status` said `Clean`, and `audit log` displayed the forgery. Only a
-/// checkpoint the operator had saved by hand, and passed back with
-/// `--expected-head`, caught it. Now `verify` catches it with no argument at
-/// all, and says specifically that the journal disagrees with the anchor rather
-/// than that the chain is corrupt — because the chain is not corrupt.
+/// This is the adversarial case replay cannot derive from record state: actor
+/// and message changed while the result stayed exact. Only a checkpoint can
+/// catch it. `verify` does so with no argument and says specifically that the
+/// journal disagrees with the anchor rather than that its state replay is
+/// corrupt — because replay is internally consistent.
 ///
 /// What this proves is bounded, and the companion assertion at the end says so:
 /// the anchor caught this only because the forger did not rewrite it too. See

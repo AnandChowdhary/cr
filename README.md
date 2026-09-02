@@ -1067,6 +1067,19 @@ Verify the journal and all current records:
 cr audit verify
 ```
 
+Verification does more than check the event hash chain. It replays every
+record's change sets, checks each `before_hash`, and requires every replayed
+post-state to reproduce that event's exact `after_hash`. Version 3 audit events
+carry a versioned exact-Markdown `after_snapshot` for every state in which the
+record exists. This keeps YAML comments, quoting, key order, and line endings
+honest without making verification depend on a serializer's current output.
+Old version 1 and 2 events remain readable: when their lost representation
+details matter at a record's current head, the matching materialized record is
+used as the exact witness. Payload versions may increase but never decrease
+within a journal. Every new mutation performs the same replay before it writes,
+so an inconsistent older event refuses the write at the guilty sequence with
+`audit_integrity_failed`.
+
 Print the current audit checkpoint:
 
 ```sh
@@ -1081,7 +1094,14 @@ cr audit verify --expected-head 'sha256:YOUR_SAVED_HASH'
 
 ### Anchor the head in Git
 
-Every audit event but the newest is pinned by the hash recorded in the event after it. The newest one is pinned by nothing, so its actor, timestamp, message, and results can be rewritten and re-hashed, and `cr audit verify` will not notice. The fix has always been to keep a copy of the head hash somewhere the forger cannot reach — and the reason it did not help is that saving one by hand is a step nobody performs.
+Every audit event but the newest is pinned by the hash recorded in the event
+after it. The newest one is pinned by nothing. Replay now catches a rewritten
+result whose change set no longer reproduces `after_hash`, but it cannot derive
+an event's actor, timestamp, message, or attribution from record state. Those
+fields can still be rewritten and re-hashed without an external checkpoint.
+The fix for that remaining boundary has always been to keep a copy of the head
+hash somewhere the forger cannot reach — and the reason it did not help is that
+saving one by hand is a step nobody performs.
 
 `cr` now keeps that copy for you, in `.cr-audit-head.json` at the root of the database:
 
@@ -1102,7 +1122,13 @@ cr audit anchor --json
 cr audit anchor --write   # (re)write it to the current head
 ```
 
-**Commit it, or it is worth nothing.** This file sits at the database root, so anybody who can rewrite `.cr/audit/` can rewrite it in the same pass — forge the event, recompute the hash, update the anchor, and verification goes quiet again. Its protection comes entirely from the copy in your **Git history**: a pushed, distributed history is a second place to write that a local process cannot reach. So keep the database in version control and commit the anchor alongside the records it attests:
+**Commit it, or it is worth nothing.** This file sits at the database root, so
+anybody who can rewrite `.cr/audit/` can rewrite it in the same pass — alter
+non-state metadata, recompute the hash, update the anchor, and verification goes
+quiet again. Its protection comes entirely from the copy in your **Git
+history**: a pushed, distributed history is a second place to write that a
+local process cannot reach. So keep the database in version control and commit
+the anchor alongside the records it attests:
 
 ```sh
 git add records .cr-audit-head.json
@@ -1136,7 +1162,15 @@ For records that existed before audit logging was introduced, establish their st
 cr --actor 'migration@example.com' audit baseline
 ```
 
-Audit events retain historical field values and deleted record bodies, and now also any recorded intent text. Everything written to the journal is permanent: removing it would break verification for that event and every event after it. Protect `.cr/audit/` at least as carefully as `records/`, particularly for personal CRM and recruiting data, and treat `--intent-request` and `--intent-rationale` as a bounded attribution channel rather than a place to paste a transcript.
+Audit events retain historical field values and deleted record bodies, and now
+also any recorded intent text. Every version 3 event with a present record
+retains the complete exact post-state in `after_snapshot`, not only the changed
+fields. Everything written to the journal is permanent: removing it would break
+verification for that event and every event after it. Protect `.cr/audit/` at
+least as carefully as `records/`, particularly for personal CRM and recruiting
+data, and treat
+`--intent-request` and `--intent-rationale` as a bounded attribution channel
+rather than a place to paste a transcript.
 
 ## Add validation with JSON Schema
 

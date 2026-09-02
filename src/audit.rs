@@ -18,7 +18,7 @@ use crate::{
         CollectionEntry, RECORDS_LABEL, collection_directory_name, collection_entry, record_label,
         validate_component,
     },
-    error::{DomainError, anchor_mismatch, approval_mismatch, conflict},
+    error::{DomainError, anchor_mismatch, approval_mismatch, audit_integrity, conflict},
     frontmatter::Document,
     paths::{self, EntryKind},
 };
@@ -49,8 +49,9 @@ const ANCHOR_LABEL: &str = "the audit anchor";
 /// and a change here never touches an audit payload or a stored hash.
 const ANCHOR_VERSION: u32 = 1;
 
-const AUDIT_VERSION: u32 = 2;
+const AUDIT_VERSION: u32 = 3;
 const MIN_AUDIT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 1;
 const EVENT_HASH_DOMAIN: &[u8] = b"cr:audit:event:v1\0";
 const RECORD_HASH_DOMAIN: &[u8] = b"cr:record:v1\0";
 /// Domain separator for the previewed-change digest.
@@ -86,6 +87,23 @@ impl std::fmt::Display for AuditAction {
 pub struct AuditRecord {
     pub collection: String,
     pub id: String,
+}
+
+/// Exact stored Markdown for an event whose semantic document does not render
+/// back to the same bytes.
+///
+/// Most records need no witness: replaying `changes` and rendering the audit
+/// JSON result reproduces `after_hash`. A baseline, direct filesystem save, or
+/// deliberately ordered managed record can introduce comments, quoting, key
+/// order, line endings, and other YAML representation the semantic document
+/// cannot retain. In that case this versioned witness supplies the exact UTF-8
+/// bytes, while replay still proves that parsing those bytes yields the
+/// semantic state in `changes`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditRecordSnapshot {
+    pub version: u32,
+    pub markdown: String,
 }
 
 impl AuditRecord {
@@ -215,6 +233,13 @@ pub struct AuditPayload {
     pub action: AuditAction,
     pub record: AuditRecord,
     pub changes: Vec<AuditChange>,
+    /// Exact post-mutation representation for every present version-3 state.
+    ///
+    /// Version 1 and 2 predate this witness. Version 3 retains it unconditionally
+    /// rather than making durable verification depend on a serializer's current
+    /// idea of canonical Markdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_snapshot: Option<AuditRecordSnapshot>,
     pub before_hash: Option<String>,
     pub after_hash: Option<String>,
     pub previous_hash: Option<String>,
@@ -558,6 +583,7 @@ struct PayloadMutation<'a> {
     after_document: Option<&'a Document>,
     before_hash: Option<String>,
     after_hash: Option<String>,
+    after_bytes: Option<&'a [u8]>,
     chain: ChainState,
     source: AuditSource,
     message: Option<&'a str>,
@@ -568,6 +594,10 @@ struct PayloadMutation<'a> {
 pub(crate) struct AuditedRecordState {
     pub hash: Option<String>,
     pub document: Option<Value>,
+    /// The newest event could not prove its exact representation because it
+    /// predates v3. When the materialized file still matches its hash, replay
+    /// uses that file as the missing witness and checks its semantics too.
+    legacy_representation_gap: Option<u64>,
 }
 
 pub(crate) type AuditedRecordStates = HashMap<(String, String), AuditedRecordState>;
@@ -639,6 +669,7 @@ impl<'a> AuditLog<'a> {
             after_document: mutation.after_document,
             before_hash,
             after_hash: mutation.after_bytes.map(record_hash),
+            after_bytes: mutation.after_bytes,
             chain,
             source: mutation.source,
             message: mutation.message,
@@ -664,6 +695,7 @@ impl<'a> AuditLog<'a> {
             after_document: mutation.after_document,
             before_hash,
             after_hash: mutation.after_bytes.map(record_hash),
+            after_bytes: mutation.after_bytes,
             chain,
             source: AuditSource::Filesystem,
             message: mutation.message,
@@ -676,6 +708,7 @@ impl<'a> AuditLog<'a> {
         let previous_hash = mutation.chain.head_hash;
         let before = mutation.before_document.map(document_value).transpose()?;
         let after = mutation.after_document.map(document_value).transpose()?;
+        let after_snapshot = exact_snapshot(mutation.after_document, mutation.after_bytes)?;
         let payload = AuditPayload {
             version: AUDIT_VERSION,
             sequence,
@@ -695,6 +728,7 @@ impl<'a> AuditLog<'a> {
                 id: mutation.id.to_owned(),
             },
             changes: diff_documents(before.as_ref(), after.as_ref()),
+            after_snapshot,
             before_hash: mutation.before_hash,
             after_hash: mutation.after_hash,
             previous_hash,
@@ -840,6 +874,9 @@ impl<'a> AuditLog<'a> {
         validate_relative_target(&pending.target)?;
         let payload: AuditPayload =
             serde_json::from_str(&pending.payload).context("pending audit payload is invalid")?;
+        if !(MIN_AUDIT_VERSION..=AUDIT_VERSION).contains(&payload.version) {
+            bail!("unsupported audit event version {}", payload.version);
+        }
         if event_hash(pending.payload.as_bytes()) != pending.hash {
             bail!("pending audit mutation hash does not match its payload");
         }
@@ -861,9 +898,14 @@ impl<'a> AuditLog<'a> {
             &payload.record.collection,
             &payload.record.id,
         )?;
+        // Recovery is a write path too. Refuse to append or bless a pending
+        // event on top of a journal whose change sets no longer reproduce the
+        // states they claim, and name the guilty committed sequence first.
+        let (mut states, _) = self.states(false)?;
+        self.verify_legacy_representation_heads(&states)?;
         let head = self.load_head()?;
 
-        if let Some(head) = head {
+        if let Some(head) = head.as_ref() {
             if head.entry.payload.sequence == payload.sequence && head.entry.hash == pending.hash {
                 if current_hash != pending.after_hash {
                     bail!(
@@ -879,6 +921,22 @@ impl<'a> AuditLog<'a> {
         }
 
         if current_hash == pending.after_hash {
+            let expected_sequence = head
+                .as_ref()
+                .map_or(1, |head| head.entry.payload.sequence + 1);
+            let expected_previous = head.as_ref().map(|head| head.entry.hash.as_str());
+            if payload.sequence != expected_sequence
+                || payload.previous_hash.as_deref() != expected_previous
+            {
+                bail!("audit event does not extend the current chain head");
+            }
+            replay_entry(
+                &mut states,
+                &AuditEntry {
+                    hash: pending.hash.clone(),
+                    payload: payload.clone(),
+                },
+            )?;
             let change_digest = change_set_hash(&pending.payload)?;
             self.append(&PreparedEntry {
                 hash: pending.hash,
@@ -974,6 +1032,7 @@ impl<'a> AuditLog<'a> {
         expected_head: Option<&str>,
     ) -> Result<(AuditVerification, VerifiedRecordHashes)> {
         let (latest, state) = self.states(true)?;
+        self.verify_legacy_representation_heads(&latest)?;
 
         let anchor = match expected_head {
             Some(expected) => {
@@ -1017,17 +1076,16 @@ impl<'a> AuditLog<'a> {
         sequence: u64,
         expected_head: Option<&str>,
     ) -> Result<VerifiedRecordHashes> {
+        let mut latest = AuditedRecordStates::new();
         let mut hashes = VerifiedRecordHashes::new();
         let mut head_at_sequence = None;
         let chain = self.verify_chain(|entry, _| {
-            if entry.payload.sequence <= sequence {
-                hashes.insert(
-                    (
-                        entry.payload.record.collection.clone(),
-                        entry.payload.record.id.clone(),
-                    ),
-                    entry.payload.after_hash.clone(),
-                );
+            replay_entry(&mut latest, entry)?;
+            if entry.payload.sequence == sequence {
+                hashes = latest
+                    .iter()
+                    .map(|(record, state)| (record.clone(), state.hash.clone()))
+                    .collect();
             }
             if entry.payload.sequence == sequence {
                 head_at_sequence = Some(entry.hash.clone());
@@ -1042,6 +1100,7 @@ impl<'a> AuditLog<'a> {
                 "sync run ledger does not match the audit head it recorded",
             ));
         }
+        self.verify_legacy_representation_heads(&latest)?;
         Ok(hashes)
     }
 
@@ -1219,7 +1278,9 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn record_states(&self) -> Result<AuditedRecordStates> {
-        self.states(false).map(|(states, _)| states)
+        let (states, _) = self.states(false)?;
+        self.verify_legacy_representation_heads(&states)?;
+        Ok(states)
     }
 
     /// Whether the latest audited state for this record is a deletion.
@@ -1282,46 +1343,7 @@ impl<'a> AuditLog<'a> {
             if check_approvals {
                 verify_approved_changes(entry, payload)?;
             }
-            let key = (
-                entry.payload.record.collection.clone(),
-                entry.payload.record.id.clone(),
-            );
-            let had_history = latest.contains_key(&key);
-            let state = latest.entry(key).or_insert_with(|| AuditedRecordState {
-                hash: None,
-                document: None,
-            });
-            if state.hash != entry.payload.before_hash {
-                bail!(
-                    "audit record-state chain is broken at sequence {}",
-                    entry.payload.sequence
-                );
-            }
-            if !had_history
-                && !matches!(
-                    entry.payload.action,
-                    AuditAction::Create | AuditAction::Baseline
-                )
-            {
-                bail!(
-                    "audit record history begins with an invalid action at sequence {}",
-                    entry.payload.sequence
-                );
-            }
-            apply_changes(&mut state.document, &entry.payload.changes).with_context(|| {
-                format!(
-                    "audit changes are inconsistent at sequence {}",
-                    entry.payload.sequence
-                )
-            })?;
-            if state.document.is_some() != entry.payload.after_hash.is_some() {
-                bail!(
-                    "audit record state is inconsistent at sequence {}",
-                    entry.payload.sequence
-                );
-            }
-            state.hash = entry.payload.after_hash.clone();
-            Ok(())
+            replay_entry(&mut latest, entry)
         })?;
         Ok((latest, chain))
     }
@@ -1336,6 +1358,13 @@ impl<'a> AuditLog<'a> {
             || entry.parsed.previous_hash.as_deref() != expected_previous
         {
             bail!("audit event does not extend the current chain head");
+        }
+        if let Some(head) = head.as_ref() {
+            verify_version_progress(
+                head.entry.payload.version,
+                entry.parsed.version,
+                entry.parsed.sequence,
+            )?;
         }
         if event_hash(entry.payload.as_bytes()) != entry.hash {
             bail!("audit event hash does not match its payload");
@@ -1426,6 +1455,7 @@ impl<'a> AuditLog<'a> {
         let paths = self.segment_paths()?;
         let mut expected_sequence = 1;
         let mut previous_hash: Option<String> = None;
+        let mut previous_version: Option<u32> = None;
 
         for path in paths {
             if segment_start(&path)? != expected_sequence {
@@ -1453,7 +1483,15 @@ impl<'a> AuditLog<'a> {
                 if stored.entry.payload.previous_hash != previous_hash {
                     bail!("audit hash chain is broken at sequence {expected_sequence}");
                 }
+                if let Some(previous_version) = previous_version {
+                    verify_version_progress(
+                        previous_version,
+                        stored.entry.payload.version,
+                        expected_sequence,
+                    )?;
+                }
                 visitor(&stored.entry, &stored.payload)?;
+                previous_version = Some(stored.entry.payload.version);
                 previous_hash = Some(stored.entry.hash);
                 expected_sequence += 1;
                 segment_entries += 1;
@@ -1475,14 +1513,68 @@ impl<'a> AuditLog<'a> {
         collection: &str,
         id: &str,
     ) -> Result<(Option<Option<String>>, ChainState)> {
-        let mut state = None;
-        let chain = self.verify_chain(|entry, _| {
-            if entry.payload.record.collection == collection && entry.payload.record.id == id {
-                state = Some(entry.payload.after_hash.clone());
-            }
-            Ok(())
-        })?;
+        let (states, chain) = self.states(false)?;
+        let state = states
+            .get(&(collection.to_owned(), id.to_owned()))
+            .map(|state| state.hash.clone());
+        self.verify_legacy_representation_heads(&states)?;
         Ok((state, chain))
+    }
+
+    /// Close a legacy exact-representation gap with the materialized record
+    /// when it is still the state named by the head event.
+    ///
+    /// A missing or hash-divergent file is left to ordinary reconciliation so
+    /// direct edits keep their established diagnosis. Exact hash agreement
+    /// makes the file a safe byte witness; its parsed document must then agree
+    /// with semantic replay or the journal is internally inconsistent.
+    fn verify_legacy_representation_heads(&self, states: &AuditedRecordStates) -> Result<()> {
+        let mut gaps = states
+            .iter()
+            .filter(|(_, state)| state.legacy_representation_gap.is_some())
+            .collect::<Vec<_>>();
+        gaps.sort_unstable_by_key(|(_, state)| state.legacy_representation_gap);
+        for ((collection, id), state) in gaps {
+            let Some(sequence) = state.legacy_representation_gap else {
+                continue;
+            };
+            let (Some(expected_hash), Some(expected_document)) =
+                (state.hash.as_deref(), state.document.as_ref())
+            else {
+                continue;
+            };
+            validate_component(collection, "collection")?;
+            validate_component(id, "id")?;
+            let path = self.records_dir.join(collection).join(format!("{id}.md"));
+            let label = record_label(collection, id);
+            let Some(bytes) = paths::read_optional(self.root, &path, &label)? else {
+                continue;
+            };
+            if record_hash(&bytes) != expected_hash {
+                continue;
+            }
+            let raw = std::str::from_utf8(&bytes).map_err(|error| {
+                anyhow::Error::new(error).context(DomainError::AuditIntegrity(format!(
+                    "audit replay is inconsistent at sequence {sequence}: legacy record witness is not UTF-8"
+                )))
+            })?;
+            let parsed = Document::parse(raw).map_err(|error| {
+                error.context(DomainError::AuditIntegrity(format!(
+                    "audit replay is inconsistent at sequence {sequence}: legacy record witness is not valid Markdown"
+                )))
+            })?;
+            let parsed = document_value(&parsed).map_err(|error| {
+                error.context(DomainError::AuditIntegrity(format!(
+                    "audit replay is inconsistent at sequence {sequence}: legacy record witness cannot be decoded"
+                )))
+            })?;
+            if parsed != *expected_document {
+                return Err(audit_integrity(format!(
+                    "audit replay is inconsistent at sequence {sequence}: legacy record witness does not describe the replayed document"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn verify_records(&self, latest: &HashMap<(String, String), Option<String>>) -> Result<()> {
@@ -1790,6 +1882,176 @@ fn document_value(document: &Document) -> Result<Value> {
     }))
 }
 
+/// Apply one event and prove that its semantic result reproduces the exact
+/// state hash the event records.
+fn replay_entry(latest: &mut AuditedRecordStates, entry: &AuditEntry) -> Result<()> {
+    let sequence = entry.payload.sequence;
+    let key = (
+        entry.payload.record.collection.clone(),
+        entry.payload.record.id.clone(),
+    );
+    let had_history = latest.contains_key(&key);
+    let state = latest.entry(key).or_insert_with(|| AuditedRecordState {
+        hash: None,
+        document: None,
+        legacy_representation_gap: None,
+    });
+    if state.hash != entry.payload.before_hash {
+        return Err(audit_integrity(format!(
+            "audit replay is inconsistent at sequence {sequence}: before hash does not match the replayed state"
+        )));
+    }
+    if had_history && entry.payload.action == AuditAction::Baseline {
+        return Err(audit_integrity(format!(
+            "audit replay is inconsistent at sequence {sequence}: baseline is not the first record event"
+        )));
+    }
+    let existed_before = state.document.is_some();
+    apply_changes(&mut state.document, &entry.payload.changes).map_err(|error| {
+        error.context(DomainError::AuditIntegrity(format!(
+            "audit replay is inconsistent at sequence {sequence}: change set cannot be applied"
+        )))
+    })?;
+    verify_action_transition(entry, existed_before, state.document.is_some())?;
+    state.legacy_representation_gap = if verify_replayed_after(entry, &state.document)? {
+        None
+    } else {
+        Some(sequence)
+    };
+    state.hash = entry.payload.after_hash.clone();
+    Ok(())
+}
+
+/// Require the verb recorded by an event to agree with the record-presence
+/// transition its changes actually produce.
+fn verify_action_transition(
+    entry: &AuditEntry,
+    existed_before: bool,
+    exists_after: bool,
+) -> Result<()> {
+    let valid = match entry.payload.action {
+        AuditAction::Create | AuditAction::Baseline => !existed_before && exists_after,
+        AuditAction::Update | AuditAction::Link => existed_before && exists_after,
+        AuditAction::Delete => existed_before && !exists_after,
+    };
+    if valid {
+        return Ok(());
+    }
+    let before = if existed_before { "present" } else { "absent" };
+    let after = if exists_after { "present" } else { "absent" };
+    Err(audit_integrity(format!(
+        "audit replay is inconsistent at sequence {}: {} action does not match the {before}-to-{after} record transition",
+        entry.payload.sequence, entry.payload.action
+    )))
+}
+
+/// `true` means the event itself proves its exact representation. `false` is
+/// the narrow v1/v2 compatibility state whose current materialized file must
+/// serve as the missing witness when the gap remains at a record head.
+fn verify_replayed_after(entry: &AuditEntry, document: &Option<Value>) -> Result<bool> {
+    let sequence = entry.payload.sequence;
+    let mismatch = |reason: &str| {
+        audit_integrity(format!(
+            "audit replay is inconsistent at sequence {sequence}: {reason}"
+        ))
+    };
+    let Some(expected_hash) = entry.payload.after_hash.as_deref() else {
+        if document.is_some() || entry.payload.after_snapshot.is_some() {
+            return Err(mismatch("deleted state still contains record content"));
+        }
+        return Ok(true);
+    };
+    let Some(document) = document else {
+        return Err(mismatch("existing state has no replayed document"));
+    };
+
+    if entry.payload.version >= 3 && entry.payload.after_snapshot.is_none() {
+        return Err(mismatch("existing state has no exact record snapshot"));
+    }
+
+    if let Some(snapshot) = entry.payload.after_snapshot.as_ref() {
+        if snapshot.version != SNAPSHOT_VERSION {
+            return Err(mismatch("record snapshot uses an unsupported version"));
+        }
+        let parsed = Document::parse(&snapshot.markdown).map_err(|error| {
+            error.context(DomainError::AuditIntegrity(format!(
+                "audit replay is inconsistent at sequence {sequence}: record snapshot is not valid Markdown"
+            )))
+        })?;
+        let value = document_value(&parsed).map_err(|error| {
+            error.context(DomainError::AuditIntegrity(format!(
+                "audit replay is inconsistent at sequence {sequence}: record snapshot cannot be decoded"
+            )))
+        })?;
+        if &value != document {
+            return Err(mismatch(
+                "record snapshot does not describe the replayed document",
+            ));
+        }
+        if record_hash(snapshot.markdown.as_bytes()) != expected_hash {
+            return Err(mismatch("record snapshot does not match after hash"));
+        }
+        return Ok(true);
+    }
+
+    let replayed = Document::from_audit_value(document)
+        .and_then(|document| document.render())
+        .map_err(|error| {
+            error.context(DomainError::AuditIntegrity(format!(
+                "audit replay is inconsistent at sequence {sequence}: replayed document cannot be rendered"
+            )))
+        })?;
+    if record_hash(replayed.as_bytes()) == expected_hash {
+        return Ok(true);
+    }
+
+    // V1/v2 recorded semantic content and the hash of the exact source file,
+    // but not its YAML spelling or mapping order. Those bytes cannot be
+    // reconstructed after the fact. Mark this historical representation gap;
+    // every later event is checked and clears it, while a gap that remains at
+    // the record head must be closed with the materialized file as a witness.
+    if entry.payload.version < 3 {
+        return Ok(false);
+    }
+    Err(mismatch("replayed document does not match after hash"))
+}
+
+/// Retain the exact bytes for every version-3 state in which the record exists.
+///
+/// Making the witness unconditional keeps future serializer changes from
+/// changing what an existing event can prove and prevents a forged event from
+/// deleting the field to enter the legacy compatibility path.
+fn exact_snapshot(
+    document: Option<&Document>,
+    bytes: Option<&[u8]>,
+) -> Result<Option<AuditRecordSnapshot>> {
+    let Some(document) = document else {
+        if bytes.is_some() {
+            bail!("a deleted audit state cannot contain record bytes");
+        }
+        return Ok(None);
+    };
+    let bytes = bytes.context("an existing audit state must contain record bytes")?;
+    let markdown = std::str::from_utf8(bytes).context("audited record bytes are not UTF-8")?;
+    let parsed = Document::parse(markdown).context("audited record bytes cannot be parsed")?;
+    if document_value(&parsed)? != document_value(document)? {
+        bail!("audited record bytes do not describe the recorded document");
+    }
+    Ok(Some(AuditRecordSnapshot {
+        version: SNAPSHOT_VERSION,
+        markdown: markdown.to_owned(),
+    }))
+}
+
+fn verify_version_progress(previous: u32, current: u32, sequence: u64) -> Result<()> {
+    if current >= previous {
+        return Ok(());
+    }
+    Err(audit_integrity(format!(
+        "audit replay is inconsistent at sequence {sequence}: payload version decreased from {previous} to {current}"
+    )))
+}
+
 fn diff_documents(before: Option<&Value>, after: Option<&Value>) -> Vec<AuditChange> {
     match (before, after) {
         (None, Some(after)) => vec![AuditChange::Add {
@@ -2068,6 +2330,7 @@ mod tests {
                 before: json!("open"),
                 after: json!("closed-won"),
             }],
+            after_snapshot: None,
             before_hash: Some("sha256:70af0060".to_owned()),
             after_hash: Some("sha256:3c583cd6".to_owned()),
             previous_hash: Some("sha256:be4bd677".to_owned()),

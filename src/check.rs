@@ -381,17 +381,28 @@ pub(crate) fn run(database: &Database, scope: &CheckScope) -> Result<CheckReport
     mark_blocked(&mut scanned, &findings);
 
     // Phase three: reconcile against the journal, or explain why we cannot.
-    let audited_records = match audit.record_states() {
-        Ok(states) => {
-            if let Err(error) = audit.verify_approvals() {
-                findings.push(approval_finding(&error));
-            }
-            reconcile(&states, &scanned, selected.as_deref(), &mut findings)
-        }
+    let audited_records = match audit.verify_approvals() {
         Err(error) => {
-            findings.push(chain_finding(&error));
+            // Approval is checked in event order before replaying that event's
+            // result. Keep its distinct diagnosis instead of immediately
+            // relabeling the same forged change set as generic replay damage.
+            if matches!(
+                DomainError::of(&error),
+                Some(DomainError::ApprovalMismatch(_))
+            ) {
+                findings.push(approval_finding(&error));
+            } else {
+                findings.push(chain_finding(&error));
+            }
             0
         }
+        Ok(()) => match audit.record_states() {
+            Ok(states) => reconcile(&states, &scanned, selected.as_deref(), &mut findings),
+            Err(error) => {
+                findings.push(chain_finding(&error));
+                0
+            }
+        },
     };
 
     // Database-wide, and therefore reported under `--collection` too: a

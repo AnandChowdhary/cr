@@ -18,6 +18,12 @@ use serde_json::Value;
 /// unnoticed.
 const LEGACY_HEAD: &str = "sha256:5b872015034716e3845cf69dc5c7ced7d801b05fe21aef406de4f965ff54f3ef";
 
+/// Head hash of the committed version-1 fixture. Unlike the unit-level legacy
+/// payload test, this database is opened, verified, mutated, and verified again
+/// through the real CLI.
+const LEGACY_V1_HEAD: &str =
+    "sha256:073612f9c305ea26aa0b99f524b3fe209654915c16db226a9c11c05606b97cde";
+
 /// The head hash of `tests/fixtures/future-journal`, whose events name
 /// attribution values this build does not know.
 const FUTURE_HEAD: &str = "sha256:b63e39719e07ca692675af1a16c98eed9749d5be01b4369a35e0668849733b60";
@@ -81,6 +87,46 @@ fn a_journal_written_before_attribution_existed_still_verifies() {
         assert!(entry.get("authorization").is_none());
         assert!(entry.get("intent").is_none());
     }
+}
+
+#[test]
+fn a_version_one_database_verifies_and_accepts_a_version_three_successor() {
+    let temporary = tempfile::tempdir().expect("could not create a temporary directory");
+    let root = temporary.path().join("legacy-v1");
+    copy_fixture("legacy-v1-journal", &root);
+
+    let verified = run_success(command_for(&root).args([
+        "audit",
+        "verify",
+        "--expected-head",
+        LEGACY_V1_HEAD,
+    ]));
+    assert!(verified.contains("Verified 2 audit events and 1 records"));
+    assert!(verified.contains(LEGACY_V1_HEAD));
+
+    run_success(command_for(&root).args([
+        "--actor",
+        "legacy@example.com",
+        "update",
+        "items",
+        "one",
+        "--set",
+        "stage=hired",
+    ]));
+    let verified = run_success(command_for(&root).args(["audit", "verify"]));
+    assert!(verified.contains("Verified 3 audit events and 1 records"));
+
+    let entries: Value = serde_json::from_str(&run_success(
+        command_for(&root).args(["audit", "log", "--json"]),
+    ))
+    .expect("audit log is JSON");
+    let versions = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["version"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(versions, vec![3, 1, 1]);
 }
 
 /// A journal written by a later `cr` that grew an attribution value must still
@@ -255,7 +301,7 @@ fn an_agent_run_update_records_the_human_the_agent_and_both_intents() {
     let event = &entries[0];
 
     assert_eq!(event["actor"], "Ada Lovelace <ada@example.com>");
-    assert_eq!(event["version"], 2);
+    assert_eq!(event["version"], 3);
     assert_eq!(event["source"], "cli");
     assert_eq!(event["agent"]["id"], "claude-code");
     assert_eq!(event["agent"]["version"], "2.1.237");
