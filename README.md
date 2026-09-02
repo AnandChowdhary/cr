@@ -1319,7 +1319,25 @@ Open [http://127.0.0.1:3000/](http://127.0.0.1:3000/) to see every collection. E
 http://127.0.0.1:3000/deals
 ```
 
-The table infers columns from the collection schema and current front matter. Its compact header keeps search and its submit action immediately available. **Filter** opens the complete schema-aware condition, column, and sorting panel only when needed, and shows the number of active ad hoc conditions. The view also includes bounded pagination, create and edit forms, and audited deletion. Click a record ID, field value, or its **View** action to open the record editor and its newest audit events. Saved views can switch the same query to a Kanban layout. Every mutation is schema-validated and recorded with `source: api`.
+The default UI uses a compact workspace shell rather than a documentation-style
+page frame. On desktop, collections and saved views stay visible in a persistent
+sidebar with audit, OpenAPI, and the RBAC perspective control anchored below;
+the active route remains highlighted on list, board, and record pages. Narrow
+screens collapse the same hierarchy into a sticky top bar and horizontally
+scrollable view strip. The main workspace uses short breadcrumbs, one-line
+context, restrained borders, and compact controls so records begin near the top
+of the viewport without losing labels or accessible fallbacks.
+
+The table infers columns from the collection schema and current front matter.
+Its dense header keeps search and its submit action immediately available.
+**Filter** opens the complete schema-aware condition, column, and sorting panel
+only when needed, and shows the number of active ad hoc conditions. Rows use the
+entire available workspace and keep the stable ID, every selected value, and a
+small open action visible without a separate oversized action column. The view
+also includes bounded pagination, create and edit forms, and audited deletion.
+Click a record ID, field value, or its row action to open the record editor.
+Saved views can switch the same query to a Kanban layout. Every mutation is
+schema-validated and recorded with `source: api`.
 
 The filter builder combines up to 20 conditions with either **all** (AND) or **any** (OR) matching. Each row has schema-aware operators: equality and inequality for every type; numeric and ISO string/date comparisons; string and array containment; starts/ends-with; and explicit empty/not-empty checks. Enum, boolean, and multi-select values use constrained dropdowns, numeric fields use numeric inputs, formatted strings use their matching input type, and other values accept typed YAML. Add or remove rows in the browser; the match mode and filters stay in the URL as `filter_match` plus repeated `filter_field`, `filter_operator`, and `filter_value` triples, including through pagination. Saved-view predicates always remain required, so choosing **any** cannot escape the view's underlying scope. Missing values match `is empty`, but do not silently match negative operators such as `is not` or `does not contain`.
 
@@ -1360,6 +1378,13 @@ Fields omitted from the order remain visible after configured fields, with requi
 Open [http://127.0.0.1:3000/audit](http://127.0.0.1:3000/audit) for the global audit journal, newest first. Filter it by collection and record ID, page through older events, and expand an event to inspect its add/remove/replace operations with before and after values.
 
 Every existing record page embeds its newest audit history with actor, source, timestamp, optional sync/save message, and field-level changes. The **View complete history** link opens `/audit` with that collection and ID already selected. Historical values are escaped before rendering and long values are preview-limited in the page; the complete event remains available from the JSON API and CLI.
+
+On wide screens, record fields and their newest activity share a two-column
+workspace so policy and provenance stay visible while editing. At smaller
+widths, activity returns to the normal document flow. Kanban cards use compact
+label/value rows and keep drag-and-drop as the fast path; the native move form
+is folded under **Move card…** until it is needed, preserving the no-JavaScript
+fallback without making every card several controls taller.
 
 ### Create saved views
 

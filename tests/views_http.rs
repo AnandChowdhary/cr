@@ -129,7 +129,11 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(home.text().contains("href=\"/deals\""));
     assert!(home.text().contains("href=\"/open-deals\""));
     assert!(home.text().contains("href=\"#main-content\""));
-    assert!(home.text().contains("data-design-system=\"cr-clean\""));
+    assert!(home.text().contains("data-design-system=\"cr-workspace\""));
+    assert!(home.text().contains("aria-label=\"Workspace navigation\""));
+    assert!(home.text().contains("Collections"));
+    assert!(home.text().contains("Saved views"));
+    assert!(home.text().contains("aria-label=\"Views\""));
 
     let automatic = request(&app, Method::GET, "/deals", None, &[]).await;
     assert_eq!(automatic.status, StatusCode::OK);
@@ -165,6 +169,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(automatic.text().contains("aria-label=\"Sort by\""));
     assert!(automatic.text().contains("aria-label=\"Sort direction\""));
     assert!(automatic.text().contains("aria-label=\"Visible columns\""));
+    assert!(automatic.text().contains("cr-sidebar-link is-active"));
     assert!(
         automatic
             .text()
@@ -996,6 +1001,12 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
     assert_eq!(audit[0].payload.actor, "sales@example.com");
 
     let edit_page = request(&app, Method::GET, "/open-deals/records/acme", None, &[]).await;
+    assert!(edit_page.text().contains("class=\"cr-record-layout mt-5\""));
+    assert!(
+        edit_page
+            .text()
+            .contains("<h2 class=\"text-base font-bold text-slate-950\">Activity</h2>")
+    );
     assert_eq!(edit_page.status, StatusCode::OK);
     assert!(edit_page.text().contains("Schema-powered"));
     assert!(edit_page.text().contains("name=\"attribute.status\""));
@@ -1006,7 +1017,7 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
     );
     assert!(edit_page.text().contains("name=\"attribute.value\""));
     assert!(edit_page.text().contains("value=\"12500\""));
-    assert!(edit_page.text().contains("Audit history"));
+    assert!(edit_page.text().contains("All activity"));
     assert!(edit_page.text().contains("sales@example.com"));
     assert!(edit_page.text().contains("create"));
     assert!(
