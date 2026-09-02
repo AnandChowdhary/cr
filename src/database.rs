@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -22,12 +23,13 @@ use crate::{
     },
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     audit::{
-        AuditFilter, AuditIdempotency, AuditIdempotencyResult, AuditLog, AuditMutation,
-        ChangePreview, ReconciledMutation, record_hash,
+        AuditEncryptionTransition, AuditFilter, AuditIdempotency, AuditIdempotencyResult, AuditLog,
+        AuditMutation, ChangePreview, ReconciledMutation, record_hash,
     },
     check::{CheckReport, CheckScope},
     encryption::{
         CONTEXT_LABEL, CONTEXT_PATH, EncryptionContext, EncryptionPolicy,
+        EncryptionStorageMetadata, audit_document_encryption_metadata,
         document_has_encrypted_storage,
     },
     error::{
@@ -46,7 +48,7 @@ const DATABASE_DIRECTORY: &str = ".cr";
 pub(crate) const SCHEMA_DIRECTORY: &str = ".cr/schemas";
 const CURRENT_FORMAT_VERSION: u32 = 1;
 const IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] = b"cr:idempotency:key:v1\0";
-const IDEMPOTENCY_REQUEST_HASH_DOMAIN: &[u8] = b"cr:idempotency:request:v1\0";
+const IDEMPOTENCY_REQUEST_HASH_DOMAIN: &[u8] = b"cr:idempotency:request:v2\0";
 const MIN_IDEMPOTENCY_KEY_BYTES: usize = 16;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 
@@ -800,6 +802,14 @@ impl Database {
         Ok(self)
     }
 
+    /// Clear a caller retry identity before entering a multi-record internal
+    /// workflow. Sync has its own durable run ledger and must never consume a
+    /// key attached to the `Database` handle that invoked it.
+    pub(crate) fn without_idempotency_key(mut self) -> Self {
+        self.idempotency_key = None;
+        self
+    }
+
     pub fn with_source(mut self, source: AuditSource) -> Self {
         self.source = source;
         self
@@ -845,7 +855,7 @@ impl Database {
             collection: collection.to_owned(),
             id: id.to_owned(),
             key_hash: idempotency_digest(IDEMPOTENCY_KEY_HASH_DOMAIN, key.as_bytes()),
-            request_hash: idempotency_digest(IDEMPOTENCY_REQUEST_HASH_DOMAIN, &serialized),
+            request_hash: idempotency_request_digest(key.as_bytes(), &serialized),
         }))
     }
 
@@ -871,8 +881,9 @@ impl Database {
         let result = value;
         validate_record_version(&result.version)
             .context("the committed idempotency result has an invalid version")?;
-        let document = Document::parse(&result.markdown)
+        let stored = Document::parse(&result.markdown)
             .context("the committed idempotency result is not valid Markdown")?;
+        let document = self.reveal_document(&request.collection, &request.id, &stored)?;
         Ok(Some(record_from_document(
             &request.collection,
             &request.id,
@@ -3543,38 +3554,73 @@ impl Database {
         let current = states
             .get(&(preview.record.collection.clone(), preview.record.id.clone()))
             .and_then(|state| state.document.as_ref());
-        let manifest_owned_storage = if policy.is_empty() {
-            current.is_some_and(crate::encryption::audit_document_has_encrypted_storage)
-                || changes_have_manifest_owned_storage(&preview.changes)
-        } else {
-            current.is_some_and(crate::encryption::audit_document_has_encryption_manifest)
-                || changes_have_encryption_manifest(&preview.changes)
-        };
+        let mut metadata = current
+            .and_then(audit_document_encryption_metadata)
+            .into_iter()
+            .collect::<Vec<_>>();
+        metadata.extend(changes_encryption_metadata(&preview.changes));
+        let manifest_owned_storage = projection_uses_policy(&policy, metadata.iter())?;
         self.reveal_changes(
             &preview.record.collection,
             &preview.record.id,
             &mut preview.changes,
+            &policy,
             manifest_owned_storage,
         )?;
         Ok(preview)
     }
 
     fn reveal_audit_entries(&self, mut entries: Vec<AuditEntry>) -> Result<Vec<AuditEntry>> {
-        let protected_sequences = self.audit().protected_storage_sequences()?;
-        let manifest_sequences = self.audit().encryption_manifest_sequences()?;
-        for entry in &mut entries {
-            let policy = self.encryption_policy(&entry.payload.record.collection)?;
-            let manifest_owned_storage = if policy.is_empty() {
-                protected_sequences.contains(&entry.payload.sequence)
-            } else {
-                manifest_sequences.contains(&entry.payload.sequence)
-            };
+        let transitions = self.audit().encryption_storage_transitions()?;
+        // Preflight every selected event before decrypting any of them. The
+        // response is built in memory and already all-or-nothing, but this also
+        // keeps plaintext out of the working projection when a later selected
+        // event proves that its historical manifest belongs to another policy.
+        let projections = entries
+            .iter()
+            .map(|entry| {
+                let policy = self.encryption_policy(&entry.payload.record.collection)?;
+                let transition = transitions.get(&entry.payload.sequence);
+                let manifest_owned_storage = projection_uses_policy(
+                    &policy,
+                    transition
+                        .into_iter()
+                        .flat_map(AuditEncryptionTransition::metadata),
+                )?;
+                Ok((policy, manifest_owned_storage))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (entry, (policy, manifest_owned_storage)) in entries.iter_mut().zip(projections.iter())
+        {
             self.reveal_changes(
                 &entry.payload.record.collection,
                 &entry.payload.record.id,
                 &mut entry.payload.changes,
-                manifest_owned_storage,
+                policy,
+                *manifest_owned_storage,
             )?;
+            if *manifest_owned_storage {
+                let context = self.encryption_context_optional()?;
+                let context = context.as_ref().map(EncryptionContext::id);
+                if let Some(snapshot) = entry.payload.after_snapshot.as_mut() {
+                    reveal_audit_markdown(
+                        policy,
+                        context,
+                        &entry.payload.record.collection,
+                        &entry.payload.record.id,
+                        &mut snapshot.markdown,
+                    )?;
+                }
+                if let Some(idempotency) = entry.payload.idempotency.as_mut() {
+                    reveal_audit_markdown(
+                        policy,
+                        context,
+                        &entry.payload.record.collection,
+                        &entry.payload.record.id,
+                        &mut idempotency.result.markdown,
+                    )?;
+                }
+            }
         }
         Ok(entries)
     }
@@ -3584,17 +3630,9 @@ impl Database {
         collection: &str,
         id: &str,
         changes: &mut [AuditChange],
+        policy: &EncryptionPolicy,
         manifest_owned_storage: bool,
     ) -> Result<()> {
-        let policy = self.encryption_policy(collection)?;
-        if policy.is_empty() {
-            if manifest_owned_storage {
-                return Err(conflict(
-                    "stored protected history is no longer declared by the collection schema",
-                ));
-            }
-            return Ok(());
-        }
         // A current schema cannot retroactively assign storage meaning to old
         // history. Only the manifest in that event's reconstructed document
         // state owns envelope-shaped values; everything else remains ordinary
@@ -3876,6 +3914,23 @@ fn idempotency_digest(domain: &[u8], bytes: &[u8]) -> String {
     format!("sha256:{hexadecimal}")
 }
 
+/// Authenticate canonical plaintext request identity with the never-persisted
+/// retry key. This prevents the durable request digest from becoming an
+/// offline dictionary oracle for low-entropy protected request values.
+fn idempotency_request_digest(key: &[u8], canonical_request: &[u8]) -> String {
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
+        .expect("HMAC accepts retry keys of every validated length");
+    mac.update(IDEMPOTENCY_REQUEST_HASH_DOMAIN);
+    mac.update(canonical_request);
+    let hexadecimal = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("hmac-sha256:{hexadecimal}")
+}
+
 /// Parse a stored record, naming it by collection and ID rather than by path.
 fn parse_record(collection: &str, id: &str, raw: &str) -> Result<Document> {
     Document::parse(raw)
@@ -3982,34 +4037,69 @@ fn validate_schema_instance(
     Ok(())
 }
 
-fn changes_have_manifest_owned_storage(changes: &[AuditChange]) -> bool {
-    changes_have_storage(
-        changes,
-        crate::encryption::audit_document_has_encrypted_storage,
-    )
+fn changes_encryption_metadata(changes: &[AuditChange]) -> Vec<EncryptionStorageMetadata> {
+    changes
+        .iter()
+        .flat_map(|change| match change {
+            AuditChange::Add { path, after } if path.is_empty() => {
+                [audit_document_encryption_metadata(after), None]
+            }
+            AuditChange::Remove { path, before } if path.is_empty() => {
+                [audit_document_encryption_metadata(before), None]
+            }
+            AuditChange::Replace {
+                path,
+                before,
+                after,
+            } if path.is_empty() => [
+                audit_document_encryption_metadata(before),
+                audit_document_encryption_metadata(after),
+            ],
+            _ => [None, None],
+        })
+        .flatten()
+        .collect()
 }
 
-fn changes_have_encryption_manifest(changes: &[AuditChange]) -> bool {
-    changes_have_storage(
-        changes,
-        crate::encryption::audit_document_has_encryption_manifest,
-    )
+/// Decide whether one historical event may be projected through the current
+/// schema. A manifest without any envelope contains no protected value to
+/// expose, so a removed marker may leave it as inert historical metadata. As
+/// soon as real ciphertext exists, every before/after policy must exactly
+/// equal the current policy; marker moves fail closed without naming paths.
+fn projection_uses_policy<'a>(
+    current: &EncryptionPolicy,
+    metadata: impl Iterator<Item = &'a EncryptionStorageMetadata>,
+) -> Result<bool> {
+    let metadata = metadata.collect::<Vec<_>>();
+    if metadata.is_empty() {
+        return Ok(false);
+    }
+    let has_envelopes = metadata.iter().any(|state| state.has_envelopes);
+    if metadata.iter().all(|state| &state.policy == current) {
+        return Ok(true);
+    }
+    if has_envelopes {
+        return Err(conflict(
+            "stored protected history is no longer declared by the current collection schema",
+        ));
+    }
+    Ok(false)
 }
 
-fn changes_have_storage(
-    changes: &[AuditChange],
-    owns_storage: fn(&serde_json::Value) -> bool,
-) -> bool {
-    changes.iter().any(|change| match change {
-        AuditChange::Add { path, after } if path.is_empty() => owns_storage(after),
-        AuditChange::Remove { path, before } if path.is_empty() => owns_storage(before),
-        AuditChange::Replace {
-            path,
-            before,
-            after,
-        } if path.is_empty() => owns_storage(before) || owns_storage(after),
-        _ => false,
-    })
+fn reveal_audit_markdown(
+    policy: &EncryptionPolicy,
+    context: Option<&str>,
+    collection: &str,
+    id: &str,
+    markdown: &mut String,
+) -> Result<()> {
+    let stored = Document::parse(markdown)
+        .map_err(|_| conflict("stored protected history cannot be decoded"))?;
+    let logical = policy.reveal(context, collection, id, &stored)?;
+    *markdown = logical
+        .render()
+        .map_err(|_| conflict("stored protected history cannot be decoded"))?;
+    Ok(())
 }
 
 /// What one entry of a collection's directory is, as far as records go.

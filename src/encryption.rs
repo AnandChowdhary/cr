@@ -99,6 +99,16 @@ pub(crate) struct EncryptionPolicy {
     body: bool,
 }
 
+/// Storage meaning proven by an exact per-record manifest in one reconstructed
+/// audit state. The policy is deliberately retained, not reduced to a boolean:
+/// a later schema marker move must never reinterpret an older envelope under a
+/// different authenticated path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EncryptionStorageMetadata {
+    pub policy: EncryptionPolicy,
+    pub has_envelopes: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProtectedDocument {
     pub document: Document,
@@ -536,26 +546,23 @@ fn manifest_has_envelopes(document: &Document, manifest: &Value) -> bool {
     }) || (body && parse_body_envelope(&document.body).is_some())
 }
 
-/// Whether a complete stored audit document contains manifest-owned
-/// ciphertext. Envelope syntax on its own remains ordinary application data;
-/// only the reserved manifest can assign storage meaning to a location.
-pub(crate) fn audit_document_has_encrypted_storage(value: &JsonValue) -> bool {
-    Document::from_audit_value(value)
-        .ok()
-        .is_some_and(|document| document_has_encrypted_storage(&document))
-}
-
-/// Whether a complete audit document has an exact CR storage manifest,
-/// including the useful case where every optional protected value is absent.
-pub(crate) fn audit_document_has_encryption_manifest(value: &JsonValue) -> bool {
-    Document::from_audit_value(value)
-        .ok()
-        .is_some_and(|document| {
-            document
-                .attributes
-                .get(Value::String(MANIFEST_KEY.to_owned()))
-                .is_some_and(|manifest| parse_storage_manifest(manifest).is_some())
-        })
+/// Recover the exact historical policy owned by a stored manifest.
+///
+/// Standalone envelope-shaped application values have no manifest and remain
+/// ordinary data. `has_envelopes` distinguishes an all-optional empty storage
+/// state from ciphertext that requires the original database context.
+pub(crate) fn audit_document_encryption_metadata(
+    value: &JsonValue,
+) -> Option<EncryptionStorageMetadata> {
+    let document = Document::from_audit_value(value).ok()?;
+    let manifest = document
+        .attributes
+        .get(Value::String(MANIFEST_KEY.to_owned()))?;
+    let (fields, body) = parse_storage_manifest(manifest)?;
+    Some(EncryptionStorageMetadata {
+        policy: EncryptionPolicy { fields, body },
+        has_envelopes: manifest_has_envelopes(&document, manifest),
+    })
 }
 
 /// JSON pointers owned by an exact storage manifest in a complete audit

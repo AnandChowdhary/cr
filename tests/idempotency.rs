@@ -13,7 +13,9 @@ use common::{
     fault::{FaultDatabase, Point, pending_bytes, pending_json},
     run_failure, run_success,
 };
-use cr::{AccessResource, Assignment, AuditSource, Database, DomainError, Role, UserKind};
+use cr::{
+    AccessResource, Assignment, AuditSource, Database, DomainError, Role, SyncAttribution, UserKind,
+};
 use yaml_serde::{Mapping, Value};
 
 const KEY: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -648,6 +650,43 @@ fn operation_source_is_bound_into_the_request() {
         DomainError::of(&error).map(DomainError::code),
         Some("idempotency_conflict")
     );
+}
+
+#[test]
+fn sync_never_carries_or_consumes_a_caller_idempotency_key() {
+    let (_temporary, database) = database("sync-idempotency-boundary");
+    fs::create_dir_all(database.root().join("scripts")).unwrap();
+    fs::write(
+        database.root().join("scripts/import.sh"),
+        "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"upsert\",\"collection\":\"items\",\"id\":\"one\",\"front_matter\":{\"stage\":\"synced\"}}'\n",
+    )
+    .unwrap();
+    database
+        .create_sync(
+            "import",
+            vec!["sh".to_owned(), "scripts/import.sh".to_owned()],
+            30,
+            1024,
+            10,
+            SyncAttribution::default(),
+        )
+        .unwrap();
+
+    database
+        .clone()
+        .with_idempotency_key(KEY)
+        .unwrap()
+        .run_sync("import")
+        .unwrap();
+    let journal = fs::read_to_string(
+        database
+            .root()
+            .join(".cr/audit/segments/00000000000000000001.jsonl"),
+    )
+    .unwrap();
+    assert!(journal.contains("\"source\":\"sync\""));
+    assert!(!journal.contains("\"idempotency\""));
+    assert!(!journal.contains(KEY));
 }
 
 #[test]

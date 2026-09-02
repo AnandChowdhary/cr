@@ -833,6 +833,7 @@ impl Database {
     ) -> Result<SyncRunSummary> {
         let mut sync_database = self
             .clone()
+            .without_idempotency_key()
             .with_source(AuditSource::Sync)
             .with_audit_message(format!("sync:{name} run:{run_id}"))?;
         if let Some(actor) = definition.actor.clone() {

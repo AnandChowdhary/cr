@@ -195,6 +195,93 @@ fn real_http_server_keeps_encryption_transparent() {
     assert_eq!(fetched["front_matter"]["token"], "api-secret");
     assert_eq!(fetched["markdown"], "API private notes");
 
+    let patch_body = json!({ "front_matter": { "token": "patch-secret" } }).to_string();
+    let patch_headers = [
+        ("Authorization", "Bearer network-secret"),
+        ("Content-Type", "application/json"),
+        ("Idempotency-Key", "550e8400-e29b-41d4-a716-446655440020"),
+    ];
+    let patched = http_request(
+        address,
+        "PATCH",
+        "/api/v1/collections/accounts/records/acme",
+        &patch_headers,
+        Some(&patch_body),
+    );
+    let patch_replay = http_request(
+        address,
+        "PATCH",
+        "/api/v1/collections/accounts/records/acme",
+        &patch_headers,
+        Some(&patch_body),
+    );
+    assert_eq!(patched.0, 200, "{}", patched.1);
+    assert_eq!(patch_replay, patched);
+    let patched_json: Value = serde_json::from_str(&patched.1).unwrap();
+    assert_eq!(patched_json["front_matter"]["token"], "patch-secret");
+    let after_patch = std::fs::read_to_string(database.join("records/accounts/acme.md")).unwrap();
+    assert!(!after_patch.contains("patch-secret"));
+
+    let etag = format!("\"{}\"", patched_json["version"].as_str().unwrap());
+    let put_body = json!({
+        "front_matter": { "token": "put-secret" },
+        "markdown": "PUT private notes"
+    })
+    .to_string();
+    let put_headers = [
+        ("Authorization", "Bearer network-secret"),
+        ("Content-Type", "application/json"),
+        ("Idempotency-Key", "550e8400-e29b-41d4-a716-446655440021"),
+        ("If-Match", etag.as_str()),
+    ];
+    let replaced = http_request(
+        address,
+        "PUT",
+        "/api/v1/collections/accounts/records/acme",
+        &put_headers,
+        Some(&put_body),
+    );
+    let replace_replay = http_request(
+        address,
+        "PUT",
+        "/api/v1/collections/accounts/records/acme",
+        &put_headers,
+        Some(&put_body),
+    );
+    assert_eq!(replaced.0, 200, "{}", replaced.1);
+    assert_eq!(replace_replay, replaced);
+    let replaced_json: Value = serde_json::from_str(&replaced.1).unwrap();
+    assert_eq!(replaced_json["front_matter"]["token"], "put-secret");
+    assert_eq!(replaced_json["markdown"], "PUT private notes");
+    let after_put = std::fs::read_to_string(database.join("records/accounts/acme.md")).unwrap();
+    assert!(!after_put.contains("put-secret"));
+    assert!(!after_put.contains("PUT private notes"));
+
+    let head = http_request(
+        address,
+        "GET",
+        "/api/v1/audit/head",
+        &[("Authorization", "Bearer network-secret")],
+        None,
+    );
+    assert_eq!(head.0, 200, "{}", head.1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&head.1).unwrap()["sequence"],
+        3
+    );
+
+    let raw_audit =
+        std::fs::read_to_string(database.join(".cr/audit/segments/00000000000000000001.jsonl"))
+            .unwrap();
+    for plaintext in [
+        "api-secret",
+        "patch-secret",
+        "put-secret",
+        "PUT private notes",
+    ] {
+        assert!(!raw_audit.contains(plaintext));
+    }
+
     let audit = http_request(
         address,
         "GET",

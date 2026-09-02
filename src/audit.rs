@@ -19,6 +19,7 @@ use crate::{
         CollectionEntry, RECORDS_LABEL, collection_directory_name, collection_entry, record_label,
         validate_component,
     },
+    encryption::{EncryptionStorageMetadata, audit_document_encryption_metadata},
     error::{
         DomainError, anchor_mismatch, approval_mismatch, audit_integrity, conflict,
         idempotency_conflict, invalid,
@@ -26,6 +27,19 @@ use crate::{
     frontmatter::Document,
     paths::{self, EntryKind},
 };
+
+/// Exact manifest ownership immediately before and after one verified event.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AuditEncryptionTransition {
+    pub before: Option<EncryptionStorageMetadata>,
+    pub after: Option<EncryptionStorageMetadata>,
+}
+
+impl AuditEncryptionTransition {
+    pub fn metadata(&self) -> impl Iterator<Item = &EncryptionStorageMetadata> {
+        self.before.iter().chain(self.after.iter())
+    }
+}
 
 /// Where the tamper-evident journal lives beneath the database root.
 const SEGMENT_DIRECTORY: &str = ".cr/audit/segments";
@@ -1099,83 +1113,57 @@ impl<'a> AuditLog<'a> {
         })
     }
 
-    /// Sequences whose verified, reconstructed record state contains actual
-    /// manifest-owned ciphertext immediately before or after the event.
-    ///
-    /// Looking for envelope syntax recursively is not enough: an unencrypted
-    /// application may legitimately store an object with the same keys. The
-    /// manifest in the complete reconstructed document is the ownership proof.
-    pub(crate) fn protected_storage_sequences(&self) -> Result<BTreeSet<u64>> {
-        self.storage_sequences(crate::encryption::audit_document_has_encrypted_storage)
-    }
-
-    /// Sequences carrying an exact CR manifest, even when every optional
-    /// protected value is absent. Current encryption policies use this to
-    /// remove storage metadata from logical history without inventing
-    /// ownership from standalone envelope syntax.
-    pub(crate) fn encryption_manifest_sequences(&self) -> Result<BTreeSet<u64>> {
-        self.storage_sequences(crate::encryption::audit_document_has_encryption_manifest)
-    }
-
-    fn storage_sequences(&self, owns_storage: fn(&Value) -> bool) -> Result<BTreeSet<u64>> {
+    /// Replay the complete verified chain and retain each event's exact
+    /// historical manifest policy. Replay also checks v3 snapshots,
+    /// idempotency results, and scoped retry uniqueness before this metadata is
+    /// trusted by logical history projection or lazy context creation.
+    pub(crate) fn encryption_storage_transitions(
+        &self,
+    ) -> Result<HashMap<u64, AuditEncryptionTransition>> {
         let mut latest = AuditedRecordStates::new();
-        let mut protected = BTreeSet::new();
+        let mut transitions = HashMap::new();
         self.verify_chain(|entry, _| {
             let key = (
                 entry.payload.record.collection.clone(),
                 entry.payload.record.id.clone(),
             );
-            let had_history = latest.contains_key(&key);
-            let state = latest.entry(key).or_insert_with(|| AuditedRecordState {
-                hash: None,
-                document: None,
-                legacy_representation_gap: None,
-            });
-            if state.hash != entry.payload.before_hash {
-                bail!(
-                    "audit record-state chain is broken at sequence {}",
-                    entry.payload.sequence
+            let before = latest
+                .get(&key)
+                .and_then(|state| state.document.as_ref())
+                .and_then(audit_document_encryption_metadata);
+            replay_entry(&mut latest, entry)?;
+            let after = latest
+                .get(&key)
+                .and_then(|state| state.document.as_ref())
+                .and_then(audit_document_encryption_metadata);
+            if before.is_some() || after.is_some() {
+                transitions.insert(
+                    entry.payload.sequence,
+                    AuditEncryptionTransition { before, after },
                 );
-            }
-            if !had_history
-                && !matches!(
-                    entry.payload.action,
-                    AuditAction::Create | AuditAction::Baseline
-                )
-            {
-                bail!(
-                    "audit record history begins with an invalid action at sequence {}",
-                    entry.payload.sequence
-                );
-            }
-            let before = state.document.as_ref().is_some_and(owns_storage);
-            apply_changes(&mut state.document, &entry.payload.changes).with_context(|| {
-                format!(
-                    "audit changes are inconsistent at sequence {}",
-                    entry.payload.sequence
-                )
-            })?;
-            if state.document.is_some() != entry.payload.after_hash.is_some() {
-                bail!(
-                    "audit record state is inconsistent at sequence {}",
-                    entry.payload.sequence
-                );
-            }
-            state.hash = entry.payload.after_hash.clone();
-            let after = state.document.as_ref().is_some_and(owns_storage);
-            if before || after {
-                protected.insert(entry.payload.sequence);
             }
             Ok(())
         })?;
-        Ok(protected)
+        Ok(transitions)
     }
 
     /// Whether verified history contains any manifest-owned ciphertext. Used
     /// before lazily creating a context for a database initialized by an older
     /// CR version, including when the encrypted record was later deleted.
     pub(crate) fn contains_protected_storage(&self) -> Result<bool> {
-        Ok(!self.protected_storage_sequences()?.is_empty())
+        Ok(self
+            .encryption_storage_transitions()?
+            .values()
+            .any(|transition| {
+                transition
+                    .before
+                    .as_ref()
+                    .is_some_and(|state| state.has_envelopes)
+                    || transition
+                        .after
+                        .as_ref()
+                        .is_some_and(|state| state.has_envelopes)
+            }))
     }
 
     /// Replay the chain, reconcile it with the records, and check the head.
@@ -1994,8 +1982,8 @@ fn verify_idempotency_result(
             entry.payload.sequence
         ))
     };
-    if !valid_stored_digest(&idempotency.key_hash)
-        || !valid_stored_digest(&idempotency.request_hash)
+    if !valid_stored_digest(&idempotency.key_hash, "sha256:")
+        || !valid_stored_digest(&idempotency.request_hash, "hmac-sha256:")
     {
         return Err(invalid("digest has an invalid format"));
     }
@@ -2078,8 +2066,8 @@ fn register_idempotency_identity(
     )))
 }
 
-fn valid_stored_digest(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|digest| {
+fn valid_stored_digest(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|digest| {
         digest.len() == 64
             && digest
                 .bytes()
@@ -3239,7 +3227,7 @@ mod tests {
             principal: "tester".to_owned(),
             operation: "update".to_owned(),
             key_hash,
-            request_hash: digest(b"test:request\0", request),
+            request_hash: format!("hmac-{}", digest(b"test:request\0", request)),
             result: AuditIdempotencyResult {
                 path: target.to_path_buf(),
                 version: record_hash(raw.as_bytes()),

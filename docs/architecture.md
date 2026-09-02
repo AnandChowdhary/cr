@@ -151,10 +151,13 @@ revelation. Audit preparation receives stored documents, so its hashes and
 replay state remain exact ciphertext and `audit verify` needs no key. Audit
 diffing treats an envelope as an atomic logical value rather than recursively
 showing nonce/ciphertext internals. Authorized history reads reveal full root
-snapshots and protected values inside changed parent subtrees in memory.
-That response is a logical projection: `changes` may contain plaintext while
-the returned `hash` and `authorization.approved_changes` still commit to the
-stored ciphertext bytes. A caller cannot recompute those commitments by
+snapshots, protected values inside changed parent subtrees, version 3
+`after_snapshot` Markdown, and idempotency result Markdown in memory.
+Per-sequence reconstructed manifests must name the exact current policy before
+projection; moving a marker cannot reinterpret an old envelope under a new AAD
+path. That response is a logical projection: those fields may contain plaintext
+while the returned `hash` and `authorization.approved_changes` still commit to
+the stored ciphertext bytes. A caller cannot recompute those commitments by
 serializing the projection; verification always reads the journal itself.
 
 Fresh encryption and the existing preview-approval protocol have incompatible
@@ -278,9 +281,10 @@ Supported single-record mutation calls may carry a validated 16–128 byte
 visible-ASCII idempotency key. `Database` hashes it with
 `cr:idempotency:key:v1\0` and never stores or reports the raw value. The lookup
 scope is the effective principal, canonical operation, and record identity. A
-second domain-separated digest commits to a canonical JSON request envelope:
-payload, conditional record versions, audit source and message, attribution,
-actor, and impersonating operator. JSON objects use `serde_json::Value`'s
+second digest is HMAC-SHA-256 keyed by the raw retry key, under the
+`cr:idempotency:request:v2\0` domain, and commits to a canonical JSON request
+envelope: payload, conditional record versions, audit source and message,
+attribution, actor, and impersonating operator. JSON objects use `serde_json::Value`'s
 sorted map representation, so member order does not change the digest; arrays
 remain ordered where order can affect mutation semantics. YAML values inside
 the envelope use an explicit tagged tree rather than JSON object encoding.
@@ -292,8 +296,11 @@ without a retry key never serializes this envelope.
 The durable source of truth is an optional `idempotency` object in the audit
 event, not a check-then-write cache. It holds the principal, operation, key and
 request hashes, and the original `Record` result as its relative path, exact
-Markdown, and exact-byte version. The path must be a safe relative path ending
-in the event's collection and record ID. Keeping it rather than deriving it
+stored Markdown, and exact-byte version. For a protected collection these are
+the ciphertext Markdown and ciphertext-derived version; replay reveals the
+logical document only after current authorization and schema/context/key
+checks, without allocating a new nonce. The path must be a safe relative path
+ending in the event's collection and record ID. Keeping it rather than deriving it
 from the current configuration makes an exact replay stable across a later
 `data_dir` change.
 The object is serialized into the prepared event before `pending.json` is
@@ -320,6 +327,10 @@ its exact-byte hash must equal the stored result version and `after_hash`, or
 names the guilty sequence. The ordinary replay-integrity pass runs first, so a
 forger cannot make a changed event and retry result agree while leaving the
 event's exact snapshot inconsistent.
+
+Sync deliberately clears any caller idempotency key from its internal database
+handle. Its multi-record recovery ledger is the only retry contract for sync;
+no per-record sync mutation can accidentally consume or replay a caller key.
 
 V1 covers library operations behind CLI create/update/link/delete and REST
 record POST/PATCH/PUT/DELETE/link POST. It deliberately excludes multi-record

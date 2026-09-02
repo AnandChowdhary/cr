@@ -18,6 +18,10 @@ use serde_json::Value;
 const OLD_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const NEW_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 const WRONG_KEY: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI";
+const RETRY_KEY: &str = "550e8400-e29b-41d4-a716-446655440000";
+const UPDATE_KEY: &str = "550e8400-e29b-41d4-a716-446655440010";
+const LINK_KEY: &str = "550e8400-e29b-41d4-a716-446655440011";
+const DELETE_KEY: &str = "550e8400-e29b-41d4-a716-446655440012";
 
 fn schema() -> &'static str {
     r#"{
@@ -177,6 +181,205 @@ fn encrypted_fields_and_body_are_plaintext_at_every_cr_read_boundary() {
     run_success(database.command().args(["audit", "verify"]));
     let report = json(command(&database).args(["check", "--json"]));
     assert_eq!(report["summary"]["errors"], 0);
+}
+
+#[test]
+fn protected_idempotency_keeps_ciphertext_durable_and_replays_logical_plaintext() {
+    let database = TestDatabase::new("encrypted-idempotency");
+    write_schema(&database);
+    let arguments = [
+        "create",
+        "accounts",
+        "acme",
+        "--set",
+        "stage=lead",
+        "--set",
+        "contact.token=retry-secret-token",
+        "--body",
+        "retry private notes\n",
+        "--idempotency-key",
+        RETRY_KEY,
+        "--json",
+    ];
+
+    let first = json(command(&database).args(arguments));
+    let stored_first = stored_document(&database, "acme");
+    let audit_first = audit_bytes(&database);
+    assert!(!stored_first.contains("retry-secret-token"));
+    assert!(!stored_first.contains("retry private notes"));
+    assert!(!audit_first.contains("retry-secret-token"));
+    assert!(!audit_first.contains("retry private notes"));
+    assert!(!audit_first.contains(RETRY_KEY));
+
+    let stored_event: Value = serde_json::from_str(audit_first.lines().next().unwrap()).unwrap();
+    assert!(
+        stored_event["payload"]["idempotency"]["request_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("hmac-sha256:")
+    );
+    let stored_result = stored_event["payload"]["idempotency"]["result"]["markdown"]
+        .as_str()
+        .unwrap();
+    assert!(stored_result.contains("$cr_encrypted"));
+    assert!(!stored_result.contains("retry-secret-token"));
+    assert_eq!(
+        stored_event["payload"]["idempotency"]["result"]["version"],
+        first["version"]
+    );
+
+    let replay = json(command(&database).args(arguments));
+    assert_eq!(replay, first);
+    assert_eq!(stored_document(&database, "acme"), stored_first);
+    assert_eq!(audit_bytes(&database), audit_first);
+
+    let history = json(command(&database).args(["audit", "log", "accounts", "acme", "--json"]));
+    for projected in [
+        history[0]["after_snapshot"]["markdown"].as_str().unwrap(),
+        history[0]["idempotency"]["result"]["markdown"]
+            .as_str()
+            .unwrap(),
+    ] {
+        assert!(projected.contains("retry-secret-token"));
+        assert!(projected.contains("retry private notes"));
+        assert!(!projected.contains("$cr_encrypted"));
+    }
+    assert_eq!(history[0]["hash"], stored_event["hash"]);
+    assert_eq!(history[0]["after_hash"], first["version"]);
+
+    let missing = run_failure(database.command().args(arguments));
+    assert!(missing.contains("CR_ENCRYPTION_KEYS is required"));
+    assert!(!missing.contains("retry-secret-token"));
+    assert_eq!(audit_bytes(&database), audit_first);
+
+    let rotated = json(
+        database
+            .command()
+            .env("CR_ENCRYPTION_ACTIVE_KEY", "new")
+            .env(
+                "CR_ENCRYPTION_KEYS",
+                format!(r#"{{"old":"{OLD_KEY}","new":"{NEW_KEY}"}}"#),
+            )
+            .args(arguments),
+    );
+    assert_eq!(rotated, first);
+    assert_eq!(stored_document(&database, "acme"), stored_first);
+    assert_eq!(audit_bytes(&database), audit_first);
+
+    fs::write(
+        database.root.join(".cr/config.yaml"),
+        "version: 1\ndata_dir: content/data\n",
+    )
+    .unwrap();
+    fs::create_dir_all(database.root.join("content/data")).unwrap();
+    let moved_replay = json(command(&database).args(arguments));
+    assert_eq!(moved_replay, first);
+    assert_eq!(moved_replay["path"], "records/accounts/acme.md");
+    assert_eq!(audit_bytes(&database), audit_first);
+}
+
+#[test]
+fn protected_update_link_and_delete_retries_return_the_exact_logical_result() {
+    let database = TestDatabase::new("encrypted-idempotency-operations");
+    write_schema(&database);
+    for (id, token) in [("one", "initial-secret-one"), ("two", "target-secret-two")] {
+        run_success(command(&database).args([
+            "create",
+            "accounts",
+            id,
+            "--set",
+            "stage=lead",
+            "--set",
+            &format!("contact.token={token}"),
+            "--body",
+            "private notes",
+        ]));
+    }
+
+    let update = [
+        "update",
+        "accounts",
+        "one",
+        "--set",
+        "contact.token=updated-secret-one",
+        "--idempotency-key",
+        UPDATE_KEY,
+        "--json",
+    ];
+    let updated = json(command(&database).args(update));
+    let updated_storage = stored_document(&database, "one");
+    let updated_head = json(database.command().args(["audit", "head", "--json"]))["sequence"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(json(command(&database).args(update)), updated);
+    assert_eq!(stored_document(&database, "one"), updated_storage);
+    assert_eq!(
+        json(database.command().args(["audit", "head", "--json"]))["sequence"],
+        updated_head
+    );
+
+    let wrong = run_failure(
+        database
+            .command()
+            .env("CR_ENCRYPTION_ACTIVE_KEY", "old")
+            .env("CR_ENCRYPTION_KEYS", format!(r#"{{"old":"{WRONG_KEY}"}}"#))
+            .args(update),
+    );
+    assert!(wrong.contains("protected data could not be decrypted"));
+    assert!(!wrong.contains("updated-secret-one"));
+    assert!(!wrong.contains("contact.token"));
+
+    let link = [
+        "link",
+        "accounts",
+        "one",
+        "peer",
+        "accounts",
+        "two",
+        "--idempotency-key",
+        LINK_KEY,
+        "--json",
+    ];
+    let linked = json(command(&database).args(link));
+    let linked_storage = stored_document(&database, "one");
+    let linked_head = json(database.command().args(["audit", "head", "--json"]))["sequence"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(json(command(&database).args(link)), linked);
+    assert_eq!(stored_document(&database, "one"), linked_storage);
+    assert_eq!(
+        json(database.command().args(["audit", "head", "--json"]))["sequence"],
+        linked_head
+    );
+
+    let delete = [
+        "delete",
+        "accounts",
+        "one",
+        "--yes",
+        "--idempotency-key",
+        DELETE_KEY,
+        "--json",
+    ];
+    let deleted = json(command(&database).args(delete));
+    let audit_after_delete = audit_bytes(&database);
+    let delete_head = json(database.command().args(["audit", "head", "--json"]))["sequence"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        deleted["attributes"]["contact"]["token"],
+        "updated-secret-one"
+    );
+    assert_eq!(json(command(&database).args(delete)), deleted);
+    assert_eq!(audit_bytes(&database), audit_after_delete);
+    assert_eq!(
+        json(database.command().args(["audit", "head", "--json"]))["sequence"],
+        delete_head
+    );
+    assert!(!database.root.join("records/accounts/one.md").exists());
+    assert!(!audit_after_delete.contains("initial-secret-one"));
+    assert!(!audit_after_delete.contains("updated-secret-one"));
+    assert!(!audit_after_delete.contains("private notes"));
 }
 
 #[test]
@@ -734,6 +937,46 @@ fn removing_schema_markers_does_not_expose_envelopes_as_ordinary_data() {
 }
 
 #[test]
+fn moving_a_schema_marker_never_projects_an_old_envelope_at_the_new_path() {
+    let database = TestDatabase::new("encrypted-marker-move");
+    write_schema(&database);
+    run_success(command(&database).args([
+        "create",
+        "accounts",
+        "one",
+        "--set",
+        "stage=lead",
+        "--set",
+        "contact.token=marker-move-secret",
+    ]));
+    fs::write(
+        database.root.join(".cr/schemas/accounts.json"),
+        r#"{
+  "type": "object",
+  "properties": {
+    "stage": { "type": "string" },
+    "contact": {
+      "type": "object",
+      "properties": {
+        "token": { "type": "string" },
+        "other": { "type": "string", "x-cr-encrypted": true }
+      }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    let history = run_failure(
+        command(&database).args(["audit", "log", "accounts", "one", "--limit", "1", "--json"]),
+    );
+    assert!(history.contains("stored protected history is no longer declared"));
+    assert!(!history.contains("marker-move-secret"));
+    assert!(!history.contains("$cr_encrypted"));
+    assert!(!history.contains("ciphertext"));
+}
+
+#[test]
 fn unencrypted_raw_reads_preserve_exact_formatting() {
     let database = TestDatabase::new("unencrypted-raw-format");
     fs::create_dir_all(database.root.join("records/notes")).unwrap();
@@ -767,6 +1010,8 @@ fn encrypted_pending_mutations_recover_over_ciphertext_without_keys() {
             "contact.token=recovery-secret",
             "--body",
             "recovery notes",
+            "--idempotency-key",
+            RETRY_KEY,
         ],
     );
     assert!(!String::from_utf8_lossy(&interruption.pending).contains("recovery-secret"));
@@ -781,6 +1026,28 @@ fn encrypted_pending_mutations_recover_over_ciphertext_without_keys() {
     let verification = run_success(database.command().args(["audit", "verify"]));
     assert!(verification.contains("Verified 1 audit events and 1 records"));
     assert!(database.read_pending().is_none());
+
+    let mut replay_command = database.command();
+    replay_command
+        .env("CR_ENCRYPTION_ACTIVE_KEY", "old")
+        .env("CR_ENCRYPTION_KEYS", format!(r#"{{"old":"{OLD_KEY}"}}"#))
+        .args([
+            "create",
+            "accounts",
+            "one",
+            "--set",
+            "stage=lead",
+            "--set",
+            "contact.token=recovery-secret",
+            "--body",
+            "recovery notes",
+            "--idempotency-key",
+            RETRY_KEY,
+            "--json",
+        ]);
+    let replay = json(&mut replay_command);
+    assert_eq!(replay["attributes"]["contact"]["token"], "recovery-secret");
+    assert_eq!(database.head_sequence(), 1);
 
     let record = json(
         database

@@ -2419,7 +2419,7 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "principal": { "type": "string" },
                 "operation": { "enum": ["create", "update", "patch", "replace", "link", "delete"] },
                 "key_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-                "request_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                "request_hash": { "type": "string", "pattern": "^hmac-sha256:[0-9a-f]{64}$", "description": "HMAC-SHA-256 of the canonical plaintext request, keyed by the raw retry key; the key itself is never stored." },
                 "result": {
                     "type": "object",
                     "required": ["path", "version", "markdown"],

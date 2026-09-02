@@ -453,8 +453,9 @@ returns the old result, so revoking access also revokes replay access. Delete
 retries return the original deleted record even though its file is now absent.
 
 The audit event is the idempotency store. It contains a domain-separated hash
-of the key—never the raw key—the canonical request hash, and the exact domain
-result, including its original relative path and exact Markdown. The stored
+of the key—never the raw key—an HMAC-SHA-256 of the canonical plaintext request
+keyed by that raw key, and the exact operation result, including its original
+relative path and exact Markdown. The stored
 path is checked against the event's collection and ID, so changing `data_dir`
 later does not alter a replayed response or open an arbitrary-path channel.
 Those fields pass through the same pending-mutation journal and audit lock as
@@ -1347,6 +1348,17 @@ projection: protected values in `changes` are decrypted for the caller. The
 event `hash` and any `authorization.approved_changes` digest still commit to the
 exact stored ciphertext bytes, so they cannot be recomputed by serializing that
 plaintext projection. `audit verify` always verifies the stored representation.
+
+The same boundary applies to idempotent mutations. Their durable result keeps
+the exact ciphertext Markdown and ciphertext-derived record version so a retry
+does not generate a nonce or event. After current authorization succeeds, CR
+decrypts that stored result in memory and returns the original logical record.
+Authorized history likewise projects `changes`, version 3 `after_snapshot`
+Markdown, and idempotency-result Markdown to plaintext, while the raw journal,
+pending mutation, hashes, and record versions continue to commit to ciphertext.
+The request identity is an HMAC-SHA-256 over canonical typed plaintext keyed by
+the never-stored retry key, so the journal is not an offline dictionary oracle
+for a protected request value.
 
 ## Import data with sync adapters
 
