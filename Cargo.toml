@@ -32,9 +32,12 @@ exclude = ["/docs/screenshots/", "/.github/"]
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
 clap = { version = "4.6", features = ["derive"] }
 form_urlencoded = "1.2"
 getrandom = "0.4"
+hmac = "0.13"
 # Default features stay off: they are `resolve-http`/`resolve-file`/`tls-*`,
 # which fetch a `$ref` over the network, and a local-first database has no
 # business doing that. `idna` is a different thing and has to be asked for
@@ -57,6 +60,7 @@ tempfile = "3.27"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal"] }
 yaml_serde = "0.10"
+zeroize = "1.8"
 
 [dev-dependencies]
 http-body-util = "0.1"

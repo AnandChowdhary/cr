@@ -24,6 +24,17 @@ pub enum DomainError {
     AlreadyExists(String),
     /// The request conflicts with durable record or audit state.
     Conflict(String),
+    /// A conditional mutation named a record version that is no longer current.
+    ///
+    /// This is deliberately distinct from [`Self::Conflict`]. HTTP maps it to
+    /// `412 Precondition Failed`, and CLI callers can branch on the stable
+    /// `precondition_failed` code instead of parsing prose.
+    PreconditionFailed(String),
+    /// An idempotency key was already committed for a different request.
+    ///
+    /// This has its own stable code so callers can distinguish a programming
+    /// error in retry handling from an ordinary record-state conflict.
+    IdempotencyConflict(String),
     /// The authenticated principal is not permitted to perform this action.
     Forbidden(String),
     /// The request is well formed but is not valid for this database.
@@ -37,6 +48,15 @@ pub enum DomainError {
     /// corrupt". Sharing a code with every other conflict would bury exactly
     /// the distinction the digest exists to make.
     ApprovalMismatch(String),
+    /// The audit chain hashes correctly, but its recorded change sets do not
+    /// reproduce the record states the same events claim.
+    ///
+    /// This is separate from [`Self::Conflict`] because it is evidence about
+    /// stored journal integrity, not an ordinary stale-write conflict. The
+    /// message deliberately names only the event sequence and the failed
+    /// invariant; lower-level parse/apply errors stay in the anyhow chain and
+    /// are never returned to a remote caller.
+    AuditIntegrity(String),
     /// The journal does not agree with the audit anchor kept beside it.
     ///
     /// Its own variant for the same reason as [`Self::ApprovalMismatch`]. "The
@@ -67,9 +87,12 @@ impl DomainError {
             Self::NotFound(_) => "not_found",
             Self::AlreadyExists(_) => "already_exists",
             Self::Conflict(_) => "conflict",
+            Self::PreconditionFailed(_) => "precondition_failed",
+            Self::IdempotencyConflict(_) => "idempotency_conflict",
             Self::Forbidden(_) => "forbidden",
             Self::Invalid(_) => "validation_failed",
             Self::ApprovalMismatch(_) => "approval_mismatch",
+            Self::AuditIntegrity(_) => "audit_integrity_failed",
             Self::AnchorMismatch(_) => "anchor_mismatch",
         }
     }
@@ -80,9 +103,12 @@ impl DomainError {
             Self::NotFound(message)
             | Self::AlreadyExists(message)
             | Self::Conflict(message)
+            | Self::PreconditionFailed(message)
+            | Self::IdempotencyConflict(message)
             | Self::Forbidden(message)
             | Self::Invalid(message)
             | Self::ApprovalMismatch(message)
+            | Self::AuditIntegrity(message)
             | Self::AnchorMismatch(message) => message,
         }
     }
@@ -174,6 +200,16 @@ pub(crate) fn conflict(message: impl Display) -> anyhow::Error {
     anyhow::Error::new(DomainError::Conflict(message.to_string()))
 }
 
+/// Build a stale-record-precondition failure for conditional mutations.
+pub(crate) fn precondition_failed(message: impl Display) -> anyhow::Error {
+    anyhow::Error::new(DomainError::PreconditionFailed(message.to_string()))
+}
+
+/// Build a failure for reuse of an idempotency key with different semantics.
+pub(crate) fn idempotency_conflict(message: impl Display) -> anyhow::Error {
+    anyhow::Error::new(DomainError::IdempotencyConflict(message.to_string()))
+}
+
 /// Build an authorization refusal for `bail!`-style returns.
 pub(crate) fn forbidden(message: impl Display) -> anyhow::Error {
     anyhow::Error::new(DomainError::Forbidden(message.to_string()))
@@ -182,6 +218,11 @@ pub(crate) fn forbidden(message: impl Display) -> anyhow::Error {
 /// Build an approved-change-digest mismatch for `bail!`-style returns.
 pub(crate) fn approval_mismatch(message: impl Display) -> anyhow::Error {
     anyhow::Error::new(DomainError::ApprovalMismatch(message.to_string()))
+}
+
+/// Build an audit-replay-integrity failure.
+pub(crate) fn audit_integrity(message: impl Display) -> anyhow::Error {
+    anyhow::Error::new(DomainError::AuditIntegrity(message.to_string()))
 }
 
 /// Build an audit-anchor disagreement for `bail!`-style returns.
@@ -210,8 +251,8 @@ fn io_kind_matches(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DomainError, anchor_mismatch, approval_mismatch, conflict, forbidden, invalid,
-        is_already_exists, is_missing,
+        DomainError, anchor_mismatch, approval_mismatch, audit_integrity, conflict, forbidden,
+        idempotency_conflict, invalid, is_already_exists, is_missing, precondition_failed,
     };
     use anyhow::anyhow;
 
@@ -245,12 +286,24 @@ mod tests {
         );
         assert_eq!(conflict("stale").to_string(), "stale");
         assert_eq!(
+            DomainError::of(&precondition_failed("stale version")).map(DomainError::code),
+            Some("precondition_failed")
+        );
+        assert_eq!(
             DomainError::of(&forbidden("not allowed")).map(DomainError::code),
             Some("forbidden")
         );
         assert_eq!(
             DomainError::of(&approval_mismatch("not approved")).map(DomainError::code),
             Some("approval_mismatch")
+        );
+        assert_eq!(
+            DomainError::of(&audit_integrity("bad replay")).map(DomainError::code),
+            Some("audit_integrity_failed")
+        );
+        assert_eq!(
+            DomainError::of(&idempotency_conflict("already used")).map(DomainError::code),
+            Some("idempotency_conflict")
         );
         assert_eq!(
             DomainError::of(&invalid("bad field")).map(DomainError::code),

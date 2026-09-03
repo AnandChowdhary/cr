@@ -99,6 +99,8 @@ mod tests {
             collection: "companies".into(),
             id: "acme".into(),
             path: PathBuf::from("records/companies/acme.md"),
+            version: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .into(),
             attributes,
             body: "Priority account [VIP].".into(),
         }

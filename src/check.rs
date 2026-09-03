@@ -346,6 +346,29 @@ pub(crate) fn run(database: &Database, scope: &CheckScope) -> Result<CheckReport
         return Err(unknown_collection(collection, &audit)?);
     }
 
+    // Replay history before projecting any record values. Besides supplying
+    // reconciliation state, this is the authenticated ownership source for a
+    // ciphertext envelope whose mutable on-disk manifest was removed. Keep
+    // the result for every record so the expensive audit pass is database-wide
+    // once, rather than once per suspicious record.
+    let audited_states = match audit.record_states_with_approvals() {
+        Err(error) => {
+            // Approval is checked in event order before replaying that event's
+            // result. Keep its distinct diagnosis instead of immediately
+            // relabeling the same forged change set as generic replay damage.
+            if matches!(
+                DomainError::of(&error),
+                Some(DomainError::ApprovalMismatch(_))
+            ) {
+                findings.push(approval_finding(&error));
+            } else {
+                findings.push(chain_finding(&error));
+            }
+            None
+        }
+        Ok(states) => Some(states),
+    };
+
     // Phase two, bounded by scope and expensive: read, hash, parse, and
     // validate every selected record.
     let mut scanned: BTreeMap<(String, String), ScannedRecord> = BTreeMap::new();
@@ -366,6 +389,7 @@ pub(crate) fn run(database: &Database, scope: &CheckScope) -> Result<CheckReport
             collection,
             id,
             index.symlinked.contains(&(collection.clone(), id.clone())),
+            audited_states.as_ref(),
             &mut findings,
         )?;
         scanned.insert((collection.clone(), id.clone()), record);
@@ -380,19 +404,10 @@ pub(crate) fn run(database: &Database, scope: &CheckScope) -> Result<CheckReport
     }
     mark_blocked(&mut scanned, &findings);
 
-    // Phase three: reconcile against the journal, or explain why we cannot.
-    let audited_records = match audit.record_states() {
-        Ok(states) => {
-            if let Err(error) = audit.verify_approvals() {
-                findings.push(approval_finding(&error));
-            }
-            reconcile(&states, &scanned, selected.as_deref(), &mut findings)
-        }
-        Err(error) => {
-            findings.push(chain_finding(&error));
-            0
-        }
-    };
+    // Phase three: reconcile against the already replayed journal.
+    let audited_records = audited_states.as_ref().map_or(0, |states| {
+        reconcile(states, &scanned, selected.as_deref(), &mut findings)
+    });
 
     // Database-wide, and therefore reported under `--collection` too: a
     // half-applied import is not a property of one collection.
@@ -547,6 +562,7 @@ fn scan_record(
     collection: &str,
     id: &str,
     special: bool,
+    audited_states: Option<&crate::audit::AuditedRecordStates>,
     findings: &mut Vec<Finding>,
 ) -> Result<ScannedRecord> {
     let mut record = ScannedRecord {
@@ -600,7 +616,7 @@ fn scan_record(
         ));
         return Ok(record);
     };
-    let document = match Document::parse(&text) {
+    let stored_document = match Document::parse(&text) {
         Ok(document) => document,
         Err(error) => {
             findings.push(Finding::record(
@@ -613,14 +629,55 @@ fn scan_record(
             return Ok(record);
         }
     };
+    let schema_state = validators.get(database, collection, findings)?;
+    if matches!(schema_state, SchemaState::Unusable) {
+        record.blocked = true;
+        return Ok(record);
+    }
+    let document = match database.reveal_document_with_audited_states(
+        collection,
+        id,
+        &stored_document,
+        audited_states,
+    ) {
+        Ok(document) => document,
+        Err(error) => {
+            findings.push(Finding::record(
+                FindingKind::UnreadableRecord,
+                Severity::Error,
+                collection,
+                id,
+                format!(
+                    "record {collection}/{id} has unreadable protected data: {}",
+                    safe(&error)
+                ),
+            ));
+            return Ok(record);
+        }
+    };
 
-    match validators.get(database, collection, findings)? {
+    match schema_state {
         SchemaState::Absent => {}
-        SchemaState::Unusable => record.blocked = true,
+        SchemaState::Unusable => unreachable!("returned above"),
         SchemaState::Ready(validator) => {
             let instance = serde_json::to_value(&document.attributes);
             match instance {
                 Ok(instance) => {
+                    if database.collection_uses_encryption(collection)?
+                        && !validator.is_valid(&instance)
+                    {
+                        findings.push(Finding::record(
+                            FindingKind::SchemaViolation,
+                            Severity::Error,
+                            collection,
+                            id,
+                            format!(
+                                "record {collection}/{id} does not match the schema for collection '{collection}' (protected values redacted)"
+                            ),
+                        ));
+                        record.attributes = Some(document.attributes);
+                        return Ok(record);
+                    }
                     for error in validator.iter_errors(&instance) {
                         let mut finding = Finding::record(
                             FindingKind::SchemaViolation,
@@ -966,6 +1023,13 @@ fn compile_schema(
     };
     if let Err(error) = jsonschema::meta::validate(&schema) {
         findings.extend(unusable(format!("it is not a valid JSON Schema: {error}")));
+        return Ok(None);
+    }
+    if let Err(error) = database.collection_uses_encryption(collection) {
+        findings.extend(unusable(format!(
+            "its encryption annotations are invalid: {}",
+            safe(&error)
+        )));
         return Ok(None);
     }
     match jsonschema::validator_for(&schema) {

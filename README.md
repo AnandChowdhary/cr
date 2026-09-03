@@ -19,7 +19,7 @@
 
 | Own the source | Model what you need |
 | --- | --- |
-| Each record is a readable Markdown file. Direct edits are first-class and reviewed with `cr status` and `cr save`. | Collections and typed YAML fields are arbitrary, with optional JSON Schema validation and relationships. |
+| Each record is a readable Markdown file by default. Direct edits are first-class; collections that need confidentiality can opt specific values into encrypted storage. | Collections and typed YAML fields are arbitrary, with optional JSON Schema validation and relationships. |
 | **Query everywhere** | **Trust the history** |
 | Filter, compare, sort, search, and page through the same data from the CLI, REST API, tables, or Kanban boards. | Every accepted create, update, link, move, direct edit, sync, and delete extends a tamper-evident audit chain. |
 
@@ -90,6 +90,7 @@ The new directory contains:
 my-database/
 ├── .cr/
 │   ├── audit/
+│   ├── encryption.json
 │   ├── schemas/
 │   ├── sync/
 │   ├── syncs/
@@ -99,6 +100,9 @@ my-database/
 
 - `records/` contains your Markdown records.
 - `.cr/audit/` contains the audit journal.
+- `.cr/encryption.json` is a portable, non-secret database identity used to
+  bind protected ciphertext to this database. Keep it with every clone and
+  backup.
 - `.cr/schemas/` can contain optional validation rules.
 - `.cr/syncs/` contains versioned external sync definitions; `.cr/sync/` holds their checkpoints and locks.
 - `.cr/views/` contains optional saved web views.
@@ -382,9 +386,96 @@ over is an error, not a silent truncation.
 `-m/--message` also now works on `create`, `update`, `link`, and `delete`, not
 only `save`. It keeps its existing meaning: a short note about the change.
 
+### Keep a read-modify-write from overwriting a newer record
+
+Every single-record read has a `version`: `sha256:` plus SHA-256 over the bytes
+`cr:record:v1\0` followed by the exact stored Markdown bytes, including front
+matter formatting and body text. The domain prefix prevents a record version
+from being confused with an audit event or change-set digest. `cr get --json`
+prints it. Pass that value back when a CLI mutation was calculated from a prior read:
+
+```sh
+version=$(cr get deals acme-renewal --json | jq -r .version)
+cr update deals acme-renewal --set status=won \
+  --expected-record-hash "$version"
+```
+
+`update`, `link`, and `delete` accept `--expected-record-hash`. A competing
+write makes the command fail with the typed `precondition_failed` code; a
+malformed hash is `validation_failed`. The comparison is made after acquiring
+the same audit lock that guards the write, so another process cannot change the
+record between checking the version and committing it.
+
+REST record reads return the same value in the JSON `version` field and as a
+strong `ETag`, including exact-document reads. Send that ETag as `If-Match` on a
+conditional `PATCH`, `DELETE`, or link request. `PUT` replaces the complete
+front matter and Markdown document and therefore requires `If-Match`; omitting
+it returns `428 precondition_required`, while a stale or weak validator returns
+`412 precondition_failed`. Atomic `PATCH` remains safe and unconditional when
+the header is omitted: its merge is calculated from the current record while
+the lock is held, rather than from a client-supplied whole document.
+
+The server-rendered editor and delete form carry the record version in a hidden
+field automatically. Leaving an old form open can no longer overwrite or
+delete a record changed in another tab; the stale submission returns 412 and
+creates no audit event.
+
+### Retry one mutation without doing it twice
+
+`create`, `update`, `link`, and `delete` accept `--idempotency-key`. Generate a
+fresh random key for one logical operation and keep it unchanged across retries:
+
+```sh
+key=$(openssl rand -hex 16)
+cr create deals acme-renewal --set status=open --idempotency-key "$key"
+# Safe after a timeout: prints the same result and appends no second event.
+cr create deals acme-renewal --set status=open --idempotency-key "$key"
+```
+
+Add `--json` to any supported CLI mutation to receive the original structured
+record result on both the first success and every exact replay. For delete,
+that JSON is the full pre-delete record retained by the event.
+
+Keys contain 16–128 visible ASCII bytes; use at least 128 bits of randomness.
+They are scoped by the effective principal, canonical operation, and target
+record. The request digest also covers the payload, record precondition, API or
+CLI source, audit message, attribution, and impersonating operator. Reusing a
+key in that scope with different semantics fails as
+`idempotency_conflict` (`409` over HTTP). JSON object member order is not a
+semantic difference. YAML input is encoded with explicit scalar, sequence,
+mapping, and tag types before hashing, so keys such as `true` and `"true"`
+remain different and non-string keys never pass through JSON's object-key
+coercion. Reusing the same key on another record is independent.
+
+Only a committed success consumes a key. Preview, validation, authorization,
+and write failures do not. A replay still runs current authorization before it
+returns the old result, so revoking access also revokes replay access. Delete
+retries return the original deleted record even though its file is now absent.
+
+The audit event is the idempotency store. It contains a domain-separated hash
+of the key—never the raw key—an HMAC-SHA-256 of the canonical plaintext request
+keyed by that raw key, and the exact operation result, including its original
+relative path and exact Markdown. The stored
+path is checked against the event's collection and ID, so changing `data_dir`
+later does not alter a replayed response or open an arbitrary-path channel.
+Those fields pass through the same pending-mutation journal and audit lock as
+the record write. A concurrent duplicate waits and replays; a crash
+after the record write is recovered into the event before the retry is looked
+up; a lost success response is therefore safe to retry. `audit verify` binds
+the stored result back to the event's semantic state, exact bytes, and record
+version.
+
+REST uses the same contract through `Idempotency-Key` on record `POST`, `PATCH`,
+`PUT`, `DELETE`, and link `POST` requests. Keep the same `If-Match` and
+attribution headers on a retry. `save`, sync application, managed `cr user` and
+`cr access` lifecycle commands, and server-rendered form posts are not in this
+single-record v1 contract; `user ensure` remains declaratively idempotent on its
+own terms.
+
 ### Approve a change set before it is written
 
-Everything above is asserted. This is the one thing `cr` checks.
+Actor and agent attribution are asserted. The preview digest is a separate
+value `cr` can check against the change it is about to record.
 
 `--preview` computes the change set a mutation would record and prints a digest
 over it, without writing anything — no record change, no audit event, no pending
@@ -449,7 +540,7 @@ curl -X PATCH 'http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renew
 ```
 
 `--preview` works on `create`, `update`, `link`, `delete`, and `save`, and
-`preview=true` on `POST`/`PATCH`/`DELETE` records, `POST` links, and `POST
+`preview=true` on `POST`/`PUT`/`PATCH`/`DELETE` records, `POST` links, and `POST
 /api/v1/save`. `cr delete --preview` does not need `--yes`, because it deletes
 nothing.
 
@@ -1032,6 +1123,19 @@ Verify the journal and all current records:
 cr audit verify
 ```
 
+Verification does more than check the event hash chain. It replays every
+record's change sets, checks each `before_hash`, and requires every replayed
+post-state to reproduce that event's exact `after_hash`. Version 3 audit events
+carry a versioned exact-Markdown `after_snapshot` for every state in which the
+record exists. This keeps YAML comments, quoting, key order, and line endings
+honest without making verification depend on a serializer's current output.
+Old version 1 and 2 events remain readable: when their lost representation
+details matter at a record's current head, the matching materialized record is
+used as the exact witness. Payload versions may increase but never decrease
+within a journal. Every new mutation performs the same replay before it writes,
+so an inconsistent older event refuses the write at the guilty sequence with
+`audit_integrity_failed`.
+
 Print the current audit checkpoint:
 
 ```sh
@@ -1046,7 +1150,14 @@ cr audit verify --expected-head 'sha256:YOUR_SAVED_HASH'
 
 ### Anchor the head in Git
 
-Every audit event but the newest is pinned by the hash recorded in the event after it. The newest one is pinned by nothing, so its actor, timestamp, message, and results can be rewritten and re-hashed, and `cr audit verify` will not notice. The fix has always been to keep a copy of the head hash somewhere the forger cannot reach — and the reason it did not help is that saving one by hand is a step nobody performs.
+Every audit event but the newest is pinned by the hash recorded in the event
+after it. The newest one is pinned by nothing. Replay now catches a rewritten
+result whose change set no longer reproduces `after_hash`, but it cannot derive
+an event's actor, timestamp, message, or attribution from record state. Those
+fields can still be rewritten and re-hashed without an external checkpoint.
+The fix for that remaining boundary has always been to keep a copy of the head
+hash somewhere the forger cannot reach — and the reason it did not help is that
+saving one by hand is a step nobody performs.
 
 `cr` now keeps that copy for you, in `.cr-audit-head.json` at the root of the database:
 
@@ -1067,7 +1178,13 @@ cr audit anchor --json
 cr audit anchor --write   # (re)write it to the current head
 ```
 
-**Commit it, or it is worth nothing.** This file sits at the database root, so anybody who can rewrite `.cr/audit/` can rewrite it in the same pass — forge the event, recompute the hash, update the anchor, and verification goes quiet again. Its protection comes entirely from the copy in your **Git history**: a pushed, distributed history is a second place to write that a local process cannot reach. So keep the database in version control and commit the anchor alongside the records it attests:
+**Commit it, or it is worth nothing.** This file sits at the database root, so
+anybody who can rewrite `.cr/audit/` can rewrite it in the same pass — alter
+non-state metadata, recompute the hash, update the anchor, and verification goes
+quiet again. Its protection comes entirely from the copy in your **Git
+history**: a pushed, distributed history is a second place to write that a
+local process cannot reach. So keep the database in version control and commit
+the anchor alongside the records it attests:
 
 ```sh
 git add records .cr-audit-head.json
@@ -1101,7 +1218,15 @@ For records that existed before audit logging was introduced, establish their st
 cr --actor 'migration@example.com' audit baseline
 ```
 
-Audit events retain historical field values and deleted record bodies, and now also any recorded intent text. Everything written to the journal is permanent: removing it would break verification for that event and every event after it. Protect `.cr/audit/` at least as carefully as `records/`, particularly for personal CRM and recruiting data, and treat `--intent-request` and `--intent-rationale` as a bounded attribution channel rather than a place to paste a transcript.
+Audit events retain historical field values and deleted record bodies, and now
+also any recorded intent text. Every version 3 event with a present record
+retains the complete exact post-state in `after_snapshot`, not only the changed
+fields. Everything written to the journal is permanent: removing it would break
+verification for that event and every event after it. Protect `.cr/audit/` at
+least as carefully as `records/`, particularly for personal CRM and recruiting
+data, and treat
+`--intent-request` and `--intent-rationale` as a bounded attribution channel
+rather than a place to paste a transcript.
 
 ## Add validation with JSON Schema
 
@@ -1133,11 +1258,129 @@ For example, `.cr/schemas/applications.json` can restrict ATS stages:
 
 Schemas validate front matter. The record ID, collection, path, and Markdown body remain separate. Creates, updates, links, direct `save` operations, and sync upserts validate before extending the audit journal.
 
+### Encrypt selected values at rest
+
+Encryption is opt-in and schema-directed. Put `x-cr-encrypted: true` on a
+property to encrypt that complete value, or put `x-cr-encrypted-body: true` on
+the schema root to encrypt the Markdown body:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "x-cr-encrypted-body": true,
+  "properties": {
+    "name": { "type": "string" },
+    "credentials": {
+      "type": "object",
+      "properties": {
+        "api_token": {
+          "type": "string",
+          "x-cr-encrypted": true
+        }
+      }
+    }
+  }
+}
+```
+
+The schema still describes plaintext. `create`, `get`, `list`, `search`,
+`update`, sync, REST, and the local app accept and return the same logical
+values as an unencrypted collection. Schema validation, filters, and search run
+over decrypted values in memory. The Markdown file and audit change values use
+versioned XChaCha20-Poly1305 envelopes instead, with a fresh random nonce and
+authenticated context binding the collection, record ID, logical field path,
+purpose, format version, and the random database identity stored in
+`.cr/encryption.json`. Moving or cloning the complete database does not
+invalidate that context, but copying an envelope into an independently
+initialized database fails authentication even when both databases use the
+same keyring. Losing the context file makes existing ciphertext unreadable; it
+is not a secret and belongs in Git and backups. Databases created by an older
+version receive one immediately before their first encrypted write, but CR
+never regenerates it when protected records or history already exist.
+`audit verify` checks stored ciphertext hashes without
+keys; `audit log` needs the keys because it renders logical values.
+
+Keys stay outside the database and its Git history. Configure an active key for
+writes and a JSON keyring for reads:
+
+```sh
+key=$(openssl rand 32 | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+export CR_ENCRYPTION_ACTIVE_KEY=primary
+export CR_ENCRYPTION_KEYS="{\"primary\":\"$key\"}"
+```
+
+Each value must be an unpadded base64url encoding of exactly 32 random bytes.
+Key IDs are stored with envelopes, so rotation means adding the old and new
+keys to the keyring and selecting the new ID as active. New or changed protected
+values use the active key; unchanged values keep their existing envelope.
+Retain every old key needed to read audit history.
+
+The stored front matter also carries a reserved `$cr_encryption` manifest. New
+writes reserve that name even in unencrypted collections. With no encryption
+policy, an unrelated managed update or direct `save` may preserve an unchanged
+legacy application value under that name; adding or changing it is rejected,
+and removing it is allowed. This grandfathering never applies under an
+encryption policy or when a valid manifest owns actual CR envelopes. The
+manifest prevents removing or moving schema markers from silently exposing
+ciphertext as ordinary application data. Existing plaintext does not become
+protected merely because a marker was added: reads and `audit baseline` fail
+with an explicit migration-required conflict. Export the plaintext before
+enabling the marker, then import it into a newly encrypted record or database.
+That boundary is deliberate—an in-place audit event would preserve the old
+plaintext in history and falsely imply migration had removed it.
+
+When the current schema declares no encryption, logical reads still consult
+verified audit lifecycle state before trusting the mutable record bytes. A
+present audited state owns protected storage only when its authenticated
+manifest owns an actual envelope; deletion carries that ownership into the
+tombstone, and a later audited ordinary create resets it. This prevents
+removing or deforming both the manifest and envelope syntax—or copying a
+stripped file back after deletion—from turning protected storage into ordinary
+output. Standalone envelope-shaped application data and manifests whose
+optional protected locations are all absent remain ordinary. The tradeoff is
+fail-closed recovery: if audit history is corrupt or cannot be verified, CR
+cannot prove that an empty-policy record is unprotected, so logical reads and
+`check` report a redacted unreadable/conflict result until the history is
+repaired. Healthy databases retain the same transparent logical UX.
+
+Direct filesystem edits remain possible for unprotected values as long as the
+envelopes and manifest are preserved; `cr save` refuses plaintext substituted
+at a protected path. `cr get` renders encrypted records as canonical plaintext
+Markdown, while unencrypted records retain their historical exact-byte output.
+Preview approval is explicitly unavailable when a change needs fresh
+ciphertext: reproducing the same preview digest would otherwise require nonce
+reuse, deterministic encryption, or a larger stateful approval protocol.
+
+This is at-rest confidentiality, not selective erasure. A process with the
+keyring sees plaintext, filesystem paths and record identities remain visible,
+and one retained key may decrypt many historical values. Per-record key
+destruction, retention windows, redaction policy, and audited key management
+remain roadmap work. The reserved `users` policy collection cannot opt its
+authorization-critical fields into encryption.
+
+Audit history returned by the CLI, REST API, and local app is a logical
+projection: protected values in `changes` are decrypted for the caller. The
+event `hash` and any `authorization.approved_changes` digest still commit to the
+exact stored ciphertext bytes, so they cannot be recomputed by serializing that
+plaintext projection. `audit verify` always verifies the stored representation.
+
+The same boundary applies to idempotent mutations. Their durable result keeps
+the exact ciphertext Markdown and ciphertext-derived record version so a retry
+does not generate a nonce or event. After current authorization succeeds, CR
+decrypts that stored result in memory and returns the original logical record.
+Authorized history likewise projects `changes`, version 3 `after_snapshot`
+Markdown, and idempotency-result Markdown to plaintext, while the raw journal,
+pending mutation, hashes, and record versions continue to commit to ciphertext.
+The request identity is an HMAC-SHA-256 over canonical typed plaintext keyed by
+the never-stored retry key, so the journal is not an offline dictionary oracle
+for a protected request value.
+
 ## Import data with sync adapters
 
 A sync adapter is an ordinary executable: a shell script, Python program, compiled Rust binary, or any other local command. It fetches or computes data and writes one JSON object per line to stdout. `cr` owns the database writes, schema validation, audit events, checkpoints, limits, and overlap protection.
 
-This subprocess boundary is intentionally simpler than an in-process Rust plugin ABI. Adapters can use any language or SDK, fail without crashing `cr`, and evolve independently. They are still trusted local programs: they inherit your environment and can access the filesystem, network, and external services with your operating-system permissions.
+This subprocess boundary is intentionally simpler than an in-process Rust plugin ABI. Adapters can use any language or SDK, fail without crashing `cr`, and evolve independently. They are still trusted local programs: they inherit your environment except for `CR_ENCRYPTION_ACTIVE_KEY` and `CR_ENCRYPTION_KEYS`, and can access the filesystem, network, and external services with your operating-system permissions. The keyring is needed by CR's storage boundary, never by the plaintext adapter protocol.
 
 ### A Notion meeting-notes adapter
 
@@ -1211,7 +1454,7 @@ Stdout is reserved for protocol messages. Send diagnostics and progress to stder
 
 - `upsert` creates the record or completely replaces its front matter and Markdown. It is unchanged when the parsed front matter and exact Markdown body already match.
 - `delete` is idempotent: deleting a missing record counts as unchanged.
-- `checkpoint` is optional, must be the final message, and is stored only after all preceding record operations succeed. It is recorded in the run ledger first, so an interrupted run knows which checkpoint it still owes.
+- `checkpoint` is optional, must be the final message, and is stored only after all preceding record operations succeed. For an encrypted interrupted stream the run ledger retains only its presence and digest; recovery obtains the value from the authenticated stream.
 - A run cannot target the same `collection/id` twice. Every message and every upsert schema is preflighted before the first mutation.
 - Output defaults to 16 MiB and 10,000 messages; the command defaults to a 300-second timeout. `sync create` can lower or raise these within the built-in safety bounds.
 
@@ -1228,17 +1471,37 @@ CR_SYNC_HAS_STATE=true|false
 
 `CR_SYNC_STATE_PATH` is a read-only-by-convention temporary snapshot containing the previous JSON checkpoint or `null`. Read it to choose an incremental cursor, then emit the next checkpoint; do not modify `.cr/sync/state` yourself.
 
+Checkpoint files under `.cr/sync/state/` are ordinary operational state, not
+schema-marked record values, and are not encrypted by record-value encryption.
+Adapter stderr likewise goes directly to the caller's terminal or job log. Do
+not put credentials or other secrets in checkpoints or stderr; use a secret
+manager or the adapter's protected environment instead.
+
 The command is stored as a program plus an exact argument array, not as a shell command string. Shell expansion, pipes, and redirects only happen when you explicitly register a shell such as `sh scripts/import.sh`. Relative executables containing a path separator are resolved from the database root, and other relative arguments are interpreted from that root.
 
 ### Failure, direct writes, and external effects
 
-The database must pass `audit verify` before an adapter starts and again after it exits. A timeout, nonzero exit, invalid JSON, output-limit violation, duplicate target, schema error, or dirty database prevents all emitted operations and checkpoint changes. Only one run of a named sync can execute at once.
+The database must pass `audit verify` before an adapter starts and again after it exits. During the second verification, `cr` holds the audit lock and captures every stream target as absent or at its exact record version at that same audit head. Every later replacement, deletion, creation, and idempotent no-op conditionally requires both that target state and the audit sequence produced by the preceding sync operation. An ordinary CLI or API write anywhere in the database therefore stops the remaining stream rather than letting stale adapter output overwrite it; the sequence guard also catches an edit that restores byte-identical target contents, which necessarily has the same public record hash. A timeout, nonzero exit, invalid JSON, output-limit violation, duplicate target, schema error, or dirty database prevents all emitted operations and checkpoint changes. Only one run of a named sync can execute at once.
 
 Do not have an unattended adapter write `records/` directly. If it does, the second verification rejects its protocol output and leaves the direct file edit visible in `cr status`; a person can review it with the normal selective `cr save` flow. This is what keeps sync automation from silently accepting unrelated manual edits or tampering.
 
 Record operations are preflighted together but committed as sequential audited single-record mutations, not one all-or-nothing multi-record transaction. A durable-write failure midway through application therefore still leaves earlier operations committed. What it can no longer do is leave that fact unrecorded.
 
-Before the first mutation `cr` writes a run ledger, and the exact operation stream beside it, under `.cr/sync/runs/`, and removes both only once the checkpoint agrees with the committed work. An interrupted run is then a durable fact rather than something to infer:
+Adapter stdout is captured in bounded memory, not a temporary file, so a hard
+crash during fetch cannot orphan a plaintext protocol stream under `.cr/`.
+Before the first mutation `cr` writes a run ledger containing that head-bound
+target-version snapshot, and the exact operation stream beside it, under
+`.cr/sync/runs/`, and removes both only once the checkpoint agrees with the
+committed work. A stream that contains an upsert for an encrypted collection is
+stored as one authenticated ciphertext blob (ledger version 3) bound to the
+database context, sync name, and run ID; recovery therefore requires the
+keyring. Its ledger stores checkpoint presence and domain-separated digests,
+not the before or after checkpoint JSON, so neither logical record operations
+nor the stream's checkpoint appear in plaintext under `.cr/sync/runs/`.
+Unprotected streams retain the plaintext version-2 format. Recovery
+also accepts version-1 ledgers written by earlier builds: it reconstructs their
+missing target snapshot by replaying the immutable audit prefix to the head
+recorded in the ledger. An interrupted run is then a durable fact rather than something to infer:
 
 ```sh
 cr sync recover notion-meeting --check          # report an interrupted run, change nothing
@@ -1248,7 +1511,9 @@ cr sync recover notion-meeting                  # complete it
 
 `cr sync run` refuses to start while a ledger is present, so a stale checkpoint can never be silently replayed from the beginning. `cr sync recover` completes the interrupted run by replaying its recorded stream. That is roll-forward, never rollback: the audit chain is append-only and nothing already committed is ever unwound. It is sound because the protocol stream is idempotent — a target appears at most once, an upsert carries the whole record, and deleting a missing record is a no-op — so the replay commits only the operations the interrupted run never reached and appends no event for the rest. The events it commits carry the original run's ID, so the audit log shows one run rather than two.
 
-Recovery refuses, rather than guessing, when a record the run still has to write changed after the run stopped, or when the recorded stream no longer matches its ledger. An unrelated record changing in the meantime is reported by `--check` but does not block completion. If the original failure is still present, recovery fails the same way and leaves the ledger intact, so the run stays completable once the cause is fixed.
+Legacy v1/v2 interrupted runs recorded their operation stream and checkpoint as plaintext. They remain recoverable when all of their upsert targets are still unprotected, including when unrelated collections use encryption. If any target collection now has an encrypted field or body policy, recovery fails before applying another operation. `cr` does not silently migrate or replay that plaintext stream under the newer storage policy. New runs also read existing upsert targets against the verified audit snapshot before staging the adapter stream, so moving or removing an encryption marker cannot leave the adapter's plaintext output in the recovery directory.
+
+Recovery refuses, rather than guessing, when a record the run still has to write changed after the run stopped, or when the recorded stream no longer matches its ledger. It recognizes committed progress only when an event has both `source: sync` and the run's message, then verifies that the event's target, action, and resulting record hash match the recorded stream. It captures that history and the current audit sequence under one lock and checks the sequence again inside every remaining mutation lock, so a writer racing after the scan — including an edit-and-restore ABA — is refused. An unrelated record changed before that recovery snapshot is reported by `--check` but does not block completion. If the original failure is still present, recovery fails the same way and leaves the ledger intact, so the run stays completable once the cause is fixed.
 
 An adapter may also perform external effects, such as creating a calendar event or sending a message. `cr` cannot roll those effects back if a later record operation fails. Use the remote service's idempotency keys, design the adapter to retry safely, and emit the checkpoint only for work that can be resumed.
 
@@ -1584,9 +1849,15 @@ recorded with `detected_from: header`. HTTP header values are visible ASCII, so
 non-ASCII intent text must use JSON `\uXXXX` escapes. `GET /api/v1/identity`
 returns the complete attribution a request would record.
 
-`X-CR-Approved-Changes` is the fifth header and the only one that can refuse a
+`X-CR-Approved-Changes` is the approval header and can refuse a
 request: it carries the digest from a `preview=true` response, and a mutation
 whose change set hashes differently is rejected with `409 approval_mismatch`.
+
+`Idempotency-Key` is the retry header for supported single-record mutations.
+It must contain 16–128 visible-ASCII bytes; callers should generate it with at
+least 128 bits of randomness. An exact retry returns the original status and
+JSON result without adding history; mismatched reuse is `409
+idempotency_conflict`.
 
 ### CRUD requests
 
@@ -1596,13 +1867,16 @@ Fetch one record:
 curl http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal
 ```
 
-The response includes the identity, relative path, typed front matter, and Markdown body:
+The response includes the identity, relative path, domain-separated exact-byte
+version, typed front matter, and Markdown body. Its `ETag` header is the quoted
+form of `version`:
 
 ```json
 {
   "collection": "deals",
   "id": "acme-renewal",
   "path": "records/deals/acme-renewal.md",
+  "version": "sha256:3d8d9a6f…",
   "front_matter": {
     "name": "Acme renewal",
     "status": "won",
@@ -1633,6 +1907,22 @@ curl -X PATCH http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewa
     "markdown": "Closed-won notes."
   }'
 ```
+
+Replace a complete document only with the ETag from a prior read:
+
+```sh
+etag=$(curl -sD - http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal \
+  -o /dev/null | awk 'tolower($1) == "etag:" { print $2 }' | tr -d '\r')
+curl -X PUT http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal \
+  -H 'Content-Type: application/json' \
+  -H "If-Match: $etag" \
+  -d '{"front_matter":{"status":"won"},"markdown":"Closed-won notes."}'
+```
+
+`If-Match` also accepts a comma-separated list of strong CR record ETags or
+`*`. Weak validators never match. Conditional previews check the same version
+without writing, and `X-CR-Approved-Changes` remains an independent guard over
+the resulting audit change set.
 
 Create a relation or delete a record:
 
@@ -1935,7 +2225,7 @@ Prefer changing the adapter to emit `upsert` or `delete` messages so future runs
 
 ## Backups and sensitive data
 
-Back up the whole database directory, not only `records/`. The `.cr/audit/` directory is necessary to verify history and reconcile direct edits, while `.cr/syncs/` and `.cr/sync/state/` are needed to resume configured incremental imports. Include `.cr-audit-head.json`, and prefer a backup that keeps history—a Git remote rather than a mirror of the current directory—because a backup taken after a tamper is a copy of the tamper, while a history is a record of when it appeared.
+Back up the whole database directory, not only `records/`. The `.cr/audit/` directory is necessary to verify history and reconcile direct edits, `.cr/encryption.json` is necessary to decrypt protected data, and `.cr/syncs/` plus `.cr/sync/state/` are needed to resume configured incremental imports. Include `.cr-audit-head.json`, and prefer a backup that keeps history—a Git remote rather than a mirror of the current directory—because a backup taken after a tamper is a copy of the tamper, while a history is a record of when it appeared.
 
 CRM and ATS records often contain personal or confidential information. Apply appropriate filesystem permissions, disk encryption, backup retention, and access controls.
 

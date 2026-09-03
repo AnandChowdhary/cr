@@ -121,6 +121,179 @@ fn installed_style_server_handles_real_http_requests() {
     );
 }
 
+#[test]
+fn real_http_server_keeps_encryption_transparent() {
+    let temporary = tempfile::tempdir().unwrap();
+    let database = temporary.path().join("encrypted-network-server");
+    run_success(Command::new(binary()).args(["init"]).arg(&database));
+    std::fs::write(
+        database.join(".cr/schemas/accounts.json"),
+        r#"{
+  "type": "object",
+  "x-cr-encrypted-body": true,
+  "properties": {
+    "token": { "type": "string", "x-cr-encrypted": true }
+  }
+}"#,
+    )
+    .unwrap();
+
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let child = Command::new(binary())
+        .args(["--database"])
+        .arg(&database)
+        .args(["serve", "--bind", &address.to_string()])
+        .env("CR_API_TOKEN", "network-secret")
+        .env("CR_ENCRYPTION_ACTIVE_KEY", "primary")
+        .env(
+            "CR_ENCRYPTION_KEYS",
+            r#"{"primary":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard(child);
+    wait_until_ready(&mut server.0, address);
+    let headers = [
+        ("Authorization", "Bearer network-secret"),
+        ("Content-Type", "application/json"),
+    ];
+    let created = http_request(
+        address,
+        "POST",
+        "/api/v1/collections/accounts/records",
+        &headers,
+        Some(
+            &json!({
+                "id": "acme",
+                "front_matter": { "token": "api-secret" },
+                "markdown": "API private notes"
+            })
+            .to_string(),
+        ),
+    );
+    assert_eq!(created.0, 201, "{}", created.1);
+    let created: Value = serde_json::from_str(&created.1).unwrap();
+    assert_eq!(created["front_matter"]["token"], "api-secret");
+    assert_eq!(created["markdown"], "API private notes");
+
+    let stored = std::fs::read_to_string(database.join("records/accounts/acme.md")).unwrap();
+    assert!(!stored.contains("api-secret"));
+    assert!(!stored.contains("API private notes"));
+    let fetched = http_request(
+        address,
+        "GET",
+        "/api/v1/collections/accounts/records/acme",
+        &[("Authorization", "Bearer network-secret")],
+        None,
+    );
+    assert_eq!(fetched.0, 200, "{}", fetched.1);
+    let fetched: Value = serde_json::from_str(&fetched.1).unwrap();
+    assert_eq!(fetched["front_matter"]["token"], "api-secret");
+    assert_eq!(fetched["markdown"], "API private notes");
+
+    let patch_body = json!({ "front_matter": { "token": "patch-secret" } }).to_string();
+    let patch_headers = [
+        ("Authorization", "Bearer network-secret"),
+        ("Content-Type", "application/json"),
+        ("Idempotency-Key", "550e8400-e29b-41d4-a716-446655440020"),
+    ];
+    let patched = http_request(
+        address,
+        "PATCH",
+        "/api/v1/collections/accounts/records/acme",
+        &patch_headers,
+        Some(&patch_body),
+    );
+    let patch_replay = http_request(
+        address,
+        "PATCH",
+        "/api/v1/collections/accounts/records/acme",
+        &patch_headers,
+        Some(&patch_body),
+    );
+    assert_eq!(patched.0, 200, "{}", patched.1);
+    assert_eq!(patch_replay, patched);
+    let patched_json: Value = serde_json::from_str(&patched.1).unwrap();
+    assert_eq!(patched_json["front_matter"]["token"], "patch-secret");
+    let after_patch = std::fs::read_to_string(database.join("records/accounts/acme.md")).unwrap();
+    assert!(!after_patch.contains("patch-secret"));
+
+    let etag = format!("\"{}\"", patched_json["version"].as_str().unwrap());
+    let put_body = json!({
+        "front_matter": { "token": "put-secret" },
+        "markdown": "PUT private notes"
+    })
+    .to_string();
+    let put_headers = [
+        ("Authorization", "Bearer network-secret"),
+        ("Content-Type", "application/json"),
+        ("Idempotency-Key", "550e8400-e29b-41d4-a716-446655440021"),
+        ("If-Match", etag.as_str()),
+    ];
+    let replaced = http_request(
+        address,
+        "PUT",
+        "/api/v1/collections/accounts/records/acme",
+        &put_headers,
+        Some(&put_body),
+    );
+    let replace_replay = http_request(
+        address,
+        "PUT",
+        "/api/v1/collections/accounts/records/acme",
+        &put_headers,
+        Some(&put_body),
+    );
+    assert_eq!(replaced.0, 200, "{}", replaced.1);
+    assert_eq!(replace_replay, replaced);
+    let replaced_json: Value = serde_json::from_str(&replaced.1).unwrap();
+    assert_eq!(replaced_json["front_matter"]["token"], "put-secret");
+    assert_eq!(replaced_json["markdown"], "PUT private notes");
+    let after_put = std::fs::read_to_string(database.join("records/accounts/acme.md")).unwrap();
+    assert!(!after_put.contains("put-secret"));
+    assert!(!after_put.contains("PUT private notes"));
+
+    let head = http_request(
+        address,
+        "GET",
+        "/api/v1/audit/head",
+        &[("Authorization", "Bearer network-secret")],
+        None,
+    );
+    assert_eq!(head.0, 200, "{}", head.1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&head.1).unwrap()["sequence"],
+        3
+    );
+
+    let raw_audit =
+        std::fs::read_to_string(database.join(".cr/audit/segments/00000000000000000001.jsonl"))
+            .unwrap();
+    for plaintext in [
+        "api-secret",
+        "patch-secret",
+        "put-secret",
+        "PUT private notes",
+    ] {
+        assert!(!raw_audit.contains(plaintext));
+    }
+
+    let audit = http_request(
+        address,
+        "GET",
+        "/api/v1/audit/log?collection=accounts&id=acme",
+        &[("Authorization", "Bearer network-secret")],
+        None,
+    );
+    assert_eq!(audit.0, 200, "{}", audit.1);
+    assert!(audit.1.contains("api-secret"));
+    assert!(audit.1.contains("API private notes"));
+}
+
 fn wait_until_ready(child: &mut Child, address: SocketAddr) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

@@ -32,9 +32,9 @@ use crate::{
     AccessAction, AccessIdentity, AccessResource, AgentEvidence, Assignment, Attribution,
     AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
     AuditIntentPart, AuditSource, CheckScope, CheckSummary, CollectionModel, Database, DomainError,
-    FilterExpression, FilterOperator, Finding, Record, SearchQuery, SearchTarget, SortDirection,
-    UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
-    audit::AuditChange, sort_records_by_field,
+    FilterExpression, FilterOperator, Finding, Record, RecordPrecondition, SearchQuery,
+    SearchTarget, SortDirection, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout,
+    ViewPredicateMatch, audit::AuditChange, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -57,6 +57,7 @@ const INTENT_HEADER: &str = "x-cr-intent";
 /// a checked write and an unchecked one, which is why the event records
 /// whether it was present.
 const APPROVED_CHANGES_HEADER: &str = "x-cr-approved-changes";
+const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const PERSPECTIVE_COOKIE: &str = "cr_perspective";
 /// The only message an unexpected failure may reveal. Everything else about it
@@ -145,6 +146,7 @@ struct ApiRecord {
     collection: String,
     id: String,
     path: String,
+    version: String,
     front_matter: JsonValue,
     markdown: String,
 }
@@ -152,6 +154,7 @@ struct ApiRecord {
 #[derive(Debug, Serialize)]
 struct ApiRecordSummary {
     path: String,
+    version: String,
     front_matter: JsonValue,
 }
 
@@ -163,6 +166,7 @@ impl TryFrom<Record> for ApiRecord {
             collection: record.collection,
             id: record.id,
             path: display_path(&record.path),
+            version: record.version,
             front_matter: json_front_matter(record.attributes)?,
             markdown: record.body,
         })
@@ -175,6 +179,7 @@ impl TryFrom<Record> for ApiRecordSummary {
     fn try_from(record: Record) -> ApiResult<Self> {
         Ok(Self {
             path: display_path(&record.path),
+            version: record.version,
             front_matter: json_front_matter(record.attributes)?,
         })
     }
@@ -456,6 +461,7 @@ struct AuditViewQuery {
 #[derive(Debug)]
 struct HtmlDocumentForm {
     csrf: String,
+    expected_record_hash: Option<String>,
     id: Option<String>,
     front_matter: Option<String>,
     markdown: String,
@@ -507,6 +513,8 @@ enum SchemaFieldKind {
 struct HtmlDeleteForm {
     #[serde(rename = "_csrf")]
     csrf: String,
+    #[serde(rename = "_expected_record_hash")]
+    expected_record_hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -634,6 +642,13 @@ struct PatchRecordRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReplaceRecordRequest {
+    front_matter: Mapping,
+    markdown: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LinkRequest {
     relation: String,
     target_collection: String,
@@ -749,8 +764,11 @@ impl ApiError {
             DomainError::NotFound(_) => StatusCode::NOT_FOUND,
             DomainError::AlreadyExists(_)
             | DomainError::Conflict(_)
+            | DomainError::IdempotencyConflict(_)
             | DomainError::ApprovalMismatch(_)
+            | DomainError::AuditIntegrity(_)
             | DomainError::AnchorMismatch(_) => StatusCode::CONFLICT,
+            DomainError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             DomainError::Forbidden(_) => StatusCode::FORBIDDEN,
             DomainError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -905,7 +923,10 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
                 )
                 .route(
                     "/collections/{collection}/records/{id}",
-                    get(get_record).patch(patch_record).delete(delete_record),
+                    get(get_record)
+                        .put(replace_record)
+                        .patch(patch_record)
+                        .delete(delete_record),
                 )
                 .route(
                     "/collections/{collection}/records/{id}/document",
@@ -1477,8 +1498,18 @@ async fn update_record_form(
         let attributes = document_form_attributes(&form, schema.as_ref())?;
         let collection = view.collection;
         let markdown = form.markdown;
+        let expected = form.expected_record_hash.ok_or_else(|| {
+            ApiError::bad_request("invalid_form", "expected record hash is required")
+        })?;
+        let precondition = RecordPrecondition::version(expected).map_err(ApiError::from_domain)?;
         run_database(&state, &headers, move |database| {
-            database.replace(&collection, &id, attributes, &markdown)
+            database.replace_conditionally(
+                &collection,
+                &id,
+                attributes,
+                &markdown,
+                Some(&precondition),
+            )
         })
         .await?;
         see_other(&notice_url(&view_name, "Record updated"))
@@ -1560,10 +1591,12 @@ async fn delete_record_form(
     let result: ApiResult<Response> = async {
         let form: HtmlDeleteForm = parse_html_form(&raw)?;
         verify_csrf(&state, &form.csrf)?;
+        let precondition = RecordPrecondition::version(form.expected_record_hash)
+            .map_err(ApiError::from_domain)?;
         let requested_view = view_name.clone();
         run_database(&state, &headers, move |database| {
             let view = database.view(&requested_view)?;
-            database.delete(&view.collection, &id)
+            database.delete_conditionally(&view.collection, &id, Some(&precondition))
         })
         .await?;
         see_other(&notice_url(&view_name, "Record deleted"))
@@ -1632,12 +1665,12 @@ async fn get_record(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((collection, id)): Path<(String, String)>,
-) -> ApiResult<Json<ApiRecord>> {
+) -> ApiResult<Response> {
     let record = run_database(&state, &headers, move |database| {
         database.get(&collection, &id)
     })
     .await?;
-    Ok(Json(record.try_into()?))
+    api_record_response(StatusCode::OK, record)
 }
 
 async fn get_document(
@@ -1645,15 +1678,19 @@ async fn get_document(
     headers: HeaderMap,
     Path((collection, id)): Path<(String, String)>,
 ) -> ApiResult<Response> {
-    let document = run_database(&state, &headers, move |database| {
-        database.read_raw(&collection, &id)
+    let (document, version) = run_database(&state, &headers, move |database| {
+        database.read_raw_versioned(&collection, &id)
     })
     .await?;
-    Ok((
+    let mut response = (
         [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
         document,
     )
-        .into_response())
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::ETAG, entity_tag(&version)?);
+    Ok(response)
 }
 
 async fn get_field(
@@ -1685,7 +1722,7 @@ async fn create_record(
     let query: PreviewQuery = parse_query(raw)?;
     let Json(payload) = json_payload(payload)?;
     if query.preview {
-        let preview = run_database(&state, &headers, move |database| {
+        let preview = run_idempotent_database(&state, &headers, move |database| {
             database.preview_create_record(
                 &collection,
                 &payload.id,
@@ -1702,7 +1739,7 @@ async fn create_record(
         encode_segment(&collection),
         encode_segment(&id)
     );
-    let record = run_database(&state, &headers, move |database| {
+    let record = run_idempotent_database(&state, &headers, move |database| {
         database.create_record(
             &collection,
             &payload.id,
@@ -1711,7 +1748,7 @@ async fn create_record(
         )
     })
     .await?;
-    let mut response = (StatusCode::CREATED, Json(ApiRecord::try_from(record)?)).into_response();
+    let mut response = api_record_response(StatusCode::CREATED, record)?;
     response.headers_mut().insert(
         header::LOCATION,
         HeaderValue::from_str(&location)
@@ -1729,30 +1766,69 @@ async fn patch_record(
 ) -> ApiResult<Response> {
     let query: PreviewQuery = parse_query(raw)?;
     let Json(payload) = json_payload(payload)?;
+    let precondition = if_match(&headers, false)?;
     if query.preview {
-        let preview = run_database(&state, &headers, move |database| {
-            database.preview_patch(
+        let preview = run_idempotent_database(&state, &headers, move |database| {
+            database.preview_patch_conditionally(
                 &collection,
                 &id,
                 &payload.front_matter,
                 &payload.remove,
                 payload.markdown.as_deref(),
+                precondition.as_ref(),
             )
         })
         .await?;
         return Ok(Json(preview).into_response());
     }
-    let record = run_database(&state, &headers, move |database| {
-        database.patch(
+    let record = run_idempotent_database(&state, &headers, move |database| {
+        database.patch_conditionally(
             &collection,
             &id,
             &payload.front_matter,
             &payload.remove,
             payload.markdown.as_deref(),
+            precondition.as_ref(),
         )
     })
     .await?;
-    Ok(Json(ApiRecord::try_from(record)?).into_response())
+    api_record_response(StatusCode::OK, record)
+}
+
+async fn replace_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((collection, id)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+    payload: std::result::Result<Json<ReplaceRecordRequest>, JsonRejection>,
+) -> ApiResult<Response> {
+    let query: PreviewQuery = parse_query(raw)?;
+    let Json(payload) = json_payload(payload)?;
+    let precondition = if_match(&headers, true)?.expect("required If-Match was parsed");
+    if query.preview {
+        let preview = run_idempotent_database(&state, &headers, move |database| {
+            database.preview_replace_conditionally(
+                &collection,
+                &id,
+                payload.front_matter,
+                &payload.markdown,
+                Some(&precondition),
+            )
+        })
+        .await?;
+        return Ok(Json(preview).into_response());
+    }
+    let record = run_idempotent_database(&state, &headers, move |database| {
+        database.replace_conditionally(
+            &collection,
+            &id,
+            payload.front_matter,
+            &payload.markdown,
+            Some(&precondition),
+        )
+    })
+    .await?;
+    api_record_response(StatusCode::OK, record)
 }
 
 async fn delete_record(
@@ -1762,15 +1838,16 @@ async fn delete_record(
     RawQuery(raw): RawQuery,
 ) -> ApiResult<Response> {
     let query: PreviewQuery = parse_query(raw)?;
+    let precondition = if_match(&headers, false)?;
     if query.preview {
-        let preview = run_database(&state, &headers, move |database| {
-            database.preview_delete(&collection, &id)
+        let preview = run_idempotent_database(&state, &headers, move |database| {
+            database.preview_delete_conditionally(&collection, &id, precondition.as_ref())
         })
         .await?;
         return Ok(Json(preview).into_response());
     }
-    let record = run_database(&state, &headers, move |database| {
-        database.delete(&collection, &id)
+    let record = run_idempotent_database(&state, &headers, move |database| {
+        database.delete_conditionally(&collection, &id, precondition.as_ref())
     })
     .await?;
     Ok(Json(DeleteResponse {
@@ -1789,30 +1866,33 @@ async fn link_record(
 ) -> ApiResult<Response> {
     let query: PreviewQuery = parse_query(raw)?;
     let Json(payload) = json_payload(payload)?;
+    let precondition = if_match(&headers, false)?;
     if query.preview {
-        let preview = run_database(&state, &headers, move |database| {
-            database.preview_link(
+        let preview = run_idempotent_database(&state, &headers, move |database| {
+            database.preview_link_conditionally(
                 &collection,
                 &id,
                 &payload.relation,
                 &payload.target_collection,
                 &payload.target_id,
+                precondition.as_ref(),
             )
         })
         .await?;
         return Ok(Json(preview).into_response());
     }
-    let record = run_database(&state, &headers, move |database| {
-        database.link(
+    let record = run_idempotent_database(&state, &headers, move |database| {
+        database.link_conditionally(
             &collection,
             &id,
             &payload.relation,
             &payload.target_collection,
             &payload.target_id,
+            precondition.as_ref(),
         )
     })
     .await?;
-    Ok(Json(ApiRecord::try_from(record)?).into_response())
+    api_record_response(StatusCode::OK, record)
 }
 
 async fn search_records(
@@ -2038,9 +2118,10 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
         "FrontMatter": { "type": "object", "additionalProperties": true },
         "RecordSummary": {
             "type": "object",
-            "required": ["path", "front_matter"],
+            "required": ["path", "version", "front_matter"],
             "properties": {
                 "path": { "type": "string" },
+                "version": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "SHA-256 of the bytes cr:record:v1\\0 followed by the exact stored Markdown bytes; the unquoted value carried by the strong ETag." },
                 "front_matter": { "$ref": "#/components/schemas/FrontMatter" }
             }
         },
@@ -2095,6 +2176,15 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
             "properties": {
                 "front_matter": { "$ref": "#/components/schemas/FrontMatter" },
                 "remove": { "type": "array", "items": { "type": "string" } },
+                "markdown": { "type": "string" }
+            }
+        },
+        "ReplaceRecordRequest": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["front_matter", "markdown"],
+            "properties": {
+                "front_matter": { "$ref": "#/components/schemas/FrontMatter" },
                 "markdown": { "type": "string" }
             }
         },
@@ -2289,22 +2379,59 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
         },
         "AuditEntry": {
             "type": "object",
-            "required": ["hash", "sequence", "timestamp", "actor", "source", "action", "record", "changes"],
+            "required": ["hash", "version", "sequence", "timestamp", "actor", "source", "action", "record", "changes", "before_hash", "after_hash", "previous_hash"],
             "properties": {
-                "hash": { "type": "string" },
+                "hash": { "type": "string", "description": "Hash of the exact stored audit payload. For encrypted collections, changes, snapshots, and idempotency results are logical plaintext projections while this hash still commits to stored ciphertext and cannot be recomputed from the response." },
+                "version": { "type": "integer", "minimum": 1, "maximum": 3 },
                 "sequence": { "type": "integer", "minimum": 1 },
                 "timestamp": { "type": "string", "format": "date-time" },
                 "actor": { "type": "string" },
                 "source": { "enum": ["cli", "api", "filesystem", "sync"] },
                 "action": { "enum": ["baseline", "create", "update", "link", "delete"] },
                 "record": { "type": "object" },
-                "changes": { "type": "array", "items": { "type": "object" } },
+                "changes": { "type": "array", "description": "Logical audit changes. Protected values are decrypted for authorized history reads; hash and authorization.approved_changes still commit to the stored ciphertext representation.", "items": { "type": "object" } },
+                "after_snapshot": {
+                    "type": "object",
+                    "description": "Versioned exact Markdown witness. Protected content is decrypted in authorized history responses while the stored journal retains ciphertext.",
+                    "required": ["version", "markdown"],
+                    "properties": {
+                        "version": { "const": 1 },
+                        "markdown": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                "before_hash": { "type": ["string", "null"] },
+                "after_hash": { "type": ["string", "null"] },
+                "previous_hash": { "type": ["string", "null"] },
                 "agent": { "$ref": "#/components/schemas/AuditAgent" },
                 "authorization": { "$ref": "#/components/schemas/AuditAuthorization" },
                 "intent": { "$ref": "#/components/schemas/AuditIntent" },
+                "idempotency": { "$ref": "#/components/schemas/AuditIdempotency" },
                 "message": { "type": "string" }
             },
             "additionalProperties": true
+        },
+        "AuditIdempotency": {
+            "type": "object",
+            "required": ["principal", "operation", "key_hash", "request_hash", "result"],
+            "description": "Durable retry identity committed in the same event as a successful single-record mutation. The caller's raw key is never stored.",
+            "properties": {
+                "principal": { "type": "string" },
+                "operation": { "enum": ["create", "update", "patch", "replace", "link", "delete"] },
+                "key_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                "request_hash": { "type": "string", "pattern": "^hmac-sha256:[0-9a-f]{64}$", "description": "HMAC-SHA-256 of the canonical plaintext request, keyed by the raw retry key; the key itself is never stored." },
+                "result": {
+                    "type": "object",
+                    "required": ["path", "version", "markdown"],
+                    "properties": {
+                        "path": { "type": "string" },
+                        "version": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                        "markdown": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
         },
         "AuditEntries": {
             "type": "array", "items": { "$ref": "#/components/schemas/AuditEntry" }
@@ -2416,12 +2543,48 @@ fn openapi_paths() -> JsonValue {
         "schema": { "type": "boolean", "default": false },
         "description": "Compute the change set and its digest without writing anything, and return a ChangePreview with 200 instead of performing the mutation."
     });
+    let if_match = json!({
+        "name": "If-Match",
+        "in": "header",
+        "required": false,
+        "schema": { "type": "string" },
+        "description": "Strong ETag returned by a record read. When present, cr compares it with the exact current record bytes while holding the audit lock and returns 412 precondition_failed on a stale value."
+    });
+    let idempotency_key = json!({
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "schema": { "type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[!-~]+$" },
+        "description": "A caller-generated, high-entropy retry key for one effective principal, operation, and record. Successful single-record mutations are replayed with their original result and no extra audit event. Reusing a scoped key for different request semantics returns 409 idempotency_conflict. Preview requests and failed mutations do not consume the key."
+    });
     let attribution_parameters = |mut path: Vec<JsonValue>| {
         path.extend(attribution_headers.iter().cloned());
         JsonValue::Array(path)
     };
     let mutation_parameters = |mut path: Vec<JsonValue>| {
         path.push(preview.clone());
+        path.extend(attribution_headers.iter().cloned());
+        JsonValue::Array(path)
+    };
+    let single_record_mutation_parameters = |mut path: Vec<JsonValue>| {
+        path.push(preview.clone());
+        path.push(idempotency_key.clone());
+        path.extend(attribution_headers.iter().cloned());
+        JsonValue::Array(path)
+    };
+    let conditional_mutation_parameters = |mut path: Vec<JsonValue>| {
+        path.push(preview.clone());
+        path.push(if_match.clone());
+        path.push(idempotency_key.clone());
+        path.extend(attribution_headers.iter().cloned());
+        JsonValue::Array(path)
+    };
+    let replacement_parameters = |mut path: Vec<JsonValue>| {
+        path.push(preview.clone());
+        let mut required_if_match = if_match.clone();
+        required_if_match["required"] = JsonValue::Bool(true);
+        path.push(required_if_match);
+        path.push(idempotency_key.clone());
         path.extend(attribution_headers.iter().cloned());
         JsonValue::Array(path)
     };
@@ -2489,28 +2652,35 @@ fn openapi_paths() -> JsonValue {
                 "responses": ok("#/components/schemas/RecordPage")
             },
             "post": {
-                "operationId": "createRecord", "parameters": mutation_parameters(vec![collection.clone()]),
+                "operationId": "createRecord", "parameters": single_record_mutation_parameters(vec![collection.clone()]),
                 "requestBody": json_body("#/components/schemas/CreateRecordRequest"),
-                "responses": created_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview")
+                "responses": created_record_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview")
             }
         },
         "/api/v1/collections/{collection}/records/{id}": {
-            "get": { "operationId": "getRecord", "parameters": [collection.clone(), id.clone()], "responses": ok("#/components/schemas/Record") },
-            "patch": {
-                "operationId": "patchRecord", "parameters": mutation_parameters(vec![collection.clone(), id.clone()]),
-                "requestBody": json_body("#/components/schemas/PatchRecordRequest"),
-                "responses": ok_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview")
+            "get": { "operationId": "getRecord", "parameters": [collection.clone(), id.clone()], "responses": record_ok("#/components/schemas/Record") },
+            "put": {
+                "operationId": "replaceRecord",
+                "description": "Replace the complete front matter and Markdown document. If-Match is required so a stale whole-document editor cannot overwrite a newer change.",
+                "parameters": replacement_parameters(vec![collection.clone(), id.clone()]),
+                "requestBody": json_body("#/components/schemas/ReplaceRecordRequest"),
+                "responses": replacement_record_ok_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview")
             },
-            "delete": { "operationId": "deleteRecord", "parameters": mutation_parameters(vec![collection.clone(), id.clone()]), "responses": ok_or_preview("#/components/schemas/DeleteResponse", "#/components/schemas/ChangePreview") }
+            "patch": {
+                "operationId": "patchRecord", "parameters": conditional_mutation_parameters(vec![collection.clone(), id.clone()]),
+                "requestBody": json_body("#/components/schemas/PatchRecordRequest"),
+                "responses": record_ok_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview")
+            },
+            "delete": { "operationId": "deleteRecord", "parameters": conditional_mutation_parameters(vec![collection.clone(), id.clone()]), "responses": conditional_ok_or_preview("#/components/schemas/DeleteResponse", "#/components/schemas/ChangePreview") }
         },
         "/api/v1/collections/{collection}/records/{id}/document": {
-            "get": { "operationId": "getRecordDocument", "parameters": [collection.clone(), id.clone()], "responses": { "200": { "description": "Exact Markdown document", "content": { "text/markdown": { "schema": { "type": "string" } } } }, "404": error_response() } }
+            "get": { "operationId": "getRecordDocument", "parameters": [collection.clone(), id.clone()], "responses": { "200": { "description": "Exact Markdown document", "headers": { "ETag": etag_response_header() }, "content": { "text/markdown": { "schema": { "type": "string" } } } }, "404": error_response() } }
         },
         "/api/v1/collections/{collection}/records/{id}/fields/{field}": {
             "get": { "operationId": "getRecordField", "parameters": [collection.clone(), id.clone(), json!({ "name": "field", "in": "path", "required": true, "schema": { "type": "string" } })], "responses": ok("#/components/schemas/FieldResponse") }
         },
         "/api/v1/collections/{collection}/records/{id}/links": {
-            "post": { "operationId": "linkRecord", "parameters": mutation_parameters(vec![collection, id]), "requestBody": json_body("#/components/schemas/LinkRequest"), "responses": ok_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview") }
+            "post": { "operationId": "linkRecord", "parameters": conditional_mutation_parameters(vec![collection, id]), "requestBody": json_body("#/components/schemas/LinkRequest"), "responses": record_ok_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview") }
         },
         "/api/v1/search": {
             "get": { "operationId": "searchRecords", "parameters": [
@@ -2555,8 +2725,22 @@ fn ok(schema: &str) -> JsonValue {
     json!({
         "200": { "description": "Success", "content": { "application/json": { "schema": { "$ref": schema } } } },
         "400": error_response(), "401": error_response(), "404": error_response(),
-        "409": error_response(), "413": error_response(), "422": error_response(), "500": error_response()
+        "409": error_response(), "413": error_response(), "422": error_response(),
+        "500": error_response()
     })
+}
+
+fn etag_response_header() -> JsonValue {
+    json!({
+        "description": "Strong validator derived by hashing the cr:record:v1\\0 domain followed by the exact stored Markdown bytes",
+        "schema": { "type": "string", "pattern": "^\"sha256:[0-9a-f]{64}\"$" }
+    })
+}
+
+fn record_ok(schema: &str) -> JsonValue {
+    let mut responses = ok(schema);
+    responses["200"]["headers"] = json!({ "ETag": etag_response_header() });
+    responses
 }
 
 /// Success responses for a mutating operation that also answers `preview=true`.
@@ -2573,6 +2757,29 @@ fn ok_or_preview(schema: &str, preview: &str) -> JsonValue {
     responses
 }
 
+fn conditional_ok_or_preview(schema: &str, preview: &str) -> JsonValue {
+    let mut responses = ok_or_preview(schema, preview);
+    responses["412"] = error_response();
+    responses
+}
+
+fn record_ok_or_preview(schema: &str, preview: &str) -> JsonValue {
+    let mut responses = conditional_ok_or_preview(schema, preview);
+    responses["200"]["headers"] = json!({
+        "ETag": {
+            "description": "Strong record validator on an applied write; absent for preview=true",
+            "schema": { "type": "string", "pattern": "^\"sha256:[0-9a-f]{64}\"$" }
+        }
+    });
+    responses
+}
+
+fn replacement_record_ok_or_preview(schema: &str, preview: &str) -> JsonValue {
+    let mut responses = record_ok_or_preview(schema, preview);
+    responses["428"] = error_response();
+    responses
+}
+
 fn created(schema: &str) -> JsonValue {
     let mut responses = ok(schema);
     if let Some(object) = responses.as_object_mut()
@@ -2584,8 +2791,9 @@ fn created(schema: &str) -> JsonValue {
 }
 
 /// A creation that answers `preview=true` with `200` and a change set.
-fn created_or_preview(schema: &str, preview: &str) -> JsonValue {
+fn created_record_or_preview(schema: &str, preview: &str) -> JsonValue {
     let mut responses = created(schema);
+    responses["201"]["headers"] = json!({ "ETag": etag_response_header() });
     responses["200"] = json!({
         "description": "The computed change set, returned when preview=true",
         "content": { "application/json": { "schema": { "$ref": preview } } }
@@ -4202,6 +4410,9 @@ fn render_record_form(
                 div class="cr-record-primary min-w-0" {
                 form method="post" action=(action) class="space-y-4" {
                     input type="hidden" name="_csrf" value=(csrf_token);
+                    @if let Some(record) = record {
+                        input type="hidden" name="_expected_record_hash" value=(&record.version);
+                    }
                     @if structured {
                         input type="hidden" name="_form_mode" value="structured";
                     }
@@ -4283,6 +4494,7 @@ fn render_record_form(
                     @if permissions.delete {
                         form method="post" action=(format!("/{}/records/{}/delete", encode_segment(&view.name), encode_segment(&record.id))) onsubmit="return window.confirm('Delete this record? This cannot be undone from the web app.');" class="cr-record-danger rounded-lg border border-red-200 bg-red-50 p-4" {
                             input type="hidden" name="_csrf" value=(csrf_token);
+                            input type="hidden" name="_expected_record_hash" value=(&record.version);
                             div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
                                 div {
                                     h2 class="font-semibold text-red-900" { "Delete this record" }
@@ -5450,6 +5662,7 @@ fn sort_link_label(query: &ViewQuery, label: &str, field: &str) -> String {
 
 fn parse_document_form(raw: &[u8]) -> ApiResult<HtmlDocumentForm> {
     let mut csrf = None;
+    let mut expected_record_hash = None;
     let mut id = None;
     let mut front_matter = None;
     let mut markdown = None;
@@ -5462,6 +5675,9 @@ fn parse_document_form(raw: &[u8]) -> ApiResult<HtmlDocumentForm> {
         let value = value.into_owned();
         match name.as_str() {
             "_csrf" => set_form_value(&mut csrf, value, "_csrf")?,
+            "_expected_record_hash" => {
+                set_form_value(&mut expected_record_hash, value, "_expected_record_hash")?
+            }
             "id" => set_form_value(&mut id, value, "id")?,
             "front_matter" => set_form_value(&mut front_matter, value, "front_matter")?,
             "markdown" => set_form_value(&mut markdown, value, "markdown")?,
@@ -5512,6 +5728,7 @@ fn parse_document_form(raw: &[u8]) -> ApiResult<HtmlDocumentForm> {
 
     Ok(HtmlDocumentForm {
         csrf: csrf.ok_or_else(|| ApiError::bad_request("invalid_form", "_csrf is required"))?,
+        expected_record_hash,
         id,
         front_matter,
         markdown: markdown
@@ -5873,6 +6090,28 @@ fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database
     Ok(database.with_attribution(attribution))
 }
 
+fn single_header<'a>(
+    headers: &'a HeaderMap,
+    header: &str,
+    name: &str,
+    code: &'static str,
+) -> ApiResult<Option<&'a str>> {
+    let mut values = headers.get_all(header).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ApiError::bad_request(
+            code,
+            format!("{name} may appear only once"),
+        ));
+    }
+    value
+        .to_str()
+        .map(Some)
+        .map_err(|_| ApiError::bad_request(code, format!("{name} must be visible ASCII")))
+}
+
 fn perspective_principal(headers: &HeaderMap) -> ApiResult<Option<String>> {
     let mut selected = None;
     for header in headers.get_all(header::COOKIE) {
@@ -5995,12 +6234,207 @@ fn attribution_header<'a>(
         .transpose()
 }
 
+/// Parse the strong validators from an HTTP `If-Match` precondition.
+///
+/// Weak validators are syntactically accepted but can never satisfy
+/// `If-Match`, whose comparison is strong. Multiple field lines and comma
+/// lists have the same meaning. The database receives the parsed condition and
+/// performs the actual comparison while holding the audit lock.
+fn if_match(headers: &HeaderMap, required: bool) -> ApiResult<Option<RecordPrecondition>> {
+    let mut present = false;
+    let mut wildcards = 0;
+    let mut entity_tag = false;
+    let mut versions = Vec::new();
+    for value in headers.get_all(header::IF_MATCH) {
+        present = true;
+        let parsed = parse_if_match_field(value.as_bytes())?;
+        wildcards += parsed.wildcards;
+        entity_tag |= parsed.entity_tag;
+        versions.extend(parsed.versions);
+    }
+    if !present {
+        return if required {
+            Err(ApiError::new(
+                StatusCode::PRECONDITION_REQUIRED,
+                "precondition_required",
+                "this whole-record replacement requires If-Match",
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+    if wildcards > 0 {
+        if wildcards != 1 || entity_tag {
+            return Err(ApiError::bad_request(
+                "invalid_if_match",
+                "If-Match '*' must be the only field value",
+            ));
+        }
+        return Ok(Some(RecordPrecondition::any_current()));
+    }
+    RecordPrecondition::versions(versions)
+        .map(Some)
+        .map_err(ApiError::from_domain)
+}
+
+struct ParsedIfMatchField {
+    wildcards: usize,
+    entity_tag: bool,
+    versions: Vec<String>,
+}
+
+/// Parse one `If-Match` field value without interpreting opaque entity-tags.
+///
+/// A comma is legal inside an entity-tag, and tags issued by another server
+/// are still syntactically valid. Only strong tags in cr's version format are
+/// passed to the domain layer; every other valid tag simply cannot match.
+fn parse_if_match_field(value: &[u8]) -> ApiResult<ParsedIfMatchField> {
+    let mut offset = 0;
+    let mut wildcards = 0;
+    let mut entity_tag = false;
+    let mut versions = Vec::new();
+    let mut parsed_items = 0;
+
+    loop {
+        while value
+            .get(offset)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            offset += 1;
+        }
+        if offset == value.len() {
+            if parsed_items == 0 {
+                return Err(ApiError::bad_request(
+                    "invalid_if_match",
+                    "If-Match must contain an entity tag",
+                ));
+            }
+            break;
+        }
+
+        if value[offset] == b'*' {
+            wildcards += 1;
+            offset += 1;
+        } else {
+            let weak = value.get(offset..offset + 2) == Some(b"W/");
+            if weak {
+                offset += 2;
+            }
+            if value.get(offset) != Some(&b'"') {
+                return Err(ApiError::bad_request(
+                    "invalid_if_match",
+                    "If-Match entity tags must be quoted",
+                ));
+            }
+            offset += 1;
+            let opaque_start = offset;
+            while value.get(offset).is_some_and(|byte| *byte != b'"') {
+                let byte = value[offset];
+                if byte != 0x21 && !(0x23..=0x7e).contains(&byte) && byte < 0x80 {
+                    return Err(ApiError::bad_request(
+                        "invalid_if_match",
+                        "If-Match contains an invalid entity tag",
+                    ));
+                }
+                offset += 1;
+            }
+            if value.get(offset) != Some(&b'"') {
+                return Err(ApiError::bad_request(
+                    "invalid_if_match",
+                    "If-Match contains an unterminated entity tag",
+                ));
+            }
+            let opaque = &value[opaque_start..offset];
+            offset += 1;
+            entity_tag = true;
+            if !weak
+                && let Ok(version) = std::str::from_utf8(opaque)
+                && RecordPrecondition::version(version.to_owned()).is_ok()
+            {
+                versions.push(version.to_owned());
+            }
+        }
+        parsed_items += 1;
+
+        while value
+            .get(offset)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            offset += 1;
+        }
+        if offset == value.len() {
+            break;
+        }
+        if value[offset] != b',' {
+            return Err(ApiError::bad_request(
+                "invalid_if_match",
+                "If-Match entity tags must be separated by commas",
+            ));
+        }
+        offset += 1;
+        let next = value[offset..]
+            .iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t'))
+            .map(|next| offset + next);
+        if next.is_none() || value[next.expect("checked above")] == b',' {
+            return Err(ApiError::bad_request(
+                "invalid_if_match",
+                "If-Match contains an empty entity tag",
+            ));
+        }
+    }
+
+    Ok(ParsedIfMatchField {
+        wildcards,
+        entity_tag,
+        versions,
+    })
+}
+
+fn entity_tag(version: &str) -> ApiResult<HeaderValue> {
+    HeaderValue::from_str(&format!("\"{version}\""))
+        .map_err(|error| ApiError::internal(anyhow!(error).context("could not build record ETag")))
+}
+
+fn api_record_response(status: StatusCode, record: Record) -> ApiResult<Response> {
+    let etag = entity_tag(&record.version)?;
+    let mut response = (status, Json(ApiRecord::try_from(record)?)).into_response();
+    response.headers_mut().insert(header::ETAG, etag);
+    Ok(response)
+}
+
 async fn run_database<T, F>(state: &AppState, headers: &HeaderMap, operation: F) -> ApiResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&Database) -> Result<T> + Send + 'static,
 {
     let database = request_database(state, headers)?;
+    tokio::task::spawn_blocking(move || operation(&database))
+        .await
+        .map_err(|error| ApiError::internal(anyhow!(error).context("database task failed")))?
+        .map_err(ApiError::from_domain)
+}
+
+async fn run_idempotent_database<T, F>(
+    state: &AppState,
+    headers: &HeaderMap,
+    operation: F,
+) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Database) -> Result<T> + Send + 'static,
+{
+    let mut database = request_database(state, headers)?;
+    if let Some(key) = single_header(
+        headers,
+        IDEMPOTENCY_HEADER,
+        "Idempotency-Key",
+        "invalid_idempotency_key",
+    )? {
+        database = database
+            .with_idempotency_key(key)
+            .map_err(ApiError::from_domain)?;
+    }
     tokio::task::spawn_blocking(move || operation(&database))
         .await
         .map_err(|error| ApiError::internal(anyhow!(error).context("database task failed")))?
@@ -6221,6 +6655,20 @@ mod tests {
                 "conflict",
             ),
             (
+                DomainError::PreconditionFailed(
+                    "record people/ada changed since the expected version".to_owned(),
+                ),
+                StatusCode::PRECONDITION_FAILED,
+                "precondition_failed",
+            ),
+            (
+                DomainError::IdempotencyConflict(
+                    "idempotency key was already used for a different request".to_owned(),
+                ),
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+            ),
+            (
                 DomainError::Forbidden("principal cannot read record people/ada".to_owned()),
                 StatusCode::FORBIDDEN,
                 "forbidden",
@@ -6229,6 +6677,13 @@ mod tests {
                 DomainError::Invalid("field path cannot be empty".to_owned()),
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation_failed",
+            ),
+            (
+                DomainError::AuditIntegrity(
+                    "audit replay is inconsistent at sequence 2".to_owned(),
+                ),
+                StatusCode::CONFLICT,
+                "audit_integrity_failed",
             ),
         ];
 

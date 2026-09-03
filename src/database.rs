@@ -7,25 +7,40 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value as JsonValue, json};
+use sha2::{Digest, Sha256};
 use yaml_serde::{Mapping, Value};
 
 use crate::{
-    AnchorReport, Assignment, AuditAction, AuditAnchor, AuditEntry, AuditHead, AuditSource,
-    AuditVerification, SearchQuery,
+    AnchorReport, Assignment, AuditAction, AuditAnchor, AuditChange, AuditEntry, AuditHead,
+    AuditSource, AuditVerification, SearchQuery,
     access::{
         AccessAction, AccessDecision, AccessIdentity, Resource as AccessResource, Role,
         USERS_COLLECTION, User, UserDeleteOptions, UserEnsureOutcome, UserKind,
         UserRegistrationOptions, UserStatus, UserUpdate, display_name, principal_id, users_schema,
     },
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
-    audit::{AuditFilter, AuditLog, AuditMutation, ChangePreview, ReconciledMutation, record_hash},
+    audit::{
+        AuditEncryptionTransition, AuditFilter, AuditHistory, AuditIdempotency,
+        AuditIdempotencyResult, AuditLog, AuditMutation, AuditedRecordStates, ChangePreview,
+        ReconciledMutation, record_hash,
+    },
     check::{CheckReport, CheckScope},
-    error::{DomainError, conflict, forbidden, invalid, is_already_exists, is_missing},
+    encryption::{
+        CONTEXT_LABEL, CONTEXT_PATH, EncryptionContext, EncryptionPolicy,
+        EncryptionStorageMetadata, audit_document_encryption_metadata,
+        document_has_encrypted_storage,
+    },
+    error::{
+        DomainError, conflict, forbidden, invalid, is_already_exists, is_missing,
+        precondition_failed,
+    },
     frontmatter::Document,
     paths,
     sync::{SYNC_DEFINITION_DIRECTORY, SYNC_LOCK_DIRECTORY, SYNC_STATE_DIRECTORY},
-    value::{compare_yaml_values, get_path, parse_path, remove_path},
+    value::{canonical_yaml_value, compare_yaml_values, get_path, parse_path, remove_path},
     views::VIEW_DIRECTORY,
 };
 
@@ -33,6 +48,10 @@ const CONFIG_PATH: &str = ".cr/config.yaml";
 const DATABASE_DIRECTORY: &str = ".cr";
 pub(crate) const SCHEMA_DIRECTORY: &str = ".cr/schemas";
 const CURRENT_FORMAT_VERSION: u32 = 1;
+const IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] = b"cr:idempotency:key:v1\0";
+const IDEMPOTENCY_REQUEST_HASH_DOMAIN: &[u8] = b"cr:idempotency:request:v2\0";
+const MIN_IDEMPOTENCY_KEY_BYTES: usize = 16;
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 
 /// How the database directory itself is named to a caller.
 pub(crate) const DATABASE_LABEL: &str = "the database directory";
@@ -113,6 +132,18 @@ enum MutationOutcome {
     Previewed(ChangePreview),
 }
 
+/// A validated, scoped request whose success may be replayed from the audit
+/// journal. This is constructed before locking, but looked up and committed
+/// only while the audit lock is held.
+#[derive(Clone, Debug)]
+struct IdempotencyRequest {
+    operation: &'static str,
+    collection: String,
+    id: String,
+    key_hash: String,
+    request_hash: String,
+}
+
 #[derive(Clone, Debug)]
 struct AccessRequest {
     action: AccessAction,
@@ -126,6 +157,8 @@ struct CreateRequest {
     mode: MutationMode,
     access: Option<AccessRequest>,
     reuse_deleted_user_id: bool,
+    expected_audit_sequence: Option<u64>,
+    idempotency: Option<IdempotencyRequest>,
 }
 
 impl CreateRequest {
@@ -134,6 +167,8 @@ impl CreateRequest {
             mode,
             access,
             reuse_deleted_user_id: false,
+            expected_audit_sequence: None,
+            idempotency: None,
         }
     }
 
@@ -142,7 +177,19 @@ impl CreateRequest {
             mode: MutationMode::Apply,
             access: Some(access),
             reuse_deleted_user_id: options.reuse_deleted_id,
+            expected_audit_sequence: None,
+            idempotency: None,
         }
+    }
+
+    fn at_audit_sequence(mut self, sequence: u64) -> Self {
+        self.expected_audit_sequence = Some(sequence);
+        self
+    }
+
+    fn with_idempotency(mut self, idempotency: Option<IdempotencyRequest>) -> Self {
+        self.idempotency = idempotency;
+        self
     }
 }
 
@@ -204,6 +251,7 @@ pub struct Database {
     source: AuditSource,
     audit_message: Option<String>,
     attribution: Attribution,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -218,8 +266,110 @@ pub struct Record {
     pub collection: String,
     pub id: String,
     pub path: PathBuf,
+    /// `sha256:` plus SHA-256 of `b"cr:record:v1\0" || stored_markdown_bytes`.
+    ///
+    /// The domain prefix keeps record digests distinct from audit event and
+    /// change-set digests. This is the authoritative record version used by
+    /// conditional writes and emitted as a strong HTTP ETag.
+    pub version: String,
     pub attributes: Mapping,
     pub body: String,
+}
+
+/// A condition that an existing record must satisfy before it is mutated.
+///
+/// The comparison is performed only after the mutation has acquired the
+/// database-wide audit lock and read the current bytes. A list represents the
+/// strong validators in an HTTP `If-Match` field; [`Self::any_current`] builds
+/// its `*` form.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordPrecondition {
+    versions: Option<Vec<String>>,
+    expected_audit_sequence: Option<u64>,
+}
+
+impl RecordPrecondition {
+    /// Require one exact record hash, as used by the CLI.
+    pub fn version(version: impl Into<String>) -> Result<Self> {
+        let version = version.into();
+        validate_record_version(&version)?;
+        Ok(Self {
+            versions: Some(vec![version]),
+            expected_audit_sequence: None,
+        })
+    }
+
+    /// Require any one of several exact record hashes, as used by `If-Match`.
+    pub fn versions(versions: impl IntoIterator<Item = String>) -> Result<Self> {
+        let versions = versions.into_iter().collect::<Vec<_>>();
+        for version in &versions {
+            validate_record_version(version)?;
+        }
+        Ok(Self {
+            versions: Some(versions),
+            expected_audit_sequence: None,
+        })
+    }
+
+    /// Require that the mutation target currently exists, as for `If-Match: *`.
+    pub fn any_current() -> Self {
+        Self {
+            versions: None,
+            expected_audit_sequence: None,
+        }
+    }
+
+    /// Bind an internal sync condition to the complete audit generation.
+    ///
+    /// Record hashes deliberately identify bytes, so an edit followed by an
+    /// exact restoration is the same public ETag. Sync additionally needs to
+    /// know that no audited writer ran after its head-bound snapshot.
+    pub(crate) fn at_audit_sequence(mut self, sequence: u64) -> Self {
+        self.expected_audit_sequence = Some(sequence);
+        self
+    }
+
+    fn assert_audit_sequence(&self, audit: &AuditLog<'_>) -> Result<()> {
+        if let Some(expected) = self.expected_audit_sequence {
+            assert_audit_sequence(audit, expected)?;
+        }
+        Ok(())
+    }
+
+    fn assert_matches(&self, collection: &str, id: &str, current: &str) -> Result<()> {
+        if self
+            .versions
+            .as_ref()
+            .is_none_or(|versions| versions.iter().any(|version| version == current))
+        {
+            return Ok(());
+        }
+        Err(precondition_failed(format!(
+            "record {collection}/{id} changed since the expected version"
+        )))
+    }
+
+    fn idempotency_value(&self) -> JsonValue {
+        let versions = self.versions.as_ref().map(|versions| {
+            let mut versions = versions.clone();
+            versions.sort();
+            versions.dedup();
+            versions
+        });
+        json!({
+            "versions": versions,
+            "expected_audit_sequence": self.expected_audit_sequence,
+        })
+    }
+}
+
+fn assert_audit_sequence(audit: &AuditLog<'_>, expected: u64) -> Result<()> {
+    if audit.head()?.sequence == expected {
+        return Ok(());
+    }
+    Err(precondition_failed(
+        "database changed since the expected audit generation",
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -350,6 +500,14 @@ impl Database {
             paths::create_directory_all(&root, Path::new(relative), label)?;
         }
 
+        let encryption_context = EncryptionContext::generate()?;
+        paths::write_new(
+            &root,
+            Path::new(CONTEXT_PATH),
+            &encryption_context.render()?,
+            CONTEXT_LABEL,
+        )?;
+
         let database = Self {
             root,
             config: Config::default(),
@@ -359,6 +517,7 @@ impl Database {
             source: AuditSource::Cli,
             audit_message: None,
             attribution: Attribution::from_environment()?,
+            idempotency_key: None,
         };
         let database = database.with_default_actor();
         database.audit().ensure_layout()?;
@@ -429,6 +588,7 @@ impl Database {
             source: AuditSource::Cli,
             audit_message: None,
             attribution: Attribution::from_environment()?,
+            idempotency_key: None,
         };
         let database = database.with_default_actor();
         let audit = database.audit();
@@ -632,6 +792,25 @@ impl Database {
         self
     }
 
+    /// Attach a retry key to the next supported single-record mutation.
+    ///
+    /// Keys are bounded visible ASCII so the CLI and HTTP header share one
+    /// portable contract. Only a domain-separated hash is written to history.
+    pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Result<Self> {
+        let key = key.into();
+        validate_idempotency_key(&key)?;
+        self.idempotency_key = Some(key);
+        Ok(self)
+    }
+
+    /// Clear a caller retry identity before entering a multi-record internal
+    /// workflow. Sync has its own durable run ledger and must never consume a
+    /// key attached to the `Database` handle that invoked it.
+    pub(crate) fn without_idempotency_key(mut self) -> Self {
+        self.idempotency_key = None;
+        self
+    }
+
     pub fn with_source(mut self, source: AuditSource) -> Self {
         self.source = source;
         self
@@ -644,6 +823,98 @@ impl Database {
         }
         self.audit_message = Some(message);
         Ok(self)
+    }
+
+    fn idempotency_request(
+        &self,
+        operation: &'static str,
+        collection: &str,
+        id: &str,
+        input: impl FnOnce() -> Result<JsonValue>,
+    ) -> Result<Option<IdempotencyRequest>> {
+        let Some(key) = self.idempotency_key.as_deref() else {
+            return Ok(None);
+        };
+        let input = input()?;
+        let envelope = json!({
+            "version": 1,
+            "operation": operation,
+            "record": { "collection": collection, "id": id },
+            "input": input,
+            "actor": self.actor,
+            "source": self.source,
+            "message": self.audit_message,
+            "agent": self.attribution.agent,
+            "authorization": self.attribution.authorization,
+            "intent": self.attribution.intent,
+            "impersonated_by": self.impersonated_by,
+        });
+        let serialized =
+            serde_json::to_vec(&envelope).context("could not serialize idempotency request")?;
+        Ok(Some(IdempotencyRequest {
+            operation,
+            collection: collection.to_owned(),
+            id: id.to_owned(),
+            key_hash: idempotency_digest(IDEMPOTENCY_KEY_HASH_DOMAIN, key.as_bytes()),
+            request_hash: idempotency_request_digest(key.as_bytes(), &serialized),
+        }))
+    }
+
+    fn replay_idempotent_record(
+        &self,
+        audit: &AuditLog<'_>,
+        request: Option<&IdempotencyRequest>,
+    ) -> Result<Option<Record>> {
+        let Some(request) = request else {
+            return Ok(None);
+        };
+        let Some(value) = audit.idempotency_result(
+            &self.principal,
+            request.operation,
+            &request.collection,
+            &request.id,
+            &request.key_hash,
+            &request.request_hash,
+        )?
+        else {
+            return Ok(None);
+        };
+        let result = value;
+        validate_record_version(&result.version)
+            .context("the committed idempotency result has an invalid version")?;
+        let stored = Document::parse(&result.markdown)
+            .context("the committed idempotency result is not valid Markdown")?;
+        let document = self.reveal_document(&request.collection, &request.id, &stored)?;
+        Ok(Some(record_from_document(
+            &request.collection,
+            &request.id,
+            result.path,
+            document,
+            result.version,
+        )))
+    }
+
+    fn audit_idempotency(
+        &self,
+        request: Option<&IdempotencyRequest>,
+        record: &Record,
+        markdown: &str,
+    ) -> Result<Option<AuditIdempotency>> {
+        request
+            .map(|request| {
+                Ok(AuditIdempotency {
+                    principal: self.principal.clone(),
+                    operation: request.operation.to_owned(),
+                    key_hash: request.key_hash.clone(),
+                    request_hash: request.request_hash.clone(),
+                    result: AuditIdempotencyResult {
+                        path: record.path.clone(),
+                        version: record.version.clone(),
+                        markdown: markdown.to_owned(),
+                    },
+                })
+            })
+            .transpose()
     }
 
     /// Whether the reserved users collection has bootstrapped access control.
@@ -1067,6 +1338,7 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
+            idempotency: None,
         })?;
         audit.commit(event, &path, || {
             paths::write_new(&self.root, &path, rendered.as_bytes(), &label).map_err(|error| {
@@ -1150,11 +1422,18 @@ impl Database {
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
+            idempotency: None,
         })?;
         audit.commit(event, &path, || {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
         })?;
-        Ok(record_from_document(USERS_COLLECTION, id, path, after))
+        Ok(record_from_document(
+            USERS_COLLECTION,
+            id,
+            path,
+            after,
+            record_hash(rendered.as_bytes()),
+        ))
     }
 
     /// Restore a manually drifted user file to the exact latest audited bytes.
@@ -1232,7 +1511,13 @@ impl Database {
         if record_hash(restored.as_bytes()) != state.1 {
             bail!("restoring record users/{id} did not reproduce its audited state");
         }
-        Ok(record_from_document(USERS_COLLECTION, id, path, document))
+        Ok(record_from_document(
+            USERS_COLLECTION,
+            id,
+            path,
+            document,
+            record_hash(rendered.as_bytes()),
+        ))
     }
 
     /// Read one registered user. Everyone may inspect their own effective
@@ -1284,6 +1569,8 @@ impl Database {
             },
             MutationMode::Apply,
             access,
+            None,
+            None,
         )?
         .record()
     }
@@ -1326,6 +1613,8 @@ impl Database {
             },
             MutationMode::Apply,
             access,
+            None,
+            None,
         )?
         .record()
     }
@@ -1421,6 +1710,12 @@ impl Database {
                 "the users collection is managed through 'cr user' and 'cr access'",
             ));
         }
+        let idempotency = self.idempotency_request("create", collection, id, || {
+            Ok(json!({
+                "attributes": canonical_yaml_value(&Value::Mapping(attributes.clone()))?,
+                "body": body,
+            }))
+        })?;
         self.run_create(
             collection,
             id,
@@ -1432,7 +1727,40 @@ impl Database {
                     AccessAction::Create,
                     AccessResource::record(collection, id),
                 )),
-            ),
+            )
+            .with_idempotency(idempotency),
+        )?
+        .record()
+    }
+
+    /// Create a sync target only if the complete audited database is still at
+    /// the generation against which the adapter output was accepted.
+    pub(crate) fn create_record_at_audit_sequence(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: Mapping,
+        body: &str,
+        expected_audit_sequence: u64,
+    ) -> Result<Record> {
+        if collection == USERS_COLLECTION {
+            return Err(invalid(
+                "the users collection is managed through 'cr user' and 'cr access'",
+            ));
+        }
+        self.run_create(
+            collection,
+            id,
+            attributes,
+            body,
+            CreateRequest::new(
+                MutationMode::Apply,
+                Some(AccessRequest::new(
+                    AccessAction::Create,
+                    AccessResource::record(collection, id),
+                )),
+            )
+            .at_audit_sequence(expected_audit_sequence),
         )?
         .record()
     }
@@ -1478,6 +1806,8 @@ impl Database {
             mode,
             access,
             reuse_deleted_user_id,
+            expected_audit_sequence,
+            idempotency,
         } = request;
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -1485,6 +1815,9 @@ impl Database {
         let _lock = audit.lock()?;
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
+        }
+        if let Some(expected) = expected_audit_sequence {
+            assert_audit_sequence(&audit, expected)?;
         }
         if access.is_none() && self.access_enabled()? {
             return Err(conflict(
@@ -1508,6 +1841,9 @@ impl Database {
             })
             .transpose()?
             .flatten();
+        if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
+            return Ok(MutationOutcome::Applied(record));
+        }
         if paths::entry_kind(&self.root, &path, &label)?.is_some() {
             return Err(DomainError::record_exists(collection, id).into());
         }
@@ -1524,21 +1860,33 @@ impl Database {
             body: body.to_owned(),
         };
         self.validate(collection, &document.attributes)?;
-        let rendered = document.render()?;
+        let stored = self.protect_document(collection, id, &document, None, mode)?;
+        let rendered = stored.render()?;
+        let record = record_from_document(
+            collection,
+            id,
+            path.clone(),
+            document.clone(),
+            record_hash(rendered.as_bytes()),
+        );
+        let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
         let event = audit.prepare(AuditMutation {
             action: AuditAction::Create,
             collection,
             id,
             before_document: None,
-            after_document: Some(&document),
+            after_document: Some(&stored),
             before_bytes: None,
             after_bytes: Some(rendered.as_bytes()),
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
+            idempotency: idempotency.as_ref(),
         })?;
         if mode == MutationMode::Preview {
-            return Ok(MutationOutcome::Previewed(event.into_preview()));
+            return Ok(MutationOutcome::Previewed(
+                self.reveal_preview(event.into_preview())?,
+            ));
         }
         audit.commit(event, &path, || {
             paths::write_new(&self.root, &path, rendered.as_bytes(), &label).map_err(|error| {
@@ -1549,16 +1897,48 @@ impl Database {
                 }
             })
         })?;
-        Ok(MutationOutcome::Applied(record_from_document(
-            collection, id, path, document,
-        )))
+        Ok(MutationOutcome::Applied(record))
     }
 
     pub fn get(&self, collection: &str, id: &str) -> Result<Record> {
+        self.get_with_optional_audited_states(collection, id, None)
+    }
+
+    /// Read one record using replay state already verified under the caller's
+    /// audit lock. Sync staging uses this to bind logical projection and record
+    /// hashes to the same adapter-head snapshot without replaying per target.
+    pub(crate) fn get_with_audited_states(
+        &self,
+        collection: &str,
+        id: &str,
+        audited_states: &AuditedRecordStates,
+    ) -> Result<Record> {
+        self.get_with_optional_audited_states(collection, id, Some(audited_states))
+    }
+
+    fn get_with_optional_audited_states(
+        &self,
+        collection: &str,
+        id: &str,
+        audited_states: Option<&AuditedRecordStates>,
+    ) -> Result<Record> {
         self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
         let path = self.record_path(collection, id)?;
-        let document = self.read_document(collection, id, &path)?;
-        Ok(record_from_document(collection, id, path, document))
+        let raw = self.read_record(collection, id, &path)?;
+        let stored = parse_record(collection, id, &raw)?;
+        let document = match audited_states {
+            Some(states) => {
+                self.reveal_document_with_audited_states(collection, id, &stored, Some(states))?
+            }
+            None => self.reveal_document(collection, id, &stored)?,
+        };
+        Ok(record_from_document(
+            collection,
+            id,
+            path,
+            document,
+            record_hash(raw.as_bytes()),
+        ))
     }
 
     pub fn get_optional(&self, collection: &str, id: &str) -> Result<Option<Record>> {
@@ -1570,12 +1950,117 @@ impl Database {
     }
 
     pub fn read_raw(&self, collection: &str, id: &str) -> Result<String> {
+        self.read_raw_versioned(collection, id).map(|(raw, _)| raw)
+    }
+
+    /// Read the exact document bytes and the version derived from that same read.
+    pub fn read_raw_versioned(&self, collection: &str, id: &str) -> Result<(String, String)> {
         self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
         let path = self.record_path(collection, id)?;
-        self.read_record(collection, id, &path)
+        let stored_raw = self.read_record(collection, id, &path)?;
+        let version = record_hash(stored_raw.as_bytes());
+        let policy = self.encryption_policy(collection)?;
+        let stored = parse_record(collection, id, &stored_raw)?;
+        let mut audited_states = None;
+        let document = self.reveal_document_with_policy_cached(
+            collection,
+            id,
+            &stored,
+            &policy,
+            &mut audited_states,
+        )?;
+        if policy.is_empty() {
+            // Empty policy normally means exact bytes pass straight through.
+            // Classification above first rejects either a surviving manifest
+            // or audited ownership of a manifest that a direct edit removed.
+            return Ok((stored_raw, version));
+        }
+        Ok((document.render()?, version))
+    }
+
+    /// Assert one target state while holding the same audit lock as writers.
+    ///
+    /// Sync uses this for idempotent operations that need no audit event: an
+    /// exact upsert that is already present, or a delete whose target was
+    /// already absent at the run's recorded audit head. The complete audit
+    /// generation is checked in the same lock scope, so byte-identical ABA
+    /// changes and unrelated audited writers cannot race the comparison.
+    pub(crate) fn assert_record_version(
+        &self,
+        collection: &str,
+        id: &str,
+        expected: Option<&str>,
+        expected_audit_sequence: u64,
+    ) -> Result<()> {
+        let precondition = expected.map(RecordPrecondition::version).transpose()?;
+        let path = self.record_path(collection, id)?;
+        let label = record_label(collection, id);
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        assert_audit_sequence(&audit, expected_audit_sequence)?;
+        self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
+        if let Some(precondition) = precondition {
+            let raw = self.read_record_for_mutation(collection, id, &path, Some(&precondition))?;
+            return precondition.assert_matches(collection, id, &record_hash(raw.as_bytes()));
+        }
+        if paths::entry_kind(&self.root, &path, &label)?.is_none() {
+            return Ok(());
+        }
+        Err(precondition_failed(format!(
+            "record {collection}/{id} changed since the expected version"
+        )))
+    }
+
+    /// Compare one sync target's logical value while holding the audit lock
+    /// that proves both its record version and complete journal generation.
+    /// This replaces a read followed by a separate generation assertion, whose
+    /// empty-policy projection otherwise replayed the chain once more and left
+    /// a race window between the two observations.
+    pub(crate) fn record_matches_logical_at_audit_sequence(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        body: &str,
+        expected_version: &str,
+        expected_audit_sequence: u64,
+    ) -> Result<bool> {
+        let precondition = RecordPrecondition::version(expected_version.to_owned())?;
+        let path = self.record_path(collection, id)?;
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let snapshot = audit.reconciliation_snapshot()?;
+        if snapshot.sequence() != expected_audit_sequence {
+            return Err(precondition_failed(
+                "database changed since the expected audit generation",
+            ));
+        }
+        self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
+        let raw = self.read_record_for_mutation(collection, id, &path, Some(&precondition))?;
+        precondition.assert_matches(collection, id, &record_hash(raw.as_bytes()))?;
+        let stored = parse_record(collection, id, &raw)?;
+        let logical = self.reveal_document_with_audited_states(
+            collection,
+            id,
+            &stored,
+            Some(&snapshot.states),
+        )?;
+        Ok(&logical.attributes == attributes && logical.body == body)
     }
 
     pub fn list(&self, collection: &str, filters: &[Assignment]) -> Result<Vec<Record>> {
+        let mut audited_states = None;
+        self.list_with_audited_cache(collection, filters, &mut audited_states)
+    }
+
+    fn list_with_audited_cache(
+        &self,
+        collection: &str,
+        filters: &[Assignment],
+        audited_states: &mut Option<AuditedRecordStates>,
+    ) -> Result<Vec<Record>> {
         validate_component(collection, "collection")?;
         let directory = self.config.data_dir.join(collection);
         let label = collection_label(collection);
@@ -1610,8 +2095,20 @@ impl Database {
                 }
                 Some((|| {
                     let path = directory.join(format!("{id}.md"));
-                    let document = self.read_document(collection, &id, &path)?;
-                    Ok(record_from_document(collection, &id, path, document))
+                    let raw = self.read_record(collection, &id, &path)?;
+                    let document = self.parse_logical_record_with_audited_cache(
+                        collection,
+                        &id,
+                        &raw,
+                        audited_states,
+                    )?;
+                    Ok(record_from_document(
+                        collection,
+                        &id,
+                        path,
+                        document,
+                        record_hash(raw.as_bytes()),
+                    ))
                 })())
             })
             .filter(|record: &Result<Record>| {
@@ -1642,9 +2139,14 @@ impl Database {
         };
 
         let mut matches = Vec::new();
+        let mut audited_states = None;
         for collection in collections {
-            for record in self.list(&collection, filters)? {
-                let raw_document = self.read_record(&collection, &record.id, &record.path)?;
+            for record in self.list_with_audited_cache(&collection, filters, &mut audited_states)? {
+                let raw_document = Document {
+                    attributes: record.attributes.clone(),
+                    body: record.body.clone(),
+                }
+                .render()?;
                 if query.matches(&record, &raw_document)? {
                     matches.push(record);
                 }
@@ -1712,6 +2214,11 @@ impl Database {
                     "invalid JSON Schema for collection '{name}'"
                 )))
             })?;
+            EncryptionPolicy::from_schema(Some(&schema)).with_context(|| {
+                DomainError::Invalid(format!(
+                    "invalid encryption annotations for collection '{name}'"
+                ))
+            })?;
             models.insert(name, Some(schema));
         }
 
@@ -1759,7 +2266,29 @@ impl Database {
         assignments: &[Assignment],
         body: Option<&str>,
     ) -> Result<Record> {
+        self.update_conditionally(collection, id, assignments, body, None)
+    }
+
+    /// Update a record, optionally requiring its exact current version.
+    pub fn update_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        assignments: &[Assignment],
+        body: Option<&str>,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
         let user_fields = validate_users_field_update(collection, assignments, body)?;
+        let idempotency = self.idempotency_request("update", collection, id, || {
+            Ok(json!({
+                "assignments": assignments
+                    .iter()
+                    .map(Assignment::idempotency_value)
+                    .collect::<Result<Vec<_>>>()?,
+                "body": body,
+                "precondition": precondition.map(RecordPrecondition::idempotency_value),
+            }))
+        })?;
         self.run_update(
             collection,
             id,
@@ -1770,6 +2299,8 @@ impl Database {
             } else {
                 AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id))
             },
+            precondition,
+            idempotency,
         )?
         .record()
     }
@@ -1782,6 +2313,18 @@ impl Database {
         assignments: &[Assignment],
         body: Option<&str>,
     ) -> Result<ChangePreview> {
+        self.preview_update_conditionally(collection, id, assignments, body, None)
+    }
+
+    /// Preview an update against an optional exact current version.
+    pub fn preview_update_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        assignments: &[Assignment],
+        body: Option<&str>,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
         let user_fields = validate_users_field_update(collection, assignments, body)?;
         self.run_update(
             collection,
@@ -1793,6 +2336,8 @@ impl Database {
             } else {
                 AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id))
             },
+            precondition,
+            None,
         )?
         .preview()
     }
@@ -1805,6 +2350,19 @@ impl Database {
         remove: &[String],
         body: Option<&str>,
     ) -> Result<Record> {
+        self.patch_conditionally(collection, id, attributes, remove, body, None)
+    }
+
+    /// Atomically merge a patch, optionally requiring an exact current version.
+    pub fn patch_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        remove: &[String],
+        body: Option<&str>,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
         self.run_patch(
             collection,
             id,
@@ -1812,6 +2370,15 @@ impl Database {
             remove,
             body,
             MutationMode::Apply,
+            precondition,
+            self.idempotency_request("patch", collection, id, || {
+                Ok(json!({
+                    "attributes": canonical_yaml_value(&Value::Mapping(attributes.clone()))?,
+                    "remove": remove,
+                    "body": body,
+                    "precondition": precondition.map(RecordPrecondition::idempotency_value),
+                }))
+            })?,
         )?
         .record()
     }
@@ -1825,6 +2392,19 @@ impl Database {
         remove: &[String],
         body: Option<&str>,
     ) -> Result<ChangePreview> {
+        self.preview_patch_conditionally(collection, id, attributes, remove, body, None)
+    }
+
+    /// Preview an atomic patch against an optional exact current version.
+    pub fn preview_patch_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        remove: &[String],
+        body: Option<&str>,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
         self.run_patch(
             collection,
             id,
@@ -1832,10 +2412,13 @@ impl Database {
             remove,
             body,
             MutationMode::Preview,
+            precondition,
+            None,
         )?
         .preview()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_patch(
         &self,
         collection: &str,
@@ -1844,6 +2427,8 @@ impl Database {
         remove: &[String],
         body: Option<&str>,
         mode: MutationMode,
+        precondition: Option<&RecordPrecondition>,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<MutationOutcome> {
         let user_fields = validate_users_field_patch(collection, attributes, remove, body)?;
         if attributes.is_empty() && remove.is_empty() && body.is_none() {
@@ -1874,6 +2459,8 @@ impl Database {
             } else {
                 AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id))
             },
+            precondition,
+            idempotency,
         )
     }
 
@@ -1888,7 +2475,26 @@ impl Database {
         attributes: Mapping,
         body: &str,
     ) -> Result<Record> {
+        self.replace_conditionally(collection, id, attributes, body, None)
+    }
+
+    /// Replace a complete document under an exact-version precondition.
+    pub fn replace_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: Mapping,
+        body: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
         reject_users_mutation(collection)?;
+        let idempotency = self.idempotency_request("replace", collection, id, || {
+            Ok(json!({
+                "attributes": canonical_yaml_value(&Value::Mapping(attributes.clone()))?,
+                "body": body,
+                "precondition": precondition.map(RecordPrecondition::idempotency_value),
+            }))
+        })?;
         self.run_update(
             collection,
             id,
@@ -1899,10 +2505,39 @@ impl Database {
             },
             MutationMode::Apply,
             AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
+            precondition,
+            idempotency,
         )?
         .record()
     }
 
+    /// Preview a complete-document replacement under a version precondition.
+    pub fn preview_replace_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: Mapping,
+        body: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
+        reject_users_mutation(collection)?;
+        self.run_update(
+            collection,
+            id,
+            |document| {
+                document.attributes = attributes;
+                document.body = body.to_owned();
+                Ok(())
+            },
+            MutationMode::Preview,
+            AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
+            precondition,
+            None,
+        )?
+        .preview()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn run_update(
         &self,
         collection: &str,
@@ -1910,6 +2545,8 @@ impl Database {
         mutate: impl FnOnce(&mut Document) -> Result<()>,
         mode: MutationMode,
         access: AccessRequest,
+        precondition: Option<&RecordPrecondition>,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -1917,6 +2554,9 @@ impl Database {
         let _lock = audit.lock()?;
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
+        }
+        if let Some(precondition) = precondition {
+            precondition.assert_audit_sequence(&audit)?;
         }
         if access.action == AccessAction::ManageAccess || access.user_fields {
             self.assert_current_principal_policy(&audit)?;
@@ -1930,36 +2570,54 @@ impl Database {
         } else {
             self.authorize(access.action, &access.resource)?
         };
-        let before_raw = self.read_record(collection, id, &path)?;
-        let before = parse_record(collection, id, &before_raw)?;
+        if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
+            return Ok(MutationOutcome::Applied(record));
+        }
+        let before_raw = self.read_record_for_mutation(collection, id, &path, precondition)?;
+        if let Some(precondition) = precondition {
+            precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
+        }
+        let before_stored = parse_record(collection, id, &before_raw)?;
+        let before = self.reveal_document(collection, id, &before_stored)?;
         let mut document = before.clone();
         mutate(&mut document)?;
         if collection == USERS_COLLECTION {
             document.attributes = User::from_attributes(&document.attributes)?.attributes()?;
         }
         self.validate(collection, &document.attributes)?;
-        let rendered = document.render()?;
+        let after_stored =
+            self.protect_document(collection, id, &document, Some(&before_stored), mode)?;
+        let rendered = after_stored.render()?;
+        let record = record_from_document(
+            collection,
+            id,
+            path.clone(),
+            document.clone(),
+            record_hash(rendered.as_bytes()),
+        );
+        let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
         let event = audit.prepare(AuditMutation {
             action: AuditAction::Update,
             collection,
             id,
-            before_document: Some(&before),
-            after_document: Some(&document),
+            before_document: Some(&before_stored),
+            after_document: Some(&after_stored),
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: Some(rendered.as_bytes()),
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
+            idempotency: idempotency.as_ref(),
         })?;
         if mode == MutationMode::Preview {
-            return Ok(MutationOutcome::Previewed(event.into_preview()));
+            return Ok(MutationOutcome::Previewed(
+                self.reveal_preview(event.into_preview())?,
+            ));
         }
         audit.commit(event, &path, || {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
         })?;
-        Ok(MutationOutcome::Applied(record_from_document(
-            collection, id, path, document,
-        )))
+        Ok(MutationOutcome::Applied(record))
     }
 
     pub fn link(
@@ -1970,7 +2628,28 @@ impl Database {
         target_collection: &str,
         target_id: &str,
     ) -> Result<Record> {
+        self.link_conditionally(collection, id, relation, target_collection, target_id, None)
+    }
+
+    /// Add a relation, optionally requiring the source record's exact version.
+    pub fn link_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        relation: &str,
+        target_collection: &str,
+        target_id: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
         reject_users_mutation(collection)?;
+        let idempotency = self.idempotency_request("link", collection, id, || {
+            Ok(json!({
+                "relation": relation,
+                "target_collection": target_collection,
+                "target_id": target_id,
+                "precondition": precondition.map(RecordPrecondition::idempotency_value),
+            }))
+        })?;
         self.run_link(
             collection,
             id,
@@ -1978,6 +2657,8 @@ impl Database {
             target_collection,
             target_id,
             MutationMode::Apply,
+            precondition,
+            idempotency,
         )?
         .record()
     }
@@ -1991,6 +2672,26 @@ impl Database {
         target_collection: &str,
         target_id: &str,
     ) -> Result<ChangePreview> {
+        self.preview_link_conditionally(
+            collection,
+            id,
+            relation,
+            target_collection,
+            target_id,
+            None,
+        )
+    }
+
+    /// Preview a relation against an optional source-record version.
+    pub fn preview_link_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        relation: &str,
+        target_collection: &str,
+        target_id: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
         reject_users_mutation(collection)?;
         self.run_link(
             collection,
@@ -1999,10 +2700,13 @@ impl Database {
             target_collection,
             target_id,
             MutationMode::Preview,
+            precondition,
+            None,
         )?
         .preview()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_link(
         &self,
         collection: &str,
@@ -2011,6 +2715,8 @@ impl Database {
         target_collection: &str,
         target_id: &str,
         mode: MutationMode,
+        precondition: Option<&RecordPrecondition>,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<MutationOutcome> {
         validate_component(relation, "relation")?;
         let audit = self.audit();
@@ -2018,12 +2724,18 @@ impl Database {
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
         }
+        if let Some(precondition) = precondition {
+            precondition.assert_audit_sequence(&audit)?;
+        }
         let decision =
             self.authorize(AccessAction::Link, &AccessResource::record(collection, id))?;
         self.authorize(
             AccessAction::Read,
             &AccessResource::record(target_collection, target_id),
         )?;
+        if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
+            return Ok(MutationOutcome::Applied(record));
+        }
         let target_path = self.record_path(target_collection, target_id)?;
         let target_raw = self
             .read_record(target_collection, target_id, &target_path)
@@ -2036,13 +2748,17 @@ impl Database {
                     error
                 }
             })?;
-        parse_record(target_collection, target_id, &target_raw)?;
+        self.parse_logical_record(target_collection, target_id, &target_raw)?;
         audit.assert_current(target_collection, target_id, target_raw.as_bytes())?;
 
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
-        let before_raw = self.read_record(collection, id, &path)?;
-        let before = parse_record(collection, id, &before_raw)?;
+        let before_raw = self.read_record_for_mutation(collection, id, &path, precondition)?;
+        if let Some(precondition) = precondition {
+            precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
+        }
+        let before_stored = parse_record(collection, id, &before_raw)?;
+        let before = self.reveal_document(collection, id, &before_stored)?;
         let mut document = before.clone();
         let relations = mapping_field(&mut document.attributes, "relations")?;
         let targets = sequence_field(relations, relation)?;
@@ -2053,44 +2769,82 @@ impl Database {
         }
 
         self.validate(collection, &document.attributes)?;
-        let rendered = document.render()?;
+        let after_stored =
+            self.protect_document(collection, id, &document, Some(&before_stored), mode)?;
+        let rendered = after_stored.render()?;
+        let record = record_from_document(
+            collection,
+            id,
+            path.clone(),
+            document.clone(),
+            record_hash(rendered.as_bytes()),
+        );
+        let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
         let event = audit.prepare(AuditMutation {
             action: AuditAction::Link,
             collection,
             id,
-            before_document: Some(&before),
-            after_document: Some(&document),
+            before_document: Some(&before_stored),
+            after_document: Some(&after_stored),
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: Some(rendered.as_bytes()),
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
+            idempotency: idempotency.as_ref(),
         })?;
         if mode == MutationMode::Preview {
-            return Ok(MutationOutcome::Previewed(event.into_preview()));
+            return Ok(MutationOutcome::Previewed(
+                self.reveal_preview(event.into_preview())?,
+            ));
         }
         audit.commit(event, &path, || {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
         })?;
-        Ok(MutationOutcome::Applied(record_from_document(
-            collection, id, path, document,
-        )))
+        Ok(MutationOutcome::Applied(record))
     }
 
     pub fn delete(&self, collection: &str, id: &str) -> Result<Record> {
+        self.delete_conditionally(collection, id, None)
+    }
+
+    /// Delete a record, optionally requiring its exact current version.
+    pub fn delete_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
         reject_users_mutation(collection)?;
+        let idempotency = self.idempotency_request("delete", collection, id, || {
+            Ok(json!({
+                "precondition": precondition.map(RecordPrecondition::idempotency_value),
+            }))
+        })?;
         self.run_delete(
             collection,
             id,
             MutationMode::Apply,
             AccessRequest::new(AccessAction::Delete, AccessResource::record(collection, id)),
             false,
+            precondition,
+            idempotency,
         )?
         .record()
     }
 
     /// Compute what `delete` would record, without deleting anything.
     pub fn preview_delete(&self, collection: &str, id: &str) -> Result<ChangePreview> {
+        self.preview_delete_conditionally(collection, id, None)
+    }
+
+    /// Preview a deletion against an optional exact current version.
+    pub fn preview_delete_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
         reject_users_mutation(collection)?;
         self.run_delete(
             collection,
@@ -2098,6 +2852,8 @@ impl Database {
             MutationMode::Preview,
             AccessRequest::new(AccessAction::Delete, AccessResource::record(collection, id)),
             false,
+            precondition,
+            None,
         )?
         .preview()
     }
@@ -2118,10 +2874,13 @@ impl Database {
             MutationMode::Apply,
             AccessRequest::owner(AccessResource::Database),
             options.if_unused,
+            None,
+            None,
         )?
         .record()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_delete(
         &self,
         collection: &str,
@@ -2129,6 +2888,8 @@ impl Database {
         mode: MutationMode,
         access: AccessRequest,
         if_unused: bool,
+        precondition: Option<&RecordPrecondition>,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -2136,6 +2897,9 @@ impl Database {
         let _lock = audit.lock()?;
         if mode == MutationMode::Apply {
             audit.recover_pending()?;
+        }
+        if let Some(precondition) = precondition {
+            precondition.assert_audit_sequence(&audit)?;
         }
         if access.action == AccessAction::ManageAccess {
             self.assert_current_principal_policy(&audit)?;
@@ -2145,8 +2909,15 @@ impl Database {
         } else {
             self.authorize(access.action, &access.resource)?
         };
-        let before_raw = self.read_record(collection, id, &path)?;
-        let document = parse_record(collection, id, &before_raw)?;
+        if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
+            return Ok(MutationOutcome::Applied(record));
+        }
+        let before_raw = self.read_record_for_mutation(collection, id, &path, precondition)?;
+        if let Some(precondition) = precondition {
+            precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
+        }
+        let stored_document = parse_record(collection, id, &before_raw)?;
+        let document = self.reveal_document(collection, id, &stored_document)?;
         if collection == USERS_COLLECTION {
             audit.assert_current(collection, id, before_raw.as_bytes())?;
             let user = User::from_attributes(&document.attributes)?;
@@ -2162,27 +2933,36 @@ impl Database {
                 )));
             }
         }
+        let record = record_from_document(
+            collection,
+            id,
+            path.clone(),
+            document.clone(),
+            record_hash(before_raw.as_bytes()),
+        );
+        let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &before_raw)?;
         let event = audit.prepare(AuditMutation {
             action: AuditAction::Delete,
             collection,
             id,
-            before_document: Some(&document),
+            before_document: Some(&stored_document),
             after_document: None,
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: None,
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
+            idempotency: idempotency.as_ref(),
         })?;
         if mode == MutationMode::Preview {
-            return Ok(MutationOutcome::Previewed(event.into_preview()));
+            return Ok(MutationOutcome::Previewed(
+                self.reveal_preview(event.into_preview())?,
+            ));
         }
         audit.commit(event, &path, || {
             paths::remove_file(&self.root, &path, &label)
         })?;
-        Ok(MutationOutcome::Applied(record_from_document(
-            collection, id, path, document,
-        )))
+        Ok(MutationOutcome::Applied(record))
     }
 
     pub fn status(&self) -> Result<Vec<WorkingChange>> {
@@ -2259,8 +3039,8 @@ impl Database {
         if all {
             self.authorize_owner(&AccessResource::Database)?;
         }
-        let states = audit.record_states()?;
-        let changes = self.working_changes_from_states(&states)?;
+        let mut snapshot = audit.reconciliation_snapshot()?;
+        let changes = self.working_changes_from_states(&snapshot.states)?;
         let available: BTreeMap<_, _> = changes
             .into_iter()
             .map(|change| ((change.collection.clone(), change.id.clone()), change))
@@ -2286,7 +3066,7 @@ impl Database {
         for change in &selected_changes {
             reject_users_mutation(&change.collection)?;
             let key = (change.collection.clone(), change.id.clone());
-            let prior = states.get(&key);
+            let prior = snapshot.states.get(&key);
             let before = prior
                 .and_then(|state| state.document.as_ref())
                 .map(Document::from_audit_value)
@@ -2302,7 +3082,15 @@ impl Database {
                 .map(|raw| parse_record(&change.collection, &change.id, raw))
                 .transpose()?;
             if let Some(document) = &after {
-                self.validate(&change.collection, &document.attributes)?;
+                let logical = self.reveal_document_with_audited_states(
+                    &change.collection,
+                    &change.id,
+                    document,
+                    Some(&snapshot.states),
+                )?;
+                self.encryption_policy(&change.collection)?
+                    .validate_logical_for_write(&logical, before.as_ref())?;
+                self.validate(&change.collection, &logical.attributes)?;
             }
             let action = match change.status {
                 WorkingChangeKind::Added => AuditAction::Create,
@@ -2324,26 +3112,66 @@ impl Database {
             prepared.push((change, before, after, after_raw, action, decision));
         }
 
-        let mut entries = Vec::with_capacity(prepared.len());
         let mut previews = Vec::with_capacity(prepared.len());
-        for (change, before, after, after_raw, action, decision) in prepared {
-            let event = audit.prepare_reconciled(ReconciledMutation {
-                action,
-                collection: &change.collection,
-                id: &change.id,
-                before_document: before.as_ref(),
-                after_document: after.as_ref(),
-                before_hash: change.audited_hash.as_deref(),
-                after_bytes: after_raw.as_deref().map(str::as_bytes),
-                had_history: states.contains_key(&(change.collection.clone(), change.id.clone())),
-                message,
-                access: decision.as_ref(),
-            })?;
+        let mut projected_changes = Vec::with_capacity(prepared.len());
+        // Projection can require decryption keys or reject stale schema
+        // metadata. Prove every selected event is displayable before accepting
+        // the first one, so `save --all` can never commit a prefix and then
+        // return an error while formatting its response.
+        for (change, before, after, after_raw, action, decision) in &prepared {
+            let event = audit.prepare_reconciled_in(
+                ReconciledMutation {
+                    action: action.clone(),
+                    collection: &change.collection,
+                    id: &change.id,
+                    before_document: before.as_ref(),
+                    after_document: after.as_ref(),
+                    before_hash: change.audited_hash.as_deref(),
+                    after_bytes: after_raw.as_deref().map(str::as_bytes),
+                    had_history: snapshot
+                        .states
+                        .contains_key(&(change.collection.clone(), change.id.clone())),
+                    message,
+                    access: decision.as_ref(),
+                },
+                &snapshot,
+            )?;
+            let preview =
+                self.reveal_preview_with_audited_states(event.into_preview(), &snapshot.states)?;
             if mode == MutationMode::Preview {
-                previews.push(event.into_preview());
-                continue;
+                previews.push(preview);
+            } else {
+                projected_changes.push(preview.changes);
             }
-            entries.push(audit.accept(event, &change.path)?);
+        }
+        if mode == MutationMode::Preview {
+            return Ok((Vec::new(), previews));
+        }
+
+        let mut entries = Vec::with_capacity(prepared.len());
+        for ((change, before, after, after_raw, action, decision), changes) in
+            prepared.into_iter().zip(projected_changes)
+        {
+            let event = audit.prepare_reconciled_in(
+                ReconciledMutation {
+                    action,
+                    collection: &change.collection,
+                    id: &change.id,
+                    before_document: before.as_ref(),
+                    after_document: after.as_ref(),
+                    before_hash: change.audited_hash.as_deref(),
+                    after_bytes: after_raw.as_deref().map(str::as_bytes),
+                    had_history: snapshot
+                        .states
+                        .contains_key(&(change.collection.clone(), change.id.clone())),
+                    message,
+                    access: decision.as_ref(),
+                },
+                &snapshot,
+            )?;
+            let mut entry = audit.accept_reconciled_in(event, &change.path, &mut snapshot)?;
+            entry.payload.changes = changes;
+            entries.push(entry);
         }
         Ok((entries, previews))
     }
@@ -2394,7 +3222,7 @@ impl Database {
             }
             (None, None) => {
                 if self.owner_access_allowed(&AccessResource::Database)? {
-                    return audit.recent(limit, filter);
+                    return self.reveal_audit_history(audit.recent_history(limit, filter)?);
                 }
                 let Some((user, policy_hash)) = self.user_unchecked_optional(&self.principal)?
                 else {
@@ -2403,7 +3231,7 @@ impl Database {
                         self.principal
                     )));
                 };
-                return audit.recent_where(limit, filter, |entry| {
+                let history = audit.recent_history_where(limit, filter, |entry| {
                     if entry.payload.record.collection == USERS_COLLECTION {
                         if entry.payload.record.id == self.principal {
                             return Ok(true);
@@ -2430,11 +3258,12 @@ impl Database {
                             &policy_hash,
                         )
                         .is_some())
-                });
+                })?;
+                return self.reveal_audit_history(history);
             }
             (None, Some(_)) => unreachable!(),
         }
-        audit.recent(limit, filter)
+        self.reveal_audit_history(audit.recent_history(limit, filter)?)
     }
 
     pub fn audit_head(&self) -> Result<AuditHead> {
@@ -2483,14 +3312,22 @@ impl Database {
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         let decision = self.authorize_owner(&AccessResource::Database)?;
+        let states = audit.record_states()?;
         let mut added = 0;
 
         for (collection, id, path) in self.record_files()? {
-            if audit.has_history(&collection, &id)? {
+            if states.contains_key(&(collection.clone(), id.clone())) {
                 continue;
             }
             let raw = self.read_record(&collection, &id, &path)?;
             let document = parse_record(&collection, &id, &raw)?;
+            let logical = self.reveal_document_with_audited_states(
+                &collection,
+                &id,
+                &document,
+                Some(&states),
+            )?;
+            self.validate(&collection, &logical.attributes)?;
             let event = audit.prepare(AuditMutation {
                 action: AuditAction::Baseline,
                 collection: &collection,
@@ -2502,6 +3339,7 @@ impl Database {
                 source: self.source.clone(),
                 message: self.audit_message.as_deref(),
                 access: decision.as_ref(),
+                idempotency: None,
             })?;
             audit.commit(event, &path, || Ok(()))?;
             added += 1;
@@ -2588,25 +3426,66 @@ impl Database {
         })
     }
 
-    fn read_document(&self, collection: &str, id: &str, path: &Path) -> Result<Document> {
-        let input = self.read_record(collection, id, path)?;
-        parse_record(collection, id, &input)
+    /// Read an existing mutation target without turning a failed conditional
+    /// write into an ordinary not-found response. `If-Match` is false when no
+    /// current representation exists, so an expected version maps that state
+    /// to the same typed precondition failure as a changed representation.
+    fn read_record_for_mutation(
+        &self,
+        collection: &str,
+        id: &str,
+        path: &Path,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<String> {
+        self.read_record(collection, id, path).map_err(|error| {
+            if precondition.is_some()
+                && matches!(DomainError::of(&error), Some(DomainError::NotFound(_)))
+            {
+                precondition_failed(format!(
+                    "record {collection}/{id} changed since the expected version"
+                ))
+            } else {
+                error
+            }
+        })
     }
 
     fn validate(&self, collection: &str, attributes: &Mapping) -> Result<()> {
         if collection == USERS_COLLECTION {
             let schema = users_schema();
-            validate_schema_instance(collection, attributes, &schema, "the built-in users schema")?;
+            validate_schema_instance(
+                collection,
+                attributes,
+                &schema,
+                "the built-in users schema",
+                false,
+            )?;
             User::from_attributes(attributes)?;
             return Ok(());
+        }
+        let Some(schema) = self.collection_schema(collection)? else {
+            return Ok(());
+        };
+        let redact_values = !EncryptionPolicy::from_schema(Some(&schema))?.is_empty();
+        validate_schema_instance(
+            collection,
+            attributes,
+            &schema,
+            &schema_label(collection),
+            redact_values,
+        )
+    }
+
+    fn collection_schema(&self, collection: &str) -> Result<Option<serde_json::Value>> {
+        if collection == USERS_COLLECTION {
+            return Ok(Some(users_schema()));
         }
         let schema_path = Path::new(SCHEMA_DIRECTORY).join(format!("{collection}.json"));
         let label = schema_label(collection);
         let Some(serialized) = paths::read_to_string_optional(&self.root, &schema_path, &label)?
         else {
-            return Ok(());
+            return Ok(None);
         };
-
         let unusable = || {
             DomainError::Invalid(format!(
                 "collection '{collection}' has an unusable JSON Schema"
@@ -2618,7 +3497,371 @@ impl Database {
         jsonschema::meta::validate(&schema)
             .map_err(|error| anyhow!("invalid JSON Schema for {label}: {error}"))
             .with_context(unusable)?;
-        validate_schema_instance(collection, attributes, &schema, &label)
+        EncryptionPolicy::from_schema(Some(&schema)).with_context(unusable)?;
+        Ok(Some(schema))
+    }
+
+    fn encryption_policy(&self, collection: &str) -> Result<EncryptionPolicy> {
+        let schema = self.collection_schema(collection)?;
+        EncryptionPolicy::from_schema(schema.as_ref())
+    }
+
+    pub(crate) fn encryption_context_optional(&self) -> Result<Option<EncryptionContext>> {
+        paths::read_to_string_optional(&self.root, Path::new(CONTEXT_PATH), CONTEXT_LABEL)?
+            .map(|serialized| EncryptionContext::parse(&serialized))
+            .transpose()
+    }
+
+    pub(crate) fn encryption_context_required(&self) -> Result<EncryptionContext> {
+        self.encryption_context_optional()?
+            .ok_or_else(|| conflict("database encryption context is missing for protected data"))
+    }
+
+    /// Create the portable context for a database initialized before encrypted
+    /// storage existed, but only while there is no ciphertext that could have
+    /// belonged to a different missing context.
+    pub(crate) fn ensure_encryption_context(&self) -> Result<EncryptionContext> {
+        if let Some(context) = self.encryption_context_optional()? {
+            return Ok(context);
+        }
+        for (collection, id, path) in self.record_files()? {
+            let raw = self.read_record(&collection, &id, &path)?;
+            let document = parse_record(&collection, &id, &raw)?;
+            if document_has_encrypted_storage(&document) {
+                return Err(conflict(
+                    "database encryption context is missing for existing protected data",
+                ));
+            }
+        }
+        if self.audit().contains_protected_storage()? {
+            return Err(conflict(
+                "database encryption context is missing for existing protected history",
+            ));
+        }
+        if self.contains_protected_sync_run()? {
+            return Err(conflict(
+                "database encryption context is missing for an interrupted protected sync run",
+            ));
+        }
+
+        let generated = EncryptionContext::generate()?;
+        match paths::write_new(
+            &self.root,
+            Path::new(CONTEXT_PATH),
+            &generated.render()?,
+            CONTEXT_LABEL,
+        ) {
+            Ok(()) => Ok(generated),
+            Err(error) if is_already_exists(&error) => self
+                .encryption_context_optional()?
+                .context("database encryption context appeared but could not be read"),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn collection_uses_encryption(&self, collection: &str) -> Result<bool> {
+        Ok(!self.encryption_policy(collection)?.is_empty())
+    }
+
+    pub(crate) fn stored_record_matches_logical(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        body: &str,
+        version: &str,
+    ) -> Result<bool> {
+        let path = self.record_path(collection, id)?;
+        let Some(raw) =
+            paths::read_to_string_optional(&self.root, &path, &record_label(collection, id))?
+        else {
+            return Ok(false);
+        };
+        if record_hash(raw.as_bytes()) != version {
+            return Ok(false);
+        }
+        let logical = self.parse_logical_record(collection, id, &raw)?;
+        Ok(&logical.attributes == attributes && logical.body == body)
+    }
+
+    pub(crate) fn reveal_document(
+        &self,
+        collection: &str,
+        id: &str,
+        stored: &Document,
+    ) -> Result<Document> {
+        let policy = self.encryption_policy(collection)?;
+        let mut audited_states = None;
+        self.reveal_document_with_policy_cached(
+            collection,
+            id,
+            stored,
+            &policy,
+            &mut audited_states,
+        )
+    }
+
+    pub(crate) fn reveal_document_with_audited_states(
+        &self,
+        collection: &str,
+        id: &str,
+        stored: &Document,
+        audited_states: Option<&AuditedRecordStates>,
+    ) -> Result<Document> {
+        let policy = self.encryption_policy(collection)?;
+        self.reveal_document_with_policy(collection, id, stored, &policy, audited_states)
+    }
+
+    fn reveal_document_with_policy_cached(
+        &self,
+        collection: &str,
+        id: &str,
+        stored: &Document,
+        policy: &EncryptionPolicy,
+        audited_states: &mut Option<AuditedRecordStates>,
+    ) -> Result<Document> {
+        if needs_audited_encryption_ownership(policy) && audited_states.is_none() {
+            *audited_states = Some(self.audit().record_states()?);
+        }
+        self.reveal_document_with_policy(collection, id, stored, policy, audited_states.as_ref())
+    }
+
+    fn reveal_document_with_policy(
+        &self,
+        collection: &str,
+        id: &str,
+        stored: &Document,
+        policy: &EncryptionPolicy,
+        audited_states: Option<&AuditedRecordStates>,
+    ) -> Result<Document> {
+        if needs_audited_encryption_ownership(policy) {
+            let states = audited_states.ok_or_else(|| {
+                conflict("protected storage ownership could not be verified from audit history")
+            })?;
+            if audited_record_owns_protected_storage(states, collection, id) {
+                return Err(conflict(
+                    "stored protected data is no longer declared by the collection schema",
+                ));
+            }
+        }
+        let context = if policy.is_empty() {
+            None
+        } else {
+            self.encryption_context_optional()?
+        };
+        policy.reveal(
+            context.as_ref().map(EncryptionContext::id),
+            collection,
+            id,
+            stored,
+        )
+    }
+
+    fn parse_logical_record(&self, collection: &str, id: &str, raw: &str) -> Result<Document> {
+        let mut audited_states = None;
+        self.parse_logical_record_with_audited_cache(collection, id, raw, &mut audited_states)
+    }
+
+    fn parse_logical_record_with_audited_cache(
+        &self,
+        collection: &str,
+        id: &str,
+        raw: &str,
+        audited_states: &mut Option<AuditedRecordStates>,
+    ) -> Result<Document> {
+        let stored = parse_record(collection, id, raw)?;
+        let policy = self.encryption_policy(collection)?;
+        self.reveal_document_with_policy_cached(collection, id, &stored, &policy, audited_states)
+    }
+
+    fn protect_document(
+        &self,
+        collection: &str,
+        id: &str,
+        logical: &Document,
+        previous_stored: Option<&Document>,
+        mode: MutationMode,
+    ) -> Result<Document> {
+        let policy = self.encryption_policy(collection)?;
+        if previous_stored.is_none() && policy.would_encrypt_on_create(logical) {
+            if mode == MutationMode::Preview {
+                return Err(invalid(
+                    "preview approval is unavailable when protected values would receive fresh encryption",
+                ));
+            }
+            if self
+                .attribution
+                .authorization
+                .as_ref()
+                .is_some_and(|authorization| authorization.approved_changes.is_some())
+            {
+                return Err(invalid(
+                    "--approved-changes cannot bind a mutation that creates fresh encrypted values",
+                ));
+            }
+        }
+        let context = if policy.is_empty() {
+            None
+        } else if mode == MutationMode::Apply {
+            Some(self.ensure_encryption_context()?)
+        } else {
+            self.encryption_context_optional()?
+        };
+        let protected = policy.protect(
+            context.as_ref().map(EncryptionContext::id),
+            collection,
+            id,
+            logical,
+            previous_stored,
+        )?;
+        if protected.encrypted_new_value {
+            if mode == MutationMode::Preview {
+                return Err(invalid(
+                    "preview approval is unavailable when protected values would receive fresh encryption",
+                ));
+            }
+            if self
+                .attribution
+                .authorization
+                .as_ref()
+                .is_some_and(|authorization| authorization.approved_changes.is_some())
+            {
+                return Err(invalid(
+                    "--approved-changes cannot bind a mutation that creates fresh encrypted values",
+                ));
+            }
+        }
+        Ok(protected.document)
+    }
+
+    fn reveal_preview(&self, preview: ChangePreview) -> Result<ChangePreview> {
+        let states = self.audit().record_states()?;
+        self.reveal_preview_with_audited_states(preview, &states)
+    }
+
+    /// Project a preview through storage encryption using one already verified
+    /// replay state. Bulk save prepares every independent preview against the
+    /// same locked journal head, so replaying that head again for each record
+    /// adds no integrity and makes `save --all` quadratic in audit history.
+    fn reveal_preview_with_audited_states(
+        &self,
+        mut preview: ChangePreview,
+        states: &AuditedRecordStates,
+    ) -> Result<ChangePreview> {
+        let policy = self.encryption_policy(&preview.record.collection)?;
+        let current = states
+            .get(&(preview.record.collection.clone(), preview.record.id.clone()))
+            .and_then(|state| state.document.as_ref());
+        let mut metadata = current
+            .and_then(audit_document_encryption_metadata)
+            .into_iter()
+            .collect::<Vec<_>>();
+        metadata.extend(changes_encryption_metadata(&preview.changes));
+        let manifest_owned_storage = projection_uses_policy(&policy, metadata.iter())?;
+        self.reveal_changes(
+            &preview.record.collection,
+            &preview.record.id,
+            &mut preview.changes,
+            &policy,
+            manifest_owned_storage,
+        )?;
+        Ok(preview)
+    }
+
+    fn reveal_audit_history(&self, history: AuditHistory) -> Result<Vec<AuditEntry>> {
+        let AuditHistory {
+            mut entries,
+            encryption_transitions: transitions,
+        } = history;
+        // Preflight every selected event before decrypting any of them. The
+        // response is built in memory and already all-or-nothing, but this also
+        // keeps plaintext out of the working projection when a later selected
+        // event proves that its historical manifest belongs to another policy.
+        let projections = entries
+            .iter()
+            .map(|entry| {
+                let policy = self.encryption_policy(&entry.payload.record.collection)?;
+                let transition = transitions.get(&entry.payload.sequence);
+                let manifest_owned_storage = projection_uses_policy(
+                    &policy,
+                    transition
+                        .into_iter()
+                        .flat_map(AuditEncryptionTransition::metadata),
+                )?;
+                Ok((policy, manifest_owned_storage))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (entry, (policy, manifest_owned_storage)) in entries.iter_mut().zip(projections.iter())
+        {
+            self.reveal_changes(
+                &entry.payload.record.collection,
+                &entry.payload.record.id,
+                &mut entry.payload.changes,
+                policy,
+                *manifest_owned_storage,
+            )?;
+            if *manifest_owned_storage {
+                let context = self.encryption_context_optional()?;
+                let context = context.as_ref().map(EncryptionContext::id);
+                if let Some(snapshot) = entry.payload.after_snapshot.as_mut() {
+                    reveal_audit_markdown(
+                        policy,
+                        context,
+                        &entry.payload.record.collection,
+                        &entry.payload.record.id,
+                        &mut snapshot.markdown,
+                    )?;
+                }
+                if let Some(idempotency) = entry.payload.idempotency.as_mut() {
+                    reveal_audit_markdown(
+                        policy,
+                        context,
+                        &entry.payload.record.collection,
+                        &entry.payload.record.id,
+                        &mut idempotency.result.markdown,
+                    )?;
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    fn reveal_changes(
+        &self,
+        collection: &str,
+        id: &str,
+        changes: &mut [AuditChange],
+        policy: &EncryptionPolicy,
+        manifest_owned_storage: bool,
+    ) -> Result<()> {
+        // A current schema cannot retroactively assign storage meaning to old
+        // history. Only the manifest in that event's reconstructed document
+        // state owns envelope-shaped values; everything else remains ordinary
+        // application data and needs neither a context nor a keyring.
+        if !manifest_owned_storage {
+            return Ok(());
+        }
+        let context = self.encryption_context_optional()?;
+        let context = context.as_ref().map(EncryptionContext::id);
+        for change in changes {
+            match change {
+                AuditChange::Add { path, after } => {
+                    policy.reveal_audit_value(context, collection, id, path, after)?;
+                }
+                AuditChange::Remove { path, before } => {
+                    policy.reveal_audit_value(context, collection, id, path, before)?;
+                }
+                AuditChange::Replace {
+                    path,
+                    before,
+                    after,
+                } => {
+                    policy.reveal_audit_value(context, collection, id, path, before)?;
+                    policy.reveal_audit_value(context, collection, id, path, after)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn record_files(&self) -> Result<Vec<(String, String, PathBuf)>> {
@@ -2813,14 +4056,80 @@ fn relation_value(collection: &str, id: &str) -> Value {
     Value::Mapping(reference)
 }
 
-fn record_from_document(collection: &str, id: &str, path: PathBuf, document: Document) -> Record {
+fn record_from_document(
+    collection: &str,
+    id: &str,
+    path: PathBuf,
+    document: Document,
+    version: String,
+) -> Record {
     Record {
         collection: collection.to_owned(),
         id: id.to_owned(),
         path,
+        version,
         attributes: document.attributes,
         body: document.body,
     }
+}
+
+fn validate_record_version(version: &str) -> Result<()> {
+    let digest = version.strip_prefix("sha256:").ok_or_else(|| {
+        invalid("record version must use the form sha256: followed by 64 lowercase hex digits")
+    })?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid(
+            "record version must use the form sha256: followed by 64 lowercase hex digits",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_idempotency_key(key: &str) -> Result<()> {
+    if key.len() < MIN_IDEMPOTENCY_KEY_BYTES || key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+        return Err(invalid(format!(
+            "idempotency key must contain between {MIN_IDEMPOTENCY_KEY_BYTES} and {MAX_IDEMPOTENCY_KEY_BYTES} visible ASCII bytes"
+        )));
+    }
+    if !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(invalid(
+            "idempotency key must contain visible ASCII without whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn idempotency_digest(domain: &[u8], bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(bytes);
+    let digest = digest.finalize();
+    let hexadecimal = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{hexadecimal}")
+}
+
+/// Authenticate canonical plaintext request identity with the never-persisted
+/// retry key. This prevents the durable request digest from becoming an
+/// offline dictionary oracle for low-entropy protected request values.
+fn idempotency_request_digest(key: &[u8], canonical_request: &[u8]) -> String {
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
+        .expect("HMAC accepts retry keys of every validated length");
+    mac.update(IDEMPOTENCY_REQUEST_HASH_DOMAIN);
+    mac.update(canonical_request);
+    let hexadecimal = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("hmac-sha256:{hexadecimal}")
 }
 
 /// Parse a stored record, naming it by collection and ID rather than by path.
@@ -2905,11 +4214,17 @@ fn validate_schema_instance(
     attributes: &Mapping,
     schema: &serde_json::Value,
     label: &str,
+    redact_values: bool,
 ) -> Result<()> {
     let validator = jsonschema::validator_for(schema)
         .map_err(|error| anyhow!("could not compile {label}: {error}"))?;
     let instance = serde_json::to_value(attributes)
         .context("front matter cannot be represented as JSON for schema validation")?;
+    if redact_values && !validator.is_valid(&instance) {
+        return Err(invalid(format!(
+            "record does not match schema for collection '{collection}' (protected values redacted)"
+        )));
+    }
     let errors: Vec<_> = validator
         .iter_errors(&instance)
         .map(|error| format!("- {error}"))
@@ -2920,6 +4235,89 @@ fn validate_schema_instance(
             errors.join("\n")
         )));
     }
+    Ok(())
+}
+
+fn changes_encryption_metadata(changes: &[AuditChange]) -> Vec<EncryptionStorageMetadata> {
+    changes
+        .iter()
+        .flat_map(|change| match change {
+            AuditChange::Add { path, after } if path.is_empty() => {
+                [audit_document_encryption_metadata(after), None]
+            }
+            AuditChange::Remove { path, before } if path.is_empty() => {
+                [audit_document_encryption_metadata(before), None]
+            }
+            AuditChange::Replace {
+                path,
+                before,
+                after,
+            } if path.is_empty() => [
+                audit_document_encryption_metadata(before),
+                audit_document_encryption_metadata(after),
+            ],
+            _ => [None, None],
+        })
+        .flatten()
+        .collect()
+}
+
+/// When a schema currently declares no encryption, verified lifecycle state
+/// must decide whether a materialized record is nevertheless protected. The
+/// mutable record syntax cannot safely short-circuit that decision: both the
+/// manifest and envelope wrapper can be removed or malformed together.
+fn needs_audited_encryption_ownership(policy: &EncryptionPolicy) -> bool {
+    policy.is_empty()
+}
+
+fn audited_record_owns_protected_storage(
+    states: &AuditedRecordStates,
+    collection: &str,
+    id: &str,
+) -> bool {
+    states
+        .get(&(collection.to_owned(), id.to_owned()))
+        .is_some_and(|state| state.protected_storage_owned)
+}
+
+/// Decide whether one historical event may be projected through the current
+/// schema. A manifest without any envelope contains no protected value to
+/// expose, so a removed marker may leave it as inert historical metadata. As
+/// soon as real ciphertext exists, every before/after policy must exactly
+/// equal the current policy; marker moves fail closed without naming paths.
+fn projection_uses_policy<'a>(
+    current: &EncryptionPolicy,
+    metadata: impl Iterator<Item = &'a EncryptionStorageMetadata>,
+) -> Result<bool> {
+    let metadata = metadata.collect::<Vec<_>>();
+    if metadata.is_empty() {
+        return Ok(false);
+    }
+    let has_envelopes = metadata.iter().any(|state| state.has_envelopes);
+    if metadata.iter().all(|state| &state.policy == current) {
+        return Ok(true);
+    }
+    if has_envelopes {
+        return Err(conflict(
+            "stored protected history is no longer declared by the current collection schema",
+        ));
+    }
+    Ok(false)
+}
+
+fn reveal_audit_markdown(
+    policy: &EncryptionPolicy,
+    context: Option<&str>,
+    collection: &str,
+    id: &str,
+    markdown: &mut String,
+) -> Result<()> {
+    let stored = Document::parse(markdown)
+        .map_err(|_| conflict("stored protected history cannot be decoded"))?;
+    let logical = policy.reveal(context, collection, id, &stored)?;
+    *markdown = logical
+        .render()
+        .map_err(|_| conflict("stored protected history cannot be decoded"))?;
     Ok(())
 }
 

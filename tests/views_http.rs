@@ -83,6 +83,70 @@ fn csrf(html: &str) -> &str {
     rest.split_once('"').unwrap().0
 }
 
+fn expected_record_hash(html: &str) -> &str {
+    let marker = "name=\"_expected_record_hash\" value=\"";
+    let rest = html
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("record version field missing from HTML:\n{html}"))
+        .1;
+    rest.split_once('"').unwrap().0
+}
+
+#[tokio::test]
+async fn stale_browser_forms_cannot_overwrite_a_newer_record() {
+    let (_temporary, database) = test_database("stale-browser-form");
+    database
+        .create(
+            "items",
+            "one",
+            &[Assignment::from_str("stage=open").unwrap()],
+            "First",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/items/records/one", None, &[]).await;
+    let token = csrf(page.text()).to_owned();
+    let version = expected_record_hash(page.text()).to_owned();
+
+    database
+        .update(
+            "items",
+            "one",
+            &[Assignment::from_str("stage=won").unwrap()],
+            Some("Newer notes"),
+        )
+        .unwrap();
+    let stale = request(
+        &app,
+        Method::POST,
+        "/items/records/one",
+        Some(form(&[
+            ("_csrf", &token),
+            ("_expected_record_hash", &version),
+            ("front_matter", "stage: lost\n"),
+            ("markdown", "Old notes"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+    assert!(
+        stale
+            .text()
+            .contains("record items/one changed since the expected version")
+    );
+    let record = database.get("items", "one").unwrap();
+    assert_eq!(record.attributes["stage"], "won");
+    assert_eq!(record.body, "Newer notes");
+    assert_eq!(
+        database
+            .audit_recent(10, AuditFilter::record("items", "one"))
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
 #[tokio::test]
 async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     let (_temporary, database) = test_database("views-render");
@@ -1026,6 +1090,7 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
             .contains("/audit?collection=deals&amp;id=acme")
     );
     let edit_token = csrf(edit_page.text()).to_owned();
+    let edit_version = expected_record_hash(edit_page.text()).to_owned();
 
     let invalid = request(
         &app,
@@ -1033,6 +1098,7 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
         "/open-deals/records/acme",
         Some(form(&[
             ("_csrf", &edit_token),
+            ("_expected_record_hash", &edit_version),
             ("front_matter", "status: lost\nvalue: 12500\n"),
             ("markdown", "Invalid attempt"),
         ])),
@@ -1053,6 +1119,7 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
         "/open-deals/records/acme",
         Some(form(&[
             ("_csrf", "wrong"),
+            ("_expected_record_hash", &edit_version),
             ("front_matter", "status: won\nvalue: 13000\n"),
             ("markdown", "Won"),
         ])),
@@ -1067,6 +1134,7 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
         "/open-deals/records/acme",
         Some(form(&[
             ("_csrf", &edit_token),
+            ("_expected_record_hash", &edit_version),
             ("front_matter", "status: won\nvalue: 13000\nowner: jane\n"),
             ("markdown", "Closed won"),
         ])),
@@ -1092,11 +1160,15 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
 
     let delete_page = request(&app, Method::GET, "/open-deals/records/acme", None, &[]).await;
     let delete_token = csrf(delete_page.text()).to_owned();
+    let delete_version = expected_record_hash(delete_page.text()).to_owned();
     let deleted = request(
         &app,
         Method::POST,
         "/open-deals/records/acme/delete",
-        Some(form(&[("_csrf", &delete_token)])),
+        Some(form(&[
+            ("_csrf", &delete_token),
+            ("_expected_record_hash", &delete_version),
+        ])),
         &[],
     )
     .await;
@@ -1239,6 +1311,7 @@ async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
             .contains("name=\"attribute.tags\" value=\"rust\" checked")
     );
     assert!(edit_page.text().contains("source: referral"));
+    let edit_version = expected_record_hash(edit_page.text()).to_owned();
 
     let invalid = request(
         &app,
@@ -1246,6 +1319,7 @@ async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
         "/candidates/records/jane-doe",
         Some(form(&[
             ("_csrf", &token),
+            ("_expected_record_hash", &edit_version),
             ("_form_mode", "structured"),
             ("attribute.name", "Jane Doe"),
             ("attribute.email", "jane@example.com"),
@@ -1278,6 +1352,7 @@ async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
         "/candidates/records/jane-doe",
         Some(form(&[
             ("_csrf", &token),
+            ("_expected_record_hash", &edit_version),
             ("_form_mode", "structured"),
             ("attribute.name", "Jane Doe"),
             ("attribute.email", "jane@example.com"),

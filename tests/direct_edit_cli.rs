@@ -46,7 +46,7 @@ fn direct_edit_stays_dirty_until_an_explicit_attributed_save() {
     run_success(database.command().args(["audit", "verify"]));
 
     let entries = json_output(&database, &["audit", "log", "candidates", "jane", "--json"]);
-    assert_eq!(entries[0]["version"], 2);
+    assert_eq!(entries[0]["version"], 3);
     assert_eq!(entries[0]["source"], "filesystem");
     assert_eq!(entries[0]["actor"], "Jane Doe <jane@example.com>");
     assert_eq!(entries[0]["message"], "Move candidate to interview");

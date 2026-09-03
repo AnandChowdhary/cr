@@ -151,7 +151,7 @@ fn an_empty_segment_file_is_refused() {
 /// A payload rewritten *and* re-hashed, so the line is internally consistent.
 ///
 /// This is the interesting tamper: hashing the line alone cannot catch it. The
-/// chain has to, through the next event's `previous_hash`.
+/// replay catches it at the guilty event before the next link is considered.
 #[test]
 fn a_re_hashed_forged_event_is_caught_by_the_events_that_follow_it() {
     let database = seeded("forged-middle");
@@ -165,24 +165,19 @@ fn a_re_hashed_forged_event_is_caught_by_the_events_that_follow_it() {
         .to_owned();
     write_lines(&segment, &stored);
 
-    verify_fails_with(&database, "audit hash chain is broken at sequence 3");
+    verify_fails_with(
+        &database,
+        "audit replay is inconsistent at sequence 2: record snapshot does not describe the replayed document",
+    );
 }
 
-/// Forging the *newest* event, where nothing follows to link it.
+/// Forging the *result* of the newest event, where nothing follows to link it.
 ///
-/// This is the weakest point of the chain and the test says so out loud. The
-/// linkage that protects every other event does not exist here, and only two
-/// things push back: the replay checks each change's `before` value against the
-/// state it reconstructed, and `verify_records` pins `after_hash` to the file on
-/// disk. Everything else in the head event — actor, timestamp, message,
-/// attribution, and the `after` value of every change — can be rewritten and
-/// re-hashed, and `cr audit verify` will call the database clean.
-///
-/// See `docs/architecture.md` (threat boundary) and the `TODO.md` entry it
-/// references: the mitigation is an externally held head hash, exactly as it is
-/// for the removal of final events.
+/// Hashing the replayed document closes this part of the head gap. Rewriting
+/// the change, event hash, and in-database anchor still fails at the event that
+/// made the false claim, and a later mutation is refused for the same reason.
 #[test]
-fn a_forged_head_event_is_accepted_by_verification_and_caught_only_by_a_checkpoint() {
+fn a_forged_head_result_is_rejected_even_if_rehashed_and_reanchored() {
     let database = TestDatabase::new("forged-head");
     run_success(
         database
@@ -200,10 +195,6 @@ fn a_forged_head_event_is_accepted_by_verification_and_caught_only_by_a_checkpoi
         "--message",
         "reviewed and approved",
     ]));
-    let checkpoint = run_success(database.command().args(["audit", "head", "--json"]));
-    let checkpoint: Value = serde_json::from_str(&checkpoint).unwrap();
-    let checkpoint = checkpoint["hash"].as_str().unwrap().to_owned();
-
     let segment = only_segment(&database);
     let mut stored = lines(&segment);
     let index = stored.len() - 1;
@@ -227,50 +218,86 @@ fn a_forged_head_event_is_accepted_by_verification_and_caught_only_by_a_checkpoi
     // forgery, without this line, is caught.
     chain::reanchor(&database.root);
 
-    // The bad news, asserted rather than glossed over.
-    let verification = run_success(database.command().args(["audit", "verify"]));
-    assert!(verification.contains("Verified 2 audit events and 1 records"));
-    assert_eq!(run_success(database.command().arg("status")), "Clean\n");
-    let log = run_success(database.command().args(["audit", "log", "--json"]));
-    let log: Value = serde_json::from_str(&log).unwrap();
-    assert_eq!(log[0]["actor"], "mallory");
-    assert_eq!(log[0]["changes"][0]["after"], "never happened");
+    verify_fails_with(
+        &database,
+        "audit replay is inconsistent at sequence 2: record snapshot does not describe the replayed document",
+    );
+    let failure = run_failure(database.command().args([
+        "--json-errors",
+        "update",
+        "items",
+        "one",
+        "--set",
+        "stage=offer",
+    ]));
+    assert!(
+        failure.contains(
+            "audit replay is inconsistent at sequence 2: record snapshot does not describe the replayed document"
+        ),
+        "unexpected mutation refusal: {failure}"
+    );
+    assert!(failure.contains("\"code\":\"audit_integrity_failed\""));
+    assert!(!failure.contains(database.root.to_str().unwrap()));
+    assert!(!failure.contains("never happened"));
+    assert_eq!(chain::read_chain(&database.root).len(), 2);
+}
 
-    // The good news: the head hash moved, so a checkpoint held outside the
-    // database catches it — the same mitigation as for a truncated chain.
+/// Non-state metadata remains outside what replay can derive.
+///
+/// An attacker able to rewrite the newest event and its local anchor can still
+/// alter actor, timestamp, message, or attribution while leaving the replayed
+/// record state intact. An external checkpoint remains the boundary for that
+/// forgery.
+#[test]
+fn a_forged_head_actor_still_needs_an_external_checkpoint() {
+    let database = TestDatabase::new("forged-head-actor");
+    run_success(
+        database
+            .command()
+            .args(["create", "items", "one", "--set", "stage=screening"]),
+    );
+    run_success(database.command().args([
+        "--actor",
+        "alice",
+        "update",
+        "items",
+        "one",
+        "--set",
+        "stage=hired",
+    ]));
+    let checkpoint = chain::read_chain(&database.root)
+        .last()
+        .unwrap()
+        .hash
+        .clone();
+
+    let segment = only_segment(&database);
+    let mut stored = lines(&segment);
+    let index = stored.len() - 1;
+    let event = chain::parse_line(&stored[index]);
+    let forged = event
+        .payload
+        .replacen("\"actor\":\"alice\"", "\"actor\":\"mallory\"", 1);
+    assert_ne!(forged, event.payload);
+    stored[index] = chain::stored_line(&chain::event_hash(&forged), &forged)
+        .trim_end()
+        .to_owned();
+    write_lines(&segment, &stored);
+    chain::reanchor(&database.root);
+
+    run_success(database.command().args(["audit", "verify"]));
     let failure =
         run_failure(
             database
                 .command()
                 .args(["audit", "verify", "--expected-head", &checkpoint]),
         );
-    assert!(
-        failure.contains("audit head does not match expected checkpoint"),
-        "unexpected failure: {failure}"
-    );
-
-    // A further mutation is accepted too, because a write replays the hash
-    // chain but not the per-record change sets. The tamper only surfaces on the
-    // next `audit verify`, by which point it is reported against the newer
-    // event rather than the forged one.
-    run_success(
-        database
-            .command()
-            .args(["update", "items", "one", "--set", "stage=offer"]),
-    );
-    verify_fails_with(&database, "audit changes are inconsistent at sequence 3");
+    assert!(failure.contains("audit head does not match expected checkpoint"));
 }
 
-/// The property the previous test shows `cr` does not have.
-///
-/// Detecting a forged head event without an external checkpoint means checking
-/// the replayed document against `after_hash` rather than only its presence.
-/// That is not a small change: the replay produces a semantic document, and
-/// re-rendering it to Markdown is not byte-identical for records introduced by
-/// `audit baseline`, which is why the implementation stops where it does. Left
-/// failing on purpose; see the `TODO.md` entry.
+/// The formerly ignored property: changing the newest event's after-state is
+/// detected without relying on an external checkpoint.
 #[test]
-#[ignore = "known gap: verification cross-checks after_hash against the file, not against the replayed document"]
 fn a_forged_head_event_should_be_detected_without_an_external_checkpoint() {
     let database = TestDatabase::new("forged-head-ideal");
     run_success(
@@ -296,8 +323,357 @@ fn a_forged_head_event_should_be_detected_without_an_external_checkpoint() {
         .trim_end()
         .to_owned();
     write_lines(&segment, &stored);
+    chain::reanchor(&database.root);
 
-    verify_fails_with(&database, "audit");
+    verify_fails_with(
+        &database,
+        "audit replay is inconsistent at sequence 2: record snapshot does not describe the replayed document",
+    );
+}
+
+#[test]
+fn a_version_three_baseline_cannot_strip_or_downgrade_its_exact_snapshot() {
+    for (name, mutate, expected) in [
+        (
+            "missing",
+            "remove",
+            "existing state has no exact record snapshot",
+        ),
+        (
+            "future",
+            "version",
+            "record snapshot uses an unsupported version",
+        ),
+        (
+            "payload-downgrade",
+            "payload-version",
+            "legacy record witness does not describe the replayed document",
+        ),
+    ] {
+        let database = TestDatabase::new(&format!("baseline-snapshot-{name}"));
+        fs::create_dir_all(database.root.join("records/legacy")).unwrap();
+        fs::write(
+            database.root.join("records/legacy/one.md"),
+            "---\r\nstage: screening\r\n---\r\nBody\r\n",
+        )
+        .unwrap();
+        run_success(database.command().args(["audit", "baseline"]));
+
+        let segment = only_segment(&database);
+        let mut stored = lines(&segment);
+        let event = chain::parse_line(&stored[0]);
+        let mut payload: Value = serde_json::from_str(&event.payload).unwrap();
+        match mutate {
+            "remove" => {
+                payload.as_object_mut().unwrap().remove("after_snapshot");
+            }
+            "version" => payload["after_snapshot"]["version"] = Value::from(99),
+            "payload-version" => {
+                payload["version"] = Value::from(2);
+                payload.as_object_mut().unwrap().remove("after_snapshot");
+                payload["changes"][0]["after"]["attributes"]["stage"] = Value::from("forged");
+            }
+            _ => unreachable!(),
+        }
+        let forged = serde_json::to_string(&payload).unwrap();
+        stored[0] = chain::stored_line(&chain::event_hash(&forged), &forged)
+            .trim_end()
+            .to_owned();
+        write_lines(&segment, &stored);
+        chain::reanchor(&database.root);
+
+        verify_fails_with(
+            &database,
+            &format!("audit replay is inconsistent at sequence 1: {expected}"),
+        );
+    }
+}
+
+#[test]
+fn every_version_three_present_state_requires_its_exact_snapshot() {
+    let database = TestDatabase::new("update-snapshot-required");
+    run_success(
+        database
+            .command()
+            .args(["create", "items", "one", "--set", "stage=screening"]),
+    );
+    run_success(
+        database
+            .command()
+            .args(["update", "items", "one", "--set", "stage=hired"]),
+    );
+
+    let segment = only_segment(&database);
+    let mut stored = lines(&segment);
+    let event = chain::parse_line(&stored[1]);
+    let mut payload: Value = serde_json::from_str(&event.payload).unwrap();
+    payload.as_object_mut().unwrap().remove("after_snapshot");
+    let forged = serde_json::to_string(&payload).unwrap();
+    stored[1] = chain::stored_line(&chain::event_hash(&forged), &forged)
+        .trim_end()
+        .to_owned();
+    write_lines(&segment, &stored);
+    chain::reanchor(&database.root);
+
+    verify_fails_with(
+        &database,
+        "audit replay is inconsistent at sequence 2: existing state has no exact record snapshot",
+    );
+}
+
+#[test]
+fn a_legacy_noncanonical_baseline_accepts_a_v3_successor_and_checks_it() {
+    let database = TestDatabase::new("legacy-baseline-successor");
+    fs::create_dir_all(database.root.join("records/legacy")).unwrap();
+    fs::write(
+        database.root.join("records/legacy/one.md"),
+        "---\r\nstage: screening\r\n---\r\nBody\r\n",
+    )
+    .unwrap();
+    run_success(database.command().args(["audit", "baseline"]));
+
+    // Model an event written by v2: it has the semantic root change and the
+    // exact file hash, but predates the exact-representation witness.
+    let segment = only_segment(&database);
+    let mut stored = lines(&segment);
+    let event = chain::parse_line(&stored[0]);
+    let mut payload: Value = serde_json::from_str(&event.payload).unwrap();
+    payload["version"] = Value::from(2);
+    payload.as_object_mut().unwrap().remove("after_snapshot");
+    let legacy = serde_json::to_string(&payload).unwrap();
+    stored[0] = chain::stored_line(&chain::event_hash(&legacy), &legacy)
+        .trim_end()
+        .to_owned();
+    write_lines(&segment, &stored);
+    chain::reanchor(&database.root);
+
+    run_success(
+        database
+            .command()
+            .args(["update", "legacy", "one", "--set", "stage=hired"]),
+    );
+    run_success(database.command().args(["audit", "verify"]));
+
+    // The compatibility exception belongs only to the v2 baseline root. A
+    // forged v3 successor is still checked against its exact after hash.
+    let segment = only_segment(&database);
+    let mut stored = lines(&segment);
+    let event = chain::parse_line(&stored[1]);
+    let forged = event
+        .payload
+        .replacen("\"after\":\"hired\"", "\"after\":\"forged\"", 1);
+    assert_ne!(forged, event.payload);
+    stored[1] = chain::stored_line(&chain::event_hash(&forged), &forged)
+        .trim_end()
+        .to_owned();
+    write_lines(&segment, &stored);
+    chain::reanchor(&database.root);
+    verify_fails_with(
+        &database,
+        "audit replay is inconsistent at sequence 2: record snapshot does not describe the replayed document",
+    );
+}
+
+#[test]
+fn a_legacy_noncanonical_filesystem_save_uses_the_current_file_as_its_witness() {
+    let database = TestDatabase::new("legacy-filesystem-save");
+    run_success(
+        database
+            .command()
+            .args(["create", "items", "one", "--set", "stage=screening"]),
+    );
+    fs::write(
+        database.root.join("records/items/one.md"),
+        "---\r\nstage: interview\r\n---\r\nNotes\r\n",
+    )
+    .unwrap();
+    run_success(database.command().args(["save", "items/one"]));
+
+    // Rewrite both entries as an internally valid v2 chain. The filesystem
+    // event then has no exact-format witness, exactly like one written by the
+    // old `prepare_reconciled` path.
+    let segment = only_segment(&database);
+    let current = lines(&segment);
+    let mut rewritten = Vec::new();
+    let mut previous = None;
+    for line in current {
+        let event = chain::parse_line(&line);
+        let mut payload: Value = serde_json::from_str(&event.payload).unwrap();
+        payload["version"] = Value::from(2);
+        payload.as_object_mut().unwrap().remove("after_snapshot");
+        payload["previous_hash"] = previous.clone().map_or(Value::Null, Value::String);
+        let payload = serde_json::to_string(&payload).unwrap();
+        let hash = chain::event_hash(&payload);
+        rewritten.push(chain::stored_line(&hash, &payload).trim_end().to_owned());
+        previous = Some(hash);
+    }
+    write_lines(&segment, &rewritten);
+    chain::reanchor(&database.root);
+
+    run_success(database.command().args(["audit", "verify"]));
+    run_success(
+        database
+            .command()
+            .args(["update", "items", "one", "--set", "stage=hired"]),
+    );
+    run_success(database.command().args(["audit", "verify"]));
+}
+
+#[test]
+fn a_baseline_event_is_valid_only_as_the_first_event_for_a_record() {
+    let database = TestDatabase::new("late-baseline");
+    run_success(
+        database
+            .command()
+            .args(["create", "items", "one", "--set", "stage=screening"]),
+    );
+    run_success(
+        database
+            .command()
+            .args(["update", "items", "one", "--set", "stage=hired"]),
+    );
+    let segment = only_segment(&database);
+    let mut stored = lines(&segment);
+    let event = chain::parse_line(&stored[1]);
+    let forged = event
+        .payload
+        .replacen("\"action\":\"update\"", "\"action\":\"baseline\"", 1);
+    assert_ne!(forged, event.payload);
+    stored[1] = chain::stored_line(&chain::event_hash(&forged), &forged)
+        .trim_end()
+        .to_owned();
+    write_lines(&segment, &stored);
+    chain::reanchor(&database.root);
+    verify_fails_with(
+        &database,
+        "audit replay is inconsistent at sequence 2: baseline is not the first record event",
+    );
+}
+
+#[test]
+fn an_empty_baseline_cannot_claim_a_present_record_hash() {
+    let database = TestDatabase::new("empty-baseline");
+    fs::create_dir_all(database.root.join("records/legacy")).unwrap();
+    fs::write(
+        database.root.join("records/legacy/one.md"),
+        "---\nstage: screening\n---\n",
+    )
+    .unwrap();
+    run_success(database.command().args(["audit", "baseline"]));
+
+    let segment = only_segment(&database);
+    let mut stored = lines(&segment);
+    let event = chain::parse_line(&stored[0]);
+    let mut payload: Value = serde_json::from_str(&event.payload).unwrap();
+    payload["changes"] = Value::Array(Vec::new());
+    let forged = serde_json::to_string(&payload).unwrap();
+    stored[0] = chain::stored_line(&chain::event_hash(&forged), &forged)
+        .trim_end()
+        .to_owned();
+    write_lines(&segment, &stored);
+    chain::reanchor(&database.root);
+
+    verify_fails_with(
+        &database,
+        "audit replay is inconsistent at sequence 1: baseline action does not match the absent-to-absent record transition",
+    );
+}
+
+#[test]
+fn event_actions_are_bound_to_their_record_presence_transitions() {
+    for (name, setup, replacement, expected) in [
+        (
+            "create-as-update",
+            "create",
+            "update",
+            "update action does not match the absent-to-present record transition",
+        ),
+        (
+            "update-as-delete",
+            "update",
+            "delete",
+            "delete action does not match the present-to-present record transition",
+        ),
+        (
+            "delete-as-update",
+            "delete",
+            "update",
+            "update action does not match the present-to-absent record transition",
+        ),
+    ] {
+        let database = TestDatabase::new(name);
+        run_success(database.command().args([
+            "create",
+            "items",
+            "one",
+            "--set",
+            "stage=screening",
+        ]));
+        if setup == "update" {
+            run_success(database.command().args([
+                "update",
+                "items",
+                "one",
+                "--set",
+                "stage=hired",
+            ]));
+        } else if setup == "delete" {
+            run_success(database.command().args(["delete", "items", "one", "--yes"]));
+        }
+
+        let segment = only_segment(&database);
+        let mut stored = lines(&segment);
+        let index = stored.len() - 1;
+        let event = chain::parse_line(&stored[index]);
+        let mut payload: Value = serde_json::from_str(&event.payload).unwrap();
+        payload["action"] = Value::String(replacement.to_owned());
+        let forged = serde_json::to_string(&payload).unwrap();
+        stored[index] = chain::stored_line(&chain::event_hash(&forged), &forged)
+            .trim_end()
+            .to_owned();
+        write_lines(&segment, &stored);
+        chain::reanchor(&database.root);
+
+        verify_fails_with(
+            &database,
+            &format!(
+                "audit replay is inconsistent at sequence {}: {expected}",
+                index + 1
+            ),
+        );
+    }
+}
+
+#[test]
+fn payload_versions_may_increase_but_never_decrease() {
+    let database = TestDatabase::new("payload-version-decrease");
+    run_success(
+        database
+            .command()
+            .args(["create", "items", "one", "--set", "stage=screening"]),
+    );
+    run_success(
+        database
+            .command()
+            .args(["update", "items", "one", "--set", "stage=hired"]),
+    );
+
+    let segment = only_segment(&database);
+    let mut stored = lines(&segment);
+    let event = chain::parse_line(&stored[1]);
+    let mut payload: Value = serde_json::from_str(&event.payload).unwrap();
+    payload["version"] = Value::from(2);
+    let forged = serde_json::to_string(&payload).unwrap();
+    stored[1] = chain::stored_line(&chain::event_hash(&forged), &forged)
+        .trim_end()
+        .to_owned();
+    write_lines(&segment, &stored);
+    chain::reanchor(&database.root);
+
+    verify_fails_with(
+        &database,
+        "audit replay is inconsistent at sequence 2: payload version decreased from 3 to 2",
+    );
 }
 
 /// A line whose hash is honest but whose format version this build refuses.
@@ -308,7 +684,7 @@ fn a_correctly_hashed_event_of_an_unsupported_version_is_refused() {
     let mut stored = lines(&segment);
     let index = stored.len() - 1;
     let event = chain::parse_line(&stored[index]);
-    let forged = event.payload.replacen("\"version\":2", "\"version\":99", 1);
+    let forged = event.payload.replacen("\"version\":3", "\"version\":99", 1);
     assert_ne!(forged, event.payload);
     stored[index] = chain::stored_line(&chain::event_hash(&forged), &forged)
         .trim_end()

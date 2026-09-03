@@ -85,6 +85,57 @@ fn json_errors_classify_duplicate_records_and_users() {
 }
 
 #[test]
+fn cli_expected_record_hash_is_obtainable_and_typed_when_stale() {
+    let database = TestDatabase::new("cli-record-preconditions");
+    run_success(
+        database
+            .command()
+            .args(["create", "items", "one", "--set", "stage=open"]),
+    );
+    let fetched: Value = serde_json::from_str(&run_success(
+        database.command().args(["get", "items", "one", "--json"]),
+    ))
+    .unwrap();
+    let version = fetched["version"].as_str().expect("record version");
+
+    run_success(database.command().args([
+        "update",
+        "items",
+        "one",
+        "--set",
+        "stage=won",
+        "--expected-record-hash",
+        version,
+    ]));
+    let stale = json_error(database.command().args([
+        "--json-errors",
+        "update",
+        "items",
+        "one",
+        "--set",
+        "stage=lost",
+        "--expected-record-hash",
+        version,
+    ]));
+    assert_eq!(stale["error"]["code"], "precondition_failed");
+    assert_eq!(
+        stale["error"]["message"],
+        "record items/one changed since the expected version"
+    );
+
+    let malformed = json_error(database.command().args([
+        "--json-errors",
+        "delete",
+        "items",
+        "one",
+        "--yes",
+        "--expected-record-hash",
+        "sha256:NOT-A-HASH",
+    ]));
+    assert_eq!(malformed["error"]["code"], "validation_failed");
+}
+
+#[test]
 fn json_errors_give_unclassified_failures_a_stable_fallback() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("existing");

@@ -4,10 +4,10 @@ use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
     AccessAction, AccessResource, AgentEvidence, Assignment, AttributionOverrides, AuditFilter,
-    CheckReport, CheckScope, Database, DomainError, FilterExpression, Record, Role, SearchQuery,
-    SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions, UserEnsureOutcome, UserKind,
-    UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout, parse_threshold,
-    sort_records_by_field,
+    CheckReport, CheckScope, Database, DomainError, FilterExpression, Record, RecordPrecondition,
+    Role, SearchQuery, SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions,
+    UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout,
+    parse_threshold, sort_records_by_field,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -131,6 +131,13 @@ fn attributed(
     }
 }
 
+fn retryable(database: Database, idempotency_key: Option<String>) -> Result<Database> {
+    match idempotency_key {
+        Some(key) => database.with_idempotency_key(key),
+        None => Ok(database),
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     version,
@@ -183,12 +190,16 @@ enum Command {
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
 
+        /// High-entropy retry key (16-128 visible ASCII bytes). Successful retries return the original result.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
+
         /// Compute the change set without writing, and print the digest that approves it.
         #[arg(long, conflicts_with = "approved_changes")]
         preview: bool,
 
-        /// Print the preview as JSON.
-        #[arg(long, requires = "preview")]
+        /// Print the applied record or preview as JSON.
+        #[arg(long)]
         json: bool,
 
         #[command(flatten)]
@@ -343,16 +354,24 @@ enum Command {
         #[arg(long)]
         body: Option<String>,
 
+        /// Refuse unless the record still has this sha256 version from `cr get --json`.
+        #[arg(long, value_name = "SHA256")]
+        expected_record_hash: Option<String>,
+
         /// Explain why this record is being updated.
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
+
+        /// High-entropy retry key (16-128 visible ASCII bytes). Successful retries return the original result.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
 
         /// Compute the change set without writing, and print the digest that approves it.
         #[arg(long, conflicts_with = "approved_changes")]
         preview: bool,
 
-        /// Print the preview as JSON.
-        #[arg(long, requires = "preview")]
+        /// Print the applied record or preview as JSON.
+        #[arg(long)]
         json: bool,
 
         #[command(flatten)]
@@ -367,16 +386,24 @@ enum Command {
         target_collection: String,
         target_id: String,
 
+        /// Refuse unless the source record still has this sha256 version from `cr get --json`.
+        #[arg(long, value_name = "SHA256")]
+        expected_record_hash: Option<String>,
+
         /// Explain why this relation is being added.
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
+
+        /// High-entropy retry key (16-128 visible ASCII bytes). Successful retries return the original result.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
 
         /// Compute the change set without writing, and print the digest that approves it.
         #[arg(long, conflicts_with = "approved_changes")]
         preview: bool,
 
-        /// Print the preview as JSON.
-        #[arg(long, requires = "preview")]
+        /// Print the applied record or preview as JSON.
+        #[arg(long)]
         json: bool,
 
         #[command(flatten)]
@@ -452,6 +479,10 @@ enum Command {
         collection: String,
         id: String,
 
+        /// Refuse unless the record still has this sha256 version from `cr get --json`.
+        #[arg(long, value_name = "SHA256")]
+        expected_record_hash: Option<String>,
+
         /// Confirm the destructive operation. Not needed with --preview, which deletes nothing.
         #[arg(long)]
         yes: bool,
@@ -460,12 +491,16 @@ enum Command {
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
 
+        /// High-entropy retry key (16-128 visible ASCII bytes). Successful retries return the original deleted result.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
+
         /// Compute the change set without writing, and print the digest that approves it.
         #[arg(long, conflicts_with = "approved_changes")]
         preview: bool,
 
-        /// Print the preview as JSON.
-        #[arg(long, requires = "preview")]
+        /// Print the deleted record or preview as JSON.
+        #[arg(long)]
         json: bool,
 
         #[command(flatten)]
@@ -1008,17 +1043,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
             assignments,
             body,
             message,
+            idempotency_key,
             preview,
             json,
             attribution,
         } => {
-            let database = attributed(database, &attribution, message.as_deref())?;
+            let database = retryable(
+                attributed(database, &attribution, message.as_deref())?,
+                idempotency_key,
+            )?;
             if preview {
                 let preview = database.preview_create(&collection, &id, &assignments, &body)?;
                 print_preview(&preview, json)?;
             } else {
                 let record = database.create(&collection, &id, &assignments, &body)?;
-                println!("{}", record.reference());
+                print_mutation_result(&record, json)?;
             }
         }
         Command::Get {
@@ -1486,7 +1525,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             id,
             assignments,
             body,
+            expected_record_hash,
             message,
+            idempotency_key,
             preview,
             json,
             attribution,
@@ -1494,14 +1535,31 @@ fn run(cli: Cli) -> Result<ExitCode> {
             if assignments.is_empty() && body.is_none() {
                 bail!("provide at least one --set or --body value");
             }
-            let database = attributed(database, &attribution, message.as_deref())?;
+            let database = retryable(
+                attributed(database, &attribution, message.as_deref())?,
+                idempotency_key,
+            )?;
+            let precondition = expected_record_hash
+                .map(RecordPrecondition::version)
+                .transpose()?;
             if preview {
-                let preview =
-                    database.preview_update(&collection, &id, &assignments, body.as_deref())?;
+                let preview = database.preview_update_conditionally(
+                    &collection,
+                    &id,
+                    &assignments,
+                    body.as_deref(),
+                    precondition.as_ref(),
+                )?;
                 print_preview(&preview, json)?;
             } else {
-                let record = database.update(&collection, &id, &assignments, body.as_deref())?;
-                println!("{}", record.reference());
+                let record = database.update_conditionally(
+                    &collection,
+                    &id,
+                    &assignments,
+                    body.as_deref(),
+                    precondition.as_ref(),
+                )?;
+                print_mutation_result(&record, json)?;
             }
         }
         Command::Link {
@@ -1510,25 +1568,40 @@ fn run(cli: Cli) -> Result<ExitCode> {
             relation,
             target_collection,
             target_id,
+            expected_record_hash,
             message,
+            idempotency_key,
             preview,
             json,
             attribution,
         } => {
-            let database = attributed(database, &attribution, message.as_deref())?;
+            let database = retryable(
+                attributed(database, &attribution, message.as_deref())?,
+                idempotency_key,
+            )?;
+            let precondition = expected_record_hash
+                .map(RecordPrecondition::version)
+                .transpose()?;
             if preview {
-                let preview = database.preview_link(
+                let preview = database.preview_link_conditionally(
                     &collection,
                     &id,
                     &relation,
                     &target_collection,
                     &target_id,
+                    precondition.as_ref(),
                 )?;
                 print_preview(&preview, json)?;
             } else {
-                let record =
-                    database.link(&collection, &id, &relation, &target_collection, &target_id)?;
-                println!("{}", record.reference());
+                let record = database.link_conditionally(
+                    &collection,
+                    &id,
+                    &relation,
+                    &target_collection,
+                    &target_id,
+                    precondition.as_ref(),
+                )?;
+                print_mutation_result(&record, json)?;
             }
         }
         Command::Status { json } => {
@@ -1629,22 +1702,35 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Delete {
             collection,
             id,
+            expected_record_hash,
             yes,
             message,
+            idempotency_key,
             preview,
             json,
             attribution,
         } => {
-            let database = attributed(database, &attribution, message.as_deref())?;
+            let database = retryable(
+                attributed(database, &attribution, message.as_deref())?,
+                idempotency_key,
+            )?;
+            let precondition = expected_record_hash
+                .map(RecordPrecondition::version)
+                .transpose()?;
             if preview {
-                let preview = database.preview_delete(&collection, &id)?;
+                let preview = database.preview_delete_conditionally(
+                    &collection,
+                    &id,
+                    precondition.as_ref(),
+                )?;
                 print_preview(&preview, json)?;
             } else {
                 if !yes {
                     bail!("deleting a record requires --yes to confirm the destructive operation");
                 }
-                let record = database.delete(&collection, &id)?;
-                println!("{}", record.reference());
+                let record =
+                    database.delete_conditionally(&collection, &id, precondition.as_ref())?;
+                print_mutation_result(&record, json)?;
             }
         }
         Command::Audit { command } => match command {
@@ -1970,6 +2056,15 @@ fn print_records(records: Vec<Record>, json: bool) -> Result<()> {
         for record in records {
             println!("{}", record.path.display());
         }
+    }
+    Ok(())
+}
+
+fn print_mutation_result(record: &Record, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(record)?);
+    } else {
+        println!("{}", record.reference());
     }
     Ok(())
 }

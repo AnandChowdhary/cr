@@ -408,6 +408,236 @@ fn unblock_collection(database: &TestDatabase, collection: &str) {
     fs::remove_file(database.root.join("records").join(collection)).unwrap();
 }
 
+fn wait_for_record_while_running(
+    child: &mut std::process::Child,
+    database: &TestDatabase,
+    collection: &str,
+    id: &str,
+) {
+    let target = database
+        .root
+        .join("records")
+        .join(collection)
+        .join(format!("{id}.md"));
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !target.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "sync stopped before reaching {collection}/{id}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "sync never reached {collection}/{id}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+fn pause_child_between_audited_mutations(child: &mut std::process::Child, database: &TestDatabase) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        // SAFETY: `child.id()` is the live process spawned by this test and the
+        // signal changes only its scheduling state.
+        let stopped = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGSTOP) };
+        assert_eq!(stopped, 0);
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(database.root.join(".cr/audit/lock"))
+            .unwrap();
+        if lock.try_lock().is_ok() {
+            return;
+        }
+        // SAFETY: this resumes the same child after the probe found it stopped
+        // inside an audited mutation; no other process is addressed.
+        let resumed = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGCONT) };
+        assert_eq!(resumed, 0);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "sync stopped before it could be paused between mutations"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "sync never reached a pause point between mutations"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(unix)]
+fn resume_child(child: &std::process::Child) {
+    // SAFETY: `child.id()` is the process this test deliberately stopped.
+    let resumed = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGCONT) };
+    assert_eq!(resumed, 0);
+}
+
+fn many_padding_upserts(stream: &mut String, count: usize) {
+    for index in 0..count {
+        stream.push_str(&format!(
+            "printf '%s\\n' '{{\"type\":\"upsert\",\"collection\":\"notes\",\"id\":\"p{index:03}\",\"front_matter\":{{\"n\":{index}}},\"markdown\":\"padding {index}\"}}'\n"
+        ));
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_run_cannot_overwrite_a_target_changed_after_its_head_snapshot() {
+    let database = TestDatabase::new("sync-run-target-race");
+    run_success(database.command().args([
+        "create", "notes", "guard", "--set", "n=0", "--body", "initial",
+    ]));
+    let mut stream = "#!/bin/sh\nset -eu\n".to_owned();
+    many_padding_upserts(&mut stream, 240);
+    stream.push_str("printf '%s\\n' '{\"type\":\"upsert\",\"collection\":\"notes\",\"id\":\"guard\",\"front_matter\":{\"n\":1},\"markdown\":\"adapter\"}'\n");
+    stream.push_str("printf '%s\\n' '{\"type\":\"checkpoint\",\"state\":{\"cursor\":\"done\"}}'\n");
+    let script = write_script(&database, "run-race", &stream);
+    create_sync(
+        &database,
+        "run-race",
+        &script,
+        &["--max-operations", "1000"],
+    );
+    let original_version = json_output(&database, &["get", "notes", "guard", "--json"])["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut child = database
+        .command()
+        .args(["sync", "run", "run-race"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_record_while_running(&mut child, &database, "notes", "p020");
+    pause_child_between_audited_mutations(&mut child, &database);
+    run_success(database.command().args([
+        "update",
+        "notes",
+        "guard",
+        "--set",
+        "n=99",
+        "--body",
+        "local writer",
+    ]));
+    run_success(database.command().args([
+        "update", "notes", "guard", "--set", "n=0", "--body", "initial",
+    ]));
+    assert_eq!(
+        json_output(&database, &["get", "notes", "guard", "--json"])["version"],
+        original_version
+    );
+    resume_child(&child);
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "stale sync unexpectedly succeeded"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("changed since the expected audit generation")
+    );
+    let guard = json_output(&database, &["get", "notes", "guard", "--json"]);
+    assert_eq!(guard["attributes"]["n"], 0);
+    assert_eq!(guard["body"], "initial");
+    assert_eq!(
+        json_output(&database, &["sync", "state", "run-race"]),
+        Value::Null
+    );
+    assert!(database.root.join(".cr/sync/runs/run-race.json").exists());
+    run_success(database.command().args(["audit", "verify"]));
+}
+
+#[test]
+#[cfg(unix)]
+fn recovery_cannot_overwrite_a_target_changed_after_its_history_scan() {
+    let database = TestDatabase::new("sync-recovery-target-race");
+    run_success(database.command().args([
+        "create", "notes", "guard", "--set", "n=0", "--body", "initial",
+    ]));
+    let mut stream = "#!/bin/sh\nset -eu\n".to_owned();
+    stream.push_str("printf '%s\\n' '{\"type\":\"upsert\",\"collection\":\"notes\",\"id\":\"first\",\"front_matter\":{\"n\":1}}'\n");
+    stream.push_str("printf '%s\\n' '{\"type\":\"upsert\",\"collection\":\"blocked\",\"id\":\"gate\",\"front_matter\":{\"n\":2}}'\n");
+    many_padding_upserts(&mut stream, 240);
+    stream.push_str("printf '%s\\n' '{\"type\":\"upsert\",\"collection\":\"notes\",\"id\":\"guard\",\"front_matter\":{\"n\":1},\"markdown\":\"adapter\"}'\n");
+    stream.push_str("printf '%s\\n' '{\"type\":\"checkpoint\",\"state\":{\"cursor\":\"done\"}}'\n");
+    let script = write_script(&database, "recovery-race", &stream);
+    create_sync(
+        &database,
+        "recovery-race",
+        &script,
+        &["--max-operations", "1000"],
+    );
+    fs::create_dir_all(database.root.join("records")).unwrap();
+    block_collection(&database, "blocked");
+    run_failure(database.command().args(["sync", "run", "recovery-race"]));
+    assert!(database.root.join("records/notes/first.md").exists());
+    assert!(
+        database
+            .root
+            .join(".cr/sync/runs/recovery-race.json")
+            .exists()
+    );
+    unblock_collection(&database, "blocked");
+    let original_version = json_output(&database, &["get", "notes", "guard", "--json"])["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut child = database
+        .command()
+        .args(["sync", "recover", "recovery-race"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_record_while_running(&mut child, &database, "notes", "p020");
+    pause_child_between_audited_mutations(&mut child, &database);
+    run_success(database.command().args([
+        "update",
+        "notes",
+        "guard",
+        "--set",
+        "n=99",
+        "--body",
+        "local writer",
+    ]));
+    run_success(database.command().args([
+        "update", "notes", "guard", "--set", "n=0", "--body", "initial",
+    ]));
+    assert_eq!(
+        json_output(&database, &["get", "notes", "guard", "--json"])["version"],
+        original_version
+    );
+    resume_child(&child);
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "stale recovery unexpectedly succeeded"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("changed since the expected audit generation")
+    );
+    let guard = json_output(&database, &["get", "notes", "guard", "--json"]);
+    assert_eq!(guard["attributes"]["n"], 0);
+    assert_eq!(guard["body"], "initial");
+    assert_eq!(
+        json_output(&database, &["sync", "state", "recovery-race"]),
+        Value::Null
+    );
+    assert!(
+        database
+            .root
+            .join(".cr/sync/runs/recovery-race.json")
+            .exists()
+    );
+    run_success(database.command().args(["audit", "verify"]));
+}
+
 /// A database whose sync stopped durably after committing two of its four
 /// record operations, with its checkpoint still on the previous cursor.
 fn interrupted_sync(name: &str) -> TestDatabase {
@@ -582,6 +812,59 @@ fn an_interrupted_run_refuses_to_overwrite_a_record_edited_after_it_stopped() {
         )["run_id"],
         run_id.as_str()
     );
+}
+
+#[test]
+fn recovery_does_not_trust_a_cli_event_that_spoofs_the_run_message() {
+    let database = interrupted_sync("sync-spoofed-message");
+    let run_id = interrupted_run_id(&database);
+    unblock_collection(&database, "blocked");
+
+    run_success(database.command().args([
+        "create",
+        "notes",
+        "fourth",
+        "--set",
+        "n=4",
+        "--body",
+        "fourth\n",
+        "--message",
+        &format!("sync:partial run:{run_id}"),
+    ]));
+
+    let error = run_failure(database.command().args(["sync", "recover", "partial"]));
+    assert!(
+        error.contains("record notes/fourth changed after it stopped"),
+        "{error}"
+    );
+    assert_eq!(
+        json_output(&database, &["get", "notes", "fourth", "--json"])["attributes"]["n"],
+        4
+    );
+    assert!(database.root.join(".cr/sync/runs/partial.json").exists());
+}
+
+#[test]
+fn recovery_reconstructs_target_versions_for_a_version_one_run_ledger() {
+    let database = interrupted_sync("sync-v1-run-ledger");
+    let run_id = interrupted_run_id(&database);
+    let ledger_path = database.root.join(".cr/sync/runs/partial.json");
+    let mut ledger: Value = serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    ledger["version"] = Value::from(1);
+    ledger.as_object_mut().unwrap().remove("target_versions");
+    fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+    unblock_collection(&database, "blocked");
+
+    let recovered = json_output(&database, &["sync", "recover", "partial", "--json"]);
+    assert_eq!(recovered["run_id"], run_id);
+    assert_eq!(recovered["created"], 2);
+    assert_eq!(recovered["unchanged"], 2);
+    assert_eq!(
+        json_output(&database, &["sync", "state", "partial"])["cursor"],
+        "page-2"
+    );
+    assert!(!ledger_path.exists());
+    run_success(database.command().args(["audit", "verify"]));
 }
 
 #[test]

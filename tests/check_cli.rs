@@ -279,6 +279,24 @@ fn records_written_before_a_schema_existed_are_reported_against_it() {
 }
 
 #[test]
+fn a_false_boolean_schema_is_a_rejecting_schema_not_an_unusable_one() {
+    let database = TestDatabase::new("check-false-boolean-schema");
+    run_success(
+        database
+            .command()
+            .args(["create", "closed", "legacy", "--set", "value=1"]),
+    );
+    fs::write(database.root.join(".cr/schemas/closed.json"), "false\n").unwrap();
+
+    let run = check(&database.root, &["--json"]);
+    assert_eq!(run.status, FOUND_PROBLEMS);
+    assert!(run.findings("unusable_schema").is_empty(), "{}", run.stdout);
+    let finding = run.one("schema_violation");
+    assert_eq!(finding["collection"], "closed");
+    assert_eq!(finding["id"], "legacy");
+}
+
+#[test]
 fn an_unusable_schema_is_reported_once_rather_than_once_per_record() {
     let database = seeded();
     run_success(database.command().args([
@@ -579,8 +597,12 @@ fn a_damaged_journal_is_reported_without_hiding_the_rest_of_the_database() {
     // Nothing could be reconciled, so no reconciliation findings are invented.
     assert!(run.findings("record_content_mismatch").is_empty());
     assert!(run.findings("missing_record").is_empty());
-    // The data-model checks still ran.
-    assert_eq!(run.findings("dangling_link").len(), 1);
+    // With no trustworthy replay state, an empty-policy record cannot be
+    // projected safely: its mutable syntax cannot prove it was never
+    // protected. The record is still enumerated, but relation checks wait
+    // until ownership can be verified instead of inspecting its values.
+    assert!(run.findings("dangling_link").is_empty());
+    assert_eq!(run.findings("unreadable_record").len(), 1);
 }
 
 #[test]

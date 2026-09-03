@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, process::Command};
 
 use axum::{
     Router,
@@ -89,6 +89,130 @@ async fn json_request(
     headers: &[(&str, &str)],
 ) -> TestResponse {
     request(app, method, uri, Some(&body.to_string()), headers).await
+}
+
+const IDEMPOTENCY_KEY: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+#[tokio::test]
+async fn rest_idempotency_replays_exact_results_and_rejects_semantic_reuse() {
+    let (_temporary, database) = test_database("server-idempotency");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let headers = [("idempotency-key", IDEMPOTENCY_KEY)];
+    let payload = json!({
+        "id": "one",
+        "front_matter": { "stage": "screening" },
+        "markdown": "Original notes\n"
+    });
+
+    let first = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        payload.clone(),
+        &headers,
+    )
+    .await;
+    let replay = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        payload,
+        &headers,
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::CREATED);
+    assert_eq!(replay.status, StatusCode::CREATED);
+    assert_eq!(replay.body, first.body);
+    assert_eq!(replay.headers[header::ETAG], first.headers[header::ETAG]);
+    assert_eq!(database.audit_head().unwrap().sequence, 1);
+
+    let mismatch = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        json!({ "id": "one", "front_matter": { "stage": "hired" } }),
+        &headers,
+    )
+    .await;
+    assert_eq!(mismatch.status, StatusCode::CONFLICT);
+    assert_eq!(mismatch.json()["error"]["code"], "idempotency_conflict");
+    assert!(!mismatch.text().contains(IDEMPOTENCY_KEY));
+
+    let preview_key = "1d94a86a-10af-4cc0-a255-1d451d52d6ff";
+    let preview = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records?preview=true",
+        json!({ "id": "previewed", "front_matter": { "stage": "screening" } }),
+        &[("idempotency-key", preview_key)],
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK);
+    let applied = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        json!({ "id": "previewed", "front_matter": { "stage": "different" } }),
+        &[("idempotency-key", preview_key)],
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::CREATED);
+
+    let order_key = "663aa76b-f0a8-4c40-9dc5-d453659b96d4";
+    let ordered = request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        Some(r#"{"id":"order","front_matter":{"alpha":1,"nested":{"left":true,"right":false}},"markdown":""}"#),
+        &[("idempotency-key", order_key)],
+    )
+    .await;
+    let reordered = request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        Some(r#"{"markdown":"","front_matter":{"nested":{"right":false,"left":true},"alpha":1},"id":"order"}"#),
+        &[("idempotency-key", order_key)],
+    )
+    .await;
+    assert_eq!(ordered.status, StatusCode::CREATED);
+    assert_eq!(reordered.status, StatusCode::CREATED);
+    assert_eq!(reordered.body, ordered.body);
+
+    let delete_key = "d6aef8cf-e532-4ca3-ac85-ae2d66743f96";
+    let deleted = request(
+        &app,
+        Method::DELETE,
+        "/api/v1/collections/items/records/one",
+        None,
+        &[("idempotency-key", delete_key)],
+    )
+    .await;
+    let delete_replay = request(
+        &app,
+        Method::DELETE,
+        "/api/v1/collections/items/records/one",
+        None,
+        &[("idempotency-key", delete_key)],
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::OK);
+    assert_eq!(delete_replay.status, StatusCode::OK);
+    assert_eq!(delete_replay.body, deleted.body);
+    assert_eq!(deleted.json()["record"]["markdown"], "Original notes\n");
+    assert_eq!(database.audit_head().unwrap().sequence, 4);
+
+    let invalid = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        json!({ "id": "invalid" }),
+        &[("idempotency-key", "too-short")],
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(invalid.json()["error"]["code"], "validation_failed");
+    assert!(!invalid.text().contains("too-short"));
 }
 
 #[tokio::test]
@@ -421,6 +545,183 @@ async fn rest_crud_search_relations_audit_and_pagination_share_database_semantic
 }
 
 #[tokio::test]
+async fn record_etags_guard_conditional_and_whole_document_writes() {
+    let (_temporary, database) = test_database("server-etags");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let uri = "/api/v1/collections/items/records/one";
+
+    let created = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/items/records",
+        json!({
+            "id": "one",
+            "front_matter": { "stage": "open", "obsolete": true },
+            "markdown": "First"
+        }),
+        &[],
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let first_version = created.json()["version"].as_str().unwrap().to_owned();
+    let first_etag = created.headers[header::ETAG].to_str().unwrap().to_owned();
+    assert_eq!(first_etag, format!("\"{first_version}\""));
+
+    let fetched = request(&app, Method::GET, uri, None, &[]).await;
+    assert_eq!(fetched.headers[header::ETAG], first_etag);
+    assert_eq!(fetched.json()["version"], first_version);
+
+    let patched = json_request(
+        &app,
+        Method::PATCH,
+        uri,
+        json!({ "front_matter": { "owner": "ada" } }),
+        &[("if-match", &first_etag)],
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK);
+    let second_version = patched.json()["version"].as_str().unwrap().to_owned();
+    let second_etag = patched.headers[header::ETAG].to_str().unwrap().to_owned();
+    assert_ne!(second_version, first_version);
+
+    let stale = json_request(
+        &app,
+        Method::PATCH,
+        uri,
+        json!({ "front_matter": { "stage": "lost" } }),
+        &[("if-match", &first_etag)],
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(stale.json()["error"]["code"], "precondition_failed");
+    assert!(
+        !stale
+            .text()
+            .contains(database.root().to_string_lossy().as_ref())
+    );
+
+    let missing = json_request(
+        &app,
+        Method::PUT,
+        uri,
+        json!({ "front_matter": { "stage": "won" }, "markdown": "Won" }),
+        &[],
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::PRECONDITION_REQUIRED);
+    assert_eq!(missing.json()["error"]["code"], "precondition_required");
+
+    let replacement = json!({ "front_matter": { "stage": "won" }, "markdown": "Won" });
+    let preview = json_request(
+        &app,
+        Method::PUT,
+        &format!("{uri}?preview=true"),
+        replacement.clone(),
+        &[("if-match", &second_etag)],
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK);
+    assert_eq!(preview.json()["preview"], true);
+    let approved = preview.json()["digest"].as_str().unwrap().to_owned();
+    assert_eq!(database.get("items", "one").unwrap().body, "First");
+
+    let replaced = json_request(
+        &app,
+        Method::PUT,
+        uri,
+        replacement,
+        &[
+            ("if-match", &second_etag),
+            ("x-cr-authorization", "interactive"),
+            ("x-cr-approved-changes", &approved),
+        ],
+    )
+    .await;
+    assert_eq!(replaced.status, StatusCode::OK);
+    assert_eq!(replaced.json()["front_matter"], json!({ "stage": "won" }));
+    assert_eq!(replaced.json()["markdown"], "Won");
+    assert!(replaced.json()["front_matter"].get("owner").is_none());
+    assert!(replaced.json()["front_matter"].get("obsolete").is_none());
+    assert_ne!(replaced.headers[header::ETAG], second_etag);
+
+    let weak = json_request(
+        &app,
+        Method::PATCH,
+        uri,
+        json!({ "front_matter": { "stage": "weak" } }),
+        &[(
+            "if-match",
+            &format!("W/{}", replaced.headers[header::ETAG].to_str().unwrap()),
+        )],
+    )
+    .await;
+    assert_eq!(weak.status, StatusCode::PRECONDITION_FAILED);
+
+    for opaque in [r#""xyzzy""#, r#"W/"xyzzy""#, r#""foo,bar""#] {
+        let nonmatching = json_request(
+            &app,
+            Method::PATCH,
+            uri,
+            json!({ "front_matter": { "stage": "opaque" } }),
+            &[("if-match", opaque)],
+        )
+        .await;
+        assert_eq!(
+            nonmatching.status,
+            StatusCode::PRECONDITION_FAILED,
+            "valid opaque entity tag {opaque} must be evaluated, not rejected"
+        );
+        assert_eq!(nonmatching.json()["error"]["code"], "precondition_failed");
+    }
+
+    for invalid in ["*, *", r#"*, "xyzzy""#] {
+        let malformed = json_request(
+            &app,
+            Method::PATCH,
+            uri,
+            json!({ "front_matter": { "stage": "invalid" } }),
+            &[("if-match", invalid)],
+        )
+        .await;
+        assert_eq!(malformed.status, StatusCode::BAD_REQUEST);
+        assert_eq!(malformed.json()["error"]["code"], "invalid_if_match");
+    }
+    let repeated_wildcard = json_request(
+        &app,
+        Method::PATCH,
+        uri,
+        json!({ "front_matter": { "stage": "invalid" } }),
+        &[("if-match", "*"), ("if-match", "*")],
+    )
+    .await;
+    assert_eq!(repeated_wildcard.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        repeated_wildcard.json()["error"]["code"],
+        "invalid_if_match"
+    );
+
+    let absent = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/items/records/missing",
+        json!({ "front_matter": { "stage": "new" } }),
+        &[("if-match", "*")],
+    )
+    .await;
+    assert_eq!(absent.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(absent.json()["error"]["code"], "precondition_failed");
+
+    let log = database
+        .audit_recent(10, cr::AuditFilter::record("items", "one"))
+        .unwrap();
+    assert_eq!(
+        log.len(),
+        3,
+        "stale and missing preconditions write no audit event"
+    );
+}
+
+#[tokio::test]
 async fn direct_edits_status_save_and_baseline_are_available_over_http() {
     let (_temporary, database) = test_database("server-direct-edits");
     let app = router(database.clone(), ServerConfig::default()).unwrap();
@@ -555,6 +856,306 @@ async fn concurrent_http_patches_are_serialized_without_losing_fields() {
 }
 
 #[tokio::test]
+async fn boolean_collection_schemas_keep_http_and_openapi_semantics() {
+    let (_temporary, database) = test_database("server-boolean-schemas");
+    fs::write(database.root().join(".cr/schemas/open.json"), "true\n").unwrap();
+    fs::write(database.root().join(".cr/schemas/closed.json"), "false\n").unwrap();
+    let app = router(database, ServerConfig::default()).unwrap();
+
+    let accepted = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/open/records",
+        json!({ "id": "accepted", "front_matter": { "anything": [1, true] } }),
+        &[],
+    )
+    .await;
+    assert_eq!(accepted.status, StatusCode::CREATED);
+
+    let rejected = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/closed/records",
+        json!({ "id": "rejected", "front_matter": {} }),
+        &[],
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(rejected.json()["error"]["code"], "validation_failed");
+
+    let collections = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections?limit=100",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(collections.status, StatusCode::OK);
+    let collections = collections.json();
+    assert!(
+        collections["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["name"] == "open" && model["schema"] == Value::Bool(true))
+    );
+    assert!(
+        collections["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["name"] == "closed" && model["schema"] == Value::Bool(false))
+    );
+
+    let openapi = request(&app, Method::GET, "/openapi.json", None, &[])
+        .await
+        .json();
+    for (collection, expected) in [("open", true), ("closed", false)] {
+        let reference = openapi["x-cr-collection-schemas"][collection]
+            .as_str()
+            .unwrap();
+        let component = reference.rsplit('/').next().unwrap();
+        assert_eq!(
+            openapi["components"]["schemas"][component],
+            Value::Bool(expected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn raw_document_reads_fail_closed_after_marker_removal_but_keep_legacy_collisions() {
+    let (_temporary, database) = test_database("server-raw-encryption-boundary");
+    let schema_path = database.root().join(".cr/schemas/secrets.json");
+    fs::write(
+        &schema_path,
+        r#"{
+  "type": "object",
+  "properties": {
+    "token": { "type": "string", "x-cr-encrypted": true }
+  },
+  "required": ["token"]
+}"#,
+    )
+    .unwrap();
+    let created = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["--database"])
+        .arg(database.root())
+        .args([
+            "--actor",
+            "api-reviewer@example.com",
+            "create",
+            "secrets",
+            "one",
+            "--set",
+            "token=http-private-token",
+        ])
+        .env("CR_ENCRYPTION_ACTIVE_KEY", "old")
+        .env(
+            "CR_ENCRYPTION_KEYS",
+            r#"{"old":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created_then_deleted = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["--database"])
+        .arg(database.root())
+        .args([
+            "--actor",
+            "api-reviewer@example.com",
+            "create",
+            "secrets",
+            "two",
+            "--set",
+            "token=deleted-http-private-token",
+        ])
+        .env("CR_ENCRYPTION_ACTIVE_KEY", "old")
+        .env(
+            "CR_ENCRYPTION_KEYS",
+            r#"{"old":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        created_then_deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created_then_deleted.stderr)
+    );
+    let deleted = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["--database"])
+        .arg(database.root())
+        .args([
+            "--actor",
+            "api-reviewer@example.com",
+            "delete",
+            "secrets",
+            "two",
+            "--yes",
+        ])
+        .env("CR_ENCRYPTION_ACTIVE_KEY", "old")
+        .env(
+            "CR_ENCRYPTION_KEYS",
+            r#"{"old":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    fs::write(&schema_path, r#"{"type":"object"}"#).unwrap();
+    fs::write(
+        database.root().join("records/secrets/two.md"),
+        "---\ntoken: resurrected-http-value\n---\nmanual resurrection\n",
+    )
+    .unwrap();
+
+    let legacy_raw = "---\n$cr_encryption:\n  version: 1\n  fields:\n  - - optional\n    - token\n  body: false\ntitle: Legacy\n---\nordinary body\n";
+    fs::create_dir_all(database.root().join("records/notes")).unwrap();
+    fs::write(database.root().join("records/notes/legacy.md"), legacy_raw).unwrap();
+
+    let record_path = database.root().join("records/secrets/one.md");
+    let app = router(database, ServerConfig::default()).unwrap();
+    let protected = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/secrets/records/one/document",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(protected.status, StatusCode::CONFLICT);
+    assert_eq!(protected.json()["error"]["code"], "conflict");
+    assert!(
+        protected.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stored protected data is no longer declared")
+    );
+    assert!(!protected.text().contains("http-private-token"));
+    assert!(!protected.text().contains("$cr_encrypted"));
+    assert!(!protected.text().contains("ciphertext"));
+
+    // Neither mutable syntax is authoritative. Removing the manifest and the
+    // envelope wrapper must still fail every logical projection because
+    // verified history records that CR owns this storage lifecycle.
+    let raw = fs::read_to_string(&record_path).unwrap();
+    let raw = raw.strip_prefix("---\n").unwrap();
+    let (front_matter, body) = raw.split_once("---\n").unwrap();
+    let mut front_matter: yaml_serde::Value = yaml_serde::from_str(front_matter).unwrap();
+    let front_matter = front_matter.as_mapping_mut().unwrap();
+    front_matter.remove(yaml_serde::Value::String("$cr_encryption".into()));
+    let token = front_matter
+        .get_mut(yaml_serde::Value::String("token".into()))
+        .unwrap();
+    let envelope_fields = token
+        .as_mapping_mut()
+        .unwrap()
+        .remove(yaml_serde::Value::String("$cr_encrypted".into()))
+        .unwrap();
+    *token = envelope_fields;
+    let serialized = yaml_serde::to_string(&front_matter).unwrap();
+    let serialized = serialized.strip_prefix("---\n").unwrap_or(&serialized);
+    fs::write(&record_path, format!("---\n{serialized}---\n{body}")).unwrap();
+
+    for uri in [
+        "/api/v1/collections/secrets/records/one",
+        "/api/v1/collections/secrets/records/one/fields/token",
+        "/api/v1/collections/secrets/records/one/document",
+        "/api/v1/collections/secrets/records/two",
+        "/api/v1/collections/secrets/records/two/fields/token",
+        "/api/v1/collections/secrets/records/two/document",
+        "/api/v1/collections/secrets/records?limit=10",
+        "/api/v1/search?q=private&collection=secrets&limit=10",
+    ] {
+        let response = request(&app, Method::GET, uri, None, &[]).await;
+        assert_eq!(response.status, StatusCode::CONFLICT, "{uri}");
+        assert_eq!(response.json()["error"]["code"], "conflict", "{uri}");
+        for private in [
+            "http-private-token",
+            "resurrected-http-value",
+            "$cr_encrypted",
+            "ciphertext",
+            "nonce",
+        ] {
+            assert!(
+                !response.text().contains(private),
+                "{uri} exposed {private}: {}",
+                response.text()
+            );
+        }
+    }
+
+    let view = request(&app, Method::GET, "/secrets", None, &[]).await;
+    assert_eq!(view.status, StatusCode::CONFLICT);
+    for private in [
+        "http-private-token",
+        "resurrected-http-value",
+        "$cr_encrypted",
+        "ciphertext",
+        "nonce",
+    ] {
+        assert!(!view.text().contains(private));
+    }
+
+    let check = request(
+        &app,
+        Method::GET,
+        "/api/v1/check?collection=secrets&limit=100",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(check.status, StatusCode::OK);
+    assert!(
+        check.json()["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["kind"] == "unreadable_record"
+                    && finding["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("stored protected data is no longer declared")
+            })
+    );
+    assert!(
+        check.json()["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| { finding["kind"] == "unreadable_record" && finding["id"] == "two" })
+    );
+    for private in [
+        "http-private-token",
+        "resurrected-http-value",
+        "$cr_encrypted",
+        "ciphertext",
+        "nonce",
+    ] {
+        assert!(!check.text().contains(private));
+    }
+
+    let legacy = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/notes/records/legacy/document",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(legacy.status, StatusCode::OK);
+    assert_eq!(legacy.text(), legacy_raw);
+}
+
+#[tokio::test]
 async fn openapi_authentication_and_http_errors_are_structured() {
     let (_temporary, database) = test_database("server-openapi");
     fs::write(
@@ -598,6 +1199,77 @@ async fn openapi_authentication_and_http_errors_are_structured() {
     let openapi = openapi.json();
     assert_eq!(openapi["openapi"], "3.1.1");
     assert_local_schema_references_resolve(&openapi, &openapi);
+    assert_eq!(
+        openapi["components"]["schemas"]["RecordSummary"]["properties"]["version"]["pattern"],
+        "^sha256:[0-9a-f]{64}$"
+    );
+    assert!(
+        openapi["components"]["schemas"]["RecordSummary"]["properties"]["version"]["description"]
+            .as_str()
+            .unwrap()
+            .contains(r"cr:record:v1\0")
+    );
+    assert_eq!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["put"]["operationId"],
+        "replaceRecord"
+    );
+    let put_parameters =
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["put"]["parameters"]
+            .as_array()
+            .unwrap();
+    let if_match = put_parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "If-Match")
+        .expect("PUT documents If-Match");
+    assert_eq!(if_match["required"], true);
+    let idempotency = put_parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "Idempotency-Key")
+        .expect("single-record mutations document Idempotency-Key");
+    assert_eq!(idempotency["schema"]["minLength"], 16);
+    let save_parameters = openapi["paths"]["/api/v1/save"]["post"]["parameters"]
+        .as_array()
+        .unwrap();
+    assert!(
+        save_parameters
+            .iter()
+            .all(|parameter| parameter["name"] != "Idempotency-Key")
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["put"]
+            ["responses"]["200"]["headers"]["ETag"]
+            .is_object()
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["put"]
+            ["responses"]["412"]
+            .is_object()
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["put"]
+            ["responses"]["428"]
+            .is_object()
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["patch"]
+            ["responses"]["412"]
+            .is_object()
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}"]["patch"]["responses"]
+            .get("428")
+            .is_none()
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections"]["get"]["responses"]
+            .get("412")
+            .is_none()
+    );
+    assert!(
+        openapi["paths"]["/api/v1/collections"]["get"]["responses"]
+            .get("428")
+            .is_none()
+    );
     assert!(
         openapi["components"]["schemas"]["AuditEntry"]["properties"]["source"]["enum"]
             .as_array()
@@ -849,6 +1521,30 @@ async fn every_public_error_mapping_is_typed_redacted_and_correlated() {
             Method::PATCH,
             "/api/v1/collections/deals/records/stale".to_owned(),
             Some(json!({ "front_matter": { "status": "won" } }).to_string()),
+            vec![authorization],
+        ),
+        (
+            "stale record precondition",
+            StatusCode::PRECONDITION_FAILED,
+            "precondition_failed",
+            Method::PATCH,
+            "/api/v1/collections/deals/records/alpha".to_owned(),
+            Some(json!({ "front_matter": { "status": "won" } }).to_string()),
+            vec![
+                authorization,
+                (
+                    "if-match",
+                    "\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"",
+                ),
+            ],
+        ),
+        (
+            "missing whole replacement precondition",
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition_required",
+            Method::PUT,
+            "/api/v1/collections/deals/records/alpha".to_owned(),
+            Some(json!({ "front_matter": {}, "markdown": "replacement" }).to_string()),
             vec![authorization],
         ),
         (
