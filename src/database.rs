@@ -29,8 +29,8 @@ use crate::{
     },
     check::{CheckReport, CheckScope},
     encryption::{
-        CONTEXT_LABEL, CONTEXT_PATH, EncryptionContext, EncryptionPolicy,
-        EncryptionStorageMetadata, audit_document_encryption_metadata,
+        BODY_EXTENSION, CONTEXT_LABEL, CONTEXT_PATH, EncryptionContext, EncryptionPolicy,
+        EncryptionStorageMetadata, FIELD_EXTENSION, audit_document_encryption_metadata,
         document_has_encrypted_storage,
     },
     error::{
@@ -2259,6 +2259,118 @@ impl Database {
         self.validate(collection, attributes)
     }
 
+    /// Add an encrypted-storage annotation to one collection-schema property.
+    ///
+    /// A changed policy is permitted only before that collection has material
+    /// records or audit history. CR cannot retroactively encrypt plaintext
+    /// history, and merely changing a marker would make existing storage
+    /// unreadable rather than migrating it.
+    pub fn encrypt_schema_field(&self, collection: &str, field: &str) -> Result<bool> {
+        let field_path = parse_path(field)?;
+        if field_path
+            .first()
+            .is_some_and(|part| part == "$cr_encryption")
+        {
+            return Err(invalid("front matter field '$cr_encryption' is reserved"));
+        }
+        self.update_encryption_schema(collection, move |schema| {
+            mark_schema_field_encrypted(schema, &field_path)
+        })
+    }
+
+    /// Add encrypted storage for the Markdown body to a collection schema.
+    pub fn encrypt_schema_body(&self, collection: &str) -> Result<bool> {
+        self.update_encryption_schema(collection, |schema| {
+            let object = schema
+                .as_object_mut()
+                .context("a boolean JSON Schema cannot carry encrypted-body storage policy")?;
+            object.insert(BODY_EXTENSION.to_owned(), JsonValue::Bool(true));
+            Ok(())
+        })
+    }
+
+    fn update_encryption_schema(
+        &self,
+        collection: &str,
+        update: impl FnOnce(&mut JsonValue) -> Result<()>,
+    ) -> Result<bool> {
+        validate_component(collection, "collection")?;
+        if collection == USERS_COLLECTION {
+            return Err(invalid(
+                "the users collection has a built-in schema and cannot define encryption policy",
+            ));
+        }
+
+        // Schema policy and record writes share one lock so a create cannot
+        // land between the empty-history check and publishing the marker.
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        if self.access_enabled()? {
+            self.assert_current_principal_policy(&audit)?;
+        }
+        self.authorize_owner(&AccessResource::collection(collection))?;
+
+        let existing = self.collection_schema(collection)?;
+        let mut schema = existing.clone().unwrap_or_else(empty_collection_schema);
+        update(&mut schema)?;
+        if existing.as_ref() == Some(&schema) {
+            return Ok(false);
+        }
+
+        jsonschema::meta::validate(&schema).map_err(|error| {
+            anyhow!("{error}").context(DomainError::Invalid(format!(
+                "invalid JSON Schema for collection '{collection}'"
+            )))
+        })?;
+        EncryptionPolicy::from_schema(Some(&schema)).with_context(|| {
+            DomainError::Invalid(format!(
+                "invalid encryption annotations for collection '{collection}'"
+            ))
+        })?;
+
+        let has_history = audit
+            .record_states()?
+            .keys()
+            .any(|(record_collection, _)| record_collection == collection);
+        if has_history || self.collection_has_record_files(collection)? {
+            return Err(conflict(format!(
+                "cannot change encryption policy for collection '{collection}' after it has records or audit history; export the plaintext and import it into a new encrypted collection"
+            )));
+        }
+
+        let mut rendered = serde_json::to_vec_pretty(&schema)
+            .context("could not serialize the collection JSON Schema")?;
+        rendered.push(b'\n');
+        let path = Path::new(SCHEMA_DIRECTORY).join(format!("{collection}.json"));
+        let label = schema_label(collection);
+        if existing.is_some() {
+            paths::write_replace(&self.root, &path, &rendered, &label)?;
+        } else {
+            paths::write_new(&self.root, &path, &rendered, &label)?;
+        }
+        Ok(true)
+    }
+
+    fn collection_has_record_files(&self, collection: &str) -> Result<bool> {
+        let directory = self.config.data_dir.join(collection);
+        let label = collection_label(collection);
+        let entries = paths::list_directory(&self.root, &directory, &label)?.unwrap_or_default();
+        for entry in entries {
+            let CollectionEntry::Record(id) = collection_entry(collection, &entry.name)? else {
+                continue;
+            };
+            if !entry.kind.is_file() {
+                return Err(paths::refuse_entry(
+                    &record_label(collection, &id),
+                    entry.kind,
+                ));
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub fn update(
         &self,
         collection: &str,
@@ -4207,6 +4319,42 @@ fn user_id_tombstoned(id: &str) -> anyhow::Error {
     conflict(format!(
         "user ID '{id}' was previously deleted; pass --reuse-deleted-id to reuse its audit identity"
     ))
+}
+
+fn empty_collection_schema() -> JsonValue {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {}
+    })
+}
+
+fn mark_schema_field_encrypted(schema: &mut JsonValue, path: &[String]) -> Result<()> {
+    let object = schema
+        .as_object_mut()
+        .context("a boolean JSON Schema cannot carry encrypted field storage policy")?;
+    let properties = object
+        .entry("properties")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("JSON Schema 'properties' must be an object")?;
+    let (field, rest) = path
+        .split_first()
+        .context("encrypted field path cannot be empty")?;
+    let property = properties.entry(field.clone()).or_insert_with(|| json!({}));
+    if rest.is_empty() {
+        property
+            .as_object_mut()
+            .with_context(|| {
+                format!(
+                    "JSON Schema property '{}' must be an object to carry encryption policy",
+                    path.join(".")
+                )
+            })?
+            .insert(FIELD_EXTENSION.to_owned(), JsonValue::Bool(true));
+        return Ok(());
+    }
+    mark_schema_field_encrypted(property, rest)
 }
 
 fn validate_schema_instance(
