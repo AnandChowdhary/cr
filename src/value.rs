@@ -14,6 +14,22 @@ pub struct Assignment {
 }
 
 impl Assignment {
+    /// Construct a string assignment without parsing its value as YAML.
+    ///
+    /// CLI environment imports use this so values such as `true`, `null`, and
+    /// leading-zero tokens remain exact strings rather than changing type.
+    pub fn string(path: &str, value: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            path: parse_path(path)?,
+            value: Value::String(value.into()),
+        })
+    }
+
+    /// The validated dotted-path components targeted by this assignment.
+    pub fn path(&self) -> &[String] {
+        &self.path
+    }
+
     /// Apply this dotted-path assignment to a YAML mapping.
     pub fn apply(&self, attributes: &mut Mapping) -> Result<()> {
         set_path(attributes, &self.path, self.value.clone())

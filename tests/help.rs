@@ -96,6 +96,39 @@ fn sync_help_documents_protocol_safety_controls() {
 }
 
 #[test]
+fn vault_help_documents_schema_policy_and_environment_imports() {
+    for command in ["create", "update"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cr"))
+            .args([command, "--help"])
+            .output()
+            .unwrap_or_else(|_| panic!("failed to run cr {command} --help"));
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("help output was not UTF-8");
+        assert!(stdout.contains("--set-env <KEY=ENV>"));
+        assert!(stdout.contains("Encryption still follows the collection schema"));
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["schema", "--help"])
+        .output()
+        .expect("failed to run cr schema --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("help output was not UTF-8");
+    assert!(stdout.contains("encrypt"));
+    assert!(stdout.contains("encrypt-body"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["schema", "encrypt", "--help"])
+        .output()
+        .expect("failed to run cr schema encrypt --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("help output was not UTF-8");
+    assert!(stdout.contains("<COLLECTION>"));
+    assert!(stdout.contains("<FIELD>"));
+    assert!(stdout.contains("Dotted paths select nested fields"));
+}
+
+#[test]
 fn access_help_documents_users_roles_and_resource_scopes() {
     let output = Command::new(env!("CARGO_BIN_EXE_cr"))
         .args(["access", "grant", "--help"])

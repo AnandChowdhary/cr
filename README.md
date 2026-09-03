@@ -50,7 +50,13 @@
 
 ## Quick start
 
-You need a current Rust toolchain. Install the CLI from this repository:
+You need a current Rust toolchain. Install the latest release from GitHub:
+
+```sh
+cargo install --git https://github.com/AnandChowdhary/cr --tag v0.1.0
+```
+
+When developing a checkout, install that exact source tree instead:
 
 ```sh
 cargo install --path .
@@ -1260,9 +1266,27 @@ Schemas validate front matter. The record ID, collection, path, and Markdown bod
 
 ### Encrypt selected values at rest
 
-Encryption is opt-in and schema-directed. Put `x-cr-encrypted: true` on a
-property to encrypt that complete value, or put `x-cr-encrypted-body: true` on
-the schema root to encrypt the Markdown body:
+Encryption is opt-in and schema-directed. Declare it from the CLI while the
+collection is new and empty:
+
+```sh
+cr schema encrypt accounts credentials.api_token
+cr schema encrypt-body accounts
+```
+
+The first command creates `.cr/schemas/accounts.json` when needed, preserves
+existing JSON Schema constraints, and puts `x-cr-encrypted: true` on the
+selected property. Dotted paths create nested `properties`. The second puts
+`x-cr-encrypted-body: true` on the schema root. Both are idempotent and require
+collection ownership when RBAC is enabled.
+
+A new marker is refused once the collection has a record or audit history.
+Changing the marker would not erase plaintext history and would make existing
+storage unreadable, so migrate by exporting the plaintext and importing it
+into a newly encrypted collection instead. An already-present marker remains a
+successful no-op regardless of collection age.
+
+The two commands above produce the same policy as this hand-written schema:
 
 ```json
 {
@@ -1309,6 +1333,30 @@ key=$(openssl rand 32 | openssl base64 -A | tr '+/' '-_' | tr -d '=')
 export CR_ENCRYPTION_ACTIVE_KEY=primary
 export CR_ENCRYPTION_KEYS="{\"primary\":\"$key\"}"
 ```
+
+Import a secret directly from an environment variable without placing its
+value in `cr`'s process arguments:
+
+```sh
+export OPENAI_API_KEY='the-value-supplied-by-your-secret-manager'
+
+cr schema encrypt secrets value
+cr schema encrypt-body secrets
+cr create secrets production-openai \
+  --set name=OPENAI_API_KEY \
+  --set environment=production \
+  --set-env value=OPENAI_API_KEY
+
+cr update secrets production-openai \
+  --set-env value=OPENAI_API_KEY
+```
+
+`--set-env KEY=ENV` is available on `create` and `update`. The variable must
+exist and contain UTF-8; its value is always stored as one exact YAML string,
+so strings such as `true`, `null`, and values with newlines do not change type.
+Assigning the same field through both `--set` and `--set-env` is rejected.
+`--set-env` changes only how input is read: encrypted storage still requires
+the schema marker above.
 
 Each value must be an unpadded base64url encoding of exactly 32 random bytes.
 Key IDs are stored with envelopes, so rotation means adding the old and new
@@ -2091,7 +2139,8 @@ cr [--database PATH] [--actor IDENTITY] [--as PRINCIPAL] [--json-errors] COMMAND
 cr init PATH
 cr identity [--json] [ATTRIBUTION]
 
-cr create COLLECTION ID [--set KEY=YAML]... [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
+cr create COLLECTION ID [--set KEY=YAML]... [--set-env KEY=ENV]...
+                        [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
                         [--preview [--json]]
 cr get COLLECTION ID [--json | --field KEY]
 cr list COLLECTION [--where KEY=YAML]... [--where-expr EXPRESSION]...
@@ -2100,13 +2149,17 @@ cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]...
                   [--where-expr EXPRESSION]... [--sort FIELD [--desc]] [--json]
                   [--front-matter | --field KEY | --body | --path]
                   [--ignore-case] [--regex]
-cr update COLLECTION ID [--set KEY=YAML]... [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
+cr update COLLECTION ID [--set KEY=YAML]... [--set-env KEY=ENV]...
+                        [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
                         [--preview [--json]]
 cr link SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
               [-m MESSAGE] [ATTRIBUTION] [--preview [--json]]
 cr delete COLLECTION ID --yes [-m MESSAGE] [ATTRIBUTION]
 cr delete COLLECTION ID --preview [--json]
 cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N]
+
+cr schema encrypt COLLECTION FIELD
+cr schema encrypt-body COLLECTION
 
 cr access init [--name NAME] [--email EMAIL] [--kind human|service | --service]
 cr access check ACTION RESOURCE [--json]

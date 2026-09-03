@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr};
 
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -16,6 +16,54 @@ use yaml_serde::Mapping;
 struct ListedRecord {
     path: PathBuf,
     front_matter: Mapping,
+}
+
+/// A front matter field whose exact string value comes from the environment.
+///
+/// Only the variable name is retained by argument parsing. The value is read
+/// after CLI parsing, so it never becomes part of this process's argument
+/// vector or a clap diagnostic.
+#[derive(Clone, Debug)]
+struct EnvironmentAssignment {
+    field: String,
+    variable: String,
+}
+
+impl EnvironmentAssignment {
+    fn resolve(&self) -> Result<Assignment> {
+        let value = std::env::var(&self.variable).map_err(|error| {
+            let detail = match error {
+                std::env::VarError::NotPresent => "is not set",
+                std::env::VarError::NotUnicode(_) => "is not valid UTF-8",
+            };
+            DomainError::Invalid(format!("environment variable '{}' {detail}", self.variable))
+        })?;
+        Assignment::string(&self.field, value)
+    }
+}
+
+impl FromStr for EnvironmentAssignment {
+    type Err = anyhow::Error;
+
+    fn from_str(input: &str) -> Result<Self> {
+        let (field, variable) = input.split_once('=').ok_or_else(|| {
+            DomainError::Invalid("expected KEY=ENV (for example, token=OPENAI_API_KEY)".to_owned())
+        })?;
+        // Reuse Assignment's field-path validation without ever parsing or
+        // retaining a placeholder secret value.
+        Assignment::string(field, "")?;
+        if variable.is_empty() || variable.contains(['=', '\0']) {
+            return Err(DomainError::Invalid(
+                "environment variable name must be non-empty and cannot contain '=' or NUL"
+                    .to_owned(),
+            )
+            .into());
+        }
+        Ok(Self {
+            field: field.to_owned(),
+            variable: variable.to_owned(),
+        })
+    }
 }
 
 impl From<Record> for ListedRecord {
@@ -182,6 +230,10 @@ enum Command {
         #[arg(short = 's', long = "set", value_name = "KEY=YAML")]
         assignments: Vec<Assignment>,
 
+        /// Set a front matter string from KEY=ENV. Encryption still follows the collection schema.
+        #[arg(long = "set-env", value_name = "KEY=ENV")]
+        environment_assignments: Vec<EnvironmentAssignment>,
+
         /// Set the Markdown body.
         #[arg(long, default_value = "")]
         body: String,
@@ -320,6 +372,12 @@ enum Command {
         command: ViewCommand,
     },
 
+    /// Declare collection encryption policy in JSON Schema.
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
+
     /// Create, inspect, and run external data syncs.
     Sync {
         #[command(subcommand)]
@@ -349,6 +407,10 @@ enum Command {
         /// Set a front matter field using KEY=YAML. Dotted keys create nested fields.
         #[arg(short = 's', long = "set", value_name = "KEY=YAML")]
         assignments: Vec<Assignment>,
+
+        /// Set a front matter string from KEY=ENV. Encryption still follows the collection schema.
+        #[arg(long = "set-env", value_name = "KEY=ENV")]
+        environment_assignments: Vec<EnvironmentAssignment>,
 
         /// Replace the Markdown body. If omitted, the existing body is preserved.
         #[arg(long)]
@@ -512,6 +574,15 @@ enum Command {
         #[command(subcommand)]
         command: AuditCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SchemaCommand {
+    /// Encrypt one complete front matter value at rest. Dotted paths select nested fields.
+    Encrypt { collection: String, field: String },
+
+    /// Encrypt every record's Markdown body at rest.
+    EncryptBody { collection: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1040,7 +1111,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Create {
             collection,
             id,
-            assignments,
+            mut assignments,
+            environment_assignments,
             body,
             message,
             idempotency_key,
@@ -1048,6 +1120,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             json,
             attribution,
         } => {
+            append_environment_assignments(&mut assignments, &environment_assignments)?;
             let database = retryable(
                 attributed(database, &attribution, message.as_deref())?,
                 idempotency_key,
@@ -1228,6 +1301,30 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 } else {
                     print!("{}", yaml_serde::to_string(&view)?);
                 }
+            }
+        },
+        Command::Schema { command } => match command {
+            SchemaCommand::Encrypt { collection, field } => {
+                let changed = database.encrypt_schema_field(&collection, &field)?;
+                println!(
+                    "{} encrypted storage for {collection}.{field}",
+                    if changed {
+                        "Enabled"
+                    } else {
+                        "Already enabled"
+                    }
+                );
+            }
+            SchemaCommand::EncryptBody { collection } => {
+                let changed = database.encrypt_schema_body(&collection)?;
+                println!(
+                    "{} encrypted body storage for {collection}",
+                    if changed {
+                        "Enabled"
+                    } else {
+                        "Already enabled"
+                    }
+                );
             }
         },
         Command::Sync { command } => match command {
@@ -1523,7 +1620,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Update {
             collection,
             id,
-            assignments,
+            mut assignments,
+            environment_assignments,
             body,
             expected_record_hash,
             message,
@@ -1532,8 +1630,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             json,
             attribution,
         } => {
+            append_environment_assignments(&mut assignments, &environment_assignments)?;
             if assignments.is_empty() && body.is_none() {
-                bail!("provide at least one --set or --body value");
+                bail!("provide at least one --set, --set-env, or --body value");
             }
             let database = retryable(
                 attributed(database, &attribution, message.as_deref())?,
@@ -1969,6 +2068,27 @@ fn selected_user_kind(kind: Option<UserKindArg>, service: bool) -> UserKind {
     } else {
         kind.map(Into::into).unwrap_or(UserKind::Human)
     }
+}
+
+fn append_environment_assignments(
+    assignments: &mut Vec<Assignment>,
+    environment_assignments: &[EnvironmentAssignment],
+) -> Result<()> {
+    for environment in environment_assignments {
+        let resolved = environment.resolve()?;
+        if assignments
+            .iter()
+            .any(|assignment| assignment.path() == resolved.path())
+        {
+            return Err(DomainError::Invalid(format!(
+                "field '{}' is assigned more than once across --set and --set-env",
+                environment.field
+            ))
+            .into());
+        }
+        assignments.push(resolved);
+    }
+    Ok(())
 }
 
 fn profile_from_assignments(assignments: &[Assignment]) -> Result<Mapping> {

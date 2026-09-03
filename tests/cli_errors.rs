@@ -234,7 +234,7 @@ fn empty_updates_and_missing_fields_return_errors() {
     run_success(database.command().args(["create", "candidates", "jane"]));
 
     let stderr = run_failure(database.command().args(["update", "candidates", "jane"]));
-    assert!(stderr.contains("provide at least one --set or --body value"));
+    assert!(stderr.contains("provide at least one --set, --set-env, or --body value"));
 
     let stderr =
         run_failure(
