@@ -47,7 +47,7 @@ hmac = "0.13"
 # schema declaring draft-07 - where `format` asserts by default, unlike the
 # 2020-12 schemas in `examples/` - would go on validating and stop refusing
 # anything. `tests/database_cli.rs` guards that.
-jsonschema = { version = "0.52", default-features = false, features = ["idna"] }
+jsonschema = { version = "0.53", default-features = false, features = ["idna"] }
 libc = "0.2"
 maud = { version = "0.27", features = ["axum"] }
 percent-encoding = "2.3"
