@@ -735,6 +735,21 @@ cr get companies acme --field industry
 cr get contacts jane-doe --field contact.email
 ```
 
+String fields can be written as exact UTF-8 bytes, without YAML quoting or an
+added trailing newline. This is useful for passing a protected value directly
+to a command that reads it from standard input:
+
+```sh
+cr get secrets production-openai --field value --raw \
+  | some-command --token-stdin
+```
+
+`--raw` requires `--field` and refuses non-string values. The pipe keeps the
+value out of the terminal and the receiving command's argument list, but that
+command can still expose what it reads. Avoid command substitution such as
+`some-command --token "$(cr get ...)"`, which puts the value in a process
+argument and may expose it in diagnostics.
+
 ### List and structured filtering
 
 List a collection:
@@ -2142,7 +2157,7 @@ cr identity [--json] [ATTRIBUTION]
 cr create COLLECTION ID [--set KEY=YAML]... [--set-env KEY=ENV]...
                         [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
                         [--preview [--json]]
-cr get COLLECTION ID [--json | --field KEY]
+cr get COLLECTION ID [--json | --field KEY [--raw]]
 cr list COLLECTION [--where KEY=YAML]... [--where-expr EXPRESSION]...
                    [--sort FIELD [--desc]] [--json]
 cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]...

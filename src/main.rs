@@ -1,4 +1,10 @@
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr};
+use std::{
+    io::{self, Write},
+    net::SocketAddr,
+    path::PathBuf,
+    process::ExitCode,
+    str::FromStr,
+};
 
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -270,6 +276,10 @@ enum Command {
         /// Return one front matter field. Dotted paths select nested fields.
         #[arg(long, value_name = "KEY", conflicts_with = "json")]
         field: Option<String>,
+
+        /// Write a string field's exact UTF-8 bytes without a trailing newline.
+        #[arg(long, requires = "field", conflicts_with = "json")]
+        raw: bool,
     },
 
     /// List and filter records in a collection.
@@ -1138,6 +1148,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             id,
             json,
             field,
+            raw,
         } => {
             let record = database.get(&collection, &id)?;
             if json {
@@ -1146,7 +1157,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 let value = record
                     .field(&path)?
                     .ok_or_else(|| anyhow::anyhow!("field '{path}' does not exist"))?;
-                print!("{}", yaml_serde::to_string(value)?);
+                if raw {
+                    let yaml_serde::Value::String(value) = value else {
+                        return Err(DomainError::Invalid(format!(
+                            "field '{path}' is not a string"
+                        ))
+                        .into());
+                    };
+                    io::stdout().write_all(value.as_bytes())?;
+                } else {
+                    print!("{}", yaml_serde::to_string(value)?);
+                }
             } else {
                 print!("{}", database.read_raw(&collection, &id)?);
             }
