@@ -19,6 +19,129 @@ use crate::{error::invalid, value::Assignment};
 /// The collection CR reserves for authenticated principals and their grants.
 pub const USERS_COLLECTION: &str = "users";
 
+/// JSON Schema extension that opts a collection into creator-owned records.
+pub const COLLECTION_ACCESS_EXTENSION: &str = "x-cr-access";
+
+/// Front matter reserved for CR's per-record access policy.
+pub const RECORD_ACCESS_FIELD: &str = "$cr_access";
+
+/// The access behavior selected for an ordinary collection.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionAccessMode {
+    RecordOwned,
+}
+
+/// Collection-level policy stored as a JSON Schema extension.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionAccessPolicy {
+    pub mode: CollectionAccessMode,
+    pub default_visibility: RecordVisibility,
+}
+
+impl CollectionAccessPolicy {
+    pub fn record_owned() -> Self {
+        Self {
+            mode: CollectionAccessMode::RecordOwned,
+            default_visibility: RecordVisibility::Private,
+        }
+    }
+
+    pub fn from_schema(schema: Option<&JsonValue>) -> Result<Option<Self>> {
+        let Some(value) = schema.and_then(|schema| schema.get(COLLECTION_ACCESS_EXTENSION)) else {
+            return Ok(None);
+        };
+        if schema
+            .and_then(|schema| schema.get("properties"))
+            .and_then(JsonValue::as_object)
+            .is_some_and(|properties| properties.contains_key(RECORD_ACCESS_FIELD))
+        {
+            return Err(invalid(format!(
+                "JSON Schema property '{RECORD_ACCESS_FIELD}' is reserved"
+            )));
+        }
+        let policy: Self = serde_json::from_value(value.clone()).map_err(|error| {
+            invalid(format!(
+                "collection has an invalid {COLLECTION_ACCESS_EXTENSION} policy: {error}"
+            ))
+        })?;
+        if policy.default_visibility != RecordVisibility::Private {
+            return Err(invalid(format!(
+                "{COLLECTION_ACCESS_EXTENSION}.default_visibility must be private"
+            )));
+        }
+        Ok(Some(policy))
+    }
+}
+
+/// Who may read a creator-owned record in addition to its owner and direct grants.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordVisibility {
+    Private,
+    Shared,
+}
+
+impl fmt::Display for RecordVisibility {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Private => "private",
+            Self::Shared => "shared",
+        })
+    }
+}
+
+/// CR-managed access metadata stored atomically with a record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordAccess {
+    pub owner: String,
+    pub visibility: RecordVisibility,
+}
+
+impl RecordAccess {
+    pub fn new(owner: impl Into<String>, visibility: RecordVisibility) -> Result<Self> {
+        let owner = owner.into();
+        if principal_id(&owner)? != owner {
+            return Err(invalid(format!("record owner '{owner}' is not canonical")));
+        }
+        Ok(Self { owner, visibility })
+    }
+
+    pub fn from_attributes(attributes: &Mapping) -> Result<Self> {
+        Self::from_attributes_optional(attributes)?.ok_or_else(|| {
+            invalid(format!(
+                "record is missing reserved '{RECORD_ACCESS_FIELD}' metadata"
+            ))
+        })
+    }
+
+    pub fn from_attributes_optional(attributes: &Mapping) -> Result<Option<Self>> {
+        let Some(value) = attributes.get(Value::String(RECORD_ACCESS_FIELD.to_owned())) else {
+            return Ok(None);
+        };
+        let access: Self = yaml_serde::from_value(value.clone()).map_err(|error| {
+            invalid(format!(
+                "record has invalid '{RECORD_ACCESS_FIELD}' metadata: {error}"
+            ))
+        })?;
+        Self::new(access.owner, access.visibility).map(Some)
+    }
+
+    pub fn insert_into(&self, attributes: &mut Mapping) -> Result<()> {
+        attributes.insert(
+            Value::String(RECORD_ACCESS_FIELD.to_owned()),
+            yaml_serde::to_value(self).map_err(|error| {
+                invalid(format!(
+                    "record access cannot be represented as YAML: {error}"
+                ))
+            })?,
+        );
+        Ok(())
+    }
+}
+
 /// A user that CR can authenticate and authorize.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -126,6 +249,76 @@ impl User {
             .map(|grant| {
                 AccessDecision::new(principal, display, action, resource, grant, policy_hash)
             })
+    }
+
+    /// Evaluate a record in a creator-owned collection.
+    ///
+    /// Collection roles deliberately stop at the collection boundary here:
+    /// editors may create records, but an existing record is readable only
+    /// through ownership, a direct record grant, or shared visibility.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_owned_decision(
+        &self,
+        principal: &str,
+        display: &str,
+        action: AccessAction,
+        resource: &Resource,
+        access: &RecordAccess,
+        policy_hash: &str,
+        resource_policy_hash: &str,
+    ) -> Option<AccessDecision> {
+        if self.status != UserStatus::Active {
+            return None;
+        }
+
+        if let Some(grant) = self
+            .access
+            .iter()
+            .filter(|grant| grant.role == Role::Owner && grant.resource.contains(resource))
+            .max_by_key(|grant| grant.resource.specificity())
+        {
+            return Some(
+                AccessDecision::new(principal, display, action, resource, grant, policy_hash)
+                    .with_resource_policy_hash(resource_policy_hash),
+            );
+        }
+
+        if let Some(grant) = self
+            .access
+            .iter()
+            .filter(|grant| &grant.resource == resource && grant.role.permits(action))
+            .max_by_key(|grant| grant.role.rank())
+        {
+            return Some(
+                AccessDecision::new(principal, display, action, resource, grant, policy_hash)
+                    .with_resource_policy_hash(resource_policy_hash),
+            );
+        }
+
+        if access.owner == principal && Role::Owner.permits(action) {
+            return Some(AccessDecision::record_policy(
+                principal,
+                display,
+                action,
+                resource,
+                Role::Owner,
+                policy_hash,
+                resource_policy_hash,
+            ));
+        }
+
+        if access.visibility == RecordVisibility::Shared && Role::Viewer.permits(action) {
+            return Some(AccessDecision::record_policy(
+                principal,
+                display,
+                action,
+                resource,
+                Role::Viewer,
+                policy_hash,
+                resource_policy_hash,
+            ));
+        }
+        None
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -459,7 +652,7 @@ impl Resource {
         }
     }
 
-    fn contains(&self, target: &Self) -> bool {
+    pub(crate) fn contains(&self, target: &Self) -> bool {
         match (self, target) {
             (Self::Database, _) => true,
             (
@@ -550,11 +743,15 @@ pub struct AccessDecision {
     pub resource: Resource,
     pub role: Role,
     pub granted_at: Resource,
-    /// Whether permission came from a stored grant or the built-in rule that
-    /// lets an active principal maintain its own name and profile.
+    /// Whether permission came from stored policy (a user grant or CR-managed
+    /// record policy) or the built-in self-service user rule.
     #[serde(default, skip_serializing_if = "AccessDecisionBasis::is_grant")]
     pub basis: AccessDecisionBasis,
     pub policy_hash: String,
+    /// Hash of CR-managed record policy when a creator-owned collection made
+    /// or constrained this decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_policy_hash: Option<String>,
 }
 
 /// Why an access decision was allowed.
@@ -591,6 +788,35 @@ impl AccessDecision {
             granted_at: grant.resource.clone(),
             basis: AccessDecisionBasis::Grant,
             policy_hash: policy_hash.to_owned(),
+            resource_policy_hash: None,
+        }
+    }
+
+    fn with_resource_policy_hash(mut self, resource_policy_hash: &str) -> Self {
+        self.resource_policy_hash = Some(resource_policy_hash.to_owned());
+        self
+    }
+
+    fn record_policy(
+        principal: &str,
+        display: &str,
+        action: AccessAction,
+        resource: &Resource,
+        role: Role,
+        policy_hash: &str,
+        resource_policy_hash: &str,
+    ) -> Self {
+        Self {
+            principal: principal.to_owned(),
+            display: display.to_owned(),
+            impersonated_by: None,
+            action,
+            resource: resource.clone(),
+            role,
+            granted_at: resource.clone(),
+            basis: AccessDecisionBasis::Grant,
+            policy_hash: policy_hash.to_owned(),
+            resource_policy_hash: Some(resource_policy_hash.to_owned()),
         }
     }
 
@@ -610,6 +836,7 @@ impl AccessDecision {
             role: Role::Editor,
             basis: AccessDecisionBasis::SelfService,
             policy_hash: policy_hash.to_owned(),
+            resource_policy_hash: None,
         }
     }
 }
@@ -699,7 +926,8 @@ fn validate_part(value: &str, label: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessAction, AccessGrant, Resource, Role, User, UserKind, UserStatus, principal_id,
+        AccessAction, AccessGrant, RecordAccess, RecordVisibility, Resource, Role, User, UserKind,
+        UserStatus, principal_id,
     };
 
     fn user(access: Vec<AccessGrant>) -> User {
@@ -753,6 +981,71 @@ mod tests {
                 "sha256:policy",
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn record_owned_policy_stops_collection_inheritance_but_keeps_direct_grants() {
+        let user = user(vec![
+            AccessGrant {
+                resource: Resource::collection("secrets"),
+                role: Role::Editor,
+            },
+            AccessGrant {
+                resource: Resource::record("secrets", "shared-with-ada"),
+                role: Role::Editor,
+            },
+        ]);
+        let private = RecordAccess::new("bob@example.com", RecordVisibility::Private).unwrap();
+        let shared = RecordAccess::new("bob@example.com", RecordVisibility::Shared).unwrap();
+
+        assert!(
+            user.record_owned_decision(
+                "ada@example.com",
+                "Ada",
+                AccessAction::Read,
+                &Resource::record("secrets", "private"),
+                &private,
+                "sha256:user",
+                "sha256:record",
+            )
+            .is_none()
+        );
+        assert!(
+            user.record_owned_decision(
+                "ada@example.com",
+                "Ada",
+                AccessAction::Read,
+                &Resource::record("secrets", "shared"),
+                &shared,
+                "sha256:user",
+                "sha256:record",
+            )
+            .is_some()
+        );
+        assert!(
+            user.record_owned_decision(
+                "ada@example.com",
+                "Ada",
+                AccessAction::Update,
+                &Resource::record("secrets", "shared"),
+                &shared,
+                "sha256:user",
+                "sha256:record",
+            )
+            .is_none()
+        );
+        assert!(
+            user.record_owned_decision(
+                "ada@example.com",
+                "Ada",
+                AccessAction::Update,
+                &Resource::record("secrets", "shared-with-ada"),
+                &private,
+                "sha256:user",
+                "sha256:record",
+            )
+            .is_some()
         );
     }
 

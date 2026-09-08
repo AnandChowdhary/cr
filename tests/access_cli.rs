@@ -8,6 +8,7 @@ use serde_json::Value;
 const OWNER: &str = "Owner <owner@example.com>";
 const BOB: &str = "Bob <bob@example.com>";
 const READER: &str = "Reader <reader@example.com>";
+const THIRD: &str = "Third <third@example.com>";
 const MANAGER: &str = "Manager <manager@example.com>";
 
 fn as_principal(database: &TestDatabase, actor: &str) -> Command {
@@ -35,6 +36,185 @@ fn add_user(database: &TestDatabase, id: &str, name: &str) {
     run_success(
         as_principal(database, OWNER).args(["user", "add", id, "--name", name, "--email", id]),
     );
+}
+
+#[test]
+fn record_owned_collection_keeps_creators_private_and_can_share_individual_records() {
+    let database = TestDatabase::new("record-owned-collection");
+    initialize(&database);
+    add_user(&database, "bob@example.com", "Bob");
+    add_user(&database, "reader@example.com", "Reader");
+    add_user(&database, "third@example.com", "Third");
+    for principal in ["bob@example.com", "reader@example.com"] {
+        run_success(as_principal(&database, OWNER).args([
+            "access",
+            "grant",
+            principal,
+            "editor",
+            "collection:secrets",
+        ]));
+    }
+    run_success(as_principal(&database, OWNER).args([
+        "access",
+        "policy",
+        "set",
+        "collection:secrets",
+        "--mode",
+        "record-owned",
+        "--default-visibility",
+        "private",
+    ]));
+
+    run_success(as_principal(&database, BOB).args([
+        "create",
+        "secrets",
+        "bob-token",
+        "--set",
+        "service=openai",
+    ]));
+    run_success(as_principal(&database, READER).args([
+        "create",
+        "secrets",
+        "reader-token",
+        "--set",
+        "service=github",
+    ]));
+
+    let bob_records = json(as_principal(&database, BOB).args(["list", "secrets", "--json"]));
+    assert_eq!(bob_records.as_array().unwrap().len(), 1);
+    assert_eq!(bob_records[0]["path"], "records/secrets/bob-token.md");
+    assert!(
+        run_failure(as_principal(&database, READER).args(["get", "secrets", "bob-token"]))
+            .contains("cannot read record:secrets/bob-token")
+    );
+    let private_history =
+        json(as_principal(&database, READER).args(["audit", "log", "secrets", "--json"]));
+    assert!(
+        private_history
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| { entry["record"]["id"] != "bob-token" })
+    );
+
+    run_success(as_principal(&database, BOB).args([
+        "access",
+        "visibility",
+        "secrets",
+        "bob-token",
+        "shared",
+    ]));
+    let reader_records = json(as_principal(&database, READER).args(["list", "secrets", "--json"]));
+    assert_eq!(reader_records.as_array().unwrap().len(), 2);
+    run_success(as_principal(&database, READER).args(["get", "secrets", "bob-token"]));
+    run_success(as_principal(&database, THIRD).args(["get", "secrets", "bob-token"]));
+    let third_search =
+        json(as_principal(&database, THIRD).args(["search", "openai", "--front-matter", "--json"]));
+    assert_eq!(third_search.as_array().unwrap().len(), 1);
+    let shared_history =
+        json(as_principal(&database, READER).args(["audit", "log", "secrets", "--json"]));
+    assert!(
+        shared_history
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["record"]["id"] == "bob-token" })
+    );
+    assert!(
+        run_failure(as_principal(&database, READER).args([
+            "access",
+            "visibility",
+            "secrets",
+            "bob-token",
+            "private",
+        ]))
+        .contains("cannot manage_access record:secrets/bob-token")
+    );
+    assert!(
+        run_failure(as_principal(&database, BOB).args([
+            "update",
+            "secrets",
+            "bob-token",
+            "--set",
+            "$cr_access.visibility=private",
+        ]))
+        .contains("is managed through 'cr access'")
+    );
+
+    run_success(as_principal(&database, BOB).args([
+        "access",
+        "owner",
+        "secrets",
+        "bob-token",
+        "reader@example.com",
+    ]));
+    run_success(as_principal(&database, READER).args([
+        "access",
+        "visibility",
+        "secrets",
+        "bob-token",
+        "private",
+    ]));
+    assert!(
+        run_failure(as_principal(&database, BOB).args(["get", "secrets", "bob-token"]))
+            .contains("cannot read record:secrets/bob-token")
+    );
+
+    let history = json(as_principal(&database, READER).args([
+        "audit",
+        "log",
+        "secrets",
+        "bob-token",
+        "--json",
+    ]));
+    assert!(history[0]["access"].get("basis").is_none());
+    assert!(
+        history[0]["access"]["resource_policy_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    run_success(as_principal(&database, OWNER).args(["audit", "verify"]));
+}
+
+#[test]
+fn record_owned_policy_refuses_nonempty_collections() {
+    let database = TestDatabase::new("record-owned-nonempty");
+    initialize(&database);
+    run_success(as_principal(&database, OWNER).args(["create", "secrets", "existing"]));
+    assert!(
+        run_failure(as_principal(&database, OWNER).args([
+            "access",
+            "policy",
+            "set",
+            "collection:secrets",
+            "--mode",
+            "record-owned",
+        ]))
+        .contains("after it has records or audit history")
+    );
+}
+
+#[test]
+fn legacy_collections_keep_existing_inheritance_and_field_names() {
+    let database = TestDatabase::new("legacy-record-access-field");
+    initialize(&database);
+    run_success(as_principal(&database, OWNER).args([
+        "create",
+        "items",
+        "one",
+        "--set",
+        "$cr_access=ordinary application data",
+    ]));
+    run_success(as_principal(&database, OWNER).args([
+        "update",
+        "items",
+        "one",
+        "--set",
+        "$cr_access=still ordinary",
+    ]));
+    let record = json(as_principal(&database, OWNER).args(["get", "items", "one", "--json"]));
+    assert_eq!(record["attributes"]["$cr_access"], "still ordinary");
 }
 
 #[test]

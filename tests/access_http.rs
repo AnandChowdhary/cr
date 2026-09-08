@@ -6,7 +6,8 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use cr::{
-    AccessDecisionBasis, AccessResource, Assignment, AuditFilter, Database, Role, UserKind,
+    AccessDecisionBasis, AccessResource, Assignment, AuditFilter, CollectionAccessPolicy, Database,
+    RecordVisibility, Role, UserKind,
     server::{ServerConfig, router},
 };
 use http_body_util::BodyExt;
@@ -143,6 +144,92 @@ fn seeded_database(name: &str) -> (TempDir, Database) {
         )
         .unwrap();
     (temporary, database)
+}
+
+#[tokio::test]
+async fn rest_reads_and_writes_enforce_record_owned_visibility() {
+    let (temporary, database) = seeded_database("record-owned-api");
+    database
+        .set_record_access_policy("secrets", CollectionAccessPolicy::record_owned())
+        .unwrap();
+    for principal in ["reader@example.com", "editor@example.com"] {
+        database
+            .grant_access(
+                principal,
+                AccessResource::collection("secrets"),
+                Role::Editor,
+            )
+            .unwrap();
+    }
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let home = request(&app, Method::GET, "/", None, None, &[]).await;
+    let csrf = csrf(home.text()).to_owned();
+    let editor = request(
+        &app,
+        Method::POST,
+        "/perspective",
+        Some(form(&[
+            ("_csrf", &csrf),
+            ("principal", "editor@example.com"),
+        ])),
+        Some("application/x-www-form-urlencoded"),
+        &[],
+    )
+    .await;
+    let editor_cookie = perspective_cookie(&editor);
+    let reader = request(
+        &app,
+        Method::POST,
+        "/perspective",
+        Some(form(&[
+            ("_csrf", &csrf),
+            ("principal", "reader@example.com"),
+        ])),
+        Some("application/x-www-form-urlencoded"),
+        &[],
+    )
+    .await;
+    let reader_cookie = perspective_cookie(&reader);
+
+    let created = request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/secrets/records",
+        Some(json!({ "id": "deploy", "front_matter": { "service": "github" } }).to_string()),
+        Some("application/json"),
+        &[("cookie", &editor_cookie)],
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+
+    let private = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/secrets/records/deploy",
+        None,
+        None,
+        &[("cookie", &reader_cookie)],
+    )
+    .await;
+    assert_eq!(private.status, StatusCode::FORBIDDEN);
+
+    database
+        .impersonate("editor@example.com")
+        .unwrap()
+        .set_record_visibility("secrets", "deploy", RecordVisibility::Shared)
+        .unwrap();
+    let shared = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/secrets/records/deploy",
+        None,
+        None,
+        &[("cookie", &reader_cookie)],
+    )
+    .await;
+    assert_eq!(shared.status, StatusCode::OK, "{}", shared.text());
+    assert_eq!(shared.json()["front_matter"]["service"], "github");
+    drop(temporary);
 }
 
 #[tokio::test]

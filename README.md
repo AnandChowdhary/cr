@@ -245,7 +245,8 @@ Resources are written as `database`, `collection:NAME`, or
 `record:COLLECTION/ID`. Database grants inherit into every collection and
 record; collection grants inherit into their records; and a direct record
 grant replaces the broader role for that record. Database ownership is never
-accidentally narrowed by a more specific grant.
+accidentally narrowed by a more specific grant. Record-owned collections are
+the explicit exception to collection inheritance described below.
 
 | Role | Effective capability |
 | --- | --- |
@@ -253,6 +254,57 @@ accidentally narrowed by a more specific grant.
 | `editor` | Viewer access plus create, update, and link. Deletion is deliberately excluded. |
 | `access_manager` | List users and grant or revoke ordinary roles, without receiving record contents. |
 | `owner` | Every operation, including deletion, ownership, integrity checks, and access administration. |
+
+### Keep private and shared records in one collection
+
+An empty collection can opt into creator-owned records instead of inheriting
+its collection role into every existing record:
+
+```sh
+cr access policy set collection:secrets \
+  --mode record-owned \
+  --default-visibility private
+cr access grant maria@example.com editor collection:secrets
+```
+
+Every `cr create secrets ...`—including creates through the REST API, web UI,
+and sync runner—then atomically records the effective principal as that
+record's owner. New records are private. The collection `editor` role permits
+discovery and creation, but does not make another creator's existing records
+readable or editable. The record owner, an applicable direct record grant, and
+an inherited `owner` grant remain valid. Database and collection owners retain
+administrative access.
+
+The owner can expose one record to every active registered principal, make it
+private again, or transfer it to another active principal:
+
+```sh
+cr access visibility secrets deployment-token shared
+cr access visibility secrets deployment-token private
+cr access owner secrets deployment-token lee@example.com
+```
+
+`shared` adds read-only access for the active-principal audience; it does not
+grant updates, deletion, or access management. Use an ordinary direct record
+grant when one additional principal needs a stronger or private role:
+
+```sh
+cr access grant lee@example.com editor record:secrets/deployment-token
+```
+
+CR stores the owner and visibility in reserved `$cr_access` front matter. The
+field is deliberately plaintext policy metadata, never secret material, and
+generic create/update/patch/save operations cannot forge or change it. Its
+changes are ordinary record audit diffs; allowed mutations also carry a
+`resource_policy_hash` beside the existing user `policy_hash`. All CLI, raw
+field, REST, search, relation, view, and audit reads pass through the same
+decision. Deleting and recreating an ID creates a new owner boundary.
+
+Activation is limited to an empty collection with no audit history. This keeps
+the first record atomic and fail-closed instead of temporarily assigning an
+owner to existing data. To consolidate older private/shared collections,
+enable the policy on a new collection and import each record through CR while
+acting as its intended owner; mark only the company-wide records `shared`.
 
 User records carry their direct `access` grants, so every policy change is a
 normal versioned audit event. A permitted record mutation stores the principal,
@@ -2180,6 +2232,9 @@ cr access init [--name NAME] [--email EMAIL] [--kind human|service | --service]
 cr access check ACTION RESOURCE [--json]
 cr access grant USER ROLE RESOURCE
 cr access revoke USER RESOURCE
+cr access policy set collection:NAME --mode record-owned [--default-visibility private]
+cr access visibility COLLECTION ID private|shared
+cr access owner COLLECTION ID PRINCIPAL
 
 cr user add ID --name NAME [--email EMAIL] [--kind human|service | --service]
             [--set KEY=YAML]... [--reuse-deleted-id] [--json]
