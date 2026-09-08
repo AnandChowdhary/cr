@@ -31,10 +31,11 @@ use yaml_serde::{Mapping, Value as YamlValue};
 use crate::{
     AccessAction, AccessIdentity, AccessResource, AgentEvidence, Assignment, Attribution,
     AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
-    AuditIntentPart, AuditSource, CheckScope, CheckSummary, CollectionModel, Database, DomainError,
-    FilterExpression, FilterOperator, Finding, Record, RecordPrecondition, SearchQuery,
-    SearchTarget, SortDirection, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout,
-    ViewPredicateMatch, audit::AuditChange, sort_records_by_field,
+    AuditIntentPart, AuditSource, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary,
+    CollectionModel, Database, DomainError, FilterExpression, FilterOperator, Finding,
+    RECORD_ACCESS_FIELD, Record, RecordPrecondition, SearchQuery, SearchTarget, SortDirection,
+    UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
+    audit::AuditChange, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -4303,6 +4304,7 @@ fn render_schema_field(field: &SchemaFormField) -> Markup {
 }
 
 fn additional_attributes(attributes: &Mapping, schema: &JsonValue) -> Mapping {
+    let record_owned = schema.get(COLLECTION_ACCESS_EXTENSION).is_some();
     let declared = schema
         .get("properties")
         .and_then(JsonValue::as_object)
@@ -4316,7 +4318,9 @@ fn additional_attributes(attributes: &Mapping, schema: &JsonValue) -> Mapping {
     attributes
         .iter()
         .filter(|(key, _)| match key {
-            YamlValue::String(key) => !declared.contains(key.as_str()),
+            YamlValue::String(key) => {
+                (!record_owned || key != RECORD_ACCESS_FIELD) && !declared.contains(key.as_str())
+            }
             _ => true,
         })
         .map(|(key, value)| (key.clone(), value.clone()))
@@ -5215,6 +5219,8 @@ fn view_available_columns(
     records: &[Record],
     schema: Option<&JsonValue>,
 ) -> Vec<String> {
+    let record_owned =
+        schema.is_some_and(|schema| schema.get(COLLECTION_ACCESS_EXTENSION).is_some());
     let mut columns = Vec::new();
     let mut known = BTreeSet::new();
     for column in &view.columns {
@@ -5228,11 +5234,18 @@ fn view_available_columns(
         .and_then(|schema| schema.get("properties"))
         .and_then(JsonValue::as_object)
     {
-        additional.extend(properties.keys().cloned());
+        additional.extend(
+            properties
+                .keys()
+                .filter(|key| !record_owned || key.as_str() != RECORD_ACCESS_FIELD)
+                .cloned(),
+        );
     }
     for record in records {
         additional.extend(record.attributes.keys().filter_map(|key| match key {
-            YamlValue::String(key) => Some(key.clone()),
+            YamlValue::String(key) if !record_owned || key != RECORD_ACCESS_FIELD => {
+                Some(key.clone())
+            }
             _ => None,
         }));
     }

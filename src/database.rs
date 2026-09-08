@@ -17,9 +17,11 @@ use crate::{
     AnchorReport, Assignment, AuditAction, AuditAnchor, AuditChange, AuditEntry, AuditHead,
     AuditSource, AuditVerification, SearchQuery,
     access::{
-        AccessAction, AccessDecision, AccessIdentity, Resource as AccessResource, Role,
-        USERS_COLLECTION, User, UserDeleteOptions, UserEnsureOutcome, UserKind,
-        UserRegistrationOptions, UserStatus, UserUpdate, display_name, principal_id, users_schema,
+        AccessAction, AccessDecision, AccessIdentity, COLLECTION_ACCESS_EXTENSION,
+        CollectionAccessPolicy, RECORD_ACCESS_FIELD, RecordAccess, RecordVisibility,
+        Resource as AccessResource, Role, USERS_COLLECTION, User, UserDeleteOptions,
+        UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus, UserUpdate, display_name,
+        principal_id, users_schema,
     },
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     audit::{
@@ -1001,7 +1003,47 @@ impl Database {
             // at which this resource can exist again.
             user.access.retain(|grant| &grant.resource != resource);
         }
-        user.decision(&self.principal, &self.actor, action, resource, &policy_hash)
+        let decision = match resource {
+            AccessResource::Record { collection, id }
+                if collection != USERS_COLLECTION
+                    && self.record_access_policy(collection)?.is_some() =>
+            {
+                let record_access = self.record_access_unchecked_optional(collection, id)?;
+                if action == AccessAction::Create {
+                    user.decision(&self.principal, &self.actor, action, resource, &policy_hash)
+                } else if let Some(access) = record_access {
+                    let resource_policy_hash = record_access_hash(&access)?;
+                    user.record_owned_decision(
+                        &self.principal,
+                        &self.actor,
+                        action,
+                        resource,
+                        &access,
+                        &policy_hash,
+                        &resource_policy_hash,
+                    )
+                } else {
+                    // Preserve the normal not-found boundary for owners while
+                    // never letting a collection role inherit into a missing
+                    // or malformed creator-owned record.
+                    user.access
+                        .iter()
+                        .any(|grant| grant.role == Role::Owner && grant.resource.contains(resource))
+                        .then(|| {
+                            user.decision(
+                                &self.principal,
+                                &self.actor,
+                                action,
+                                resource,
+                                &policy_hash,
+                            )
+                        })
+                        .flatten()
+                }
+            }
+            _ => user.decision(&self.principal, &self.actor, action, resource, &policy_hash),
+        };
+        decision
             .map(|mut decision| {
                 decision.impersonated_by = self.impersonated_by.clone();
                 decision
@@ -1058,6 +1100,45 @@ impl Database {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn user_can_read_record_audit(
+        &self,
+        user: &User,
+        policy_hash: &str,
+        collection: &str,
+        id: &str,
+    ) -> Result<bool> {
+        let resource = AccessResource::record(collection, id);
+        if self.record_access_policy(collection)?.is_some() {
+            let Some(access) = self.record_access_unchecked_optional(collection, id)? else {
+                return Ok(user
+                    .access
+                    .iter()
+                    .any(|grant| grant.role == Role::Owner && grant.resource.contains(&resource)));
+            };
+            let resource_policy_hash = record_access_hash(&access)?;
+            return Ok(user
+                .record_owned_decision(
+                    &self.principal,
+                    &self.actor,
+                    AccessAction::ReadAudit,
+                    &resource,
+                    &access,
+                    policy_hash,
+                    &resource_policy_hash,
+                )
+                .is_some());
+        }
+        Ok(user
+            .decision(
+                &self.principal,
+                &self.actor,
+                AccessAction::ReadAudit,
+                &resource,
+                policy_hash,
+            )
+            .is_some())
     }
 
     pub(crate) fn authorize_owner(
@@ -1619,6 +1700,68 @@ impl Database {
         .record()
     }
 
+    /// Change whether every active registered principal may read one
+    /// creator-owned record. Only its record owner or an inherited owner may
+    /// change this CR-managed field.
+    pub fn set_record_visibility(
+        &self,
+        collection: &str,
+        id: &str,
+        visibility: RecordVisibility,
+    ) -> Result<Record> {
+        if self.record_access_policy(collection)?.is_none() {
+            return Err(conflict(format!(
+                "collection '{collection}' does not use record-owned access"
+            )));
+        }
+        self.run_update(
+            collection,
+            id,
+            move |document| {
+                let mut access = RecordAccess::from_attributes(&document.attributes)?;
+                access.visibility = visibility;
+                access.insert_into(&mut document.attributes)
+            },
+            MutationMode::Apply,
+            AccessRequest::owner(AccessResource::record(collection, id)),
+            None,
+            None,
+        )?
+        .record()
+    }
+
+    /// Transfer ownership of one creator-owned record to an active registered
+    /// principal. The current record owner or an inherited owner authorizes
+    /// the transfer.
+    pub fn set_record_owner(&self, collection: &str, id: &str, owner: &str) -> Result<Record> {
+        if self.record_access_policy(collection)?.is_none() {
+            return Err(conflict(format!(
+                "collection '{collection}' does not use record-owned access"
+            )));
+        }
+        let owner = principal_id(owner)?;
+        self.run_update(
+            collection,
+            id,
+            move |document| {
+                let Some((target, _)) = self.user_unchecked_optional(&owner)? else {
+                    return Err(DomainError::record_not_found(USERS_COLLECTION, &owner).into());
+                };
+                if target.status != UserStatus::Active {
+                    return Err(conflict(format!("record owner '{owner}' is not active")));
+                }
+                let mut access = RecordAccess::from_attributes(&document.attributes)?;
+                access.owner = owner;
+                access.insert_into(&mut document.attributes)
+            },
+            MutationMode::Apply,
+            AccessRequest::owner(AccessResource::record(collection, id)),
+            None,
+            None,
+        )?
+        .record()
+    }
+
     fn user_ids_unchecked(&self) -> Result<Vec<String>> {
         let directory = self.config.data_dir.join(USERS_COLLECTION);
         let entries = paths::list_directory(&self.root, &directory, "the users collection")?
@@ -1798,7 +1941,7 @@ impl Database {
         &self,
         collection: &str,
         id: &str,
-        attributes: Mapping,
+        mut attributes: Mapping,
         body: &str,
         request: CreateRequest,
     ) -> Result<MutationOutcome> {
@@ -1830,7 +1973,7 @@ impl Database {
         {
             self.assert_current_principal_policy(&audit)?;
         }
-        let decision = access
+        let mut decision = access
             .as_ref()
             .map(|access| {
                 if access.owner_only {
@@ -1854,6 +1997,19 @@ impl Database {
                 return Err(user_id_tombstoned(id));
             }
             self.authorize_owner(&AccessResource::Database)?;
+        }
+        if let Some(policy) = self.record_access_policy(collection)? {
+            if attributes.contains_key(Value::String(RECORD_ACCESS_FIELD.to_owned())) {
+                return Err(invalid(format!(
+                    "front matter field '{RECORD_ACCESS_FIELD}' is managed through 'cr access'"
+                )));
+            }
+            let record_access =
+                RecordAccess::new(self.principal.clone(), policy.default_visibility)?;
+            record_access.insert_into(&mut attributes)?;
+            if let Some(decision) = &mut decision {
+                decision.resource_policy_hash = Some(record_access_hash(&record_access)?);
+            }
         }
         let document = Document {
             attributes,
@@ -2219,6 +2375,11 @@ impl Database {
                     "invalid encryption annotations for collection '{name}'"
                 ))
             })?;
+            CollectionAccessPolicy::from_schema(Some(&schema)).with_context(|| {
+                DomainError::Invalid(format!(
+                    "invalid access annotations for collection '{name}'"
+                ))
+            })?;
             models.insert(name, Some(schema));
         }
 
@@ -2238,7 +2399,11 @@ impl Database {
                             AccessResource::Record { collection, .. } if collection == &name
                         )
                     });
+                let has_record_owned_visibility = user.status == UserStatus::Active
+                    && CollectionAccessPolicy::from_schema(schema.as_ref())?.is_some()
+                    && self.collection_has_readable_record(&name)?;
                 if has_record_grant
+                    || has_record_owned_visibility
                     || self
                         .can_access(AccessAction::Discover, &AccessResource::collection(&name))?
                 {
@@ -2257,6 +2422,75 @@ impl Database {
     pub fn validate_record_attributes(&self, collection: &str, attributes: &Mapping) -> Result<()> {
         validate_component(collection, "collection")?;
         self.validate(collection, attributes)
+    }
+
+    /// Opt an empty collection into creator-owned, private-by-default records.
+    ///
+    /// The empty/history-free requirement keeps activation atomic: there is
+    /// never a moment where an existing record lacks the policy metadata that
+    /// authorization requires.
+    pub fn set_record_access_policy(
+        &self,
+        collection: &str,
+        policy: CollectionAccessPolicy,
+    ) -> Result<bool> {
+        validate_component(collection, "collection")?;
+        if collection == USERS_COLLECTION {
+            return Err(invalid("the users collection has fixed access semantics"));
+        }
+        if !self.access_enabled()? {
+            return Err(conflict(
+                "initialize access control with 'cr access init' before enabling record-owned access",
+            ));
+        }
+
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        self.assert_current_principal_policy(&audit)?;
+        self.authorize_owner(&AccessResource::collection(collection))?;
+
+        let existing = self.collection_schema(collection)?;
+        let mut schema = existing.clone().unwrap_or_else(empty_collection_schema);
+        let object = schema
+            .as_object_mut()
+            .context("a boolean JSON Schema cannot carry collection access policy")?;
+        object.insert(
+            COLLECTION_ACCESS_EXTENSION.to_owned(),
+            serde_json::to_value(policy)
+                .context("could not serialize the collection access policy")?,
+        );
+        CollectionAccessPolicy::from_schema(Some(&schema))?;
+        if existing.as_ref() == Some(&schema) {
+            return Ok(false);
+        }
+
+        let has_history = audit
+            .record_states()?
+            .keys()
+            .any(|(record_collection, _)| record_collection == collection);
+        if has_history || self.collection_has_record_files(collection)? {
+            return Err(conflict(format!(
+                "cannot enable record-owned access for collection '{collection}' after it has records or audit history; create a new collection and import records through CR so each owner is recorded atomically"
+            )));
+        }
+
+        jsonschema::meta::validate(&schema).map_err(|error| {
+            anyhow!("{error}").context(DomainError::Invalid(format!(
+                "invalid JSON Schema for collection '{collection}'"
+            )))
+        })?;
+        let mut rendered = serde_json::to_vec_pretty(&schema)
+            .context("could not serialize the collection JSON Schema")?;
+        rendered.push(b'\n');
+        let path = Path::new(SCHEMA_DIRECTORY).join(format!("{collection}.json"));
+        let label = schema_label(collection);
+        if existing.is_some() {
+            paths::write_replace(&self.root, &path, &rendered, &label)?;
+        } else {
+            paths::write_new(&self.root, &path, &rendered, &label)?;
+        }
+        Ok(true)
     }
 
     /// Add an encrypted-storage annotation to one collection-schema property.
@@ -2371,6 +2605,27 @@ impl Database {
         Ok(false)
     }
 
+    fn collection_has_readable_record(&self, collection: &str) -> Result<bool> {
+        let directory = self.config.data_dir.join(collection);
+        let label = collection_label(collection);
+        let entries = paths::list_directory(&self.root, &directory, &label)?.unwrap_or_default();
+        for entry in entries {
+            let CollectionEntry::Record(id) = collection_entry(collection, &entry.name)? else {
+                continue;
+            };
+            if !entry.kind.is_file() {
+                return Err(paths::refuse_entry(
+                    &record_label(collection, &id),
+                    entry.kind,
+                ));
+            }
+            if self.can_access(AccessAction::Read, &AccessResource::record(collection, &id))? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn update(
         &self,
         collection: &str,
@@ -2390,6 +2645,9 @@ impl Database {
         body: Option<&str>,
         precondition: Option<&RecordPrecondition>,
     ) -> Result<Record> {
+        if self.record_access_policy(collection)?.is_some() {
+            reject_record_access_assignments(assignments)?;
+        }
         let user_fields = validate_users_field_update(collection, assignments, body)?;
         let idempotency = self.idempotency_request("update", collection, id, || {
             Ok(json!({
@@ -2437,6 +2695,9 @@ impl Database {
         body: Option<&str>,
         precondition: Option<&RecordPrecondition>,
     ) -> Result<ChangePreview> {
+        if self.record_access_policy(collection)?.is_some() {
+            reject_record_access_assignments(assignments)?;
+        }
         let user_fields = validate_users_field_update(collection, assignments, body)?;
         self.run_update(
             collection,
@@ -2542,6 +2803,20 @@ impl Database {
         precondition: Option<&RecordPrecondition>,
         idempotency: Option<IdempotencyRequest>,
     ) -> Result<MutationOutcome> {
+        if self.record_access_policy(collection)?.is_some()
+            && (attributes.contains_key(Value::String(RECORD_ACCESS_FIELD.to_owned()))
+                || remove.iter().any(|path| {
+                    parse_path(path).is_ok_and(|parts| {
+                        parts
+                            .first()
+                            .is_some_and(|part| part == RECORD_ACCESS_FIELD)
+                    })
+                }))
+        {
+            return Err(invalid(format!(
+                "front matter field '{RECORD_ACCESS_FIELD}' is managed through 'cr access'"
+            )));
+        }
         let user_fields = validate_users_field_patch(collection, attributes, remove, body)?;
         if attributes.is_empty() && remove.is_empty() && body.is_none() {
             return Err(invalid("patch must change front matter or Markdown"));
@@ -2693,6 +2968,29 @@ impl Database {
         let before = self.reveal_document(collection, id, &before_stored)?;
         let mut document = before.clone();
         mutate(&mut document)?;
+        if self.record_access_policy(collection)?.is_some() {
+            let before_access = RecordAccess::from_attributes(&before.attributes)?;
+            match RecordAccess::from_attributes(&document.attributes) {
+                Ok(after_access) if after_access == before_access => {}
+                Err(_)
+                    if access.action != AccessAction::ManageAccess
+                        && !document
+                            .attributes
+                            .contains_key(Value::String(RECORD_ACCESS_FIELD.to_owned())) =>
+                {
+                    // Complete-document replacements do not need to round-trip
+                    // CR's internal field. Preserve it on their behalf.
+                    before_access.insert_into(&mut document.attributes)?;
+                }
+                Ok(_) | Err(_) if access.action != AccessAction::ManageAccess => {
+                    return Err(invalid(format!(
+                        "front matter field '{RECORD_ACCESS_FIELD}' is managed through 'cr access'"
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
         if collection == USERS_COLLECTION {
             document.attributes = User::from_attributes(&document.attributes)?.attributes()?;
         }
@@ -3193,6 +3491,41 @@ impl Database {
                 .as_deref()
                 .map(|raw| parse_record(&change.collection, &change.id, raw))
                 .transpose()?;
+            if self.record_access_policy(&change.collection)?.is_some() {
+                match change.status {
+                    WorkingChangeKind::Added => {
+                        return Err(conflict(format!(
+                            "record {}/{} belongs to a record-owned collection; create it through CR so ownership is recorded atomically",
+                            change.collection, change.id
+                        )));
+                    }
+                    WorkingChangeKind::Deleted => {
+                        return Err(conflict(format!(
+                            "record {}/{} belongs to a record-owned collection; delete it through CR so authorization uses its current owner",
+                            change.collection, change.id
+                        )));
+                    }
+                    WorkingChangeKind::Modified => {
+                        let before_access = before
+                            .as_ref()
+                            .ok_or_else(|| conflict("audited record state is missing"))
+                            .and_then(|document| {
+                                RecordAccess::from_attributes(&document.attributes)
+                            })?;
+                        let after_access = after
+                            .as_ref()
+                            .ok_or_else(|| conflict("working record state is missing"))
+                            .and_then(|document| {
+                                RecordAccess::from_attributes(&document.attributes)
+                            })?;
+                        if before_access != after_access {
+                            return Err(invalid(format!(
+                                "front matter field '{RECORD_ACCESS_FIELD}' is managed through 'cr access'"
+                            )));
+                        }
+                    }
+                }
+            }
             if let Some(document) = &after {
                 let logical = self.reveal_document_with_audited_states(
                     &change.collection,
@@ -3327,6 +3660,27 @@ impl Database {
                 )?;
             }
             (Some(collection), None) => {
+                if self.record_access_policy(collection)?.is_some()
+                    && !self.owner_access_allowed(&AccessResource::collection(collection))?
+                {
+                    let Some((user, policy_hash)) =
+                        self.user_unchecked_optional(&self.principal)?
+                    else {
+                        return Err(forbidden(format!(
+                            "principal '{}' is not registered in the users collection",
+                            self.principal
+                        )));
+                    };
+                    let history = audit.recent_history_where(limit, filter, |entry| {
+                        self.user_can_read_record_audit(
+                            &user,
+                            &policy_hash,
+                            &entry.payload.record.collection,
+                            &entry.payload.record.id,
+                        )
+                    })?;
+                    return self.reveal_audit_history(history);
+                }
                 self.authorize(
                     AccessAction::ReadAudit,
                     &AccessResource::collection(collection),
@@ -3358,18 +3712,12 @@ impl Database {
                             )
                             .is_some());
                     }
-                    Ok(user
-                        .decision(
-                            &self.principal,
-                            &self.actor,
-                            AccessAction::ReadAudit,
-                            &AccessResource::record(
-                                &entry.payload.record.collection,
-                                &entry.payload.record.id,
-                            ),
-                            &policy_hash,
-                        )
-                        .is_some())
+                    self.user_can_read_record_audit(
+                        &user,
+                        &policy_hash,
+                        &entry.payload.record.collection,
+                        &entry.payload.record.id,
+                    )
                 })?;
                 return self.reveal_audit_history(history);
             }
@@ -3578,10 +3926,16 @@ impl Database {
         let Some(schema) = self.collection_schema(collection)? else {
             return Ok(());
         };
+        let policy = CollectionAccessPolicy::from_schema(Some(&schema))?;
+        let mut application_attributes = attributes.clone();
+        if policy.is_some() {
+            RecordAccess::from_attributes(attributes)?;
+            application_attributes.remove(Value::String(RECORD_ACCESS_FIELD.to_owned()));
+        }
         let redact_values = !EncryptionPolicy::from_schema(Some(&schema))?.is_empty();
         validate_schema_instance(
             collection,
-            attributes,
+            &application_attributes,
             &schema,
             &schema_label(collection),
             redact_values,
@@ -3610,7 +3964,26 @@ impl Database {
             .map_err(|error| anyhow!("invalid JSON Schema for {label}: {error}"))
             .with_context(unusable)?;
         EncryptionPolicy::from_schema(Some(&schema)).with_context(unusable)?;
+        CollectionAccessPolicy::from_schema(Some(&schema)).with_context(unusable)?;
         Ok(Some(schema))
+    }
+
+    fn record_access_policy(&self, collection: &str) -> Result<Option<CollectionAccessPolicy>> {
+        CollectionAccessPolicy::from_schema(self.collection_schema(collection)?.as_ref())
+    }
+
+    fn record_access_unchecked_optional(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<RecordAccess>> {
+        let path = self.record_path(collection, id)?;
+        if paths::entry_kind(&self.root, &path, &record_label(collection, id))?.is_none() {
+            return Ok(None);
+        }
+        let raw = self.read_record(collection, id, &path)?;
+        let stored = parse_record(collection, id, &raw)?;
+        RecordAccess::from_attributes_optional(&stored.attributes)
     }
 
     fn encryption_policy(&self, collection: &str) -> Result<EncryptionPolicy> {
@@ -4327,6 +4700,29 @@ fn empty_collection_schema() -> JsonValue {
         "type": "object",
         "properties": {}
     })
+}
+
+fn record_access_hash(access: &RecordAccess) -> Result<String> {
+    let encoded = serde_json::to_vec(&json!({
+        "collection": CollectionAccessPolicy::record_owned(),
+        "record": access,
+    }))
+    .context("could not hash record access policy")?;
+    Ok(idempotency_digest(b"cr:record-access:v1\0", &encoded))
+}
+
+fn reject_record_access_assignments(assignments: &[Assignment]) -> Result<()> {
+    if assignments.iter().any(|assignment| {
+        assignment
+            .path()
+            .first()
+            .is_some_and(|part| part == RECORD_ACCESS_FIELD)
+    }) {
+        return Err(invalid(format!(
+            "front matter field '{RECORD_ACCESS_FIELD}' is managed through 'cr access'"
+        )));
+    }
+    Ok(())
 }
 
 fn mark_schema_field_encrypted(schema: &mut JsonValue, path: &[String]) -> Result<()> {

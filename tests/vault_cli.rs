@@ -23,8 +23,84 @@ fn as_principal(database: &TestDatabase, actor: &str) -> Command {
     command
 }
 
+fn encrypted_as_principal(database: &TestDatabase, actor: &str) -> Command {
+    let mut command = encrypted_command(database);
+    command.env("CR_ACTOR", actor);
+    command
+}
+
 fn json(command: &mut Command) -> Value {
     serde_json::from_str(&run_success(command)).unwrap()
+}
+
+#[test]
+fn encrypted_record_owned_secrets_keep_policy_plaintext_and_values_protected() {
+    let database = TestDatabase::new("record-owned-encrypted-secrets");
+    run_success(encrypted_as_principal(&database, OWNER).args([
+        "access",
+        "init",
+        "--name",
+        "Owner",
+        "--email",
+        "owner@example.com",
+    ]));
+    run_success(encrypted_as_principal(&database, OWNER).args([
+        "user",
+        "add",
+        "editor@example.com",
+        "--name",
+        "Editor",
+        "--email",
+        "editor@example.com",
+    ]));
+    run_success(
+        encrypted_as_principal(&database, OWNER).args(["schema", "encrypt", "secrets", "value"]),
+    );
+    run_success(encrypted_as_principal(&database, OWNER).args([
+        "schema",
+        "encrypt-body",
+        "secrets",
+    ]));
+    run_success(encrypted_as_principal(&database, OWNER).args([
+        "access",
+        "policy",
+        "set",
+        "collection:secrets",
+        "--mode",
+        "record-owned",
+    ]));
+    run_success(encrypted_as_principal(&database, OWNER).args([
+        "access",
+        "grant",
+        "editor@example.com",
+        "editor",
+        "collection:secrets",
+    ]));
+
+    let sentinel = "test-only-secret-value";
+    run_success(encrypted_as_principal(&database, EDITOR).args([
+        "create",
+        "secrets",
+        "openai",
+        "--set",
+        &format!("value={sentinel}"),
+        "--body",
+        "test-only-secret-body",
+    ]));
+    let stored = fs::read_to_string(database.root.join("records/secrets/openai.md")).unwrap();
+    assert!(stored.contains("$cr_access:"));
+    assert!(stored.contains("owner: editor@example.com"));
+    assert!(stored.contains("ciphertext:"));
+    assert!(!stored.contains(sentinel));
+    assert!(!stored.contains("test-only-secret-body"));
+    assert_eq!(
+        run_success(
+            encrypted_as_principal(&database, EDITOR)
+                .args(["get", "secrets", "openai", "--field", "value", "--raw",])
+        ),
+        sentinel
+    );
+    run_success(encrypted_as_principal(&database, OWNER).args(["audit", "verify"]));
 }
 
 #[test]

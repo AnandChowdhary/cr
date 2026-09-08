@@ -10,10 +10,10 @@ use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
     AccessAction, AccessResource, AgentEvidence, Assignment, AttributionOverrides, AuditFilter,
-    CheckReport, CheckScope, Database, DomainError, FilterExpression, Record, RecordPrecondition,
-    Role, SearchQuery, SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions,
-    UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout,
-    parse_threshold, sort_records_by_field,
+    CheckReport, CheckScope, CollectionAccessPolicy, Database, DomainError, FilterExpression,
+    Record, RecordPrecondition, RecordVisibility, Role, SearchQuery, SearchTarget, SortDirection,
+    SyncAttribution, UserDeleteOptions, UserEnsureOutcome, UserKind, UserRegistrationOptions,
+    UserStatus, UserUpdate, ViewLayout, parse_threshold, sort_records_by_field,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -772,6 +772,65 @@ enum AccessCommand {
         user: String,
         resource: AccessResource,
     },
+
+    /// Configure creator-owned access for a collection.
+    Policy {
+        #[command(subcommand)]
+        command: AccessPolicyCommand,
+    },
+
+    /// Change whether one creator-owned record is private or shared.
+    Visibility {
+        collection: String,
+        id: String,
+        visibility: RecordVisibilityArg,
+    },
+
+    /// Transfer a creator-owned record to another active principal.
+    Owner {
+        collection: String,
+        id: String,
+        principal: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AccessPolicyCommand {
+    /// Enable a policy on an empty, history-free collection.
+    Set {
+        resource: AccessResource,
+
+        #[arg(long, value_enum)]
+        mode: CollectionAccessModeArg,
+
+        #[arg(long, value_enum, default_value = "private")]
+        default_visibility: DefaultVisibilityArg,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CollectionAccessModeArg {
+    RecordOwned,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RecordVisibilityArg {
+    Private,
+    Shared,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DefaultVisibilityArg {
+    Private,
+}
+
+impl From<RecordVisibilityArg> for RecordVisibility {
+    fn from(value: RecordVisibilityArg) -> Self {
+        match value {
+            RecordVisibilityArg::Private => Self::Private,
+            RecordVisibilityArg::Shared => Self::Shared,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -1636,6 +1695,49 @@ fn run(cli: Cli) -> Result<ExitCode> {
             AccessCommand::Revoke { user, resource } => {
                 database.revoke_access(&user, &resource)?;
                 println!("Revoked direct access on {resource} from {user}");
+            }
+            AccessCommand::Policy { command } => match command {
+                AccessPolicyCommand::Set {
+                    resource,
+                    mode: CollectionAccessModeArg::RecordOwned,
+                    default_visibility: DefaultVisibilityArg::Private,
+                } => {
+                    let AccessResource::Collection { collection } = resource else {
+                        return Err(DomainError::Invalid(
+                            "record-owned access policy requires collection:NAME".to_owned(),
+                        )
+                        .into());
+                    };
+                    let changed = database.set_record_access_policy(
+                        &collection,
+                        CollectionAccessPolicy::record_owned(),
+                    )?;
+                    println!(
+                        "{} private-by-default record ownership for collection:{collection}",
+                        if changed {
+                            "Enabled"
+                        } else {
+                            "Already enabled"
+                        }
+                    );
+                }
+            },
+            AccessCommand::Visibility {
+                collection,
+                id,
+                visibility,
+            } => {
+                let visibility = RecordVisibility::from(visibility);
+                database.set_record_visibility(&collection, &id, visibility)?;
+                println!("Set record:{collection}/{id} visibility to {visibility}");
+            }
+            AccessCommand::Owner {
+                collection,
+                id,
+                principal,
+            } => {
+                database.set_record_owner(&collection, &id, &principal)?;
+                println!("Transferred record:{collection}/{id} ownership to {principal}");
             }
         },
         Command::Update {
