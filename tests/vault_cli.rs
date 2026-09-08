@@ -160,6 +160,63 @@ fn set_env_round_trips_exact_strings_through_encrypted_create_and_update() {
 }
 
 #[test]
+fn raw_get_emits_an_encrypted_string_as_exact_bytes() {
+    let database = TestDatabase::new("encrypted-raw-get");
+    run_success(
+        database
+            .command()
+            .args(["schema", "encrypt", "secrets", "value"]),
+    );
+
+    let value = "true: [still one exact string]\nwith a second line 👋";
+    run_success(
+        encrypted_command(&database)
+            .env("EXACT_VAULT_VALUE", value)
+            .args([
+                "create",
+                "secrets",
+                "exact",
+                "--set",
+                "name=EXACT_VAULT_VALUE",
+                "--set-env",
+                "value=EXACT_VAULT_VALUE",
+            ]),
+    );
+
+    let output = encrypted_command(&database)
+        .args(["get", "secrets", "exact", "--field", "value", "--raw"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, value.as_bytes());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn raw_get_refuses_non_string_fields_without_exposing_the_value() {
+    let database = TestDatabase::new("raw-get-types");
+    run_success(database.command().args([
+        "create",
+        "secrets",
+        "typed",
+        "--set",
+        "value={private: material}",
+    ]));
+
+    let output = database
+        .command()
+        .args(["get", "secrets", "typed", "--field", "value", "--raw"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("field 'value' is not a string"));
+    assert!(!error.contains("private"));
+    assert!(!error.contains("material"));
+}
+
+#[test]
 fn set_env_reports_only_variable_names_and_rejects_ambiguous_fields() {
     let database = TestDatabase::new("set-env-errors");
     let missing = run_failure(database.command().args([

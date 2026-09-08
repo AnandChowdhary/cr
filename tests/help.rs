@@ -126,6 +126,15 @@ fn vault_help_documents_schema_policy_and_environment_imports() {
     assert!(stdout.contains("<COLLECTION>"));
     assert!(stdout.contains("<FIELD>"));
     assert!(stdout.contains("Dotted paths select nested fields"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cr"))
+        .args(["get", "--help"])
+        .output()
+        .expect("failed to run cr get --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("help output was not UTF-8");
+    assert!(stdout.contains("--raw"));
+    assert!(stdout.contains("exact UTF-8 bytes without a trailing newline"));
 }
 
 #[test]

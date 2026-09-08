@@ -900,9 +900,10 @@ fn encrypt_bytes(keyring: &Keyring, plaintext: &[u8], aad: &[u8]) -> Result<Enve
     getrandom::fill(&mut nonce).map_err(|_| conflict("secure randomness is unavailable"))?;
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| decryption_failed())?;
     let authenticated_context = keyed_aad(aad, key_id);
+    let cipher_nonce = XNonce::try_from(nonce.as_slice()).map_err(|_| decryption_failed())?;
     let ciphertext = cipher
         .encrypt(
-            XNonce::from_slice(&nonce),
+            &cipher_nonce,
             Payload {
                 msg: plaintext,
                 aad: &authenticated_context,
@@ -925,9 +926,10 @@ fn decrypt_bytes(keyring: &Keyring, envelope: &Envelope, aad: &[u8]) -> Result<V
     let key = keyring.decryption_key(&envelope.key_id)?;
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| decryption_failed())?;
     let authenticated_context = keyed_aad(aad, &envelope.key_id);
+    let nonce = XNonce::try_from(envelope.nonce.as_slice()).map_err(|_| decryption_failed())?;
     cipher
         .decrypt(
-            XNonce::from_slice(&envelope.nonce),
+            &nonce,
             Payload {
                 msg: &envelope.ciphertext,
                 aad: &authenticated_context,
