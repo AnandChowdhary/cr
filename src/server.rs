@@ -131,6 +131,32 @@ struct UiUser {
     status: UserStatus,
 }
 
+/// One pinned location, resolved for the sidebar.
+#[derive(Clone, Debug)]
+struct UiPin {
+    /// The stored spelling, which is what unpinning submits back.
+    stored: String,
+    label: String,
+    /// The absolute location, shown as the link's tooltip.
+    location: String,
+    /// The browse URL. Built from the canonical location when the pin
+    /// resolves, because that is what the browse page addresses itself by, so
+    /// the link and the page agree on which sidebar entry is active.
+    href: String,
+    canonical: Option<PathBuf>,
+    kind: UiPinKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiPinKind {
+    Directory,
+    File,
+    /// Pinned, but nothing is there now. Still listed: a log directory that
+    /// has not been created yet, or a mount that is down, is exactly when the
+    /// owner needs to see that the pin exists.
+    Missing,
+}
+
 #[derive(Clone, Debug)]
 struct UiContext {
     operator: AccessIdentity,
@@ -145,6 +171,14 @@ struct UiContext {
     /// only a database owner may use the browser, and the route is absent when
     /// RBAC is disabled because there is then no authenticated administrator.
     can_browse_files: bool,
+    /// Pinned filesystem locations, loaded only for a perspective that may
+    /// browse files.
+    pins: Vec<UiPin>,
+    /// Why the pins could not be loaded — a hand-edited `.cr/pins.yaml` that no
+    /// longer parses, say. The sidebar says so instead of every page failing,
+    /// because a typo in a navigation preference must not lock the owner out
+    /// of the UI they would use to see it.
+    pins_error: Option<String>,
     users: Vec<UiUser>,
 }
 
@@ -655,6 +689,17 @@ struct HtmlDeleteForm {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct HtmlPinForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    path: String,
+    /// The browse location to return to, which is not always `path`: unpinning
+    /// submits the stored spelling, which may be relative to the database.
+    from: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HtmlPerspectiveForm {
     #[serde(rename = "_csrf")]
     csrf: String,
@@ -1065,6 +1110,8 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         // served by the `/{view}` route.
         .route("/users", get(users_view))
         .route("/browse", get(browse_view))
+        .route("/browse/pin", post(pin_location_form))
+        .route("/browse/unpin", post(unpin_location_form))
         .route("/{view}", get(view_records))
         .route("/{view}/save-view", post(save_view_form))
         .route("/{view}/new", get(new_record_form))
@@ -1618,6 +1665,66 @@ async fn browse_view(
     }
     .await;
     html_result(result)
+}
+
+async fn pin_location_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawForm(raw): RawForm,
+) -> Response {
+    change_pin(state, headers, raw, |database, path| {
+        database.pin(path, None).map(|_| ())
+    })
+    .await
+}
+
+async fn unpin_location_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawForm(raw): RawForm,
+) -> Response {
+    // Unpinning something already unpinned is not an error here: the form is
+    // native, so a double click submits twice, and the second has nothing left
+    // to do. The CLI, where a typo is the likelier cause, does refuse it.
+    change_pin(state, headers, raw, |database, path| {
+        database.unpin(path).map(|_| ())
+    })
+    .await
+}
+
+/// Apply one pin change from the browser and return to the page it came from.
+///
+/// The return address is only ever a browse URL built from an absolute path,
+/// so a crafted `from` cannot turn this into a redirect off the browser.
+async fn change_pin(
+    state: AppState,
+    headers: HeaderMap,
+    raw: axum::body::Bytes,
+    change: fn(&Database, &str) -> Result<()>,
+) -> Response {
+    let result: ApiResult<Response> = async {
+        if !state.access_controlled {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "route_not_found",
+                "route not found",
+            ));
+        }
+        let form: HtmlPinForm = parse_html_form(&raw)?;
+        verify_csrf(&state, &form.csrf)?;
+        if !FilePath::new(&form.from).is_absolute() {
+            return Err(ApiError::bad_request(
+                "invalid_browse_path",
+                "filesystem browser paths must be absolute",
+            ));
+        }
+        let back = browse_url(&form.from);
+        let path = form.path;
+        run_database(&state, &headers, move |database| change(database, &path)).await?;
+        see_other(&back)
+    }
+    .await;
+    result.unwrap_or_else(html_error)
 }
 
 fn browse_filesystem(start: &FilePath, requested: Option<&str>) -> ApiResult<BrowserPage> {
@@ -4082,10 +4189,21 @@ fn render_browse_view(
     csrf_token: &str,
 ) -> Markup {
     let location = page.location.to_string_lossy();
+    // The page addresses itself by its canonical location, which is how a
+    // pin's link is built too, so the sidebar can tell which entry this is.
+    let current_path = page
+        .location
+        .to_str()
+        .map_or_else(|| "/browse".to_owned(), browse_url);
+    let pinned = ui.and_then(|ui| {
+        ui.pins
+            .iter()
+            .find(|pin| pin.canonical.as_deref() == Some(page.location.as_path()))
+    });
     page_or_content(
         representation,
         "Browse files",
-        "/browse",
+        &current_path,
         views,
         html! {
             nav aria-label="Breadcrumb" class="mb-3 flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-500" {
@@ -4110,6 +4228,9 @@ fn render_browse_view(
                 }
                 div class="flex shrink-0 flex-wrap items-center gap-2" {
                     span class="cr-pill cr-pill-warn" { "read-only" }
+                    @if let Some(here) = page.location.to_str() {
+                        (render_pin_control(here, pinned, csrf_token))
+                    }
                     a href="/browse" class="cr-button" { "Database root" }
                     @if let Some(parent) = &page.parent {
                         a href=(browse_url(parent.to_string_lossy().as_ref())) class="cr-button" { "Up" }
@@ -4215,6 +4336,38 @@ fn render_browse_view(
         ui,
         csrf_token,
     )
+}
+
+/// Pin or unpin the location a browse page shows.
+///
+/// Unpinning submits the pin's stored spelling rather than this page's
+/// location. A pin written through a symbolic link resolves to this page, but
+/// only its own spelling names it in `.cr/pins.yaml`.
+///
+/// Both forms stay native (`UNBOOSTED`): a refusal — a stale token, the pin
+/// limit — answers with an error document, which htmx will not swap into a
+/// failed `POST`, the same reason the save-as-view form is native.
+fn render_pin_control(here: &str, pinned: Option<&UiPin>, csrf_token: &str) -> Markup {
+    html! {
+        @match pinned {
+            Some(pin) => {
+                form method="post" action="/browse/unpin" hx-boost=(UNBOOSTED) {
+                    input type="hidden" name="_csrf" value=(csrf_token);
+                    input type="hidden" name="path" value=(&pin.stored);
+                    input type="hidden" name="from" value=(here);
+                    button type="submit" class="cr-button" title="Remove this location from the sidebar" { "Unpin" }
+                }
+            }
+            None => {
+                form method="post" action="/browse/pin" hx-boost=(UNBOOSTED) {
+                    input type="hidden" name="_csrf" value=(csrf_token);
+                    input type="hidden" name="path" value=(here);
+                    input type="hidden" name="from" value=(here);
+                    button type="submit" class="cr-button" title="Add this location to the sidebar" { "Pin to sidebar" }
+                }
+            }
+        }
+    }
 }
 
 /// One bounded file preview: the panel an opened file gets, and the panel a
@@ -6689,6 +6842,7 @@ html {
 }
 
 .cr-nav-note { margin-left: auto; color: #aaa9a5; font-size: 0.62rem; font-weight: 550; }
+.cr-sidebar-notice { margin: 4px 8px; color: #92400e; font-size: 0.68rem; line-height: 1.35; overflow-wrap: anywhere; }
 
 .cr-nav-glyph-collection::after { content: ""; width: 5px; border-top: 1px solid #aaa9a5; border-bottom: 1px solid #aaa9a5; height: 4px; }
 .cr-nav-glyph-view::after { content: ""; width: 7px; border-top: 1px solid #aaa9a5; }
@@ -7119,21 +7273,15 @@ fn sidebar_navigation(
                         }
                     }
                 }
-                @if ui.is_some_and(|ui| ui.can_read_users || ui.can_browse_files) {
+                @if let Some(ui) = ui.filter(|ui| ui.can_browse_files) {
+                    (browse_navigation(current_path, ui))
+                }
+                @if ui.is_some_and(|ui| ui.can_read_users) {
                     p class="cr-sidebar-label" { "Internal" }
-                    @if ui.is_some_and(|ui| ui.can_read_users) {
-                        a href="/users" class=(if current_path == "/users" { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == "/users").then_some("page")] title="Users · read-only" {
-                            span class="cr-nav-glyph cr-nav-glyph-internal" aria-hidden="true" { "" }
-                            span class="truncate" { "Users" }
-                            span class="cr-nav-note" { "read-only" }
-                        }
-                    }
-                    @if ui.is_some_and(|ui| ui.can_browse_files) {
-                        a href="/browse" class=(if current_path == "/browse" { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == "/browse").then_some("page")] title="Browse files · owner only · read-only" {
-                            span class="cr-nav-glyph cr-nav-glyph-internal" aria-hidden="true" { "" }
-                            span class="truncate" { "Browse" }
-                            span class="cr-nav-note" { "read-only" }
-                        }
+                    a href="/users" class=(if current_path == "/users" { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == "/users").then_some("page")] title="Users · read-only" {
+                        span class="cr-nav-glyph cr-nav-glyph-internal" aria-hidden="true" { "" }
+                        span class="truncate" { "Users" }
+                        span class="cr-nav-note" { "read-only" }
                     }
                 }
             }
@@ -7159,6 +7307,43 @@ fn sidebar_navigation(
                     code { "cr serve" }
                 }
             }
+        }
+    }
+}
+
+/// The sidebar's Browse section: every file, then the locations pinned to it.
+///
+/// "All files" is the active entry anywhere in the browser that is not itself
+/// pinned, so the section always shows where the reader is — on a pin, or
+/// somewhere reached from the database root.
+fn browse_navigation(current_path: &str, ui: &UiContext) -> Markup {
+    let on_pin = ui.pins.iter().any(|pin| pin.href == current_path);
+    let in_browser = current_path == "/browse" || current_path.starts_with("/browse?");
+    let all_files = in_browser && !on_pin;
+    html! {
+        p class="cr-sidebar-label" { "Browse" }
+        a href="/browse" class=(if all_files { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[all_files.then_some("page")] title="Every file visible to the server · owner only · read-only" {
+            span class="cr-nav-glyph cr-nav-glyph-internal" aria-hidden="true" { "" }
+            span class="truncate" { "All files" }
+            span class="cr-nav-note" { "read-only" }
+        }
+        @for pin in &ui.pins {
+            @let active = pin.href == current_path;
+            a href=(&pin.href) class=(if active { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[active.then_some("page")] title=(&pin.location) {
+                span class="cr-nav-glyph" aria-hidden="true" {
+                    @match pin.kind {
+                        UiPinKind::Directory => { "▸" }
+                        UiPinKind::File | UiPinKind::Missing => { "·" }
+                    }
+                }
+                span class="truncate" { (&pin.label) }
+                @if pin.kind == UiPinKind::Missing {
+                    span class="cr-nav-note" { "missing" }
+                }
+            }
+        }
+        @if let Some(error) = &ui.pins_error {
+            p class="cr-sidebar-notice" role="note" title=(error) { "Pins unavailable: " (error) }
         }
     }
 }
@@ -7196,8 +7381,13 @@ fn mobile_navigation(
                 @if ui.is_some_and(|ui| ui.can_read_users) {
                     a href="/users" class=(if current_path == "/users" { "is-active" } else { "" }) { "Users" }
                 }
-                @if ui.is_some_and(|ui| ui.can_browse_files) {
-                    a href="/browse" class=(if current_path == "/browse" { "is-active" } else { "" }) { "Browse" }
+                @if let Some(ui) = ui.filter(|ui| ui.can_browse_files) {
+                    @let on_pin = ui.pins.iter().any(|pin| pin.href == current_path);
+                    @let all_files = (current_path == "/browse" || current_path.starts_with("/browse?")) && !on_pin;
+                    a href="/browse" class=(if all_files { "is-active" } else { "" }) { "All files" }
+                    @for pin in &ui.pins {
+                        a href=(&pin.href) class=(if pin.href == current_path { "is-active" } else { "" }) title=(&pin.location) { (&pin.label) }
+                    }
                 }
                 @if ui.is_none_or(|ui| ui.can_view_global_audit) {
                     a href="/audit" class=(if current_path == "/audit" { "is-active" } else { "" }) { "Audit" }
@@ -8811,6 +9001,13 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
         let can_read_users = selected_database
             .access_allowed(AccessAction::ReadAccess, &AccessResource::Database)?;
         let can_browse_files = selected_database.owner_access_allowed(&AccessResource::Database)?;
+        let pins = if can_browse_files {
+            selected_database
+                .pins()
+                .map(|pins| resolve_pins(selected_database.root(), pins))
+        } else {
+            Ok(Vec::new())
+        };
         let users = users
             .into_iter()
             .map(|(id, user)| UiUser {
@@ -8820,24 +9017,79 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
                 status: user.status,
             })
             .collect();
-        Ok(UiContext {
-            operator: AccessIdentity {
-                principal: database.principal().to_owned(),
-                display: database.actor().to_owned(),
+        let (pins, pins_error) = match pins {
+            Ok(pins) => (pins, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        Ok((
+            UiContext {
+                operator: AccessIdentity {
+                    principal: database.principal().to_owned(),
+                    display: database.actor().to_owned(),
+                },
+                selected,
+                selected_name,
+                selected_status,
+                can_view_global_audit,
+                can_read_users,
+                can_browse_files,
+                pins,
+                pins_error: None,
+                users,
             },
-            selected,
-            selected_name,
-            selected_status,
-            can_view_global_audit,
-            can_read_users,
-            can_browse_files,
-            users,
-        })
+            pins_error,
+        ))
     })
     .await
     .map_err(|error| ApiError::internal(anyhow!(error).context("database task failed")))?
-    .map(Some)
     .map_err(ApiError::from_domain)
+    .map(|(mut context, pins_error)| {
+        // Published here, on the request's own task, so the log line carries
+        // this request's ID; the sidebar shows only the public message.
+        context.pins_error = pins_error.map(|error| ApiError::from_domain(error).publish().message);
+        Some(context)
+    })
+}
+
+/// Resolve stored pins into sidebar entries.
+///
+/// Each pin costs one `canonicalize` and one `metadata` call per page render.
+/// That is why the domain caps the list: it is cheap for a sidebar's worth of
+/// entries and would not be for an unbounded one.
+fn resolve_pins(root: &FilePath, pins: Vec<crate::Pin>) -> Vec<UiPin> {
+    pins.into_iter()
+        .filter_map(|pin| {
+            let location = pin.location(root);
+            let canonical = std::fs::canonicalize(&location).ok();
+            let kind = match canonical.as_deref().map(std::fs::metadata) {
+                Some(Ok(metadata)) if metadata.is_dir() => UiPinKind::Directory,
+                Some(Ok(_)) => UiPinKind::File,
+                _ => UiPinKind::Missing,
+            };
+            // A pin is stored as UTF-8, so only a canonical target that is not
+            // — reached through a link with a non-UTF-8 name — can fail here,
+            // and the browser has no URL for such a place anyway.
+            let target = match canonical.as_deref() {
+                Some(canonical) => canonical.to_str()?,
+                None => location.to_str()?,
+            };
+            let href = browse_url(target);
+            let label = pin.label.clone().unwrap_or_else(|| {
+                location.file_name().map_or_else(
+                    || "/".to_owned(),
+                    |name| name.to_string_lossy().into_owned(),
+                )
+            });
+            Some(UiPin {
+                stored: pin.path,
+                label,
+                location: location.to_string_lossy().into_owned(),
+                href,
+                canonical,
+                kind,
+            })
+        })
+        .collect()
 }
 
 fn user_role_summary(grants: &[crate::AccessGrant]) -> String {

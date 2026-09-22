@@ -1746,6 +1746,158 @@ async fn an_unreadable_readme_does_not_hide_the_listing() {
     assert!(!listing.text().contains("contents-the-server-cannot-read"));
 }
 
+/// The sidebar's Browse section: "All files", then pinned locations, each an
+/// ordinary link an owner can add and remove from the page it points at.
+#[tokio::test]
+async fn owners_pin_browse_locations_to_their_own_sidebar_section() {
+    let (temporary, database) = test_database("filesystem-pins");
+    let database = database.with_actor("Owner <owner@example.com>").unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    let docs = database.root().join("docs");
+    fs::create_dir(&docs).unwrap();
+    let outside = temporary.path().join("notes.txt");
+    fs::write(&outside, "outside the database").unwrap();
+    database
+        .pin(outside.to_str().unwrap(), Some("Notes"))
+        .unwrap();
+    database.pin("not-yet-created", None).unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    // A section of its own, ahead of Internal, which keeps only Users.
+    let home = request(&app, Method::GET, "/", None, &[]).await;
+    let text = home.text();
+    let browse = text.find("cr-sidebar-label\">Browse<").unwrap();
+    let internal = text.find("cr-sidebar-label\">Internal<").unwrap();
+    assert!(browse < internal);
+    let section = &text[browse..internal];
+    assert!(section.contains("All files"));
+    assert!(section.contains(">Notes<"));
+    assert!(section.contains(&browse_uri(&outside).replace('&', "&amp;")));
+    assert!(section.contains(">not-yet-created<"));
+    assert!(section.contains(">missing<"));
+    // Internal ends where the sidebar's primary navigation does; the mobile
+    // strip further down lists "All files" too.
+    let internal_section = &text[internal..internal + text[internal..].find("</nav>").unwrap()];
+    assert!(internal_section.contains(">Users<"));
+    assert!(!internal_section.contains("All files"));
+
+    // Browsing somewhere unpinned: "All files" is the active entry, and the page
+    // offers to pin itself.
+    let page = request(&app, Method::GET, &browse_uri(&docs), None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.text());
+    assert!(page.text().contains("Pin to sidebar"));
+    let token = csrf(page.text()).to_owned();
+    let docs_path = docs.to_str().unwrap();
+    let pinned = request(
+        &app,
+        Method::POST,
+        "/browse/pin",
+        Some(form(&[
+            ("_csrf", &token),
+            ("path", docs_path),
+            ("from", docs_path),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(pinned.status, StatusCode::SEE_OTHER, "{}", pinned.text());
+    assert_eq!(pinned.headers[header::LOCATION], browse_uri(&docs).as_str());
+    assert_eq!(database.pins().unwrap()[2].path, "docs");
+
+    // The pinned page is now the active entry, and offers to unpin by the
+    // stored spelling.
+    let page = request(&app, Method::GET, &browse_uri(&docs), None, &[]).await;
+    let text = page.text();
+    let href = browse_uri(&docs).replace('&', "&amp;");
+    assert!(text.contains(&format!(
+        "href=\"{href}\" class=\"cr-sidebar-link is-active\""
+    )));
+    assert!(
+        !text.contains(
+            "class=\"cr-sidebar-link is-active\" aria-current=\"page\" title=\"Every file"
+        )
+    );
+    assert!(text.contains("name=\"path\" value=\"docs\""));
+    let unpinned = request(
+        &app,
+        Method::POST,
+        "/browse/unpin",
+        Some(form(&[
+            ("_csrf", &token),
+            ("path", "docs"),
+            ("from", docs_path),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(unpinned.status, StatusCode::SEE_OTHER);
+    assert_eq!(database.pins().unwrap().len(), 2);
+    // A second submission of the same native form has nothing left to do.
+    let again = request(
+        &app,
+        Method::POST,
+        "/browse/unpin",
+        Some(form(&[
+            ("_csrf", &token),
+            ("path", "docs"),
+            ("from", docs_path),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::SEE_OTHER);
+
+    // Refusals: a forged token, and a return address that is not a browse path.
+    let forged = request(
+        &app,
+        Method::POST,
+        "/browse/pin",
+        Some(form(&[
+            ("_csrf", "forged"),
+            ("path", docs_path),
+            ("from", docs_path),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    let elsewhere = request(
+        &app,
+        Method::POST,
+        "/browse/pin",
+        Some(form(&[
+            ("_csrf", &token),
+            ("path", docs_path),
+            ("from", "https://example.com"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(elsewhere.status, StatusCode::BAD_REQUEST);
+    assert_eq!(database.pins().unwrap().len(), 2);
+}
+
+/// A hand-edited pins file that no longer parses must not take the UI down.
+#[tokio::test]
+async fn an_invalid_pins_file_is_reported_in_the_sidebar_not_on_every_page() {
+    let (_temporary, database) = test_database("filesystem-pins-invalid");
+    let database = database.with_actor("Owner <owner@example.com>").unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    fs::write(database.root().join(".cr/pins.yaml"), "pins: [unclosed").unwrap();
+    let app = router(database, ServerConfig::default()).unwrap();
+
+    for path in ["/", "/browse"] {
+        let page = request(&app, Method::GET, path, None, &[]).await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.text());
+        assert!(page.text().contains("All files"));
+        assert!(page.text().contains("Pins unavailable"));
+    }
+}
+
 /// Without RBAC there is nothing in the internal registry to show, so the page
 /// stays reachable but unlinked and says how to bootstrap access control. The
 /// more sensitive filesystem browser is absent until RBAC can identify an
@@ -1768,6 +1920,18 @@ async fn the_internal_users_page_is_unlinked_until_access_control_exists() {
     assert_eq!(users.status, StatusCode::OK, "{}", users.text());
     assert!(users.text().contains("no registered principals"));
     assert!(users.text().contains("cr access init"));
+
+    // Pinning belongs to the browser, so it is absent with it.
+    let pin = request(
+        &app,
+        Method::POST,
+        "/browse/pin",
+        Some(form(&[("_csrf", "x"), ("path", "/tmp"), ("from", "/tmp")])),
+        &[],
+    )
+    .await;
+    assert_eq!(pin.status, StatusCode::NOT_FOUND);
+    assert!(!home.text().contains("All files"));
 }
 
 #[tokio::test]

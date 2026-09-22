@@ -1768,8 +1768,8 @@ that `cr access init` bootstraps the registry.
 
 ### Browse server files
 
-Database owners also get **Browse** immediately after **Users** under
-**Internal**:
+Database owners also get a **Browse** section in the sidebar, after
+**Collections** and before **Internal**. Its first entry, **All files**, opens:
 
 ```text
 http://127.0.0.1:3000/browse
@@ -1799,8 +1799,48 @@ when RBAC is active, only a database-owner perspective sees its navigation
 entry, and a direct request from an editor or access manager receives `403
 Forbidden`. Without RBAC it is unlinked and returns `404 Not Found`, because a
 local process with no principal registry cannot prove that a requester is an
-administrator. Every response remains `no-store`, and the route supports only
-`GET`; it has no create, upload, rename, edit, or delete operation.
+administrator. Every response remains `no-store`. Apart from pinning, the route
+supports only `GET`; it has no create, upload, rename, edit, or delete
+operation.
+
+#### Pin locations to the sidebar
+
+Pin the places you keep returning to, and they appear under **All files** in
+the **Browse** section. Every browse page has a **Pin to sidebar** button, and
+**Unpin** once it is pinned; the sidebar entry is highlighted while you are on
+it. The CLI does the same:
+
+```sh
+cr pin add docs                     # relative to the database root
+cr pin add /var/log/app --label "App logs"
+cr pin list [--json]
+cr pin remove docs
+```
+
+Pins live in `.cr/pins.yaml`, a small file you can also edit by hand:
+
+```yaml
+version: 1
+pins:
+- path: docs
+- path: /var/log/app
+  label: App logs
+```
+
+A path inside the database is stored relative to it, whether you typed it that
+way or not, because `.cr/` travels with the database in Git and an absolute
+path would point nowhere in someone else's clone. Paths are normalized without
+touching the filesystem, so `docs/../logs` and `logs` are one pin, a location
+that does not exist yet can be pinned (the sidebar marks it **missing**), and a
+symbolic link stays a link rather than being frozen to today's target. Pinning
+an already-pinned path with `--label` relabels it. The list holds at most 50
+entries, and a label at most 80 characters.
+
+Pins are an owner's map of the host, so the same rule as browsing applies:
+only a database-owner perspective sees the section or may change it, and the
+CLI refuses a non-owner principal. If `.cr/pins.yaml` stops parsing, the
+sidebar says so and every page keeps working; `cr pin` refuses to overwrite the
+file until it is fixed.
 
 **Browse can reveal every secret readable by the operating-system account that
 runs `cr serve`, including files outside the database.** Keep the RBAC console
@@ -2353,6 +2393,10 @@ cr view create NAME --collection COLLECTION [--where KEY=YAML]... [--column FIEL
                     [--sort-by FIELD] [--sort-direction asc|desc] [--page-size N]
 cr view list [--json]
 cr view show NAME [--json]
+
+cr pin add PATH [--label LABEL]
+cr pin remove PATH
+cr pin list [--json]
 
 cr sync create NAME [--actor IDENTITY] [--agent AGENT] [--timeout-seconds N] -- COMMAND...
 cr sync list [--json]

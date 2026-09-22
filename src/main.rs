@@ -382,6 +382,12 @@ enum Command {
         command: ViewCommand,
     },
 
+    /// Pin filesystem locations to the web file browser's sidebar.
+    Pin {
+        #[command(subcommand)]
+        command: PinCommand,
+    },
+
     /// Declare collection encryption policy in JSON Schema.
     Schema {
         #[command(subcommand)]
@@ -926,6 +932,31 @@ enum ViewCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum PinCommand {
+    /// Pin a file or directory, or relabel one that is already pinned.
+    ///
+    /// Relative paths are resolved against the database root, and a location
+    /// inside the database is stored relative to it so the pin still works in
+    /// another clone.
+    Add {
+        path: String,
+
+        /// Show this instead of the location's own name in the sidebar.
+        #[arg(long)]
+        label: Option<String>,
+    },
+
+    /// Remove a pinned location. Any spelling that pinned it also unpins it.
+    Remove { path: String },
+
+    /// List pinned locations in sidebar order.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ViewLayoutArgument {
     Table,
@@ -1381,6 +1412,31 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     println!("{}", serde_json::to_string_pretty(&view)?);
                 } else {
                     print!("{}", yaml_serde::to_string(&view)?);
+                }
+            }
+        },
+        Command::Pin { command } => match command {
+            PinCommand::Add { path, label } => {
+                let pin = database.pin(&path, label.as_deref())?;
+                println!("{}", pin.path);
+            }
+            PinCommand::Remove { path } => {
+                if !database.unpin(&path)? {
+                    return Err(DomainError::NotFound(format!("'{path}' is not pinned")).into());
+                }
+                println!("Unpinned {path}");
+            }
+            PinCommand::List { json } => {
+                let pins = database.pins()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&pins)?);
+                } else {
+                    for pin in pins {
+                        match pin.label {
+                            Some(label) => println!("{}\t{label}", pin.path),
+                            None => println!("{}", pin.path),
+                        }
+                    }
                 }
             }
         },
