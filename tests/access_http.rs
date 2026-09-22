@@ -346,6 +346,36 @@ async fn internal_user_records_are_readable_without_any_web_mutation() {
     )
     .await;
     assert_eq!(manager_files.status, StatusCode::FORBIDDEN);
+
+    // Pins are the owner's map of this host: an access manager sees none of
+    // them and cannot add one.
+    database.pin("/etc", Some("Owner's pinned place")).unwrap();
+    let manager_home = request(
+        &app,
+        Method::GET,
+        "/",
+        None,
+        None,
+        &[("cookie", &editor_cookie)],
+    )
+    .await;
+    assert!(!manager_home.text().contains("Owner's pinned place"));
+    assert!(!manager_home.text().contains("All files"));
+    let manager_pin = request(
+        &app,
+        Method::POST,
+        "/browse/pin",
+        Some(form(&[
+            ("_csrf", &csrf),
+            ("path", "/tmp"),
+            ("from", "/tmp"),
+        ])),
+        Some("application/x-www-form-urlencoded"),
+        &[("cookie", &editor_cookie)],
+    )
+    .await;
+    assert_eq!(manager_pin.status, StatusCode::FORBIDDEN);
+    assert_eq!(database.pins().unwrap().len(), 1);
 }
 
 #[tokio::test]

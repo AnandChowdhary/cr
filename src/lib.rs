@@ -7,6 +7,7 @@ mod encryption;
 mod error;
 mod frontmatter;
 mod paths;
+mod pins;
 mod search;
 pub mod server;
 mod sync;
@@ -37,6 +38,7 @@ pub use database::{
     WorkingChange, WorkingChangeKind, sort_records_by_field,
 };
 pub use error::DomainError;
+pub use pins::Pin;
 pub use search::{SearchQuery, SearchTarget};
 pub use sync::{SyncAttribution, SyncDefinition, SyncRunLedger, SyncRunSummary};
 pub use value::{Assignment, FilterExpression, FilterOperator, compare_yaml_values};
