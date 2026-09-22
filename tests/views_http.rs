@@ -803,7 +803,10 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     assert!(board.text().contains("Kanban grouped by"));
     assert!(board.text().contains("data-kanban-board=\"true\""));
     assert!(board.text().contains("draggable=\"true\""));
-    assert!(board.text().contains("form.submit()"));
+    // The drag-and-drop enhancement moved to the embedded asset the page
+    // links; `tests/static_assets_http.rs` asserts the script it serves.
+    assert!(board.text().contains("<script src=\"/static/cr-"));
+    assert!(!board.text().contains("form.submit()"));
     assert!(board.text().contains("Move alpha to"));
     assert!(board.text().contains("score&gt;=40"));
     assert!(!board.text().contains("/pipeline/records/excluded"));
