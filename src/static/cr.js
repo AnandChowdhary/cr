@@ -273,24 +273,33 @@ if (window.htmx) {
   window.htmx.config.historyRestoreAsHxRequest = false;
 }
 
-// A boosted navigation has to be able to land on an error page.
+// Two things htmx would otherwise drop on the floor, because it ignores the body
+// of a response that is not a success.
 //
-// htmx ignores the body of a non-2xx response, which is right for the form
-// posts phase 3 will boost but wrong for navigation: the server answers a
-// request for a record that no longer exists with a rendered 404 page, and
-// without this a click on a stale link would leave the previous page on screen
-// and look like the click was never registered. Allowing the swap restores what
-// the browser would have done, including the URL — htmx decides whether to push
-// history before this event and applies it only if the swap happens.
+// The first is a boosted navigation that lands on an error page. The server
+// answers a request for a record that no longer exists with a rendered 404 page,
+// and without this a click on a stale link would leave the previous page on
+// screen and look like the click was never registered. Allowing the swap
+// restores what the browser would have done, including the URL — htmx decides
+// whether to push history before this event and applies it only if the swap
+// happens.
 //
-// Narrow on purpose. Only boosted GETs, so it cannot pre-empt the response
-// contract phase 3 defines for mutations, and only responses that are HTML
-// documents, so an error from a route that answers JSON is left to fall through
-// rather than being poured into the page as text.
+// The second is a refused form submission. The server answers one with the form
+// itself: the same values, escaped, in the controls they were typed into, with
+// the reason at the top and beside each field the schema located. Its status is
+// the status of the refusal — 422 for a schema violation, 412 for a record that
+// changed underneath the form, 409 for an identity already taken — so the server
+// marks exactly those answers with `CR-Form-Invalid` rather than making this
+// listener keep a list of statuses in step with the routes. Nothing else sends
+// that header, which makes this clause as narrow as the one above it: every
+// other failed request still swaps nothing and leaves the page as it was.
 document.addEventListener('htmx:beforeSwap', (event) => {
   const { boosted, requestConfig, xhr } = event.detail;
   const isHtml = (xhr.getResponseHeader('content-type') || '').startsWith('text/html');
   if (boosted && requestConfig.verb === 'get' && xhr.status >= 400 && isHtml) {
+    event.detail.shouldSwap = true;
+  }
+  if (isHtml && xhr.getResponseHeader('CR-Form-Invalid') === 'true') {
     event.detail.shouldSwap = true;
   }
 });
