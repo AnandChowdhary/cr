@@ -1055,7 +1055,14 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
             get(edit_record_form).post(update_record_form),
         )
         .route("/{view}/records/{id}/move", post(move_kanban_card))
-        .route("/{view}/records/{id}/delete", post(delete_record_form))
+        // One path, both methods: `GET` renders the confirmation and `POST`
+        // performs the deletion, which keeps the destructive request's contract
+        // exactly as it was while making the question that precedes it something
+        // the server asks rather than something a script does.
+        .route(
+            "/{view}/records/{id}/delete",
+            get(confirm_delete_record).post(delete_record_form),
+        )
         .nest(
             "/api/v1",
             Router::new()
@@ -1308,11 +1315,16 @@ static HTMX_SCRIPT_PATH: LazyLock<String> =
 /// like the rest of the page. The remaining three keep the attribute, each for a
 /// reason of its own:
 ///
-/// * The **delete** form's confirmation is an `onsubmit` handler. Returning
-///   false from it cancels the browser's submit, but htmx's own submit listener
-///   does not consult `defaultPrevented`, so under boost a declined confirmation
-///   would still delete the record. It stays native until `hx-confirm` replaces
-///   the handler, which is phase 5 of `.context/htmx-plan.md`.
+/// * The **delete** form — now the one on the confirmation page, not a form on
+///   the record page — answers a refusal with a rendered error document. A
+///   version that no longer matches is a `412`, and htmx will not swap a failed
+///   `POST`, so boosting it would turn a lost race into a button that visibly
+///   does nothing. This is the save-as-view reason below, and it replaces the
+///   older one: the form used to stay native because its confirmation was an
+///   `onsubmit` handler that htmx's submit listener does not consult, so a boost
+///   would have deleted a record after a declined confirmation. That handler is
+///   gone. The confirmation is a page the server renders, which is asked of a
+///   browser with no JavaScript too; see `delete_confirmation_url`.
 /// * The **save-as-view** form answers a refusal — a name already taken, a
 ///   Kanban layout with no grouping field — with a rendered error page, which is
 ///   a whole document and not a form. Boosting it would turn those refusals into
@@ -2462,6 +2474,56 @@ async fn move_kanban_card(
     }
     .await;
     result.unwrap_or_else(html_error)
+}
+
+/// Ask before deleting, on the server.
+///
+/// The `GET` half of the delete path; `delete_confirmation_url` explains why the
+/// confirmation is a page. It reads the record for two reasons beyond rendering
+/// its id: a record that does not exist must answer `404` rather than offering
+/// to delete nothing, and the form needs the record's current version so the
+/// `POST` can refuse a deletion of something that changed in between.
+///
+/// It checks the delete permission itself rather than trusting that the reader
+/// arrived from a page that rendered the link. A principal who may read a record
+/// but not delete it can type this URL, and answering it with a confirmation
+/// page whose only possible outcome is `403` would be a worse answer than the
+/// `403` itself.
+async fn confirm_delete_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((view_name, id)): Path<(String, String)>,
+) -> Response {
+    let result: ApiResult<Markup> = async {
+        let requested_view = view_name.clone();
+        let requested_id = id.clone();
+        let (view, record, navigation) = run_database(&state, &headers, move |database| {
+            let view = database.view(&requested_view)?;
+            let record = database.get(&view.collection, &requested_id)?;
+            let resource = AccessResource::record(&view.collection, &record.id);
+            if !database.access_allowed(AccessAction::Delete, &resource)? {
+                return Err(DomainError::Forbidden(format!(
+                    "principal cannot delete record:{}/{}",
+                    view.collection, record.id
+                ))
+                .into());
+            }
+            let navigation = database.views()?;
+            Ok((view, record, navigation))
+        })
+        .await?;
+        let ui = ui_context(&state, &headers).await?;
+        Ok(render_delete_confirmation(
+            &Representation::requested(&headers),
+            &view,
+            &record,
+            &navigation,
+            ui.as_ref(),
+            &state.csrf_token,
+        ))
+    }
+    .await;
+    html_result(result)
 }
 
 async fn delete_record_form(
@@ -4556,13 +4618,19 @@ fn render_view_records(
     // the heading, the search box and the filter panel, none of which the
     // request asked for.
     //
-    // Two elements travel with the region, marked `hx-swap-oob` so htmx applies
-    // each to the element of the same id already on the page and then drops it
-    // from the content it swaps. They are the whole of the heading that depends
-    // on the results — the record count and the badge counting applied filters —
-    // and they are rendered here by the same functions the heading below calls,
-    // with the attribute as their only difference, so neither can start
-    // disagreeing with the page it patches.
+    // Three elements travel with the region, marked `hx-swap-oob` so htmx
+    // applies each to the element of the same id already on the page and then
+    // drops it from the content it swaps. Two are the whole of the heading that
+    // depends on the results — the record count and the badge counting applied
+    // filters — and they are rendered here by the same functions the heading
+    // below calls, with the attribute as their only difference, so neither can
+    // start disagreeing with the page it patches.
+    //
+    // The third is the announcement, and it is last because it is not part of
+    // the page's appearance at all: it is the sentence a reader who cannot see
+    // the table is told about the swap that just happened, sent into the live
+    // region the shell rendered. It patches that region's *contents* rather than
+    // replacing it, for the reason `view_results_announcement` explains.
     if representation.wants(VIEW_TABLE_REGION) {
         return fragment(
             &view.title,
@@ -4570,6 +4638,7 @@ fn render_view_records(
                 (results)
                 (view_record_count(page.total, OutOfBand::Yes))
                 (view_filter_summary(active_filter_count, OutOfBand::Yes))
+                (view_results_announcement(page))
             },
         );
     }
@@ -4754,8 +4823,18 @@ fn render_view_records(
                     }
                 }
             }
+            // The banner a successful mutation redirects to, carrying the
+            // notice in the query string. It is plain markup and deliberately
+            // not a live region of its own: it arrives *with* the page, which is
+            // the one case a live region does not reliably announce, and a
+            // second `role="status"` on the page would mean two candidates for
+            // one announcement. `cr.js` copies this text into `ANNOUNCE_REGION`
+            // a beat after the page settles, which is a mutation of a region
+            // that was already being watched. With JavaScript off nothing is
+            // announced and nothing needs to be: the reader has just been
+            // navigated to a new document and this is the first thing in it.
             @if let Some(notice) = query.notice.as_deref() {
-                div role="status" class="mb-5 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800" { (notice) }
+                div data-notice="true" class="mb-5 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800" { (notice) }
             }
             (results)
         },
@@ -4876,6 +4955,73 @@ fn view_record_count(total: usize, out_of_band: OutOfBand) -> Markup {
     }
 }
 
+/// The one-based positions of the first and last record on this page.
+///
+/// Both pager footers and the announcement below state the same range, and they
+/// are three renderings of one fact rather than three calculations of it. An
+/// empty page is `(0, page.start)` — "showing 0 of 33" after a filter emptied
+/// the page the reader was on — which is the arithmetic the table footer has
+/// always printed, kept here so the sentence a screen reader hears and the
+/// sentence on screen cannot disagree.
+fn page_range(page: &ViewPage) -> (usize, usize) {
+    let first = if page.records.is_empty() {
+        0
+    } else {
+        page.start + 1
+    };
+    (first, page.start + page.records.len())
+}
+
+/// What a reader who cannot see the table is told after a page turn, a re-sort,
+/// a search or a filter apply.
+///
+/// One sentence, and the same sentence for all four, because it states the fact
+/// every one of them changes: which records are on screen now. The alternative —
+/// a message per control, "sorted by name descending", "2 filters applied" —
+/// says what was *asked for*, which the reader already knows, having just asked;
+/// and for sorting and filtering it would also duplicate what htmx's focus
+/// restoration already reads out, since the sort link's own label is re-rendered
+/// by the same swap and the reader is returned to it.
+///
+/// "1 to 10" rather than the footer's "1–10": an en dash is read out
+/// inconsistently — as a pause, as "dash", or as nothing — and this string
+/// exists only to be spoken.
+fn view_results_summary(page: &ViewPage) -> String {
+    let (first, last) = page_range(page);
+    if page.records.is_empty() {
+        if page.total == 0 {
+            "No records match".to_owned()
+        } else {
+            format!("No records on this page, {} in total", page.total)
+        }
+    } else {
+        format!("Showing records {first} to {last} of {}", page.total)
+    }
+}
+
+/// The results announcement as the third out-of-band passenger of a results
+/// swap.
+///
+/// `hx-swap-oob="innerHTML"` rather than the `"true"` the other two use, and the
+/// difference is the entire reason this is a separate function. `"true"` means
+/// *replace the element*, which is right for the count pill and the filter
+/// summary and would be wrong here: an assistive technology announces a live
+/// region because it is watching that element, and replacing the node it was
+/// watching with an identical one carrying text is how a region ends up silent.
+/// Swapping the region's contents leaves the node — and the watcher on it — in
+/// place, which is also why `ANNOUNCE_REGION` is rendered by the shell rather
+/// than travelling with any fragment.
+///
+/// It is sent only with a fragment. A whole document must not carry it for the
+/// reason `OutOfBand` gives — a boosted navigation would apply the patch and
+/// then deliver the page — and it would be wrong even if htmx ignored it, since
+/// arriving on a page is not a change to announce.
+fn view_results_announcement(page: &ViewPage) -> Markup {
+    html! {
+        div id=(ANNOUNCE_REGION) hx-swap-oob="innerHTML" { (view_results_summary(page)) }
+    }
+}
+
 /// The filter disclosure's summary: the word "Filter", and a badge counting the
 /// conditions the current URL applies.
 ///
@@ -4923,12 +5069,7 @@ fn view_results(
     csrf_token: &str,
     updatable: &BTreeSet<String>,
 ) -> Markup {
-    let first = if page.records.is_empty() {
-        0
-    } else {
-        page.start + 1
-    };
-    let last = page.start + page.records.len();
+    let (first, last) = page_range(page);
     html! {
         div id=(VIEW_TABLE_REGION) {
             @if view.layout == ViewLayout::Kanban {
@@ -5088,12 +5229,7 @@ fn render_kanban_board(
         .filter(|column| column.as_str() != group_by)
         .take(5)
         .collect::<Vec<_>>();
-    let first = if page.records.is_empty() {
-        0
-    } else {
-        page.start + 1
-    };
-    let last = page.start + page.records.len();
+    let (first, last) = page_range(page);
 
     html! {
         div class="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600" {
@@ -6041,21 +6177,135 @@ fn render_record_form(
                             a href=(audit_filter_url(&view.collection, &record.id)) class="text-xs font-semibold text-indigo-700 hover:text-indigo-900" { "All activity" span aria-hidden="true" { " →" } }
                         }
                         (render_audit_entries(audit_entries))
+                    // A link to the confirmation page, not a form that deletes.
+                    // See `delete_confirmation_url` for why the confirmation is
+                    // a page rather than a dialog; the consequence here is that
+                    // this element cannot write anything, so it needs no CSRF
+                    // token, no version, and no handler to guard it.
                     @if permissions.delete {
-                        form method="post" action=(format!("/{}/records/{}/delete", encode_segment(&view.name), encode_segment(&record.id))) onsubmit="return window.confirm('Delete this record? This cannot be undone from the web app.');" hx-boost=(UNBOOSTED) class="cr-record-danger rounded-lg border border-red-200 bg-red-50 p-4" {
-                            input type="hidden" name="_csrf" value=(csrf_token);
-                            input type="hidden" name="_expected_record_hash" value=(&record.version);
+                        div class="cr-record-danger rounded-lg border border-red-200 bg-red-50 p-4" {
                             div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
                                 div {
                                     h2 class="font-semibold text-red-900" { "Delete this record" }
-                                    p class="mt-1 text-sm text-red-700" { "The previous document remains represented in the tamper-evident audit log." }
+                                    p class="mt-1 text-sm text-red-700" { "You will be asked to confirm. The previous document remains represented in the tamper-evident audit log." }
                                 }
-                                button type="submit" class="rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-semibold text-red-700 hover:bg-red-100" { "Delete record" }
+                                a href=(delete_confirmation_url(view, record)) class="rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-semibold text-red-700 hover:bg-red-100" { "Delete record…" }
                             }
                         }
                     }
                     }
                 }
+                }
+            }
+        },
+        ui,
+        csrf_token,
+    )
+}
+
+/// The URL of a record's delete confirmation, which is the same path its
+/// deletion is posted to.
+///
+/// One path, two methods: `GET` asks the question and `POST` performs the write,
+/// which is the ordinary HTML shape for a destructive action and the reason this
+/// needed no second route. The `POST` contract is byte for byte the one it has
+/// always had — the same fields, the same statuses, the same audit event — so
+/// every existing test of it is still a test of it.
+///
+/// **Why a page and not a dialog.** The button used to be a form whose
+/// `onsubmit` called `window.confirm`, and that guard is worth less than it
+/// looks: an inline handler needs JavaScript, so a browser with JavaScript
+/// switched off — the configuration the whole HTTP suite stands in for — already
+/// deleted the record on the first click with nothing asked. Replacing the
+/// handler with htmx's `hx-confirm` would have kept exactly that hole, because
+/// `hx-confirm` is also JavaScript; it would merely have moved which script was
+/// missing. A confirmation the server renders is asked of everyone, needs
+/// nothing to be running, and is the one shape of this that a test can assert.
+///
+/// It is also better where the dialog worked. `window.confirm` can say one
+/// sentence with no markup; the page names the record, shows which view it is
+/// being deleted from, says what survives in the audit log, and offers Cancel as
+/// a real link rather than a button in a modal a screen reader has to be handed.
+/// And it costs no more clicks than the dialog did: one to ask, one to confirm,
+/// exactly as before.
+///
+/// The version the form carries is read when this page is rendered rather than
+/// when the record page was, which narrows the window in which a record can
+/// change between being read and being deleted — the `POST` still refuses with
+/// `412` if it changes inside that window.
+fn delete_confirmation_url(view: &ViewDefinition, record: &Record) -> String {
+    format!(
+        "/{}/records/{}/delete",
+        encode_segment(&view.name),
+        encode_segment(&record.id)
+    )
+}
+
+/// The confirmation page: what is about to be deleted, and the two ways out.
+///
+/// A whole page rather than a region, and it takes a `Representation` for the
+/// same reason every other renderer does — a boosted click on "Delete record…"
+/// swaps it into `<body>` like any other navigation, and asks for a document
+/// because a boost names no target.
+fn render_delete_confirmation(
+    representation: &Representation,
+    view: &ViewDefinition,
+    record: &Record,
+    navigation: &[ViewDefinition],
+    ui: Option<&UiContext>,
+    csrf_token: &str,
+) -> Markup {
+    let back = format!("/{}", encode_segment(&view.name));
+    let record_url = format!(
+        "/{}/records/{}",
+        encode_segment(&view.name),
+        encode_segment(&record.id)
+    );
+    page_or_content(
+        representation,
+        &format!("Delete {}", record.id),
+        &back,
+        navigation,
+        html! {
+            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-slate-500" {
+                a href="/" class="font-medium hover:text-blue-700" { "Views" }
+                span aria-hidden="true" { "/" }
+                a href=(&back) class="font-medium hover:text-blue-700" { (&view.title) }
+                span aria-hidden="true" { "/" }
+                a href=(&record_url) class="font-medium hover:text-blue-700" { (&record.id) }
+                span aria-hidden="true" { "/" }
+                span class="text-slate-900" { "Delete" }
+            }
+            div class="mx-auto max-w-2xl" {
+                div class="cr-record-danger rounded-xl border border-red-200 bg-red-50 p-6" {
+                    h1 class="cr-title text-red-900" { "Delete this record?" }
+                    p class="mt-2 text-sm text-red-800" {
+                        "You are about to delete "
+                        code class="cr-filter-tag" { (&record.id) }
+                        " from collection "
+                        code class="cr-filter-tag" { (&view.collection) }
+                        "."
+                    }
+                    p class="mt-2 text-sm text-red-700" {
+                        "This cannot be undone from the web app. The document's previous contents remain represented in the tamper-evident audit log, and "
+                        code class="cr-filter-tag" { "cr" }
+                        " records who deleted it."
+                    }
+                    // The form does the writing, so it carries the token and the
+                    // version; the page that linked here carries neither. It
+                    // stays native for the reason `UNBOOSTED` gives: a refusal
+                    // here is a rendered error document, which htmx will not
+                    // swap into a boosted `POST`, so boosting it would turn a
+                    // stale version into a button that visibly does nothing.
+                    form method="post" action=(delete_confirmation_url(view, record)) hx-boost=(UNBOOSTED) class="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center" {
+                        input type="hidden" name="_csrf" value=(csrf_token);
+                        input type="hidden" name="_expected_record_hash" value=(&record.version);
+                        button type="submit" class="rounded-lg border border-red-300 bg-red-700 px-4 py-2 text-sm font-semibold text-white hover:bg-red-800" { "Delete record" }
+                        // A link rather than a second button, because cancelling
+                        // is a navigation back to the record and must not be
+                        // able to submit the form it sits inside.
+                        a href=(&record_url) class="cr-button" { "Cancel" }
+                    }
                 }
             }
         },
@@ -6170,6 +6420,25 @@ html {
 @keyframes cr-progress {
   from { transform: scaleX(0.04); }
   to { transform: scaleX(0.96); }
+}
+
+/* Present to a screen reader, absent from the layout. This is what hides the
+   live region `page_layout` renders, and `display: none` or
+   `visibility: hidden` — either of which would be simpler — would remove that
+   element from the accessibility tree along with the viewport, which is exactly
+   what it must not be. The 1px clipped box is the long-standing recipe for the
+   difference; `white-space: nowrap` keeps a long sentence from being wrapped
+   into that box and re-laying out the page around it. */
+.cr-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 
 .cr-shell {
@@ -6811,6 +7080,45 @@ fn mobile_navigation(
 /// the seam pointing at an element that no longer exists.
 const CONTENT_REGION: &str = "main-content";
 
+/// The DOM id of the page's single live region — the element a screen reader
+/// watches, and the only one on the page whose changes are spoken without being
+/// asked for.
+///
+/// It is rendered by `page_layout` rather than by any page, which is the whole
+/// point: a live region is only announced when an assistive technology was
+/// already watching the element that changed, so a region delivered *inside* a
+/// swap is a region that was created and filled in one step and may be read out
+/// late, once, or never. Every fragment this server sends is a region of
+/// `<main>` or smaller; this element is outside all of them, so a page turn, a
+/// re-sort, a search and a filter apply all mutate an element that was on the
+/// page before the request went out.
+///
+/// It is empty in every document. Nothing has changed when a page loads — the
+/// page *is* the change — so the region starts silent and says something only
+/// when a later interaction gives it something to say.
+const ANNOUNCE_REGION: &str = "cr-announce";
+
+/// The live region itself, visually hidden and initially empty.
+///
+/// `role="status"` already implies `aria-live="polite"` and `aria-atomic="true"`,
+/// and both are stated anyway: the implicit mapping is what several screen
+/// readers historically got wrong, and the cost of saying it twice is three
+/// attributes in one place, while the cost of it being wrong is an announcement
+/// nobody hears and no test can see.
+///
+/// Visually hidden rather than merely off-screen or `display: none`, which
+/// removes an element from the accessibility tree along with the viewport and
+/// would make this a no-op. The class is in the server's own stylesheet rather
+/// than Tailwind's `sr-only`, because this is the one element whose styling is
+/// load bearing for correctness: if the CDN in `<head>` is blocked, every other
+/// page element degrades to unstyled but readable, and this one would degrade to
+/// a duplicate sentence in the middle of the layout.
+fn live_region() -> Markup {
+    html! {
+        div id=(ANNOUNCE_REGION) class="cr-visually-hidden" role="status" aria-live="polite" aria-atomic="true" {}
+    }
+}
+
 /// The DOM id of a view's results region: the table and its pager, or the
 /// Kanban board, whichever the view's layout renders.
 ///
@@ -7084,13 +7392,23 @@ fn page_layout(
                 // request that replaced it has by definition finished, and every
                 // page renders a fresh one.
                 div id="cr-progress" class="cr-progress" aria-hidden="true" {}
+                (live_region())
                 div class="cr-shell" {
                     (sidebar_navigation(current_path, views, ui, csrf_token))
                     div class="cr-workspace" {
                         (mobile_navigation(current_path, views, ui, csrf_token))
                         @if let Some(ui) = ui {
                             @if ui.selected != ui.operator.principal {
-                                div role="status" class="cr-perspective-banner" {
+                                // Not a live region. It states a standing fact
+                                // about the whole page — you are impersonating
+                                // someone — rather than the outcome of an
+                                // interaction, and `hx-boost` re-creates it on
+                                // every navigation, so marking it `role="status"`
+                                // asked a screen reader to read the impersonation
+                                // banner out again after every click. It is the
+                                // first thing inside the workspace and is read in
+                                // document order like the rest of the page.
+                                div class="cr-perspective-banner" {
                                     div class="flex w-full flex-wrap items-center justify-between gap-2 px-4 py-2 text-xs sm:px-6" {
                                         span {
                                             "Viewing as " strong { (&ui.selected_name) }

@@ -42,14 +42,15 @@ use tower::ServiceExt;
 
 /// Every page the HTML UI renders without access control configured, which is
 /// every shape of document the boost has to work on: the view index, a table, a
-/// Kanban board, a create form, an edit form with its delete control, and the
-/// audit log.
-const PAGES: [&str; 6] = [
+/// Kanban board, a create form, an edit form with its link to the delete
+/// confirmation, that confirmation page, and the audit log.
+const PAGES: [&str; 7] = [
     "/",
     "/deals",
     "/pipeline",
     "/deals/new",
     "/deals/records/alpha",
+    "/deals/records/alpha/delete",
     "/audit",
 ];
 
@@ -142,8 +143,12 @@ async fn every_page_boosts_its_body_and_renders_the_progress_indicator() {
         );
         // No inline handler and no inline `<script>`: phase 0 moved the last of
         // those out so `script-src 'self'` stays reachable, and a boost must not
-        // reintroduce one. `onsubmit`/`onchange` on two controls predate this
-        // work and are tracked in `TODO.md`.
+        // reintroduce one. The delete form's `onsubmit` is gone — its
+        // confirmation is a page the server renders, which is also the only way
+        // a browser with no JavaScript is asked the question at all. The
+        // perspective selector's `onchange` is the last one and is tracked in
+        // `TODO.md`; it is not on any of these pages, because it renders only
+        // under access control.
         assert!(
             !html.contains("hx-on:"),
             "{uri} uses an inline hx-on handler"
@@ -153,6 +158,7 @@ async fn every_page_boosts_its_body_and_renders_the_progress_indicator() {
             "{uri} uses an inline hx-on handler"
         );
         assert!(!html.contains("onclick="), "{uri} uses an inline onclick");
+        assert!(!html.contains("onsubmit="), "{uri} uses an inline onsubmit");
     }
 }
 
