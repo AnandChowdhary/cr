@@ -1178,6 +1178,93 @@ static UI_SCRIPT_NAME: LazyLock<String> =
 static UI_SCRIPT_PATH: LazyLock<String> =
     LazyLock::new(|| format!("/static/{}", UI_SCRIPT_NAME.as_str()));
 
+/// htmx, vendored into the binary rather than fetched from a CDN.
+///
+/// These are the bytes of `dist/htmx.min.js` from the published `htmx.org`
+/// 2.0.10 npm tarball — byte for byte what
+/// `unpkg.com/htmx.org@2.0.10/dist/htmx.min.js` serves — with a SHA-256 of
+/// `71ea67185bfa8c98c39d31717c6fce5d852370fcdfd129db4543774d3145c0de`. The
+/// digest is written down because 50 KiB of minified JavaScript is not
+/// something a reviewer can read in a diff, while "these are exactly the bytes
+/// upstream published" is something they can check in one command. It is not
+/// only a comment: the served URL below embeds that digest's first eight bytes
+/// and `tests/static_assets_http.rs` asserts the whole name, so re-pinning htmx
+/// is necessarily a deliberate commit that updates a failing assertion rather
+/// than a silent file swap.
+///
+/// htmx is 0BSD, whose entire grant is "Permission to use, copy, modify, and/or
+/// distribute this software for any purpose with or without fee is hereby
+/// granted" followed by a warranty disclaimer. It attaches no condition at all:
+/// no notice to reproduce, no attribution to carry, nothing this binary or its
+/// output has to say in order to redistribute the file. That is also why the
+/// minified file has no license header to preserve — upstream ships it without
+/// one. The upstream text is committed beside it as
+/// `src/static/htmx-2.0.10.LICENSE.txt` regardless, because a vendored
+/// dependency whose terms a reader has to leave the tree to find is worse than
+/// one they can read in place.
+const HTMX_SCRIPT: &str = include_str!("static/htmx-2.0.10.min.js");
+
+/// The vendored release, carried in the served name so the version a page is
+/// running is legible in a browser's network panel without hashing anything.
+const HTMX_VERSION: &str = "2.0.10";
+
+/// `htmx-<version>-<digest>.min.js`, content addressed like `cr-<digest>.js`.
+///
+/// The version alone could not carry the `immutable` promise below: a
+/// re-published or locally patched 2.0.10 would keep the name and leave caches
+/// on the old bytes for a year. The version is in the name for humans, the
+/// digest for correctness.
+static HTMX_SCRIPT_NAME: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "htmx-{HTMX_VERSION}-{}.min.js",
+        hexadecimal(&Sha256::digest(HTMX_SCRIPT)[..8])
+    )
+});
+
+/// The absolute path rendered pages link, as
+/// `/static/htmx-<version>-<digest>.min.js`.
+static HTMX_SCRIPT_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("/static/{}", HTMX_SCRIPT_NAME.as_str()));
+
+/// `hx-boost="false"`: the value that hands one element back to the browser's
+/// own navigation, spelled as a constant so the reasons for using it are
+/// written down once rather than repeated at every call site.
+///
+/// Two kinds of element carry it. The first is a link to a representation that
+/// is not an HTML page — `/openapi.json` in the sidebar and both mobile navs,
+/// and the JSON-API buttons on `/users` and `/audit`. Boosting those would swap
+/// a JSON document into the page body as text, whereas they exist to leave the
+/// UI for a raw representation, which is exactly what the `↗` beside them
+/// promises.
+///
+/// The second is every mutating form: record create and edit, record delete,
+/// save-as-view, the Kanban move form, and the perspective switcher. Boosting
+/// them would change how a mutation answers, and phase 3 of
+/// `.context/htmx-plan.md` is where that contract is redesigned; until then
+/// they submit natively, which is precisely how they behave today. Three
+/// concrete things would break if they did not:
+///
+/// * htmx does not swap a non-2xx response, and a rejected create or update is
+///   today a rendered error page, so a validation failure would become a submit
+///   button that visibly does nothing. Phase 3 answers 422 with the re-rendered
+///   form instead.
+/// * The delete form's confirmation is an `onsubmit` handler. Returning false
+///   from it cancels the browser's submit, but htmx's own submit listener does
+///   not consult `defaultPrevented`, so under boost a declined confirmation
+///   would still delete the record. Phase 3 replaces it with `hx-confirm`.
+/// * A mutation answers `303 See Other` to an idempotent `GET`. An
+///   `XMLHttpRequest` follows that redirect invisibly, so htmx would swap the
+///   right page in while pushing the *posted* path — `/perspective`, say — into
+///   the address bar. Phase 3 answers `HX-Location` instead, which htmx can
+///   turn into a correct URL.
+///
+/// The perspective form is the one case where the attribute is belt and braces
+/// rather than load bearing: its `<select>` calls `form.submit()`, which fires
+/// no submit event, so htmx would never see it regardless. It is marked anyway
+/// so that the opt-out is a decision on the page rather than an accident of how
+/// that one control happens to submit.
+const UNBOOSTED: &str = "false";
+
 /// Serve one of the embedded UI assets.
 ///
 /// The match is over names we compiled in, not a lookup rooted at a directory:
@@ -1187,9 +1274,15 @@ static UI_SCRIPT_PATH: LazyLock<String> =
 /// database-relative paths component by component with `O_NOFOLLOW`, and a
 /// static route that joined a request-supplied name onto a directory would
 /// reintroduce exactly the class of bug that walk exists to prevent.
+///
+/// Both assets are JavaScript, so the headers below are shared rather than
+/// per-asset. The day a stylesheet joins them, the content type moves into the
+/// match; the cache lifetime never has to, because every name here is derived
+/// from the bytes it names.
 async fn static_asset(Path(file): Path<String>) -> Response {
     let content = match file.as_str() {
         name if name == UI_SCRIPT_NAME.as_str() => UI_SCRIPT,
+        name if name == HTMX_SCRIPT_NAME.as_str() => HTMX_SCRIPT,
         _ => return not_found().await.into_response(),
     };
     (
@@ -3451,7 +3544,7 @@ fn render_users_view(
                 div class="flex flex-wrap items-center gap-2" {
                     span class="cr-pill" { (users.len()) " principals" }
                     span class="cr-pill cr-pill-warn" { "read-only" }
-                    a href="/api/v1/collections/users/records" class="cr-button" { "JSON API" span aria-hidden="true" { " ↗" } }
+                    a href="/api/v1/collections/users/records" hx-boost=(UNBOOSTED) class="cr-button" { "JSON API" span aria-hidden="true" { " ↗" } }
                 }
             }
             div class="cr-table-shell" {
@@ -3744,7 +3837,7 @@ fn render_audit_view(
                         "Every accepted record mutation, newest first. Expand an event to inspect its field-level changes."
                     }
                 }
-                a href="/api/v1/audit/log" class="cr-button" { "JSON API" span aria-hidden="true" { " ↗" } }
+                a href="/api/v1/audit/log" hx-boost=(UNBOOSTED) class="cr-button" { "JSON API" span aria-hidden="true" { " ↗" } }
             }
             form method="get" action=(reset_url) class="cr-surface mb-4 grid gap-3 p-3 sm:grid-cols-[1fr_1fr_1fr_1fr_auto]" {
                 label class="block" {
@@ -4415,7 +4508,7 @@ fn render_save_view_control(
                 "Save as view"
             }
             div class="cr-popover absolute right-0 z-20 mt-2 w-80 p-4" {
-                form method="post" action=(action) class="space-y-3" {
+                form method="post" action=(action) hx-boost=(UNBOOSTED) class="space-y-3" {
                     input type="hidden" name="_csrf" value=(csrf_token);
                     input type="hidden" name="filter_match" value=(match query.filter_match { ViewFilterMatch::All => "all", ViewFilterMatch::Any => "any" });
                     @for (index, (field, value)) in query.filter_field.iter().zip(&query.filter_value).enumerate() {
@@ -4547,7 +4640,7 @@ fn render_kanban_board(
                                     @if can_move {
                                         details class="cr-kanban-move mt-3 border-t border-slate-100 pt-2" {
                                             summary class="cursor-pointer list-none" { "Move card…" }
-                                            form method="post" action=(kanban_move_url(view, &record.id)) class="flex items-center gap-2" {
+                                            form method="post" action=(kanban_move_url(view, &record.id)) hx-boost=(UNBOOSTED) class="flex items-center gap-2" {
                                                 input type="hidden" name="_csrf" value=(csrf_token);
                                                 label class="min-w-0 flex-1" {
                                                     span class="sr-only" { "Move " (&record.id) " to" }
@@ -5074,7 +5167,7 @@ fn render_record_form(
                 }
                 div class=(if editing { "cr-record-layout mt-5" } else { "mx-auto mt-5 max-w-5xl" }) {
                 div class="cr-record-primary min-w-0" {
-                form method="post" action=(action) class="space-y-4" {
+                form method="post" action=(action) hx-boost=(UNBOOSTED) class="space-y-4" {
                     input type="hidden" name="_csrf" value=(csrf_token);
                     @if let Some(record) = record {
                         input type="hidden" name="_expected_record_hash" value=(&record.version);
@@ -5158,7 +5251,7 @@ fn render_record_form(
                         }
                         (render_audit_entries(audit_entries))
                     @if permissions.delete {
-                        form method="post" action=(format!("/{}/records/{}/delete", encode_segment(&view.name), encode_segment(&record.id))) onsubmit="return window.confirm('Delete this record? This cannot be undone from the web app.');" class="cr-record-danger rounded-lg border border-red-200 bg-red-50 p-4" {
+                        form method="post" action=(format!("/{}/records/{}/delete", encode_segment(&view.name), encode_segment(&record.id))) onsubmit="return window.confirm('Delete this record? This cannot be undone from the web app.');" hx-boost=(UNBOOSTED) class="cr-record-danger rounded-lg border border-red-200 bg-red-50 p-4" {
                             input type="hidden" name="_csrf" value=(csrf_token);
                             input type="hidden" name="_expected_record_hash" value=(&record.version);
                             div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
@@ -5246,6 +5339,47 @@ html {
 }
 
 .cr-skip-link:focus { transform: translateY(0); }
+
+/* The boosted-navigation progress bar, driven entirely by the `htmx-request`
+   class htmx puts on `#cr-progress` while a request is in flight. While it is
+   waiting it grows quickly at first and then slows, and never reaches the
+   right-hand edge, because the server reports no progress: a bar that filled
+   itself would be claiming something it cannot know. When the response lands
+   the class goes, the bar snaps to its resting full width and fades out over
+   150ms, so a finish reads as a finish rather than as an interruption.
+   Everything here is dormant until a navigation is actually waiting. */
+.cr-progress {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 110;
+  height: 2px;
+  background: var(--cr-accent-soft);
+  opacity: 0;
+  transition: opacity 150ms ease-out;
+  pointer-events: none;
+}
+
+.cr-progress::after {
+  content: "";
+  display: block;
+  height: 100%;
+  background: var(--cr-accent);
+  transform: scaleX(1);
+  transform-origin: left center;
+}
+
+.cr-progress.htmx-request { opacity: 1; }
+
+.cr-progress.htmx-request::after {
+  animation: cr-progress 12s cubic-bezier(0, 0.65, 0.2, 1) forwards;
+}
+
+@keyframes cr-progress {
+  from { transform: scaleX(0.04); }
+  to { transform: scaleX(0.96); }
+}
 
 .cr-shell {
   display: grid;
@@ -5710,12 +5844,19 @@ html {
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   .cr-app *, .cr-app *::before, .cr-app *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  /* The blanket rule above already collapses the progress bar's growth, but by
+     accident rather than on purpose, and a 0.01ms animation is a strange thing
+     to leave in the sheet. State the intent instead: no motion at all, which
+     leaves the bar at the full width it rests at, so the feedback survives the
+     preference as a plain static strip even though the movement does not. */
+  .cr-progress { transition: none; }
+  .cr-progress.htmx-request::after { animation: none; }
 }
 "#;
 
 fn perspective_control(ui: &UiContext, csrf_token: &str, id: &str) -> Markup {
     html! {
-        form method="post" action="/perspective" class="cr-perspective" {
+        form method="post" action="/perspective" hx-boost=(UNBOOSTED) class="cr-perspective" {
             input type="hidden" name="_csrf" value=(csrf_token);
             label for=(id) class="cr-perspective-label" { "Viewing as" }
             select id=(id) name="principal" aria-label="View as user" onchange="this.form.submit()" {
@@ -5797,7 +5938,7 @@ fn sidebar_navigation(
                             span { "Audit log" }
                         }
                     }
-                    a href="/openapi.json" class="cr-sidebar-link" {
+                    a href="/openapi.json" hx-boost=(UNBOOSTED) class="cr-sidebar-link" {
                         span class="cr-nav-glyph" aria-hidden="true" { "{}" }
                         span { "OpenAPI" }
                         span class="cr-external" aria-hidden="true" { "↗" }
@@ -5833,7 +5974,7 @@ fn mobile_navigation(
                 } @else {
                     div class="cr-mobile-utilities" {
                         a href="/audit" class="cr-nav-link" { "Audit" }
-                        a href="/openapi.json" class="cr-nav-link" { "API" }
+                        a href="/openapi.json" hx-boost=(UNBOOSTED) class="cr-nav-link" { "API" }
                     }
                 }
             }
@@ -5855,7 +5996,7 @@ fn mobile_navigation(
                     a href="/audit" class=(if current_path == "/audit" { "is-active" } else { "" }) { "Audit" }
                 }
                 @if ui.is_some() {
-                    a href="/openapi.json" { "API" }
+                    a href="/openapi.json" hx-boost=(UNBOOSTED) { "API" }
                 }
             }
         }
@@ -5882,6 +6023,9 @@ fn page_layout(
                 link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='1' y='1' width='30' height='30' rx='7' fill='%23fff' stroke='%23d4d4d0'/%3E%3Cpath d='M20.5 20.2c-1.1 1-2.4 1.5-4 1.5-3.5 0-6-2.4-6-5.8s2.5-5.8 6-5.8c1.6 0 3 .5 4 1.5l-1.7 2a3.2 3.2 0 0 0-2.2-.8c-1.8 0-3 1.2-3 3.1s1.2 3.1 3 3.1c.9 0 1.6-.3 2.2-.8l1.7 2z' fill='%23242424'/%3E%3C/svg%3E";
                 title { (title) " · cr" }
                 script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4" {}
+                // htmx is linked before `cr.js` because `cr.js` configures
+                // it, and two deferred scripts run in document order.
+                script src=(HTMX_SCRIPT_PATH.as_str()) defer {}
                 // `defer` keeps the previous execution order: the blocks used
                 // to be emitted below the markup they enhance, so they ran
                 // against a parsed document, and a deferred head script runs at
@@ -5889,8 +6033,38 @@ fn page_layout(
                 script src=(UI_SCRIPT_PATH.as_str()) defer {}
                 style { (PreEscaped(GLOBAL_STYLES)) }
             }
-            body class="cr-app min-h-full antialiased" data-design-system="cr-workspace" {
+            // `hx-boost` makes every same-origin link and every form in the
+            // page an htmx request whose response replaces the body's contents,
+            // so navigating keeps the parsed stylesheet and the JavaScript the
+            // page already had running instead of rebuilding both. Everything
+            // a navigation is supposed to change still changes: htmx takes
+            // `<title>` from the response, pushes the URL, and scrolls to the
+            // top exactly as a load would.
+            //
+            // htmx only intercepts. With JavaScript off, before the deferred
+            // script has run, or on a link that leaves this origin, the very
+            // same markup is an ordinary anchor and an ordinary form — which is
+            // why the HTTP test suite, which never sends an htmx header, still
+            // exercises every route end to end.
+            //
+            // The elements that must not be intercepted say so individually;
+            // see `UNBOOSTED` for which ones and why.
+            body class="cr-app min-h-full antialiased" data-design-system="cr-workspace"
+                hx-boost="true" hx-indicator="#cr-progress" {
                 a href="#main-content" class="cr-skip-link" { "Skip to content" }
+                // The navigation progress bar. htmx adds its `htmx-request`
+                // class to whatever `hx-indicator` names for exactly as long as
+                // a request is in flight, and `.cr-progress` in `GLOBAL_STYLES`
+                // animates from nothing else, so this is inert markup rather
+                // than a second mechanism to keep in step with the first. A
+                // boosted navigation shows nothing at all until the response
+                // arrives, and an audit-journal walk over a large database
+                // takes long enough for that silence to read as a dead click.
+                //
+                // It sits inside the body the swap replaces, which is fine: the
+                // request that replaced it has by definition finished, and every
+                // page renders a fresh one.
+                div id="cr-progress" class="cr-progress" aria-hidden="true" {}
                 div class="cr-shell" {
                     (sidebar_navigation(current_path, views, ui, csrf_token))
                     div class="cr-workspace" {
