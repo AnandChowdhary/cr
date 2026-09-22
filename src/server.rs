@@ -219,16 +219,20 @@ struct BrowserPage {
     item: BrowserItem,
 }
 
-/// A directory's README, previewed beneath its listing the way a code host
-/// shows one.
+/// A document that explains its directory — a README, or an agent skill's
+/// `SKILL.md` — previewed beneath the listing the way a code host shows a
+/// README.
 ///
 /// The preview is the same bounded, escaped `BrowserFile` that opening the
-/// file produces, so a README is never read or rendered by a looser rule than
-/// the file itself. A README that cannot be previewed keeps its public error
+/// file produces, so a document is never read or rendered by a looser rule
+/// than the file itself. One that cannot be previewed keeps its public error
 /// message rather than failing the listing: the directory is what was asked
 /// for, and it is still readable.
 #[derive(Debug)]
-struct BrowserReadme {
+struct BrowserDocument {
+    /// The element id the section renders with, so `#readme` and `#skill` are
+    /// stable links to the section itself.
+    anchor: &'static str,
     name: String,
     href: Option<String>,
     preview: Result<BrowserFile, String>,
@@ -1581,36 +1585,32 @@ async fn browse_view(
                 .map_err(|error| {
                     ApiError::internal(anyhow!(error).context("filesystem browser task failed"))
                 })??;
-        let readme = match &page.item {
-            BrowserItem::Directory(entries) => match directory_readme(entries) {
-                Some(entry) => {
-                    let path = page.location.join(&entry.name);
-                    let preview = tokio::task::spawn_blocking(move || browse_file(&path))
-                        .await
-                        .map_err(|error| {
-                            ApiError::internal(
-                                anyhow!(error).context("filesystem browser task failed"),
-                            )
-                        })?;
-                    Some(BrowserReadme {
-                        name: entry.name.clone(),
-                        href: entry.href.clone(),
-                        // Published here rather than on the blocking worker:
-                        // publishing logs the full chain under this request's
-                        // ID, and that ID only exists on the request's own
-                        // task. The page shows the public message alone.
-                        preview: preview.map_err(|error| error.publish().message),
-                    })
-                }
-                None => None,
-            },
-            _ => None,
-        };
+        let mut documents = Vec::new();
+        if let BrowserItem::Directory(entries) = &page.item {
+            for (anchor, entry) in directory_documents(entries) {
+                let path = page.location.join(&entry.name);
+                let preview = tokio::task::spawn_blocking(move || browse_file(&path))
+                    .await
+                    .map_err(|error| {
+                        ApiError::internal(anyhow!(error).context("filesystem browser task failed"))
+                    })?;
+                documents.push(BrowserDocument {
+                    anchor,
+                    name: entry.name.clone(),
+                    href: entry.href.clone(),
+                    // Published here rather than on the blocking worker:
+                    // publishing logs the full chain under this request's ID,
+                    // and that ID only exists on the request's own task. The
+                    // page shows the public message alone.
+                    preview: preview.map_err(|error| error.publish().message),
+                });
+            }
+        }
         let ui = ui_context(&state, &headers).await?;
         Ok(render_browse_view(
             &Representation::requested(&headers),
             &page,
-            readme.as_ref(),
+            &documents,
             &navigation,
             ui.as_ref(),
             &state.csrf_token,
@@ -1712,18 +1712,35 @@ fn browse_directory(path: &FilePath) -> ApiResult<Vec<BrowserEntry>> {
 /// tool directories still ship them.
 const README_NAMES: [&str; 4] = ["readme.md", "readme.markdown", "readme.txt", "readme"];
 
-/// The entry to preview beneath a directory listing, if the directory has one.
+/// The file that defines an agent skill, and so explains its directory the way
+/// a README explains a project. Matched without case like a README.
+const SKILL_NAME: &str = "skill.md";
+
+/// The documents to preview beneath a directory listing: its README, then its
+/// `SKILL.md`, each only if present.
+///
+/// Both rather than one, because they answer different readers. A skill
+/// directory commonly carries a `SKILL.md` for the agent and a README for the
+/// person maintaining it, and hiding either would make the other look like the
+/// whole story.
 ///
 /// Only regular files qualify. A symbolic link named `README.md` is listed as a
 /// link and left alone: previews open with `O_NOFOLLOW`, so it would fail, and
 /// following it silently would show a file from somewhere the listing does not
 /// say.
-fn directory_readme(entries: &[BrowserEntry]) -> Option<&BrowserEntry> {
-    README_NAMES.iter().find_map(|name| {
+fn directory_documents(entries: &[BrowserEntry]) -> Vec<(&'static str, &BrowserEntry)> {
+    let regular = |name: &str| {
         entries.iter().find(|entry| {
             entry.kind == BrowserEntryKind::File && entry.name.eq_ignore_ascii_case(name)
         })
-    })
+    };
+    let readme = README_NAMES.iter().find_map(|name| regular(name));
+    let skill = regular(SKILL_NAME);
+    readme
+        .map(|entry| ("readme", entry))
+        .into_iter()
+        .chain(skill.map(|entry| ("skill", entry)))
+        .collect()
 }
 
 fn browse_file(path: &FilePath) -> ApiResult<BrowserFile> {
@@ -4059,7 +4076,7 @@ fn render_users_view(
 fn render_browse_view(
     representation: &Representation,
     page: &BrowserPage,
-    readme: Option<&BrowserReadme>,
+    documents: &[BrowserDocument],
     views: &[ViewDefinition],
     ui: Option<&UiContext>,
     csrf_token: &str,
@@ -4166,15 +4183,15 @@ fn render_browse_view(
                             (entries.len()) " entries · directories first · hidden files included"
                         }
                     }
-                    @if let Some(readme) = readme {
-                        section id="readme" aria-label=(&readme.name) class="mt-6" {
-                            @match &readme.preview {
+                    @for document in documents {
+                        section id=(document.anchor) aria-label=(&document.name) class="mt-6" {
+                            @match &document.preview {
                                 Ok(file) => {
-                                    (render_file_preview(file, Some((&readme.name, readme.href.as_deref()))))
+                                    (render_file_preview(file, Some((&document.name, document.href.as_deref()))))
                                 }
                                 Err(message) => {
                                     div class="cr-table-shell px-4 py-3 text-sm text-slate-600" {
-                                        span class="font-mono font-semibold text-slate-900" { (&readme.name) }
+                                        span class="font-mono font-semibold text-slate-900" { (&document.name) }
                                         " could not be previewed: " (message)
                                     }
                                 }
@@ -4201,18 +4218,18 @@ fn render_browse_view(
 }
 
 /// One bounded file preview: the panel an opened file gets, and the panel a
-/// directory's README gets beneath its listing.
+/// directory's README or `SKILL.md` gets beneath its listing.
 ///
-/// A README passes its name and link so the header says which file is being
-/// shown and opens it on its own, as a code host's README header does; an
-/// opened file already names itself in the breadcrumb and path above.
+/// A directory document passes its name and link so the header says which
+/// file is being shown and opens it on its own, as a code host's README header
+/// does; an opened file already names itself in the breadcrumb and path above.
 ///
 /// Text wraps; hexadecimal does not. A long line of prose or configuration is
 /// read rather than scrolled to, and a minified file or a URL with no spaces
 /// still breaks instead of pushing the panel wider than the page. A hex dump is
 /// the opposite case: its value is in the aligned offset, byte, and character
 /// columns, which wrapping would scramble, so it keeps horizontal scrolling.
-fn render_file_preview(file: &BrowserFile, readme: Option<(&str, Option<&str>)>) -> Markup {
+fn render_file_preview(file: &BrowserFile, document: Option<(&str, Option<&str>)>) -> Markup {
     let (contents, class) = match &file.contents {
         BrowserFileContents::Text(contents) => (contents, "cr-file-preview cr-file-preview-wrap"),
         BrowserFileContents::Binary(contents) => (contents, "cr-file-preview"),
@@ -4221,7 +4238,7 @@ fn render_file_preview(file: &BrowserFile, readme: Option<(&str, Option<&str>)>)
         div class="cr-table-shell overflow-hidden" {
             div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600" {
                 div class="flex flex-wrap items-center gap-2" {
-                    @if let Some((name, href)) = readme {
+                    @if let Some((name, href)) = document {
                         @if let Some(href) = href {
                             a href=(href) class="font-mono text-sm font-semibold text-slate-900 hover:text-blue-700" { (name) }
                         } @else {

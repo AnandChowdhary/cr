@@ -1622,11 +1622,11 @@ async fn owners_can_browse_and_preview_the_filesystem_without_mutating_it() {
     );
 }
 
-/// A directory with a README shows it beneath the listing, in the same bounded,
-/// escaped panel opening the file would give, and text previews wrap while hex
-/// dumps keep their columns.
+/// A directory with a README or a `SKILL.md` shows it beneath the listing, in
+/// the same bounded, escaped panel opening the file would give, and text
+/// previews wrap while hex dumps keep their columns.
 #[tokio::test]
-async fn directories_preview_their_readme_and_text_previews_wrap() {
+async fn directories_preview_their_readme_and_skill_and_text_previews_wrap() {
     let (_temporary, database) = test_database("filesystem-readme");
     let database = database.with_actor("Owner <owner@example.com>").unwrap();
     database
@@ -1646,6 +1646,14 @@ async fn directories_preview_their_readme_and_text_previews_wrap() {
     )
     .unwrap();
     fs::write(docs.join("data.bin"), [0_u8, 1, 2, 255]).unwrap();
+    fs::write(
+        docs.join("SKILL.md"),
+        "---\nname: docs\n---\nskill instructions\n",
+    )
+    .unwrap();
+    let skill_only = database.root().join("skill-only");
+    fs::create_dir(&skill_only).unwrap();
+    fs::write(skill_only.join("skill.md"), "a skill with no README").unwrap();
     let app = router(database.clone(), ServerConfig::default()).unwrap();
 
     let listing = request(&app, Method::GET, &browse_uri(&docs), None, &[]).await;
@@ -1660,6 +1668,15 @@ async fn directories_preview_their_readme_and_text_previews_wrap() {
     // The README header opens the file itself.
     assert!(text[readme..].contains(&browse_uri(&docs.join("readme.md")).replace('&', "&amp;")));
     assert!(text[readme..].contains("cr-file-preview cr-file-preview-wrap"));
+    // The skill follows the README rather than replacing it.
+    let skill = text.find("id=\"skill\"").unwrap();
+    assert!(readme < skill, "the SKILL.md renders after the README");
+    assert!(text[skill..].contains("skill instructions"));
+
+    let only = request(&app, Method::GET, &browse_uri(&skill_only), None, &[]).await;
+    assert!(only.text().contains("id=\"skill\""));
+    assert!(only.text().contains("a skill with no README"));
+    assert!(!only.text().contains("id=\"readme\""));
 
     // Opening a text file wraps; opening a binary file keeps its hex columns.
     let file = request(
@@ -1709,7 +1726,7 @@ async fn an_unreadable_readme_does_not_hide_the_listing() {
     let docs = database.root().join("docs");
     fs::create_dir(&docs).unwrap();
     let readme = docs.join("README.md");
-    fs::write(&readme, "private").unwrap();
+    fs::write(&readme, "contents-the-server-cannot-read").unwrap();
     fs::write(docs.join("notes.txt"), "public").unwrap();
     fs::set_permissions(&readme, fs::Permissions::from_mode(0o000)).unwrap();
     // Permission bits do not bind a superuser, and then there is nothing to
@@ -1724,7 +1741,9 @@ async fn an_unreadable_readme_does_not_hide_the_listing() {
     assert_eq!(listing.status, StatusCode::OK, "{}", listing.text());
     assert!(listing.text().contains("notes.txt"));
     assert!(listing.text().contains("could not be previewed"));
-    assert!(!listing.text().contains("private"));
+    // Not the word "private": on macOS temporary directories canonicalize under
+    // `/private`, and the page names its own location.
+    assert!(!listing.text().contains("contents-the-server-cannot-read"));
 }
 
 /// Without RBAC there is nothing in the internal registry to show, so the page
