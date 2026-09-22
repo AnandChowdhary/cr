@@ -1780,7 +1780,16 @@ first page is the canonical database root and lists every visible entry,
 including dotfiles, with directories first. Open a directory to continue
 browsing, open a regular file for an escaped text preview (or a hexadecimal
 binary preview), and use the `..` row to move above the database until reaching
-the filesystem root. Symbolic links are identified in listings and resolve to
+the filesystem root. Text previews wrap long lines, breaking even a URL or a
+minified line with no spaces, while hex previews keep their aligned columns and
+scroll instead. A directory that contains a README shows it beneath the listing,
+the way a code host does, in the same bounded, escaped panel opening the file
+gives; `README.md` wins over `README.markdown`, `README.txt`, and a bare
+`README`, and names match without regard to case. An agent skill's `SKILL.md`
+is shown the same way, after the README when a directory has both, since the
+two are written for different readers. A document that cannot be read is
+reported in place without hiding the listing. Both are shown as text rather
+than rendered Markdown. Symbolic links are identified in listings and resolve to
 their canonical target when opened. Devices, sockets, and named pipes are not
 opened. Text previews stop after 1 MiB and binary previews after 4 KiB, so this
 page is an inspector rather than a bulk-download endpoint.
