@@ -1322,8 +1322,14 @@ static HTMX_SCRIPT_PATH: LazyLock<String> =
 /// * The **Kanban move** form has no fields to preserve and its drag-and-drop
 ///   equivalent in `cr.js` submits a form it builds itself with `form.submit()`,
 ///   which fires no submit event and so is never boosted. Leaving the rendered
-///   form native keeps both ways of moving a card behaving identically; phase 4
-///   swaps the board region and is where that changes.
+///   form native keeps both ways of moving a card behaving identically. The board
+///   *is* `VIEW_TABLE_REGION` and a page turn on a Kanban view already swaps it,
+///   so the region is not what is missing: a move is a `POST`, and the answer to
+///   a successful one is a redirect (`mutation_redirect`), not the region. Making
+///   a move swap the board means giving the mutation a second success shape that
+///   returns markup, and only the rendered form could use it — the drop would
+///   still reload the page, which is the asymmetry this attribute exists to
+///   prevent. It waits for the drag to go through htmx too.
 ///
 /// The **perspective** form is the one case where the attribute is belt and
 /// braces rather than load bearing: its `<select>` calls `form.submit()`, which
@@ -4549,8 +4555,23 @@ fn render_view_records(
     // It comes first because it is the narrower answer: everything below builds
     // the heading, the search box and the filter panel, none of which the
     // request asked for.
+    //
+    // Two elements travel with the region, marked `hx-swap-oob` so htmx applies
+    // each to the element of the same id already on the page and then drops it
+    // from the content it swaps. They are the whole of the heading that depends
+    // on the results — the record count and the badge counting applied filters —
+    // and they are rendered here by the same functions the heading below calls,
+    // with the attribute as their only difference, so neither can start
+    // disagreeing with the page it patches.
     if representation.wants(VIEW_TABLE_REGION) {
-        return results;
+        return fragment(
+            &view.title,
+            html! {
+                (results)
+                (view_record_count(page.total, OutOfBand::Yes))
+                (view_filter_summary(active_filter_count, OutOfBand::Yes))
+            },
+        );
     }
     page_or_content(
         representation,
@@ -4573,7 +4594,7 @@ fn render_view_records(
                         @if view.layout == ViewLayout::Kanban {
                             span class="cr-pill cr-pill-accent" { "kanban" }
                         }
-                        span class="cr-pill" { (page.total) " records" }
+                        (view_record_count(page.total, OutOfBand::No))
                     }
                     p class="cr-lede mt-1" {
                         "Collection " code class="cr-filter-tag" { (&view.collection) }
@@ -4605,19 +4626,32 @@ fn render_view_records(
                             csrf_token,
                         ))
                     }
-                    form method="get" action=(reset_url.clone()) data-filter-builder="true" data-max-filters=(MAX_VIEW_FILTERS) class="contents" {
+                    // One form, two submit buttons, and both of them only change
+                    // which records are listed: the magnifying glass beside the
+                    // search box and "Apply view" at the bottom of the filter
+                    // panel. Targeting the results region is what keeps the
+                    // panel open across an apply — it is not re-rendered, so the
+                    // browser never has a reason to close it or to forget what
+                    // was typed into it.
+                    //
+                    // It stays an ordinary `method="get"` form with an `action`,
+                    // so with JavaScript off, or before the deferred script has
+                    // run, the same click navigates to the same URL and gets the
+                    // same records inside a whole page. `hx-push-url="true"`
+                    // makes the enhanced path end on that URL too, which is the
+                    // property that keeps every filtered, sorted and searched
+                    // state shareable: what the reader copies out of the address
+                    // bar is what a stranger with no JavaScript would be served.
+                    form method="get" action=(reset_url.clone())
+                        hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_IN_PLACE) hx-push-url="true"
+                        data-filter-builder="true" data-max-filters=(MAX_VIEW_FILTERS) class="contents" {
                         div class="relative min-w-48 flex-1 sm:flex-none" {
                             label class="sr-only" { "Search records" }
                             input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Search records" placeholder="Search records…" autocomplete="off" data-view-search="true" class="w-full border bg-white py-2 pl-3 pr-10 text-sm outline-none placeholder:text-slate-400 sm:w-56";
                             button type="submit" aria-label="Submit search" title="Search" class="absolute inset-y-1 right-1 inline-flex w-8 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-blue-700" { "⌕" }
                         }
-                        details class="relative" data-filter-disclosure="true" data-active-filters=(active_filter_count) {
-                            summary class="cr-button cursor-pointer list-none gap-2" {
-                                "Filter"
-                                @if active_filter_count > 0 {
-                                    span class="cr-pill cr-pill-accent" { (active_filter_count) }
-                                }
-                            }
+                        details class="relative" data-filter-disclosure="true" {
+                            (view_filter_summary(active_filter_count, OutOfBand::No))
                             div data-filter-panel="true" class="cr-popover cr-filter-popover z-30 space-y-4 overflow-y-auto p-4 sm:p-5" {
                                 div {
                                     div class="mb-3 flex flex-wrap items-center justify-between gap-3" {
@@ -4696,6 +4730,17 @@ fn render_view_records(
                                     }
                                 }
                                 div class="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-4" {
+                                    // "Clear all" is the one control in this
+                                    // panel that is deliberately *not* a
+                                    // targeted swap. It goes to the view's bare
+                                    // URL, and the conditions it clears are the
+                                    // rendered contents of the panel beside it:
+                                    // swapping only the results would leave the
+                                    // reader looking at the filters they just
+                                    // discarded, still typed in, above rows that
+                                    // no longer reflect them. A whole page is the
+                                    // correct answer for the one action whose
+                                    // point is that the panel should be empty.
                                     a href=(reset_url.clone()) class="cr-button" { "Clear all" }
                                     button type="submit" class="cr-button cr-button-primary" { "Apply view" }
                                 }
@@ -4719,15 +4764,147 @@ fn render_view_records(
     )
 }
 
+/// Every sortable column heading of a table view, left to right, as
+/// `(query field, heading text, spoken name)`.
+///
+/// The three differ, which is why they are all here: the record id column is
+/// headed `ID` and read out as "record ID", an audit column is headed `Created`
+/// and read out as "created", and a view's own column is headed by its raw front
+/// matter key — which is what a reader correlating the table with a record file
+/// needs to see — while being read out humanized.
+fn sortable_headings(columns: &[String]) -> Vec<(&str, String, String)> {
+    std::iter::once(("$id", "ID".to_owned(), "record ID".to_owned()))
+        .chain(
+            ACTIVITY_COLUMNS
+                .iter()
+                .map(|(field, label)| (*field, humanize_field_name(label), (*label).to_owned())),
+        )
+        .chain(
+            columns
+                .iter()
+                .map(|column| (column.as_str(), column.clone(), humanize_field_name(column))),
+        )
+        .collect()
+}
+
+/// The DOM id of the sort link in the *n*th column heading.
+///
+/// It exists so that focus survives the swap. htmx restores focus after a swap by
+/// looking up the id of the element that had it, and replacing the results region
+/// destroys the header cell the reader just activated: without an id a keyboard or
+/// screen reader user is returned to the top of the document by every re-sort,
+/// which is worse than the full page load this replaces rather than better. With
+/// one they stay on the column they are sorting and hear its label — which the
+/// same swap has just updated from "sort by name ascending" to "sort by name
+/// descending" — read out again.
+///
+/// The position rather than the field name, because a field here is a front matter
+/// key and may be any string a YAML mapping key may be, including one that
+/// collides with another heading's. The position is unique by construction and it
+/// is stable across exactly the swaps that need it: re-sorting, paging, filtering
+/// and searching all leave the column set alone.
+fn sort_link_id(index: usize) -> String {
+    format!("cr-sort-{index}")
+}
+
+/// The cursor links, shared by the table's pager and the Kanban board's.
+///
+/// One function because the two layouts render the same three links with the same
+/// ids and the same swap, and a second copy is how one of them would end up
+/// reloading the page after the other stopped. The ids are here for the reason
+/// `sort_link_id` explains: "Next" is inside the region it replaces, so htmx needs
+/// a name to put focus back on.
+fn view_pager_links(view: &ViewDefinition, query: &ViewQuery, page: &ViewPage) -> Markup {
+    html! {
+        div class="flex items-center gap-2" {
+            @if page.records.is_empty() && page.start > 0 {
+                a id="cr-page-first" href=(view_page_url(view, query, page.limit, ViewPosition::Start)) class="cr-button"
+                    hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_FROM_INSIDE) hx-push-url="true" { "First page" }
+            }
+            @if let Some(cursor) = page.previous.as_deref() {
+                a id="cr-page-previous" href=(view_page_url(view, query, page.limit, ViewPosition::Before(cursor))) rel="prev" class="cr-button"
+                    hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_FROM_INSIDE) hx-push-url="true" { "Previous" }
+            }
+            @if let Some(cursor) = page.next.as_deref() {
+                a id="cr-page-next" href=(view_page_url(view, query, page.limit, ViewPosition::After(cursor))) rel="next" class="cr-button"
+                    hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_FROM_INSIDE) hx-push-url="true" { "Next" }
+            }
+        }
+    }
+}
+
+/// Whether an element is being rendered into the page it belongs to, or beside a
+/// fragment as a patch for the copy already on the page.
+///
+/// A boolean would read as `view_record_count(total, true)` at the call site,
+/// where `true` says nothing about which of the two an answer is sending. It
+/// matters which: an `hx-swap-oob` attribute in a *document* would be acted on
+/// the next time a boosted navigation swapped that document into the body — htmx
+/// would patch the element into place and then remove it from the incoming
+/// markup, so the page would arrive with the element missing.
+#[derive(Copy, Clone)]
+enum OutOfBand {
+    Yes,
+    No,
+}
+
+impl OutOfBand {
+    /// The `hx-swap-oob` attribute value, or nothing at all.
+    ///
+    /// `hx-swap-oob="true"` means "replace the element with this id, wherever it
+    /// is". Maud omits an attribute given `None`, so the document and the patch
+    /// come out of one renderer differing by exactly this attribute, which is
+    /// what `tests/targeted_swap_http.rs` asserts by stripping it and comparing.
+    fn attribute(self) -> Option<&'static str> {
+        match self {
+            Self::Yes => Some("true"),
+            Self::No => None,
+        }
+    }
+}
+
+/// The heading's "*n* records" pill.
+///
+/// Lives outside the results region and is changed by every filter and search
+/// that hits it, which is why it is a function: the heading renders it and a
+/// results fragment sends it again as an out-of-band patch, and two copies of
+/// `page.total` in two `html!` blocks is how a count starts disagreeing with the
+/// pager six inches below it.
+fn view_record_count(total: usize, out_of_band: OutOfBand) -> Markup {
+    html! {
+        span id=(VIEW_COUNT_ID) class="cr-pill" hx-swap-oob=[out_of_band.attribute()] { (total) " records" }
+    }
+}
+
+/// The filter disclosure's summary: the word "Filter", and a badge counting the
+/// conditions the current URL applies.
+///
+/// The `<details>` element around it is what the reader opens, and a targeted
+/// apply leaves it strictly alone — that is the point of the phase. Its summary
+/// is the exception, because it reports a number the apply just changed, and it
+/// can be replaced without disturbing either the open state or the controls
+/// inside. `data-active-filters` moved here from the `<details>` for that reason:
+/// it states the same count, so it has to live on the element that gets it right.
+fn view_filter_summary(active: usize, out_of_band: OutOfBand) -> Markup {
+    html! {
+        summary id=(VIEW_FILTER_SUMMARY_ID) data-active-filters=(active) class="cr-button cursor-pointer list-none gap-2" hx-swap-oob=[out_of_band.attribute()] {
+            "Filter"
+            @if active > 0 {
+                span class="cr-pill cr-pill-accent" { (active) }
+            }
+        }
+    }
+}
+
 /// The region of a view page that a page turn, a re-sort, a filter or a search
 /// replaces, and the only part of the page any of them change.
 ///
 /// Split out of `render_view_records` so that one URL can answer with either
-/// the whole page or just this, from the same data and the same markup. Phase 4
-/// of `.context/htmx-plan.md` is what will ask for it: the pagination, sort,
-/// filter and search controls become targeted swaps, and a filter panel that
-/// survives an apply — which today closes, because applying reloads the page —
-/// falls out of not re-rendering it.
+/// the whole page or just this, from the same data and the same markup. The
+/// pagination, sort, filter and search controls are what ask for it, and the
+/// filter panel surviving an apply falls out of not re-rendering it: the panel is
+/// the same DOM nodes before and after, so the browser has no occasion to close
+/// the disclosure or to forget what was typed into it.
 ///
 /// The fragment carries its own root element, id and all, which is what lets a
 /// swap be `outerHTML`: the response is the element it replaces rather than a
@@ -4762,22 +4939,18 @@ fn view_results(
                     table class="min-w-full divide-y divide-slate-200 text-left text-sm" {
                         thead {
                             tr {
-                                th scope="col" aria-sort=(sort_aria_state(query, "$id")) class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" {
-                                    a href=(view_sort_url(view, query, "$id", page.limit)) aria-label=(sort_link_label(query, "record ID", "$id")) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
-                                        "ID" span aria-hidden="true" class="text-slate-400" { (sort_indicator(query, "$id")) }
-                                    }
-                                }
-                                @for (field, label) in ACTIVITY_COLUMNS {
+                                // One loop over the three kinds of sortable
+                                // heading — the record id, the two audit
+                                // timestamps and the view's own columns — rather
+                                // than three near-identical blocks, because every
+                                // one of them now needs its position for
+                                // `sort_link_id` and a position is only
+                                // meaningful across the whole row.
+                                @for (index, (field, heading, spoken)) in sortable_headings(columns).iter().enumerate() {
                                     th scope="col" aria-sort=(sort_aria_state(query, field)) class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" {
-                                        a href=(view_sort_url(view, query, field, page.limit)) aria-label=(sort_link_label(query, label, field)) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
-                                            (humanize_field_name(label)) span aria-hidden="true" class="text-slate-400" { (sort_indicator(query, field)) }
-                                        }
-                                    }
-                                }
-                                @for column in columns {
-                                    th scope="col" aria-sort=(sort_aria_state(query, column)) class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" {
-                                        a href=(view_sort_url(view, query, column, page.limit)) aria-label=(sort_link_label(query, &humanize_field_name(column), column)) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
-                                            (column) span aria-hidden="true" class="text-slate-400" { (sort_indicator(query, column)) }
+                                        a id=(sort_link_id(index)) href=(view_sort_url(view, query, field, page.limit)) aria-label=(sort_link_label(query, spoken, field)) class="inline-flex items-center gap-1.5 hover:text-indigo-700"
+                                            hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_FROM_INSIDE) hx-push-url="true" {
+                                            (heading) span aria-hidden="true" class="text-slate-400" { (sort_indicator(query, field)) }
                                         }
                                     }
                                 }
@@ -4821,17 +4994,7 @@ fn view_results(
                     p class="text-slate-600" {
                         "Showing " (first) "–" (last) " of " (page.total)
                     }
-                    div class="flex items-center gap-2" {
-                        @if page.records.is_empty() && page.start > 0 {
-                            a href=(view_page_url(view, query, page.limit, ViewPosition::Start)) class="cr-button" { "First page" }
-                        }
-                        @if let Some(cursor) = page.previous.as_deref() {
-                            a href=(view_page_url(view, query, page.limit, ViewPosition::Before(cursor))) rel="prev" class="cr-button" { "Previous" }
-                        }
-                        @if let Some(cursor) = page.next.as_deref() {
-                            a href=(view_page_url(view, query, page.limit, ViewPosition::After(cursor))) rel="next" class="cr-button" { "Next" }
-                        }
-                    }
+                    (view_pager_links(view, query, page))
                 }
             }
             }
@@ -5014,17 +5177,7 @@ fn render_kanban_board(
             p class="text-slate-600" {
                 "Showing " (first) "–" (last) " of " (page.total)
             }
-            div class="flex items-center gap-2" {
-                @if page.records.is_empty() && page.start > 0 {
-                    a href=(view_page_url(view, query, page.limit, ViewPosition::Start)) class="cr-button" { "First page" }
-                }
-                @if let Some(cursor) = page.previous.as_deref() {
-                    a href=(view_page_url(view, query, page.limit, ViewPosition::Before(cursor))) rel="prev" class="cr-button" { "Previous" }
-                }
-                @if let Some(cursor) = page.next.as_deref() {
-                    a href=(view_page_url(view, query, page.limit, ViewPosition::After(cursor))) rel="next" class="cr-button" { "Next" }
-                }
-            }
+            (view_pager_links(view, query, page))
         }
     }
 }
@@ -5833,6 +5986,13 @@ fn render_record_form(
             }
         }
     };
+    // The one fragment that is deliberately not wrapped by `fragment`. A refused
+    // submission does not move the reader anywhere — `rejected_form_response`
+    // sends `HX-Push-Url: false` precisely so the address bar stays on the form
+    // they are still looking at — so there is no new state for a title to name,
+    // and sending one anyway would make this answer stop being byte for byte the
+    // form the document contains, which is what `tests/record_form_http.rs`
+    // holds it to.
     if representation.wants(RECORD_FORM_REGION) {
         return form_region;
     }
@@ -6657,9 +6817,67 @@ const CONTENT_REGION: &str = "main-content";
 /// One id for both layouts because it names a role rather than a shape — the
 /// part of a view page that turning the page, re-sorting, filtering or
 /// searching replaces, and nothing else — and the search and filter controls
-/// that phase 4 of `.context/htmx-plan.md` points at that role are shared by
-/// both layouts.
+/// that point at that role are shared by both layouts. A Kanban view is paged,
+/// filtered and searched by the same three controls a table is, so answering
+/// them with the board is what makes one id correct rather than convenient.
 const VIEW_TABLE_REGION: &str = "cr-view-table";
+
+/// `VIEW_TABLE_REGION` as the CSS selector an `hx-target` attribute takes.
+///
+/// Derived rather than written out a second time: htmx puts the *id* of the
+/// element it resolved into `HX-Target`, and `Representation::requested` matches
+/// that against `VIEW_TABLE_REGION`, so a selector that drifted from the id
+/// would ask for a region the server does not answer and silently fall back to
+/// whole pages.
+static VIEW_TABLE_TARGET: LazyLock<String> = LazyLock::new(|| format!("#{VIEW_TABLE_REGION}"));
+
+/// `hx-swap` for a control that lives *inside* the results region: replace the
+/// region and put the top of the new rows at the top of the viewport.
+///
+/// Both halves are spelled out because both would otherwise be wrong by
+/// default. A boosted element swaps `innerHTML` unless told otherwise — the
+/// response here is the region including its own root element, so it has to be
+/// `outerHTML` — and `htmx.config.scrollIntoViewOnBoost` already scrolls a
+/// boosted swap's target into view, which is behaviour inherited from the body
+/// swap this replaces rather than a decision about a page turn. Stating
+/// `show:top` makes it the decision it looks like: turning a page or re-sorting
+/// a column changes *which* rows are on screen, and a full reload used to leave
+/// the reader at the top of them.
+const VIEW_TABLE_SWAP_FROM_INSIDE: &str = "outerHTML show:top";
+
+/// `hx-swap` for a control that lives *above* the results region: replace the
+/// region and move nothing.
+///
+/// The filter and search controls sit in the page heading, and an open filter
+/// panel hangs below them. Scrolling the region to the top of the viewport —
+/// which is what `htmx.config.scrollIntoViewOnBoost` would do, because these
+/// requests are still boosted — would push the panel that submitted them off
+/// the top of the screen, and a panel nobody can see is not meaningfully
+/// different from the panel that used to close on every apply.
+const VIEW_TABLE_SWAP_IN_PLACE: &str = "outerHTML show:none";
+
+/// The DOM id of the heading's record-count pill.
+///
+/// Not a region: no request may ask for it, and it is never an answer on its
+/// own. It is the one fact outside `VIEW_TABLE_REGION` that replacing that
+/// region changes, so the results fragment carries the pill beside the region as
+/// an out-of-band swap. Widening the region to include the heading was the
+/// alternative and it defeats the purpose — the filter panel is in the heading,
+/// and re-rendering it is exactly what closes it.
+const VIEW_COUNT_ID: &str = "cr-view-count";
+
+/// The DOM id of the filter disclosure's `<summary>`, the second out-of-band
+/// passenger of a results swap.
+///
+/// The summary is the closed state of the filter panel: the word "Filter" and a
+/// badge counting the conditions currently applied. An apply changes that count
+/// while deliberately leaving the panel itself alone, so the badge is the one
+/// piece of the heading that a targeted apply has to re-render — the reader
+/// closes the panel afterwards and reads it. It is the summary rather than the
+/// badge alone because the badge is absent when no filter is applied, and an
+/// out-of-band element whose target does not exist is dropped, which would make
+/// "two filters" recoverable and "no filters" not.
+const VIEW_FILTER_SUMMARY_ID: &str = "cr-view-filter-summary";
 
 /// The DOM id of the record create and edit form.
 ///
@@ -6762,9 +6980,46 @@ fn page_or_content(
     csrf_token: &str,
 ) -> Markup {
     if representation.wants(CONTENT_REGION) {
-        return content;
+        return fragment(title, content);
     }
     page_layout(title, current_path, views, content, ui, csrf_token)
+}
+
+/// The document title, rendered by the one function both envelopes use.
+///
+/// A whole document states it in `<head>`. A fragment states it as its first
+/// top-level element, which is not decoration: htmx lifts a `<title>` out of a
+/// response fragment, applies it to `document.title` and removes it before
+/// anything is swapped into the page, so the element never reaches the DOM. That
+/// is also the *only* mechanism available — htmx has no title response header, so
+/// unlike the URL (`HX-Push-Url`) a title cannot be corrected out of band.
+fn document_title(title: &str) -> Markup {
+    html! { title { (title) " · cr" } }
+}
+
+/// Wrap a region's markup in the metadata a whole document would have carried.
+///
+/// Today that is the title and nothing else, and the reason to have a function
+/// for it is that the alternative is a promise. A fragment that lands the reader
+/// somewhere new is a page state like any other: the URL it pushed is
+/// bookmarkable and comes back as a document, so the two have to agree about what
+/// the state is called. Sending it from here makes that structural rather than
+/// something each renderer remembers. The exception proves the rule — a refused
+/// record form pushes no URL at all and so goes out unwrapped; see the comment
+/// beside `RECORD_FORM_REGION` in `render_record_form`.
+///
+/// Nothing phase 4 of `.context/htmx-plan.md` swaps actually changes the title:
+/// sorting, filtering, searching and turning a page all stay on the view they
+/// started on, so the title a targeted swap sends is the title the tab already
+/// shows. `main-content`, though, is a region of *every* page, and the first
+/// control that targets it across two pages would otherwise be the commit that
+/// discovers a fragment carries no title — after shipping a tab that names the
+/// page the reader left.
+fn fragment(title: &str, content: Markup) -> Markup {
+    html! {
+        (document_title(title))
+        (content)
+    }
 }
 
 fn page_layout(
@@ -6785,7 +7040,7 @@ fn page_layout(
                 meta name="theme-color" content="#ffffff";
                 meta name="robots" content="noindex, nofollow";
                 link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='1' y='1' width='30' height='30' rx='7' fill='%23fff' stroke='%23d4d4d0'/%3E%3Cpath d='M20.5 20.2c-1.1 1-2.4 1.5-4 1.5-3.5 0-6-2.4-6-5.8s2.5-5.8 6-5.8c1.6 0 3 .5 4 1.5l-1.7 2a3.2 3.2 0 0 0-2.2-.8c-1.8 0-3 1.2-3 3.1s1.2 3.1 3 3.1c.9 0 1.6-.3 2.2-.8l1.7 2z' fill='%23242424'/%3E%3C/svg%3E";
-                title { (title) " · cr" }
+                (document_title(title))
                 script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4" {}
                 // htmx is linked before `cr.js` because `cr.js` configures
                 // it, and two deferred scripts run in document order.
@@ -7890,12 +8145,17 @@ fn html_result(result: ApiResult<Markup>) -> Response {
 ///
 /// Deliberately outside the fragment seam. htmx refuses to swap a non-2xx
 /// response unless something says otherwise, and the two things that do are
-/// both in the `htmx:beforeSwap` listener in `cr.js`: a boosted navigation, so
-/// a click on a link to a deleted record can land on the 404 page the browser
-/// would have shown, and a response carrying `CR-Form-Invalid`, which this page
-/// never does. A targeted request that fails therefore swaps nothing, leaves the
-/// region it asked for as it was, and never has a chance to paste an error page
-/// into a table cell.
+/// both in the `htmx:beforeSwap` listener in `cr.js`: a boosted navigation
+/// replacing the whole body, so a click on a link to a deleted record can land on
+/// the 404 page the browser would have shown, and a response carrying
+/// `CR-Form-Invalid`, which this page never does. A targeted request that fails
+/// therefore swaps nothing, leaves the region it asked for as it was, and never
+/// has a chance to paste an error page into a table cell.
+///
+/// "Replacing the whole body" is load bearing in that sentence and is checked
+/// there rather than assumed: a view's own controls are boosted elements that
+/// override `hx-target`, and htmx keeps calling those requests boosted, so
+/// "boosted" alone stopped meaning "whole page" the moment they did.
 ///
 /// A refused form does not come here at all; `reject_record_form` answers it
 /// with the form and the values that were typed into it. What is left for this

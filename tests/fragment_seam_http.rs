@@ -15,6 +15,17 @@
 //! document the same URL answers a browser with. A second renderer would be a
 //! second place for "what may this principal see" to be decided.
 //!
+//! Phase 4 added one thing to that envelope and one thing beside it, and both
+//! are checked here rather than assumed. Every fragment now leads with a
+//! `<title>` element, because htmx lifts a top-level title out of a response,
+//! applies it to `document.title` and removes it before swapping — it is the only
+//! way a fragment can name the state it produces, and `split_fragment` below is
+//! where this suite accounts for it. A view's results fragment additionally
+//! carries the two heading elements a change of result set changes, marked
+//! `hx-swap-oob`; `tests/targeted_swap_http.rs` owns the assertions about them,
+//! and the property this file keeps is that stripping that marker leaves markup
+//! the document contains verbatim.
+//!
 //! The second is that nothing gets a fragment by accident. A browser address
 //! bar, a `curl`, a feed reader, JavaScript switched off and the rest of this
 //! HTTP suite all send no htmx headers and all still get exactly the page they
@@ -114,9 +125,38 @@ async fn fragment(app: &Router, uri: &str, region: &str) -> TestResponse {
     .await
 }
 
+/// Split a fragment into the title htmx applies to the tab and the markup it
+/// swaps into the page.
+///
+/// A fragment leads with a `<title>` element, which is envelope rather than
+/// content: htmx lifts a top-level title out of a response, sets `document.title`
+/// from it and removes it before swapping anything, so the element never reaches
+/// the DOM. It is there because htmx offers no title response header, so a
+/// fragment that omitted it would leave the tab naming whatever state the reader
+/// was in before — and because the URL a swap pushes is bookmarkable, the tab and
+/// the URL have to agree.
+fn split_fragment(uri: &str, body: &str) -> (String, String) {
+    let (title, rest) = body
+        .strip_prefix("<title>")
+        .and_then(|body| body.split_once("</title>"))
+        .unwrap_or_else(|| panic!("{uri} fragment does not lead with a title element: {body}"));
+    (title.to_owned(), rest.to_owned())
+}
+
+/// The title a whole document states in its `<head>`, so the two envelopes can be
+/// held to naming the same state.
+fn document_title(uri: &str, body: &str) -> String {
+    let (_, rest) = body
+        .split_once("<title>")
+        .unwrap_or_else(|| panic!("{uri} document has no title"));
+    rest.split_once("</title>").unwrap().0.to_owned()
+}
+
 /// A document with no shell around it: the markup below belongs to the page
 /// layout, so a fragment containing any of it would be a fragment that had been
-/// swapped a whole document's worth of furniture into one element.
+/// swapped a whole document's worth of furniture into one element. `<title>` is
+/// in the list because `split_fragment` has already taken the one a fragment is
+/// allowed — a second would be shell that leaked.
 fn assert_is_a_fragment(uri: &str, body: &str) {
     for shell in [
         "<!DOCTYPE",
@@ -185,7 +225,13 @@ async fn a_targeted_request_gets_the_content_region_and_a_browser_gets_the_page_
         assert_eq!(document.status, StatusCode::OK, "{uri}");
         assert_eq!(region.status, document.status, "{uri}");
         assert!(document.body.starts_with("<!DOCTYPE html>"), "{uri}");
-        assert_is_a_fragment(uri, &region.body);
+        let (title, content) = split_fragment(uri, &region.body);
+        assert_is_a_fragment(uri, &content);
+
+        // Both envelopes name the same state, from one renderer. A fragment
+        // cannot be corrected out of band — htmx has no title response header —
+        // so a drift here is a tab that names the page the reader left.
+        assert_eq!(title, document_title(uri, &document.body), "{uri}");
 
         // The load-bearing assertion of this whole phase: the fragment is not a
         // second rendering of the page, it is the contents of the one element
@@ -194,7 +240,7 @@ async fn a_targeted_request_gets_the_content_region_and_a_browser_gets_the_page_
         assert!(
             document
                 .body
-                .contains(&format!("tabindex=\"-1\">{}</main>", region.body)),
+                .contains(&format!("tabindex=\"-1\">{content}</main>")),
             "{uri} fragment is not exactly the content of <main>"
         );
 
@@ -222,18 +268,18 @@ async fn a_view_answers_its_results_region_without_the_controls_that_surround_it
     // that stays open across an apply.
     let table = fragment(&app, "/deals", VIEW_TABLE_REGION).await;
     assert_eq!(table.status, StatusCode::OK);
-    assert_is_a_fragment("/deals", &table.body);
+    let (_, table_content) = split_fragment("/deals", &table.body);
+    let table_region = results_region(&table_content);
+    assert_is_a_fragment("/deals", table_region);
     assert!(
-        table
-            .body
-            .starts_with(&format!("<div id=\"{VIEW_TABLE_REGION}\">")),
+        table_region.starts_with(&format!("<div id=\"{VIEW_TABLE_REGION}\">")),
         "results fragment is not rooted at the region it replaces: {}",
-        &table.body[..table.body.len().min(120)]
+        &table_region[..table_region.len().min(120)]
     );
-    assert!(table.body.ends_with("</div>"));
-    assert!(table.body.contains("cr-table-shell"));
-    assert!(table.body.contains("/deals/records/alpha"));
-    assert!(table.body.contains("Showing 1–2 of 2"));
+    assert!(table_region.ends_with("</div>"));
+    assert!(table_region.contains("cr-table-shell"));
+    assert!(table_region.contains("/deals/records/alpha"));
+    assert!(table_region.contains("Showing 1–2 of 2"));
     for surrounding in [
         "cr-page-heading",
         "data-filter-builder",
@@ -242,7 +288,7 @@ async fn a_view_answers_its_results_region_without_the_controls_that_surround_it
         "Breadcrumb",
     ] {
         assert!(
-            !table.body.contains(surrounding),
+            !table_region.contains(surrounding),
             "results fragment carries a control from outside the region: {surrounding}"
         );
     }
@@ -252,21 +298,40 @@ async fn a_view_answers_its_results_region_without_the_controls_that_surround_it
     // results — the grouping caption and the board — rather than with nothing.
     let board = fragment(&app, "/pipeline", VIEW_TABLE_REGION).await;
     assert_eq!(board.status, StatusCode::OK);
-    assert_is_a_fragment("/pipeline", &board.body);
-    assert!(board.body.contains("data-kanban-board"));
-    assert!(board.body.contains("data-kanban-lane"));
-    assert!(!board.body.contains("data-filter-builder"));
+    let (_, board_content) = split_fragment("/pipeline", &board.body);
+    let board_region = results_region(&board_content);
+    assert_is_a_fragment("/pipeline", board_region);
+    assert!(board_region.contains("data-kanban-board"));
+    assert!(board_region.contains("data-kanban-lane"));
+    assert!(!board_region.contains("data-filter-builder"));
 
     // Both are regions of the page a browser gets, and the results region is
     // inside the content region, so each fragment is a substring of the larger
     // answer. That is what makes "same handler, same data, two envelopes" a
     // property rather than a description.
     let content = fragment(&app, "/deals", CONTENT_REGION).await;
+    let (_, content_markup) = split_fragment("/deals", &content.body);
     let document = get(&app, "/deals", &[]).await;
-    assert!(content.body.contains(&table.body));
-    assert!(document.body.contains(&table.body));
-    assert!(document.body.len() > content.body.len());
-    assert!(content.body.len() > table.body.len());
+    assert!(content_markup.contains(table_region));
+    assert!(document.body.contains(table_region));
+    assert!(document.body.len() > content_markup.len());
+    assert!(content_markup.len() > table_region.len());
+}
+
+/// The results region of a results fragment, without the out-of-band elements
+/// that travel behind it.
+///
+/// A swap of the region changes two things the heading states — the record count
+/// and the badge counting applied filters — so the answer carries both, marked for
+/// htmx to patch into place by id. They are the only markup in the fragment that
+/// is not the region, they come after it, and each of them is the document's own
+/// element with `hx-swap-oob="true"` added; `tests/targeted_swap_http.rs` asserts
+/// that relationship. Here they are only in the way.
+fn results_region(content: &str) -> &str {
+    content
+        .split_once(" hx-swap-oob=\"true\"")
+        .map(|(before, _)| before.rsplit_once('<').expect("an element to patch").0)
+        .unwrap_or(content)
 }
 
 #[tokio::test]
@@ -438,15 +503,16 @@ async fn the_seam_survives_access_control_without_widening_what_a_perspective_se
     // so the perspective banner and the users link are decided in one place.
     let region = fragment(&app, "/", CONTENT_REGION).await;
     assert_eq!(region.status, StatusCode::OK);
-    assert_is_a_fragment("/", &region.body);
+    let (_, content) = split_fragment("/", &region.body);
+    assert_is_a_fragment("/", &content);
     assert!(
         document
             .body
-            .contains(&format!("tabindex=\"-1\">{}</main>", region.body))
+            .contains(&format!("tabindex=\"-1\">{content}</main>"))
     );
     // The sidebar is shell, so the perspective switcher it carries is not in
     // the fragment. Phase 4 targets regions, not the shell, which is why that
     // is the correct answer rather than a gap.
     assert!(document.body.contains("aria-label=\"View as user\""));
-    assert!(!region.body.contains("aria-label=\"View as user\""));
+    assert!(!content.contains("aria-label=\"View as user\""));
 }
