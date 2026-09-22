@@ -25,6 +25,13 @@
 // would come back from that snapshot claiming elements are bound when their
 // listeners died with the old document, which is the same bug one layer
 // deeper. The WeakSet instead lets the entries go when the nodes do.
+//
+// Targeted swaps make that distinction load bearing rather than merely tidy.
+// Turning a page on a Kanban view replaces the board, which needs its drop
+// handlers bound again, while leaving the filter panel's nodes exactly where they
+// were — the whole point of swapping a region — so the panel must keep the
+// listeners it has and must not be handed out a second time. `claim` decides both
+// from one fact: whether this particular node has been seen before.
 const enhanced = new WeakSet();
 
 // True the first time it is asked about an element, false forever after, and
@@ -284,6 +291,15 @@ if (window.htmx) {
 // whether to push history before this event and applies it only if the swap
 // happens.
 //
+// "Boosted" is not on its own enough to identify that case, which is why the
+// target is checked as well. A view's pagination, sort, filter and search
+// controls are boosted elements that override `hx-target` to replace the results
+// region alone, and htmx still reports those requests as boosted; without the
+// second condition a failed re-sort would paste a whole rendered error document —
+// doctype, sidebar and all — inside the table it was supposed to replace. htmx
+// resolves a boosted element with no `hx-target` to `<body>`, so comparing
+// against it is the same test htmx itself used to pick the target.
+//
 // The second is a refused form submission. The server answers one with the form
 // itself: the same values, escaped, in the controls they were typed into, with
 // the reason at the top and beside each field the schema located. Its status is
@@ -294,9 +310,9 @@ if (window.htmx) {
 // that header, which makes this clause as narrow as the one above it: every
 // other failed request still swaps nothing and leaves the page as it was.
 document.addEventListener('htmx:beforeSwap', (event) => {
-  const { boosted, requestConfig, xhr } = event.detail;
+  const { boosted, requestConfig, target, xhr } = event.detail;
   const isHtml = (xhr.getResponseHeader('content-type') || '').startsWith('text/html');
-  if (boosted && requestConfig.verb === 'get' && xhr.status >= 400 && isHtml) {
+  if (boosted && target === document.body && requestConfig.verb === 'get' && xhr.status >= 400 && isHtml) {
     event.detail.shouldSwap = true;
   }
   if (isHtml && xhr.getResponseHeader('CR-Form-Invalid') === 'true') {

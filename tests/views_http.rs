@@ -218,10 +218,16 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(automatic.text().contains("data-filter-builder=\"true\""));
     assert!(automatic.text().contains("data-view-search=\"true\""));
     assert!(automatic.text().contains("aria-label=\"Submit search\""));
+    assert!(automatic.text().contains("data-filter-disclosure=\"true\""));
+    // The applied-condition count states itself on the disclosure's `<summary>`
+    // rather than on the `<details>` around it, because the summary is the one
+    // element of the filter panel a targeted apply re-renders — see
+    // `tests/targeted_swap_http.rs`. An attribute on the `<details>` would be
+    // describing a count it could no longer be corrected to.
     assert!(
         automatic
             .text()
-            .contains("data-filter-disclosure=\"true\" data-active-filters=\"0\"")
+            .contains("id=\"cr-view-filter-summary\" data-active-filters=\"0\"")
     );
     assert!(automatic.text().contains("data-filter-panel=\"true\""));
     let search_position = automatic.text().find("data-view-search=\"true\"").unwrap();
@@ -597,7 +603,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(
         greater_than
             .text()
-            .contains("data-filter-disclosure=\"true\" data-active-filters=\"1\"")
+            .contains("id=\"cr-view-filter-summary\" data-active-filters=\"1\"")
     );
     assert!(greater_than.text().contains("value=\"gt\" selected"));
     assert!(greater_than.text().contains("alpha"));
