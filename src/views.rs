@@ -31,6 +31,7 @@ const MAX_VIEW_GROUP_EXPRESSIONS: usize = 20;
 const RESERVED_VIEW_NAMES: &[&str] = &[
     "api",
     "audit",
+    "browse",
     "health",
     "openapi.json",
     "perspective",
@@ -584,6 +585,13 @@ mod tests {
         assert!(
             database
                 .create_view("audit", None, "deals", vec![], vec![], 50)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+        assert!(
+            database
+                .create_view("browse", None, "deals", vec![], vec![], 50)
                 .unwrap_err()
                 .to_string()
                 .contains("reserved")

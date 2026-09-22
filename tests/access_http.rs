@@ -251,6 +251,9 @@ async fn internal_user_records_are_readable_without_any_web_mutation() {
     assert!(!owner.text().contains("Save changes"));
     assert!(!owner.text().contains("Delete this record"));
     assert!(!owner.text().contains("href=\"/users/records"));
+    let owner_files = request(&app, Method::GET, "/browse", None, None, &[]).await;
+    assert_eq!(owner_files.status, StatusCode::OK, "{}", owner_files.text());
+    assert!(owner_files.text().contains("Filesystem browser"));
 
     // `users` is not a view, so the record routes never reach it.
     let record = request(
@@ -293,6 +296,7 @@ async fn internal_user_records_are_readable_without_any_web_mutation() {
     .await;
     assert_eq!(editor_home.status, StatusCode::OK);
     assert!(!editor_home.text().contains("href=\"/users\""));
+    assert!(!editor_home.text().contains("href=\"/browse\""));
     let editor_users = request(
         &app,
         Method::GET,
@@ -303,6 +307,16 @@ async fn internal_user_records_are_readable_without_any_web_mutation() {
     )
     .await;
     assert_eq!(editor_users.status, StatusCode::FORBIDDEN);
+    let editor_files = request(
+        &app,
+        Method::GET,
+        "/browse",
+        None,
+        None,
+        &[("cookie", &editor_cookie)],
+    )
+    .await;
+    assert_eq!(editor_files.status, StatusCode::FORBIDDEN);
 
     database
         .grant_access(
@@ -322,6 +336,16 @@ async fn internal_user_records_are_readable_without_any_web_mutation() {
     .await;
     assert_eq!(managed.status, StatusCode::OK, "{}", managed.text());
     assert!(managed.text().contains("reader@example.com"));
+    let manager_files = request(
+        &app,
+        Method::GET,
+        "/browse",
+        None,
+        None,
+        &[("cookie", &editor_cookie)],
+    )
+    .await;
+    assert_eq!(manager_files.status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

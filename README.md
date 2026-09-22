@@ -1766,6 +1766,38 @@ owners and access managers—and `/users` itself answers `403 Forbidden` to
 anyone else. Without RBAC the page stays reachable but unlinked, and explains
 that `cr access init` bootstraps the registry.
 
+### Browse server files
+
+Database owners also get **Browse** immediately after **Users** under
+**Internal**:
+
+```text
+http://127.0.0.1:3000/browse
+```
+
+It is a read-only fallback for inspecting files that are not CR records. The
+first page is the canonical database root and lists every visible entry,
+including dotfiles, with directories first. Open a directory to continue
+browsing, open a regular file for an escaped text preview (or a hexadecimal
+binary preview), and use the `..` row to move above the database until reaching
+the filesystem root. Symbolic links are identified in listings and resolve to
+their canonical target when opened. Devices, sockets, and named pipes are not
+opened. Text previews stop after 1 MiB and binary previews after 4 KiB, so this
+page is an inspector rather than a bulk-download endpoint.
+
+The route is deliberately stricter than the users registry. It is only enabled
+when RBAC is active, only a database-owner perspective sees its navigation
+entry, and a direct request from an editor or access manager receives `403
+Forbidden`. Without RBAC it is unlinked and returns `404 Not Found`, because a
+local process with no principal registry cannot prove that a requester is an
+administrator. Every response remains `no-store`, and the route supports only
+`GET`; it has no create, upload, rename, edit, or delete operation.
+
+**Browse can reveal every secret readable by the operating-system account that
+runs `cr serve`, including files outside the database.** Keep the RBAC console
+on its enforced loopback bind and do not treat read-only access as a reason to
+weaken the host, reverse-proxy, or bearer-token boundary.
+
 ### Use schema-driven record forms
 
 When a collection has a JSON Schema, create and edit pages generate one control per declared top-level attribute:
