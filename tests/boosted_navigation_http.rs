@@ -6,13 +6,14 @@
 //! entirely a client-side change, and these tests exist to keep it one.
 //!
 //! Two properties are load bearing. The first is that the opt-outs are where
-//! they have to be: every mutating form and every link that leaves the HTML UI
-//! for a JSON representation says `hx-boost="false"`, because htmx would change
-//! how a `303` or a rendered error page behaves and phase 3 of
-//! `.context/htmx-plan.md` is where that contract is redesigned. The second is
-//! that a boosted navigation is still a request for a whole document: htmx
-//! swaps the response into `<body>`, so anything less than a document would
-//! leave the page without its shell.
+//! they have to be: every link that leaves the HTML UI for a JSON representation
+//! says `hx-boost="false"`, and so does every mutating form whose answers htmx
+//! cannot act on. Phase 3 of `.context/htmx-plan.md` gave the record form both
+//! answers it needs — `204` with `HX-Location` on success, the form itself on a
+//! refusal — so that one form is boosted and is asserted here to carry the whole
+//! contract rather than half of it. The second is that a boosted navigation is
+//! still a request for a whole document: htmx swaps the response into `<body>`,
+//! so anything less than a document would leave the page without its shell.
 //!
 //! That second property used to be stated as "an htmx request and a plain
 //! browser request get byte-identical answers", because phase 1 gave the server
@@ -156,21 +157,34 @@ async fn every_page_boosts_its_body_and_renders_the_progress_indicator() {
 }
 
 #[tokio::test]
-async fn every_mutating_form_stays_a_native_browser_submission() {
+async fn every_mutating_form_is_native_or_carries_the_boosted_contract() {
     let (_temporary, database) = database_with_a_board("boost-forms");
     let app = router(database, ServerConfig::default()).unwrap();
 
+    let mut boosted_forms = 0;
     for uri in PAGES {
         let (_, html) = get(&app, uri, &[]).await;
         for tag in tags(&html, "form") {
-            // A `POST` answers `303 See Other`, or a rendered error page with a
-            // non-2xx status that htmx would refuse to swap. Neither shape is
-            // something htmx can act on until phase 3 redefines it, so every
-            // mutation is left to the browser exactly as it behaves today.
-            if tag.contains(r#"method="post""#) {
+            // A mutation is either left to the browser or given every part of
+            // the contract that makes boosting it safe. The record form has
+            // that contract: it targets itself, so a refusal comes back as the
+            // form rather than being swapped into `<body>`, and it disables its
+            // submit button for the life of the request, because an HTML form
+            // post is deliberately outside the `Idempotency-Key` contract and
+            // two clicks would otherwise be two writes.
+            if tag.contains(r#"method="post""#) && !tag.contains(r#"hx-boost="false""#) {
+                boosted_forms += 1;
                 assert!(
-                    tag.contains(r#"hx-boost="false""#),
-                    "{uri} boosts a mutating form: {tag}"
+                    tag.contains(r#"id="cr-record-form""#),
+                    "{uri} boosts a mutating form that is not the record form: {tag}"
+                );
+                assert!(
+                    tag.contains(r#"hx-target="this""#) && tag.contains(r#"hx-swap="outerHTML""#),
+                    "{uri} boosts the record form without targeting it: {tag}"
+                );
+                assert!(
+                    tag.contains(r#"hx-disabled-elt="find button[type=submit]""#),
+                    "{uri} boosts the record form without disabling its submit button: {tag}"
                 );
             }
             // The read-only forms are the opposite case, and the reason the
@@ -185,6 +199,12 @@ async fn every_mutating_form_stays_a_native_browser_submission() {
             }
         }
     }
+
+    // The create form and the edit form, and nothing else on these pages.
+    assert_eq!(
+        boosted_forms, 2,
+        "expected exactly the create and edit record forms to be boosted"
+    );
 
     // Both ways of moving a Kanban card are the same native POST: the drop
     // handler in `cr.js` builds and submits a form, and `form.submit()` fires no

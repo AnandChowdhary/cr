@@ -38,9 +38,9 @@ use crate::{
     AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
     AuditIntentPart, AuditSource, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary,
     CollectionModel, Database, DomainError, FilterExpression, FilterOperator, Finding,
-    RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SearchQuery, SearchTarget,
-    SortDirection, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout,
-    ViewPredicateMatch, audit::AuditChange, sort_records_by_field,
+    RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SchemaViolation, SearchQuery,
+    SearchTarget, SortDirection, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup,
+    ViewLayout, ViewPredicateMatch, audit::AuditChange, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -562,7 +562,13 @@ struct AuditViewQuery {
     offset: Option<usize>,
 }
 
-#[derive(Debug)]
+/// One submitted record form, exactly as the browser sent it.
+///
+/// Every text field is the submitted string and not a value parsed out of it,
+/// which is what lets a refused submission be answered with the user's own text:
+/// re-rendering a reparsed round trip would quietly normalise `1.50` to `1.5`,
+/// reorder a YAML mapping, and drop a comment somebody wrote in the front matter.
+#[derive(Clone, Debug)]
 struct HtmlDocumentForm {
     csrf: String,
     expected_record_hash: Option<String>,
@@ -581,6 +587,13 @@ struct SchemaFormField {
     description: Option<String>,
     required: bool,
     value: Option<YamlValue>,
+    /// What the browser sent for this field, verbatim, when the form is being
+    /// re-rendered after a refusal; `None` on a first render, which is the only
+    /// time `value` is what the controls should show. A field with no submitted
+    /// values is `Some(empty)` rather than `None`: a checkbox group with nothing
+    /// ticked sends nothing, and coming back with the stored list ticked again
+    /// would silently undo what the user did.
+    submitted: Option<Vec<String>>,
     kind: SchemaFieldKind,
 }
 
@@ -804,6 +817,16 @@ struct ApiError {
     code: &'static str,
     message: String,
     detail: Option<anyhow::Error>,
+    /// The submitted field this failure is about, when it is about one.
+    ///
+    /// Only the HTML form re-render reads it, to show the message beside the
+    /// control the value was typed into instead of only at the top of the page.
+    /// It is a hint about presentation and never about classification: `status`
+    /// and `code` decide the answer, and a failure that names no field is
+    /// answered exactly as it was before this field existed. The JSON envelope
+    /// deliberately ignores it — giving the API a field-level error shape is a
+    /// contract of its own, not a side effect of improving a form.
+    field: Option<String>,
 }
 
 /// An error after logging and redaction, shared by the JSON and HTML renderers.
@@ -833,11 +856,22 @@ impl ApiError {
             code,
             message: message.into(),
             detail: None,
+            field: None,
         }
     }
 
     fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, code, message)
+    }
+
+    /// Record which submitted field this failure is about. Called where the
+    /// field is known — the parser that rejected a value, or the one route that
+    /// can tell a taken record ID from any other conflict — because that is the
+    /// only place that knows, and nothing downstream can work it back out of a
+    /// sentence.
+    fn with_field(mut self, field: impl Into<String>) -> Self {
+        self.field = Some(field.into());
+        self
     }
 
     fn unprocessable(message: impl Into<String>) -> Self {
@@ -855,6 +889,7 @@ impl ApiError {
             code: "internal_error",
             message: INTERNAL_MESSAGE.to_owned(),
             detail: Some(error),
+            field: None,
         }
     }
 
@@ -883,6 +918,7 @@ impl ApiError {
             code,
             message,
             detail: Some(error),
+            field: None,
         }
     }
 
@@ -1264,32 +1300,36 @@ static HTMX_SCRIPT_PATH: LazyLock<String> =
 /// UI for a raw representation, which is exactly what the `↗` beside them
 /// promises.
 ///
-/// The second is every mutating form: record create and edit, record delete,
-/// save-as-view, the Kanban move form, and the perspective switcher. Boosting
-/// them would change how a mutation answers, and phase 3 of
-/// `.context/htmx-plan.md` is where that contract is redesigned; until then
-/// they submit natively, which is precisely how they behave today. Three
-/// concrete things would break if they did not:
+/// The second is a mutating form whose two possible answers are not yet shapes
+/// htmx can act on. A boosted form needs both: a success it can turn into a
+/// navigation, and a refusal it can show. The record create and edit form now
+/// has both — `204` with `HX-Location` (see `mutation_redirect`) and the
+/// re-rendered form itself (see `reject_record_form`) — and is therefore boosted
+/// like the rest of the page. The remaining three keep the attribute, each for a
+/// reason of its own:
 ///
-/// * htmx does not swap a non-2xx response, and a rejected create or update is
-///   today a rendered error page, so a validation failure would become a submit
-///   button that visibly does nothing. Phase 3 answers 422 with the re-rendered
-///   form instead.
-/// * The delete form's confirmation is an `onsubmit` handler. Returning false
-///   from it cancels the browser's submit, but htmx's own submit listener does
-///   not consult `defaultPrevented`, so under boost a declined confirmation
-///   would still delete the record. Phase 3 replaces it with `hx-confirm`.
-/// * A mutation answers `303 See Other` to an idempotent `GET`. An
-///   `XMLHttpRequest` follows that redirect invisibly, so htmx would swap the
-///   right page in while pushing the *posted* path — `/perspective`, say — into
-///   the address bar. Phase 3 answers `HX-Location` instead, which htmx can
-///   turn into a correct URL.
+/// * The **delete** form's confirmation is an `onsubmit` handler. Returning
+///   false from it cancels the browser's submit, but htmx's own submit listener
+///   does not consult `defaultPrevented`, so under boost a declined confirmation
+///   would still delete the record. It stays native until `hx-confirm` replaces
+///   the handler, which is phase 5 of `.context/htmx-plan.md`.
+/// * The **save-as-view** form answers a refusal — a name already taken, a
+///   Kanban layout with no grouping field — with a rendered error page, which is
+///   a whole document and not a form. Boosting it would turn those refusals into
+///   a button that visibly does nothing. It is a different form with different
+///   fields, so giving it this phase's treatment is its own change rather than a
+///   side effect of this one.
+/// * The **Kanban move** form has no fields to preserve and its drag-and-drop
+///   equivalent in `cr.js` submits a form it builds itself with `form.submit()`,
+///   which fires no submit event and so is never boosted. Leaving the rendered
+///   form native keeps both ways of moving a card behaving identically; phase 4
+///   swaps the board region and is where that changes.
 ///
-/// The perspective form is the one case where the attribute is belt and braces
-/// rather than load bearing: its `<select>` calls `form.submit()`, which fires
-/// no submit event, so htmx would never see it regardless. It is marked anyway
-/// so that the opt-out is a decision on the page rather than an accident of how
-/// that one control happens to submit.
+/// The **perspective** form is the one case where the attribute is belt and
+/// braces rather than load bearing: its `<select>` calls `form.submit()`, which
+/// fires no submit event, so htmx would never see it regardless. It is marked
+/// anyway so that the opt-out is a decision on the page rather than an accident
+/// of how that one control happens to submit.
 const UNBOOSTED: &str = "false";
 
 /// Serve one of the embedded UI assets.
@@ -1733,12 +1773,14 @@ fn browse_io_error(error: io::Error, context: &'static str) -> ApiError {
             code: "filesystem_not_found",
             message: "the requested filesystem location does not exist".to_owned(),
             detail: Some(detail),
+            field: None,
         },
         io::ErrorKind::PermissionDenied => ApiError {
             status: StatusCode::FORBIDDEN,
             code: "filesystem_permission_denied",
             message: "the CR server process cannot read this filesystem location".to_owned(),
             detail: Some(detail),
+            field: None,
         },
         _ => ApiError::internal(detail),
     }
@@ -2071,14 +2113,26 @@ async fn create_record_form(
     Path(view_name): Path<String>,
     RawForm(raw): RawForm,
 ) -> Response {
+    // A body that is not the form this server rendered — a field it never emits,
+    // one it emits twice, no `markdown` at all — is a broken or tampering client
+    // rather than somebody's typing, and there is nothing to preserve because
+    // nothing in it says what was typed. Every refusal after this point is
+    // answered with the form itself.
+    let form = match parse_document_form(&raw) {
+        Ok(form) => form,
+        Err(error) => return html_error(error),
+    };
+    let submitted = form.clone();
     let result: ApiResult<Response> = async {
-        let form = parse_document_form(&raw)?;
         verify_csrf(&state, &form.csrf)?;
         let id = form
             .id
             .as_deref()
             .filter(|id| !id.is_empty())
-            .ok_or_else(|| ApiError::bad_request("invalid_form", "record ID cannot be empty"))?
+            .ok_or_else(|| {
+                ApiError::bad_request("invalid_form", "record ID cannot be empty")
+                    .with_field(ID_CONTROL)
+            })?
             .to_owned();
         let requested_view = view_name.clone();
         let (view, schema) = run_database(&state, &headers, move |database| {
@@ -2093,11 +2147,30 @@ async fn create_record_form(
         run_database(&state, &headers, move |database| {
             database.create_record(&collection, &id, attributes, &markdown)
         })
-        .await?;
-        see_other(&notice_url(&view_name, "Record created"))
+        .await
+        .map_err(taken_record_id)?;
+        mutation_redirect(
+            &Representation::requested(&headers),
+            &notice_url(&view_name, "Record created"),
+        )
     }
     .await;
-    result.unwrap_or_else(html_error)
+    match result {
+        Ok(response) => response,
+        Err(error) => {
+            reject_record_form(&state, &headers, &view_name, None, submitted, error).await
+        }
+    }
+}
+
+/// A creation refused because that identity is taken is about the record ID, the
+/// one field on a create form no collection schema describes. The classification
+/// is the stable domain code, never the message text.
+fn taken_record_id(error: ApiError) -> ApiError {
+    if error.code == DomainError::AlreadyExists(String::new()).code() {
+        return error.with_field(ID_CONTROL);
+    }
+    error
 }
 
 async fn update_record_form(
@@ -2106,8 +2179,13 @@ async fn update_record_form(
     Path((view_name, id)): Path<(String, String)>,
     RawForm(raw): RawForm,
 ) -> Response {
+    let form = match parse_document_form(&raw) {
+        Ok(form) => form,
+        Err(error) => return html_error(error),
+    };
+    let submitted = form.clone();
+    let record_id = id.clone();
     let result: ApiResult<Response> = async {
-        let form = parse_document_form(&raw)?;
         verify_csrf(&state, &form.csrf)?;
         if form.id.is_some() {
             return Err(ApiError::bad_request(
@@ -2139,10 +2217,181 @@ async fn update_record_form(
             )
         })
         .await?;
-        see_other(&notice_url(&view_name, "Record updated"))
+        mutation_redirect(
+            &Representation::requested(&headers),
+            &notice_url(&view_name, "Record updated"),
+        )
     }
     .await;
-    result.unwrap_or_else(html_error)
+    match result {
+        Ok(response) => response,
+        Err(error) => {
+            reject_record_form(
+                &state,
+                &headers,
+                &view_name,
+                Some(&record_id),
+                submitted,
+                error,
+            )
+            .await
+        }
+    }
+}
+
+/// Everything a re-rendered record form needs that the submission itself does
+/// not carry, read in one pass so a refusal costs one trip to the database.
+struct RecordFormContext {
+    view: ViewDefinition,
+    record: Option<Record>,
+    audit_entries: Vec<AuditEntry>,
+    schema: Option<JsonValue>,
+    navigation: Vec<ViewDefinition>,
+    permissions: RecordPermissions,
+    violations: Vec<SchemaViolation>,
+    ui: Option<UiContext>,
+}
+
+/// Answer a refused submission with the form the user is still looking at.
+///
+/// The point of the phase: a rejected write used to become the generic error
+/// page, which meant navigating back to recover — and browsers do not reliably
+/// restore a `<textarea>` full of typed YAML, so "navigate back" often meant
+/// "type it again". The same values come back instead, escaped, in the controls
+/// they were typed into, with the reason at the top and, where the schema locates
+/// it, beside the field it is about.
+///
+/// The status is the status of the refusal, not a fixed one: `422` for a schema
+/// violation, `412` for a record that changed underneath the form, `409` for an
+/// identity already taken, `400` for YAML that does not parse. Each is what the
+/// API answers for the same failure, and a browser without JavaScript sees the
+/// same page and the same status a plain `POST` has always received — only with
+/// the form filled in.
+async fn reject_record_form(
+    state: &AppState,
+    headers: &HeaderMap,
+    view_name: &str,
+    id: Option<&str>,
+    submitted: HtmlDocumentForm,
+    error: ApiError,
+) -> Response {
+    // An internal failure is not a rejected form: nothing that was typed is
+    // wrong, the message is deliberately generic, and the very data a form needs
+    // to re-render may be what could not be read. That keeps the error page.
+    if error.status.is_server_error() {
+        return html_error(error);
+    }
+    let error_field = error.field.clone();
+    let requested_view = view_name.to_owned();
+    let requested_id = id.map(str::to_owned);
+    let form = submitted.clone();
+    let loaded: ApiResult<RecordFormContext> = async {
+        let context = run_database(state, headers, move |database| {
+            let view = database.view(&requested_view)?;
+            let schema = collection_schema(database, &view.collection)?;
+            let navigation = database.views()?;
+            let (record, audit_entries, permissions) = match &requested_id {
+                Some(id) => {
+                    let record = database.get(&view.collection, id)?;
+                    let audit_entries = database.audit_recent(
+                        DEFAULT_PAGE_SIZE,
+                        AuditFilter::record(&view.collection, id),
+                    )?;
+                    let resource = AccessResource::record(&view.collection, &record.id);
+                    let permissions = RecordPermissions {
+                        update: database.access_allowed(AccessAction::Update, &resource)?,
+                        delete: database.access_allowed(AccessAction::Delete, &resource)?,
+                    };
+                    (Some(record), audit_entries, permissions)
+                }
+                // A refused creation renders the same form a refused edit does,
+                // so it answers the same question about permission: a principal
+                // who may not create here gets their text back in a form they
+                // cannot submit, rather than a button that will refuse again.
+                None => (
+                    None,
+                    Vec::new(),
+                    RecordPermissions {
+                        update: can_create_in_collection(database, &view.collection)?,
+                        delete: false,
+                    },
+                ),
+            };
+            // Field-level diagnostics explain a refusal that already has a
+            // message, so an explanation that cannot be produced is simply
+            // absent: deriving the attributes again is how the schema is asked
+            // which field each violation is about, and if that derivation is
+            // itself what failed, the failure already names its own field.
+            let violations = document_form_attributes(&form, schema.as_ref())
+                .ok()
+                .and_then(|attributes| {
+                    database
+                        .schema_violations(&view.collection, &attributes)
+                        .ok()
+                })
+                .unwrap_or_default();
+            Ok((
+                view,
+                record,
+                audit_entries,
+                schema,
+                navigation,
+                permissions,
+                violations,
+            ))
+        })
+        .await?;
+        let (view, record, audit_entries, schema, navigation, permissions, violations) = context;
+        Ok(RecordFormContext {
+            view,
+            record,
+            audit_entries,
+            schema,
+            navigation,
+            permissions,
+            violations,
+            ui: ui_context(state, headers).await?,
+        })
+    }
+    .await;
+    let context = match loaded {
+        Ok(context) => context,
+        Err(secondary) => {
+            // The form cannot be re-rendered, so answer with the failure that
+            // refused the write rather than the one that refused to describe it.
+            // `publish` is what writes the second failure to the log, under its
+            // own request ID, so it is not lost by being answered with the first.
+            secondary.publish();
+            return html_error(error);
+        }
+    };
+    let published = error.publish();
+    let fields = record_form_diagnostics(
+        &submitted,
+        context.schema.as_ref(),
+        &published,
+        error_field.as_deref(),
+        &context.violations,
+    );
+    let status = published.status;
+    let rejection = RecordFormRejection {
+        error: published,
+        fields,
+        submitted,
+    };
+    let markup = render_record_form(
+        &Representation::requested(headers),
+        &context.view,
+        context.record.as_ref(),
+        &context.audit_entries,
+        context.schema.as_ref(),
+        &state.csrf_token,
+        Some(&rejection),
+        &context.navigation,
+        context.ui.as_ref(),
+        context.permissions,
+    );
+    rejected_form_response(status, markup)
 }
 
 async fn move_kanban_card(
@@ -4947,6 +5196,7 @@ fn schema_form_fields(schema: &JsonValue, attributes: &Mapping) -> Option<Vec<Sc
                 .map(str::to_owned),
             required: required.contains(key.as_str()),
             value: attributes.get(YamlValue::String(key.clone())).cloned(),
+            submitted: None,
             kind: schema_field_kind(definition),
         })
         .collect::<Vec<_>>();
@@ -5083,12 +5333,80 @@ fn field_text_value(value: Option<&YamlValue>) -> String {
     }
 }
 
-fn render_schema_field(field: &SchemaFormField) -> Markup {
+/// What a single-valued control shows: the submitted text when this is a
+/// re-render, and otherwise the stored value written out for display.
+fn field_control_text(field: &SchemaFormField) -> String {
+    match &field.submitted {
+        Some(values) => values.first().cloned().unwrap_or_default(),
+        None => field_text_value(field.value.as_ref()),
+    }
+}
+
+/// The same, for the structured-YAML textarea, whose stored rendering is YAML
+/// rather than a bare string.
+fn field_yaml_text(field: &SchemaFormField) -> String {
+    match &field.submitted {
+        Some(values) => values.first().cloned().unwrap_or_default(),
+        None => field
+            .value
+            .as_ref()
+            .map(serialize_yaml_value)
+            .unwrap_or_default(),
+    }
+}
+
+/// Whether a select or checkbox option is the one the form shows as chosen.
+///
+/// A re-render compares the option's submitted text, because that is the only
+/// thing the browser sent back and the submitted text is what the user chose. A
+/// first render compares the stored value, so an enum of numbers or tagged
+/// values keeps matching by value rather than by however YAML printed it.
+fn option_is_chosen(field: &SchemaFormField, option: &YamlValue) -> bool {
+    if let Some(values) = &field.submitted {
+        return values
+            .iter()
+            .any(|value| *value == serialize_yaml_value(option));
+    }
+    match (&field.kind, &field.value) {
+        (SchemaFieldKind::MultiSelect(_), Some(YamlValue::Sequence(values))) => {
+            values.contains(option)
+        }
+        (SchemaFieldKind::MultiSelect(_), _) => false,
+        (_, value) => value.as_ref() == Some(option),
+    }
+}
+
+/// Whether the form shows this field as having no value, which selects the blank
+/// option of a `<select>`. A submitted field is unset when the browser sent
+/// nothing for it or sent only the blank option's empty value.
+fn field_is_unset(field: &SchemaFormField) -> bool {
+    match &field.submitted {
+        Some(values) => values.iter().all(|value| value.is_empty()),
+        None => field.value.is_none(),
+    }
+}
+
+fn render_schema_field(field: &SchemaFormField, diagnostics: &[String]) -> Markup {
     let name = format!("attribute.{}", field.key);
     let wide = schema_field_is_wide(&field.kind);
-    let current = field.value.as_ref();
+    let unset = field_is_unset(field);
+    // Maud writes an attribute with a `[…]` value only when the option is
+    // `Some`, so a field nothing was said about carries no `aria-invalid` at all
+    // rather than carrying `aria-invalid="false"`.
+    let invalid = (!diagnostics.is_empty()).then_some("true");
+    let field_class = if diagnostics.is_empty() {
+        if wide {
+            "cr-field p-4 sm:col-span-2"
+        } else {
+            "cr-field p-4"
+        }
+    } else if wide {
+        "cr-field cr-field-invalid p-4 sm:col-span-2"
+    } else {
+        "cr-field cr-field-invalid p-4"
+    };
     html! {
-        div class=(if wide { "cr-field p-4 sm:col-span-2" } else { "cr-field p-4" }) {
+        div class=(field_class) {
             div class="mb-2 flex items-start justify-between gap-3" {
                 label for=(format!("field-{}", field.key)) class="text-sm font-semibold text-slate-900" {
                     (&field.label)
@@ -5103,51 +5421,66 @@ fn render_schema_field(field: &SchemaFormField) -> Markup {
             @if let Some(description) = &field.description {
                 p class="mb-3 text-xs leading-5 text-slate-500" { (description) }
             }
+            (render_field_diagnostics(diagnostics))
             @match &field.kind {
                 SchemaFieldKind::Select(options) => {
-                    select id=(format!("field-{}", field.key)) name=(name) required[field.required] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" {
-                        option value="" selected[current.is_none()] disabled[field.required] {
+                    select id=(format!("field-{}", field.key)) name=(name) required[field.required] aria-invalid=[invalid] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                        option value="" selected[unset] disabled[field.required] {
                             @if field.required { "Select a value…" } @else { "Not set" }
                         }
                         @for option in options {
-                            option value=(serialize_yaml_value(option)) selected[current == Some(option)] { (schema_value_label(option)) }
+                            option value=(serialize_yaml_value(option)) selected[option_is_chosen(field, option)] { (schema_value_label(option)) }
                         }
                     }
                 }
                 SchemaFieldKind::MultiSelect(options) => {
                     div id=(format!("field-{}", field.key)) class="flex flex-wrap gap-2" {
                         @for option in options {
-                            @let checked = match current {
-                                Some(YamlValue::Sequence(values)) => values.contains(option),
-                                _ => false,
-                            };
                             label class="inline-flex cursor-pointer items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 has-checked:border-indigo-500 has-checked:bg-indigo-50 has-checked:text-indigo-800" {
-                                input type="checkbox" name=(name.clone()) value=(serialize_yaml_value(option)) checked[checked] class="size-4 accent-indigo-600";
+                                input type="checkbox" name=(name.clone()) value=(serialize_yaml_value(option)) checked[option_is_chosen(field, option)] aria-invalid=[invalid] class="size-4 accent-indigo-600";
                                 (schema_value_label(option))
                             }
                         }
                     }
                 }
                 SchemaFieldKind::String { input_type, min_length, max_length } => {
-                    input id=(format!("field-{}", field.key)) type=(input_type) name=(name) value=(field_text_value(current)) required[field.required] minlength=[*min_length] maxlength=[*max_length] autocomplete=(if *input_type == "email" { "email" } else { "off" }) class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
+                    input id=(format!("field-{}", field.key)) type=(input_type) name=(name) value=(field_control_text(field)) required[field.required] minlength=[*min_length] maxlength=[*max_length] aria-invalid=[invalid] autocomplete=(if *input_type == "email" { "email" } else { "off" }) class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
                 }
                 SchemaFieldKind::Integer { minimum, maximum } => {
-                    input id=(format!("field-{}", field.key)) type="number" step="1" name=(name) value=(field_text_value(current)) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
+                    input id=(format!("field-{}", field.key)) type="number" step="1" name=(name) value=(field_control_text(field)) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] aria-invalid=[invalid] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
                 }
                 SchemaFieldKind::Number { minimum, maximum } => {
-                    input id=(format!("field-{}", field.key)) type="number" step="any" name=(name) value=(field_text_value(current)) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
+                    input id=(format!("field-{}", field.key)) type="number" step="any" name=(name) value=(field_control_text(field)) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] aria-invalid=[invalid] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
                 }
                 SchemaFieldKind::Boolean => {
-                    select id=(format!("field-{}", field.key)) name=(name) required[field.required] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" {
-                        option value="" selected[current.is_none()] disabled[field.required] {
+                    select id=(format!("field-{}", field.key)) name=(name) required[field.required] aria-invalid=[invalid] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                        option value="" selected[unset] disabled[field.required] {
                             @if field.required { "Choose true or false…" } @else { "Not set" }
                         }
-                        option value="true" selected[current == Some(&YamlValue::Bool(true))] { "True" }
-                        option value="false" selected[current == Some(&YamlValue::Bool(false))] { "False" }
+                        option value="true" selected[option_is_chosen(field, &YamlValue::Bool(true))] { "True" }
+                        option value="false" selected[option_is_chosen(field, &YamlValue::Bool(false))] { "False" }
                     }
                 }
                 SchemaFieldKind::Yaml => {
-                    textarea id=(format!("field-{}", field.key)) name=(name) rows="5" spellcheck="false" required[field.required] placeholder="{}" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (current.map(serialize_yaml_value).unwrap_or_default()) }
+                    textarea id=(format!("field-{}", field.key)) name=(name) rows="5" spellcheck="false" required[field.required] aria-invalid=[invalid] placeholder="{}" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (field_yaml_text(field)) }
+                }
+            }
+        }
+    }
+}
+
+/// The diagnostics about one control, rendered where that control is.
+///
+/// `role="alert"` rather than plain text: after an htmx swap there is no page
+/// load to announce, so the region a screen reader is told about has to be the
+/// markup itself. Empty diagnostics render nothing at all, so every caller can
+/// place this unconditionally.
+fn render_field_diagnostics(diagnostics: &[String]) -> Markup {
+    html! {
+        @if !diagnostics.is_empty() {
+            ul role="alert" class="mb-2 space-y-1 text-xs font-semibold text-red-700" {
+                @for message in diagnostics {
+                    li { (message) }
                 }
             }
         }
@@ -5182,6 +5515,121 @@ fn schema_allows_additional_attributes(schema: &JsonValue) -> bool {
     schema.get("additionalProperties") != Some(&JsonValue::Bool(false))
 }
 
+/// The names of the three controls a collection schema cannot describe, used as
+/// diagnostic keys beside the schema's own property names.
+///
+/// They are the form field names the browser submits, so one map covers both
+/// kinds of control and a diagnostic about the record ID cannot collide with one
+/// about a schema property called `id` — a property is only ever looked up on a
+/// structured form, where the ID input is not rendered at all.
+const ID_CONTROL: &str = "id";
+const FRONT_MATTER_CONTROL: &str = "front_matter";
+const ADDITIONAL_ATTRIBUTES_CONTROL: &str = "_additional_attributes";
+
+/// A submission the server refused, ready to be rendered back as the form.
+struct RecordFormRejection {
+    /// The refusal after logging and redaction. It carries the message a caller
+    /// may see and the request ID that message was logged under, which is the
+    /// same boundary the error page goes through: a form is not a reason to
+    /// disclose anything an error page would not.
+    error: PublicError,
+    /// Diagnostics by the control they belong to. Absent for a refusal the
+    /// schema does not locate in a field, which is then only shown at the top of
+    /// the form.
+    fields: BTreeMap<String, Vec<String>>,
+    /// Exactly what the browser sent.
+    submitted: HtmlDocumentForm,
+}
+
+/// The diagnostics about one control, or nothing when this is not a re-render.
+fn form_diagnostics<'a>(rejection: Option<&'a RecordFormRejection>, control: &str) -> &'a [String] {
+    rejection
+        .and_then(|rejection| rejection.fields.get(control))
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// The first line of the alert on a refused form, which says what happened to
+/// the record rather than repeating the reason underneath it.
+fn rejected_form_headline(editing: bool) -> &'static str {
+    if editing {
+        "This record was not saved."
+    } else {
+        "This record was not created."
+    }
+}
+
+/// Decide where each diagnostic belongs on the form.
+///
+/// A diagnostic is worth more beside the control the value was typed into than
+/// at the top of a long form, but only if it lands on the right one. The mapping
+/// is therefore explicit: a violation about a property the structured form
+/// renders goes to that property's control; one about `profile.team` goes to the
+/// `profile` control, keeping the full path in its text, because that is the box
+/// the value was typed into; and anything the form does not render a control for
+/// — an attribute the schema does not declare, or a schema-shaped name on a form
+/// that has no schema — goes to whichever free-text box carries it, which is the
+/// whole point of that box existing.
+///
+/// A violation the schema locates in the record as a whole is deliberately left
+/// where it is: it is already in the message at the top of the form, and putting
+/// it beside an arbitrary control would be a guess dressed up as a diagnosis.
+fn record_form_diagnostics(
+    submitted: &HtmlDocumentForm,
+    schema: Option<&JsonValue>,
+    error: &PublicError,
+    error_field: Option<&str>,
+    violations: &[SchemaViolation],
+) -> BTreeMap<String, Vec<String>> {
+    let declared = schema
+        .and_then(|schema| schema.get("properties"))
+        .and_then(JsonValue::as_object)
+        .map(|properties| properties.keys().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    // Where anything the form renders no control for ends up.
+    let overflow = if submitted.structured {
+        ADDITIONAL_ATTRIBUTES_CONTROL
+    } else {
+        FRONT_MATTER_CONTROL
+    };
+    let control_for = |field: &str| -> String {
+        let root = field.split('.').next().unwrap_or(field);
+        if submitted.structured && declared.contains(root) {
+            return root.to_owned();
+        }
+        if matches!(
+            root,
+            ID_CONTROL | FRONT_MATTER_CONTROL | ADDITIONAL_ATTRIBUTES_CONTROL
+        ) {
+            return root.to_owned();
+        }
+        overflow.to_owned()
+    };
+
+    let mut diagnostics: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for violation in violations {
+        let Some(field) = &violation.field else {
+            continue;
+        };
+        let control = control_for(field);
+        let message = if control == *field {
+            violation.message.clone()
+        } else {
+            // A nested path keeps naming itself, so a diagnostic on a YAML box
+            // says which key inside it is meant.
+            format!("{field}: {}", violation.message)
+        };
+        diagnostics.entry(control).or_default().push(message);
+    }
+    if let Some(field) = error_field {
+        diagnostics
+            .entry(control_for(field))
+            .or_default()
+            .push(error.message.clone());
+    }
+    diagnostics
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_record_form(
     representation: &Representation,
@@ -5190,12 +5638,13 @@ fn render_record_form(
     audit_entries: &[AuditEntry],
     schema: Option<&JsonValue>,
     csrf_token: &str,
-    error: Option<&str>,
+    rejection: Option<&RecordFormRejection>,
     navigation: &[ViewDefinition],
     ui: Option<&UiContext>,
     permissions: RecordPermissions,
 ) -> Markup {
     let editing = record.is_some();
+    let submitted = rejection.map(|rejection| &rejection.submitted);
     let title = record
         .map(|record| {
             if permissions.update {
@@ -5220,15 +5669,173 @@ fn render_record_form(
         .unwrap_or(&empty_attributes);
     let schema_fields = schema.and_then(|schema| schema_form_fields(schema, attributes));
     let structured = schema_fields.is_some();
-    let schema_fields = schema_fields.unwrap_or_default();
-    let front_matter = yaml_serde::to_string(attributes).unwrap_or_else(|_| "{}\n".to_owned());
+    let mut schema_fields = schema_fields.unwrap_or_default();
+    // Every value below is the submitted text when there is one, and the stored
+    // record's otherwise. The two are overlaid here rather than inside each
+    // control so that "show what was typed" is one decision per field group
+    // instead of a judgement call repeated a dozen times in the markup — and so
+    // that the text is the submitted string throughout: re-serializing what the
+    // server parsed would answer a rejected `1.50` with `1.5` and a rejected
+    // YAML mapping with its keys reordered.
+    if let Some(submitted) = submitted.filter(|submitted| submitted.structured) {
+        for field in &mut schema_fields {
+            field.submitted = Some(
+                submitted
+                    .fields
+                    .get(&field.key)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    let front_matter = submitted
+        .and_then(|submitted| submitted.front_matter.clone())
+        .unwrap_or_else(|| yaml_serde::to_string(attributes).unwrap_or_else(|_| "{}\n".to_owned()));
     let additional = schema
         .map(|schema| additional_attributes(attributes, schema))
         .unwrap_or_default();
-    let additional_yaml = yaml_serde::to_string(&additional).unwrap_or_else(|_| "{}\n".to_owned());
+    let additional_yaml = submitted
+        .filter(|submitted| submitted.structured)
+        .map(|submitted| submitted.additional_attributes.clone())
+        .unwrap_or_else(|| {
+            yaml_serde::to_string(&additional).unwrap_or_else(|_| "{}\n".to_owned())
+        });
+    let additional_diagnostics = form_diagnostics(rejection, ADDITIONAL_ATTRIBUTES_CONTROL);
     let allows_additional = schema.is_some_and(schema_allows_additional_attributes);
-    let markdown = record.map(|record| record.body.as_str()).unwrap_or("");
+    // A collapsed disclosure would hide a diagnostic about what is inside it, and
+    // hide the YAML the reader is being asked to correct.
+    let additional_open = (!additional_yaml.trim().is_empty() && additional_yaml.trim() != "{}")
+        || !additional_diagnostics.is_empty();
+    let markdown = submitted
+        .map(|submitted| submitted.markdown.as_str())
+        .unwrap_or_else(|| record.map(|record| record.body.as_str()).unwrap_or(""));
+    let record_id = submitted
+        .and_then(|submitted| submitted.id.clone())
+        .unwrap_or_default();
+    // A refused submission keeps the version it was submitted with, not the
+    // record's current one. For every refusal but a stale version they are the
+    // same string, and where they differ that difference is the refusal: handing
+    // back the current version would turn "somebody else changed this record"
+    // into a form that silently overwrites their change on the next click.
+    let expected_version = submitted
+        .and_then(|submitted| submitted.expected_record_hash.clone())
+        .or_else(|| record.map(|record| record.version.clone()));
     let back = format!("/{}", encode_segment(&view.name));
+    // The form is rendered on its own first because it is a region in its own
+    // right: a refused submission is answered with exactly this element, rooted
+    // at the `id` the request named, and the document below embeds the very same
+    // markup. One rendering, two envelopes, as everywhere else in the seam.
+    let form_region = html! {
+        form id=(RECORD_FORM_REGION) method="post" action=(action)
+            // The form posts through htmx and is answered with either `204` and
+            // an `HX-Location` or its own markup again, so it is boosted like
+            // the rest of the page. `hx-target` points at the form itself, which
+            // both narrows the answer — the breadcrumb, the heading and the
+            // record's activity beside it are not re-rendered — and puts this
+            // region's name in `HX-Target`, which is how the server knows a
+            // fragment is wanted. `hx-disabled-elt` covers the gap that makes a
+            // double click dangerous here: an HTML form post deliberately sits
+            // outside the `Idempotency-Key` contract the JSON API offers, so two
+            // submissions really are two writes, and disabling the button for
+            // the life of the request is what stops the second one.
+            hx-target="this" hx-swap="outerHTML" hx-disabled-elt="find button[type=submit]"
+            class="space-y-4" {
+            input type="hidden" name="_csrf" value=(csrf_token);
+            @if let Some(version) = &expected_version {
+                input type="hidden" name="_expected_record_hash" value=(version);
+            }
+            @if structured {
+                input type="hidden" name="_form_mode" value="structured";
+            }
+            @if let Some(rejection) = rejection {
+                div role="alert" class="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" {
+                    p class="font-semibold" { (rejected_form_headline(editing)) }
+                    p class="mt-1 whitespace-pre-line" { (&rejection.error.message) }
+                    p class="mt-2 text-xs text-red-700" {
+                        "Nothing was written and no audit event was recorded. The values below are exactly what you submitted. Request ID " (&rejection.error.request_id)
+                    }
+                }
+            }
+            fieldset disabled[!permissions.update] class="contents disabled:opacity-80" {
+            section class="cr-form-section p-4 sm:p-5" {
+                div class="mb-4 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" {
+                    div {
+                        h2 class="text-lg font-bold text-slate-950" { "Record details" }
+                        p class="mt-1 text-sm text-slate-500" {
+                            @if structured { "Fields and controls follow this collection’s JSON Schema." } @else { "Front matter accepts any YAML mapping." }
+                        }
+                    }
+                    @if structured {
+                        span class="rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700" { "Schema-powered" }
+                    }
+                }
+                @if !editing {
+                    div class="mb-4 rounded-xl border border-indigo-100 bg-indigo-50/60 p-4" {
+                        label for="record-id" class="mb-1.5 block text-sm font-semibold text-slate-900" { "Record ID " span class="text-red-500" aria-hidden="true" { "*" } }
+                        (render_field_diagnostics(form_diagnostics(rejection, ID_CONTROL)))
+                        // Both characters are escaped, so the rendered attribute
+                        // is `[^\/\\]+`. `pattern` is compiled with the
+                        // Unicode-sets semantics current browsers apply, which
+                        // require `/` inside a character class to be escaped;
+                        // the previous `[^/\]+` failed to compile, so the
+                        // browser logged a syntax error on every submission and
+                        // ignored an attribute whose whole purpose is to refuse
+                        // `/` and `\` in a record ID. The server refuses those
+                        // characters regardless — this is the hint, not the rule.
+                        input id="record-id" type="text" name="id" value=(record_id) required pattern="[^\\/\\\\]+" placeholder="acme-renewal" aria-describedby="record-id-help" aria-invalid=[(!form_diagnostics(rejection, ID_CONTROL).is_empty()).then_some("true")] class="w-full rounded-lg border border-indigo-200 bg-white px-3 py-2.5 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+                        span id="record-id-help" class="mt-1.5 block text-xs text-slate-500" { "Stable URL and filename identifier. It cannot be changed later." }
+                    }
+                }
+                @if structured {
+                    div class="grid gap-3 sm:grid-cols-2" {
+                        @for field in &schema_fields {
+                            (render_schema_field(field, form_diagnostics(rejection, &field.key)))
+                        }
+                    }
+                    @if allows_additional {
+                        details class="mt-5 rounded-xl border border-dashed border-slate-300 bg-slate-50" open[additional_open] {
+                            summary class="cursor-pointer px-4 py-3 text-sm font-semibold text-slate-700 hover:text-indigo-700" { "+ Additional attributes" }
+                            div class="border-t border-slate-200 p-4" {
+                                p class="mb-2 text-xs leading-5 text-slate-500" { "Optional front matter not declared in the schema. Declared fields above cannot be overridden here." }
+                                (render_field_diagnostics(additional_diagnostics))
+                                textarea name="_additional_attributes" rows="5" spellcheck="false" aria-invalid=[(!additional_diagnostics.is_empty()).then_some("true")] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (additional_yaml) }
+                            }
+                        }
+                    }
+                } @else {
+                    label class="block" {
+                        span class="mb-1.5 block text-sm font-semibold text-slate-800" { "Front matter" }
+                        (render_field_diagnostics(form_diagnostics(rejection, FRONT_MATTER_CONTROL)))
+                        textarea name="front_matter" rows="14" spellcheck="false" aria-invalid=[(!form_diagnostics(rejection, FRONT_MATTER_CONTROL).is_empty()).then_some("true")] class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (front_matter) }
+                    }
+                }
+            }
+            section class="cr-form-section p-4 sm:p-5" {
+                div class="mb-3 flex items-center justify-between gap-3" {
+                    div {
+                        h2 class="text-lg font-bold text-slate-950" { "Notes" }
+                        p class="mt-1 text-sm text-slate-500" { "Long-form context stored as the Markdown body." }
+                    }
+                    span class="rounded-md bg-slate-100 px-2 py-1 font-mono text-xs font-semibold text-slate-500" { "Markdown" }
+                }
+                textarea name="markdown" aria-label="Markdown notes" rows="12" class="w-full rounded-lg border border-slate-300 px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (markdown) }
+            }
+            }
+            div class="cr-surface flex flex-wrap items-center justify-between gap-3 p-3" {
+                a href=(back.clone()) class="cr-button" { "Cancel" }
+                @if permissions.update {
+                    button type="submit" class="cr-button cr-button-primary" {
+                        @if editing { "Save changes" } @else { "Create record" }
+                    }
+                } @else {
+                    span class="cr-pill" { "Read-only perspective" }
+                }
+            }
+        }
+    };
+    if representation.wants(RECORD_FORM_REGION) {
+        return form_region;
+    }
     page_or_content(
         representation,
         &title,
@@ -5260,83 +5867,9 @@ fn render_record_form(
                         "This collection has no field schema yet, so front matter remains available as typed YAML."
                     }
                 }
-                @if let Some(error) = error {
-                    div role="alert" class="mt-5 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" { (error) }
-                }
                 div class=(if editing { "cr-record-layout mt-5" } else { "mx-auto mt-5 max-w-5xl" }) {
                 div class="cr-record-primary min-w-0" {
-                form method="post" action=(action) hx-boost=(UNBOOSTED) class="space-y-4" {
-                    input type="hidden" name="_csrf" value=(csrf_token);
-                    @if let Some(record) = record {
-                        input type="hidden" name="_expected_record_hash" value=(&record.version);
-                    }
-                    @if structured {
-                        input type="hidden" name="_form_mode" value="structured";
-                    }
-                    fieldset disabled[!permissions.update] class="contents disabled:opacity-80" {
-                    section class="cr-form-section p-4 sm:p-5" {
-                        div class="mb-4 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" {
-                            div {
-                                h2 class="text-lg font-bold text-slate-950" { "Record details" }
-                                p class="mt-1 text-sm text-slate-500" {
-                                    @if structured { "Fields and controls follow this collection’s JSON Schema." } @else { "Front matter accepts any YAML mapping." }
-                                }
-                            }
-                            @if structured {
-                                span class="rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700" { "Schema-powered" }
-                            }
-                        }
-                        @if !editing {
-                            div class="mb-4 rounded-xl border border-indigo-100 bg-indigo-50/60 p-4" {
-                                label for="record-id" class="mb-1.5 block text-sm font-semibold text-slate-900" { "Record ID " span class="text-red-500" aria-hidden="true" { "*" } }
-                                input id="record-id" type="text" name="id" required pattern="[^/\\]+" placeholder="acme-renewal" aria-describedby="record-id-help" class="w-full rounded-lg border border-indigo-200 bg-white px-3 py-2.5 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
-                                span id="record-id-help" class="mt-1.5 block text-xs text-slate-500" { "Stable URL and filename identifier. It cannot be changed later." }
-                            }
-                        }
-                        @if structured {
-                            div class="grid gap-3 sm:grid-cols-2" {
-                                @for field in &schema_fields {
-                                    (render_schema_field(field))
-                                }
-                            }
-                            @if allows_additional {
-                                details class="mt-5 rounded-xl border border-dashed border-slate-300 bg-slate-50" open[!additional.is_empty()] {
-                                    summary class="cursor-pointer px-4 py-3 text-sm font-semibold text-slate-700 hover:text-indigo-700" { "+ Additional attributes" }
-                                    div class="border-t border-slate-200 p-4" {
-                                        p class="mb-2 text-xs leading-5 text-slate-500" { "Optional front matter not declared in the schema. Declared fields above cannot be overridden here." }
-                                        textarea name="_additional_attributes" rows="5" spellcheck="false" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (additional_yaml) }
-                                    }
-                                }
-                            }
-                        } @else {
-                            label class="block" {
-                                span class="mb-1.5 block text-sm font-semibold text-slate-800" { "Front matter" }
-                                textarea name="front_matter" rows="14" spellcheck="false" class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (front_matter) }
-                            }
-                        }
-                    }
-                    section class="cr-form-section p-4 sm:p-5" {
-                        div class="mb-3 flex items-center justify-between gap-3" {
-                            div {
-                                h2 class="text-lg font-bold text-slate-950" { "Notes" }
-                                p class="mt-1 text-sm text-slate-500" { "Long-form context stored as the Markdown body." }
-                            }
-                            span class="rounded-md bg-slate-100 px-2 py-1 font-mono text-xs font-semibold text-slate-500" { "Markdown" }
-                        }
-                        textarea name="markdown" aria-label="Markdown notes" rows="12" class="w-full rounded-lg border border-slate-300 px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (markdown) }
-                    }
-                    }
-                    div class="cr-surface flex flex-wrap items-center justify-between gap-3 p-3" {
-                        a href=(back.clone()) class="cr-button" { "Cancel" }
-                        @if permissions.update {
-                            button type="submit" class="cr-button cr-button-primary" {
-                                @if editing { "Save changes" } @else { "Create record" }
-                            }
-                        } @else {
-                            span class="cr-pill" { "Read-only perspective" }
-                        }
-                    }
-                }
+                (form_region)
                 }
                 @if let Some(record) = record {
                     aside id="audit-history" class="cr-record-activity scroll-mt-20" {
@@ -5887,6 +6420,14 @@ html {
 
 .cr-field { background: var(--cr-surface-subtle); }
 
+/* A field a refused submission had something to say about. Colour alone never
+   carries the message: the reason is rendered above the control as text, and the
+   control itself is marked `aria-invalid`. */
+.cr-field-invalid {
+  border-color: #fca5a5;
+  background: #fef2f2;
+}
+
 .cr-record-layout { display: grid; grid-template-columns: minmax(0, 1fr) 350px; align-items: start; gap: 18px; }
 .cr-record-layout .cr-field { padding: 14px !important; }
 .cr-record-activity { position: sticky; top: 20px; min-width: 0; max-height: calc(100vh - 40px); overflow-y: auto; padding: 2px; scrollbar-width: thin; }
@@ -6120,6 +6661,17 @@ const CONTENT_REGION: &str = "main-content";
 /// both layouts.
 const VIEW_TABLE_REGION: &str = "cr-view-table";
 
+/// The DOM id of the record create and edit form.
+///
+/// The third region, and the only one that is a `<form>` rather than a container:
+/// a refused submission is answered with this element and nothing else, so the
+/// values the browser sent come back in the controls they were typed into while
+/// the breadcrumb, the heading and the record's audit history beside it are left
+/// alone. The form points `hx-target` at itself, which is what puts this name in
+/// the `HX-Target` of every submission and is why only the two routes that render
+/// the form can ever be asked for it.
+const RECORD_FORM_REGION: &str = "cr-record-form";
+
 /// Which representation of a page a request is asking for: the whole document,
 /// or one region of it.
 ///
@@ -6152,6 +6704,11 @@ const VIEW_TABLE_REGION: &str = "cr-view-table";
 /// never asked. `html_response` names these headers in `Vary` so it cannot.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Representation {
+    /// Whether htmx made this request and can therefore act on an htmx response
+    /// header. False for every browser navigation, `curl`, and test in the HTTP
+    /// suite, and false for a history restore, which is an ordinary navigation
+    /// wearing htmx's label.
+    htmx: bool,
     /// The `HX-Target` of an htmx request that may be answered with a fragment,
     /// verbatim. `None` means "send the whole document"; a target no route
     /// recognises is stored and simply matches nothing.
@@ -6167,6 +6724,7 @@ impl Representation {
             return Self::default();
         }
         Self {
+            htmx: true,
             region: header("hx-target").map(str::to_owned),
         }
     }
@@ -6175,6 +6733,13 @@ impl Representation {
     /// answer with markup that really is that region's contents.
     fn wants(&self, region: &str) -> bool {
         self.region.as_deref() == Some(region)
+    }
+
+    /// Whether the answer may use htmx's response headers instead of a shape a
+    /// browser understands on its own. A mutation asks this to choose between a
+    /// `303` redirect and `204` plus `HX-Location`; see `mutation_redirect`.
+    fn is_htmx(&self) -> bool {
+        self.htmx
     }
 }
 
@@ -7014,7 +7579,8 @@ fn document_form_attributes(
             form.front_matter
                 .as_deref()
                 .expect("raw forms have front matter"),
-        );
+        )
+        .map_err(|error| error.with_field(FRONT_MATTER_CONTROL));
     }
     let schema = schema.ok_or_else(|| {
         ApiError::bad_request(
@@ -7040,11 +7606,16 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
             return Err(ApiError::bad_request(
                 "invalid_form",
                 format!("attribute '{field}' is not declared by the collection schema"),
-            ));
+            )
+            .with_field(field));
         }
     }
 
-    let mut attributes = parse_front_matter(&form.additional_attributes)?;
+    // Every refusal below is about text somebody typed into the
+    // additional-attributes box, so each one says so and the re-rendered form
+    // opens that box with the message inside it.
+    let mut attributes = parse_front_matter(&form.additional_attributes)
+        .map_err(|error| error.with_field(ADDITIONAL_ATTRIBUTES_CONTROL))?;
     for key in attributes.keys() {
         if let YamlValue::String(key) = key
             && properties.contains_key(key)
@@ -7052,14 +7623,16 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
             return Err(ApiError::bad_request(
                 "invalid_form",
                 format!("declared attribute '{key}' cannot be overridden in additional YAML"),
-            ));
+            )
+            .with_field(ADDITIONAL_ATTRIBUTES_CONTROL));
         }
     }
     if !schema_allows_additional_attributes(schema) && !attributes.is_empty() {
         return Err(ApiError::bad_request(
             "invalid_form",
             "this collection schema does not allow additional attributes",
-        ));
+        )
+        .with_field(ADDITIONAL_ATTRIBUTES_CONTROL));
     }
 
     let required = schema
@@ -7071,8 +7644,11 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
         .collect::<BTreeSet<_>>();
     for (key, definition) in properties {
         let values = form.fields.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        // Every refusal from here names the property it is about, so a
+        // re-rendered form can put it beside that property's control.
         if let Some(value) =
-            parse_schema_form_value(key, definition, required.contains(key.as_str()), values)?
+            parse_schema_form_value(key, definition, required.contains(key.as_str()), values)
+                .map_err(|error| error.with_field(key))?
         {
             attributes.insert(YamlValue::String(key.clone()), value);
         }
@@ -7243,6 +7819,66 @@ fn see_other(location: &str) -> ApiResult<Response> {
     Ok((StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response())
 }
 
+/// Answer a successful HTML form post, in the shape the client can act on.
+///
+/// Two envelopes again, for the same reason a page has two. A browser gets the
+/// `303 See Other` it has always got: the `POST` is answered by a `GET` of the
+/// view, so a reload cannot repeat the write and the notice arrives in the URL.
+///
+/// htmx gets `204 No Content` and `HX-Location`, because an `XMLHttpRequest`
+/// follows a `303` invisibly. htmx would see only the redirect's *target*, swap
+/// that page's body in, and push the path that was posted to — `/deals/records`,
+/// which renders nothing on its own — into the address bar. `HX-Location` hands
+/// it the destination as something it can navigate to properly: it issues the
+/// `GET` itself, swaps the body, and pushes the URL the redirect named, which is
+/// exactly what a browser would have ended up showing.
+///
+/// Only the routes whose forms are boosted answer this way. A form that is still
+/// an ordinary browser submission never sends `HX-Request`, so a shape nothing
+/// can request would be a branch nothing exercises; see `UNBOOSTED`.
+fn mutation_redirect(representation: &Representation, location: &str) -> ApiResult<Response> {
+    if !representation.is_htmx() {
+        return see_other(location);
+    }
+    let location = HeaderValue::from_str(location)
+        .map_err(|error| ApiError::bad_request("invalid_location", error.to_string()))?;
+    Ok((
+        StatusCode::NO_CONTENT,
+        [(HeaderName::from_static("hx-location"), location)],
+    )
+        .into_response())
+}
+
+/// The response header that tells htmx this answer is a form, not a page.
+///
+/// htmx refuses to swap a response that is not a success unless something says
+/// otherwise, and the `htmx:beforeSwap` listener in `cr.js` says it for exactly
+/// the responses carrying this header. A header rather than a list of statuses
+/// in the browser, because the status of a refused write is the status of the
+/// *refusal* — `422` for a schema violation, `412` for a stale version, `409`
+/// for an identity already taken, `400` for YAML that does not parse — while the
+/// answer is the same thing in every one of those cases. A listener that had to
+/// enumerate them would quietly stop covering the day a route learned to refuse
+/// for a new reason.
+const FORM_INVALID_HEADER: HeaderName = HeaderName::from_static("cr-form-invalid");
+
+fn rejected_form_response(status: StatusCode, markup: Markup) -> Response {
+    let mut response = html_response(status, markup);
+    response
+        .headers_mut()
+        .insert(FORM_INVALID_HEADER, HeaderValue::from_static("true"));
+    // htmx pushes the URL of a boosted request whenever it swaps the response,
+    // and the URL this one was posted to is not a page: `/deals/records` answers
+    // nothing at all to a `GET`. Refusing the push leaves the address bar on the
+    // form the reader is still looking at, which is where a browser with no
+    // JavaScript leaves it too.
+    response.headers_mut().insert(
+        HeaderName::from_static("hx-push-url"),
+        HeaderValue::from_static("false"),
+    );
+    response
+}
+
 fn html_result(result: ApiResult<Markup>) -> Response {
     match result {
         Ok(markup) => html_response(StatusCode::OK, markup),
@@ -7253,14 +7889,19 @@ fn html_result(result: ApiResult<Markup>) -> Response {
 /// The rendered error page, always as a whole document.
 ///
 /// Deliberately outside the fragment seam. htmx refuses to swap a non-2xx
-/// response unless something says otherwise, and the only thing that does is
-/// the `htmx:beforeSwap` listener in `cr.js`, which allows it for boosted
-/// navigation alone — a boosted click on a link to a deleted record has to be
-/// able to land on the 404 page the browser would have shown. A targeted
-/// request that fails therefore swaps nothing, leaves the region it asked for
-/// as it was, and never has a chance to paste an error page into a table cell.
-/// Phase 3 of `.context/htmx-plan.md` gives *validation* failures a different
-/// answer, which is a re-rendered form and not this page.
+/// response unless something says otherwise, and the two things that do are
+/// both in the `htmx:beforeSwap` listener in `cr.js`: a boosted navigation, so
+/// a click on a link to a deleted record can land on the 404 page the browser
+/// would have shown, and a response carrying `CR-Form-Invalid`, which this page
+/// never does. A targeted request that fails therefore swaps nothing, leaves the
+/// region it asked for as it was, and never has a chance to paste an error page
+/// into a table cell.
+///
+/// A refused form does not come here at all; `reject_record_form` answers it
+/// with the form and the values that were typed into it. What is left for this
+/// page is a request that names something that does not exist, a principal who
+/// may not do what was asked, a body that is not a form this server rendered,
+/// and an internal failure — none of which has a form to go back to.
 fn html_error(error: ApiError) -> Response {
     let error = error.publish();
     let status = error.status;

@@ -263,6 +263,42 @@ pub struct CollectionModel {
     pub schema: Option<serde_json::Value>,
 }
 
+/// One reason a record's front matter does not satisfy its collection's schema.
+///
+/// Produced by [`Database::schema_violations`] for a caller that can place each
+/// reason where the value it is about was entered. `field` is the dotted front
+/// matter path the violation concerns and is `None` when the schema locates the
+/// failure in the record as a whole; `message` is the schema's own description of
+/// what does not fit, which names fields and values from the request and never a
+/// filesystem path or an operating-system error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaViolation {
+    pub field: Option<String>,
+    pub message: String,
+}
+
+/// What judging one record's front matter against its collection's schema takes.
+///
+/// Assembled once by [`Database::schema_check`] so that refusing a write and
+/// explaining the refusal share a single answer to "which schema, which
+/// attributes, and may the values be quoted back".
+struct SchemaCheck {
+    collection: String,
+    schema: serde_json::Value,
+    /// The attributes the application schema applies to: CR-owned metadata such
+    /// as record access is reserved, excluded from the schema, and removed here
+    /// rather than at each call site.
+    attributes: Mapping,
+    /// What to call the schema in a diagnostic that could not compile it.
+    label: String,
+    /// Whether this collection encrypts field values, in which case no
+    /// description of a mismatch may quote one.
+    redact_values: bool,
+    /// Whether this collection stores creator-owned records, whose reserved
+    /// access metadata has its own shape rules.
+    record_owned: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
     pub collection: String,
@@ -3959,35 +3995,88 @@ impl Database {
     }
 
     fn validate(&self, collection: &str, attributes: &Mapping) -> Result<()> {
-        if collection == USERS_COLLECTION {
-            let schema = users_schema();
-            validate_schema_instance(
-                collection,
-                attributes,
-                &schema,
-                "the built-in users schema",
-                false,
-            )?;
-            User::from_attributes(attributes)?;
-            return Ok(());
-        }
-        let Some(schema) = self.collection_schema(collection)? else {
+        let Some(check) = self.schema_check(collection, attributes)? else {
             return Ok(());
         };
-        let policy = CollectionAccessPolicy::from_schema(Some(&schema))?;
-        let mut application_attributes = attributes.clone();
-        if policy.is_some() {
+        // Two shape rules are not schema violations, and each keeps the position
+        // it had before `SchemaCheck` existed because it is a precondition for
+        // the check beside it: CR-owned access metadata has to be well formed
+        // before the application fields it is excluded from are judged, and the
+        // reserved users schema is judged before the stricter domain shape that
+        // reads its fields.
+        if check.record_owned {
             RecordAccess::from_attributes(attributes)?;
+        }
+        validate_schema_instance(&check)?;
+        if collection == USERS_COLLECTION {
+            User::from_attributes(attributes)?;
+        }
+        Ok(())
+    }
+
+    /// Every reason `attributes` do not satisfy `collection`'s schema, one per
+    /// finding, each naming the front matter path it is about where the schema
+    /// locates one.
+    ///
+    /// This explains a refusal rather than deciding one. [`Self::validate`] and
+    /// the mutations that call it stay the authority on whether a write is
+    /// allowed; a caller asks for this afterwards when it has somewhere specific
+    /// to put each reason. The HTML form re-render in `src/server.rs` is that
+    /// caller: it shows each diagnostic beside the control the value was typed
+    /// into, which is not something a single assembled sentence can be taken
+    /// apart into safely.
+    ///
+    /// An empty result is the honest answer in three situations, none of them an
+    /// error: the attributes satisfy the schema, the collection has no schema at
+    /// all, or the collection's values are protected, where quoting the
+    /// offending value back would disclose it.
+    pub fn schema_violations(
+        &self,
+        collection: &str,
+        attributes: &Mapping,
+    ) -> Result<Vec<SchemaViolation>> {
+        validate_component(collection, "collection")?;
+        let Some(check) = self.schema_check(collection, attributes)? else {
+            return Ok(Vec::new());
+        };
+        schema_instance_violations(&check)
+    }
+
+    /// The schema a record's front matter is judged against, together with the
+    /// attributes that are judged and how the outcome may be described.
+    ///
+    /// One place decides all of that, so refusing a write and explaining the
+    /// refusal cannot disagree about which fields the schema owns. `None` means
+    /// the collection has no schema, which is how every collection starts and is
+    /// not a failure.
+    fn schema_check(&self, collection: &str, attributes: &Mapping) -> Result<Option<SchemaCheck>> {
+        if collection == USERS_COLLECTION {
+            return Ok(Some(SchemaCheck {
+                collection: collection.to_owned(),
+                schema: users_schema(),
+                attributes: attributes.clone(),
+                label: "the built-in users schema".to_owned(),
+                redact_values: false,
+                record_owned: false,
+            }));
+        }
+        let Some(schema) = self.collection_schema(collection)? else {
+            return Ok(None);
+        };
+        let record_owned = CollectionAccessPolicy::from_schema(Some(&schema))?.is_some();
+        let mut application_attributes = attributes.clone();
+        if record_owned {
             application_attributes.remove(Value::String(RECORD_ACCESS_FIELD.to_owned()));
         }
         let redact_values = !EncryptionPolicy::from_schema(Some(&schema))?.is_empty();
-        validate_schema_instance(
-            collection,
-            &application_attributes,
-            &schema,
-            &schema_label(collection),
+        Ok(Some(SchemaCheck {
+            collection: collection.to_owned(),
+            schema,
+            attributes: application_attributes,
+            label: schema_label(collection),
             redact_values,
-        )
+            record_owned,
+        }))
     }
 
     fn collection_schema(&self, collection: &str) -> Result<Option<serde_json::Value>> {
@@ -4801,33 +4890,83 @@ fn mark_schema_field_encrypted(schema: &mut JsonValue, path: &[String]) -> Resul
     mark_schema_field_encrypted(property, rest)
 }
 
-fn validate_schema_instance(
-    collection: &str,
-    attributes: &Mapping,
-    schema: &serde_json::Value,
-    label: &str,
-    redact_values: bool,
-) -> Result<()> {
-    let validator = jsonschema::validator_for(schema)
-        .map_err(|error| anyhow!("could not compile {label}: {error}"))?;
-    let instance = serde_json::to_value(attributes)
+/// Refuse attributes that do not satisfy their collection's schema.
+///
+/// The message is assembled from the same violations
+/// [`Database::schema_violations`] hands to a caller that can place each one
+/// beside the control it concerns, so a form, a terminal and an HTTP error
+/// envelope cannot end up describing one refusal in three different ways.
+fn validate_schema_instance(check: &SchemaCheck) -> Result<()> {
+    let violations = schema_instance_violations(check)?;
+    if violations.is_empty() {
+        return Ok(());
+    }
+    if check.redact_values {
+        return Err(invalid(redacted_mismatch(&check.collection)));
+    }
+    let detail = violations
+        .iter()
+        .map(|violation| format!("- {}", violation.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(invalid(format!(
+        "record does not match schema for collection '{}':\n{detail}",
+        check.collection
+    )))
+}
+
+/// Judge attributes against a schema and describe, rather than refuse, whatever
+/// does not fit.
+fn schema_instance_violations(check: &SchemaCheck) -> Result<Vec<SchemaViolation>> {
+    let validator = jsonschema::validator_for(&check.schema)
+        .map_err(|error| anyhow!("could not compile {}: {error}", check.label))?;
+    let instance = serde_json::to_value(&check.attributes)
         .context("front matter cannot be represented as JSON for schema validation")?;
-    if redact_values && !validator.is_valid(&instance) {
-        return Err(invalid(format!(
-            "record does not match schema for collection '{collection}' (protected values redacted)"
-        )));
+    if check.redact_values {
+        // Every per-error description quotes the value that failed, and in a
+        // collection with encrypted fields that value is the protected data
+        // itself. A protected collection therefore gets exactly one violation,
+        // naming no field and quoting nothing: the same sentence this refusal
+        // has always carried, and the reason a caller that wanted field-level
+        // detail is told there is none rather than being handed a disclosure.
+        if validator.is_valid(&instance) {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![SchemaViolation {
+            field: None,
+            message: redacted_mismatch(&check.collection),
+        }]);
     }
-    let errors: Vec<_> = validator
+    Ok(validator
         .iter_errors(&instance)
-        .map(|error| format!("- {error}"))
-        .collect();
-    if !errors.is_empty() {
-        return Err(invalid(format!(
-            "record does not match schema for collection '{collection}':\n{}",
-            errors.join("\n")
-        )));
-    }
-    Ok(())
+        .map(|error| SchemaViolation {
+            field: violation_field(&error),
+            message: error.to_string(),
+        })
+        .collect())
+}
+
+/// The one sentence a collection with protected values may say about a schema
+/// mismatch, in one place so the refusal and its explanation cannot drift apart.
+fn redacted_mismatch(collection: &str) -> String {
+    format!(
+        "record does not match schema for collection '{collection}' (protected values redacted)"
+    )
+}
+
+/// The dotted front matter path a schema violation is about, where its instance
+/// location names one.
+///
+/// Deliberately the same derivation `cr check` records in a finding's `field`: a
+/// violation reported by `cr check` and the same violation shown beside a form
+/// control have to name the same path, or nobody can match the two up. A
+/// violation about the record as a whole — a missing required property, a failed
+/// `additionalProperties` rule — has an empty location and therefore no field,
+/// which is a fact about what the schema said rather than a gap to guess at.
+fn violation_field(error: &jsonschema::ValidationError<'_>) -> Option<String> {
+    let pointer = error.instance_path().to_string();
+    let trimmed = pointer.trim_start_matches('/');
+    (!trimmed.is_empty()).then(|| trimmed.replace('/', "."))
 }
 
 fn changes_encryption_metadata(changes: &[AuditChange]) -> Vec<EncryptionStorageMetadata> {
