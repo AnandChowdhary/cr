@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     str::FromStr,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -969,6 +969,13 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
 
     Ok(Router::new()
         .route("/health", get(health))
+        // Outside the authorization layer, for the same reason `/health` is: it
+        // carries no database data, only bytes that are already in the binary
+        // any caller is talking to. It also cannot be inside it. A browser
+        // cannot attach a bearer header to a `<script src>`, so with
+        // `CR_API_TOKEN` set an authenticated asset route would leave every
+        // page requesting a script it is not allowed to fetch.
+        .route("/static/{file}", get(static_asset))
         .merge(protected)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
@@ -1053,6 +1060,60 @@ async fn authorize(State(state): State<AppState>, request: Request<Body>, next: 
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+/// The UI's progressive-enhancement script, compiled into the binary.
+///
+/// It used to be three string constants emitted as `<script>` blocks in the
+/// body of every page that needed them, which meant the browser re-parsed them
+/// on every navigation, no page could ever declare `script-src 'self'`, and
+/// the JavaScript sat in a Rust file where no editor or linter understood it.
+/// Embedding keeps the single-binary, no-build-step, works-offline property
+/// that ruled out a CDN in the first place.
+const UI_SCRIPT: &str = include_str!("static/cr.js");
+
+/// The asset's served file name, derived from the bytes it serves.
+///
+/// A digest rather than a version number because a number is a promise a
+/// future edit has to remember to keep: with a content hash, changing the
+/// script changes its URL, which is what makes the year-long `immutable`
+/// cache below safe to promise. Eight bytes is far more than enough to
+/// distinguish the handful of revisions a cache will ever hold at once.
+static UI_SCRIPT_NAME: LazyLock<String> =
+    LazyLock::new(|| format!("cr-{}.js", hexadecimal(&Sha256::digest(UI_SCRIPT)[..8])));
+
+/// The absolute path rendered pages link, as `/static/cr-<digest>.js`.
+static UI_SCRIPT_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("/static/{}", UI_SCRIPT_NAME.as_str()));
+
+/// Serve one of the embedded UI assets.
+///
+/// The match is over names we compiled in, not a lookup rooted at a directory:
+/// this route performs no filesystem access at all, so `/static/../Cargo.toml`
+/// and every other traversal shape has nothing to traverse. That is deliberate
+/// rather than incidental. `src/paths.rs` goes to considerable trouble to walk
+/// database-relative paths component by component with `O_NOFOLLOW`, and a
+/// static route that joined a request-supplied name onto a directory would
+/// reintroduce exactly the class of bug that walk exists to prevent.
+async fn static_asset(Path(file): Path<String>) -> Response {
+    let content = match file.as_str() {
+        name if name == UI_SCRIPT_NAME.as_str() => UI_SCRIPT,
+        _ => return not_found().await.into_response(),
+    };
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/javascript; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            ),
+        ],
+        content,
+    )
+        .into_response()
 }
 
 async fn switch_perspective(State(state): State<AppState>, RawForm(raw): RawForm) -> Response {
@@ -3498,126 +3559,6 @@ fn render_filter_row(
     }
 }
 
-const FILTER_BUILDER_SCRIPT: &str = r#"(() => {
-  const builder = document.querySelector('[data-filter-builder]');
-  if (!builder) return;
-  const disclosure = builder.querySelector('[data-filter-disclosure]');
-  const list = builder.querySelector('[data-filter-list]');
-  const template = builder.querySelector('template[data-filter-template]');
-  const addButton = builder.querySelector('[data-add-filter]');
-  const closeButton = builder.querySelector('[data-close-filter]');
-  const maximum = Number(builder.dataset.maxFilters || '20');
-
-  const closeDisclosure = () => {
-    if (!disclosure) return;
-    disclosure.open = false;
-    disclosure.querySelector('summary')?.focus();
-  };
-
-  closeButton?.addEventListener('click', closeDisclosure);
-  builder.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && disclosure?.open) closeDisclosure();
-  });
-
-  const reindex = () => {
-    const rows = [...list.querySelectorAll('[data-filter-row]')];
-    rows.forEach((row, index) => {
-      row.querySelector('[data-filter-field]').setAttribute('aria-label', `Filter field ${index + 1}`);
-      row.querySelector('[data-filter-operator]').setAttribute('aria-label', `Filter operator ${index + 1}`);
-      row.querySelector('[data-filter-value]').setAttribute('aria-label', `Filter value ${index + 1}`);
-      row.querySelector('[data-remove-filter]').setAttribute('aria-label', `Remove filter ${index + 1}`);
-    });
-    addButton.disabled = rows.length >= maximum;
-  };
-
-  const replaceValueControl = (row) => {
-    const field = row.querySelector('[data-filter-field]');
-    const option = field.selectedOptions[0];
-    const operator = row.querySelector('[data-filter-operator]').value;
-    const slot = row.querySelector('[data-filter-value-slot]');
-    const kind = option.dataset.filterKind || 'input';
-    let control;
-    if (operator === 'is-empty' || operator === 'is-not-empty') {
-      control = document.createElement('input');
-      control.type = 'hidden';
-      control.value = '';
-      const hint = document.createElement('span');
-      hint.className = 'block px-3 py-2 text-sm text-slate-400';
-      hint.textContent = 'No value needed';
-      control.name = 'filter_value';
-      control.dataset.filterValue = 'true';
-      slot.replaceChildren(control, hint);
-      reindex();
-      return;
-    } else if (kind === 'select') {
-      control = document.createElement('select');
-      const blank = document.createElement('option');
-      blank.value = '';
-      blank.textContent = 'Select a value…';
-      control.appendChild(blank);
-      JSON.parse(option.dataset.filterOptions || '[]').forEach((item) => {
-        const choice = document.createElement('option');
-        choice.value = item.value;
-        choice.textContent = item.label;
-        control.appendChild(choice);
-      });
-    } else {
-      control = document.createElement('input');
-      control.type = option.dataset.filterInputType || 'text';
-      if (control.type === 'number') control.step = 'any';
-      control.placeholder = control.type === 'number' ? 'Exact number' : 'Exact value';
-    }
-    control.name = 'filter_value';
-    control.dataset.filterValue = 'true';
-    control.className = 'w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2';
-    slot.replaceChildren(control);
-    reindex();
-  };
-
-  const replaceOperatorControl = (row) => {
-    const field = row.querySelector('[data-filter-field]');
-    const selected = field.selectedOptions[0];
-    const operator = row.querySelector('[data-filter-operator]');
-    const previous = operator.value;
-    const options = JSON.parse(selected.dataset.filterOperators || '[]');
-    operator.replaceChildren(...options.map((item) => {
-      const choice = document.createElement('option');
-      choice.value = item.value;
-      choice.textContent = item.label;
-      return choice;
-    }));
-    if (options.some((item) => item.value === previous)) operator.value = previous;
-    replaceValueControl(row);
-  };
-
-  const bindRow = (row) => {
-    row.querySelector('[data-filter-field]').addEventListener('change', () => replaceOperatorControl(row));
-    row.querySelector('[data-filter-operator]').addEventListener('change', () => replaceValueControl(row));
-    row.querySelector('[data-remove-filter]').addEventListener('click', () => {
-      const rows = list.querySelectorAll('[data-filter-row]');
-      if (rows.length === 1) {
-        row.querySelector('[data-filter-field]').value = '';
-        row.querySelector('[data-filter-operator]').value = 'eq';
-        replaceOperatorControl(row);
-      } else {
-        row.remove();
-        reindex();
-      }
-    });
-  };
-
-  list.querySelectorAll('[data-filter-row]').forEach(bindRow);
-  addButton.addEventListener('click', () => {
-    if (list.querySelectorAll('[data-filter-row]').length >= maximum) return;
-    const row = template.content.firstElementChild.cloneNode(true);
-    list.appendChild(row);
-    bindRow(row);
-    reindex();
-    row.querySelector('[data-filter-field]').focus();
-  });
-  reindex();
-})();"#;
-
 #[allow(clippy::too_many_arguments)]
 fn render_view_records(
     view: &ViewDefinition,
@@ -3826,7 +3767,6 @@ fn render_view_records(
             @if let Some(notice) = query.notice.as_deref() {
                 div role="status" class="mb-5 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800" { (notice) }
             }
-            script { (PreEscaped(FILTER_BUILDER_SCRIPT)) }
             @if view.layout == ViewLayout::Kanban {
                 (render_kanban_board(view, columns, page, query, schema, csrf_token, updatable))
             } @else {
@@ -3978,25 +3918,8 @@ fn render_save_view_control(
                 }
             }
         }
-        script { (PreEscaped(SAVE_VIEW_LAYOUT_SCRIPT)) }
     }
 }
-
-const SAVE_VIEW_LAYOUT_SCRIPT: &str = r#"(() => {
-  document.querySelectorAll('[data-view-layout]').forEach((layout) => {
-    const form = layout.closest('form');
-    const groupBy = form && form.querySelector('[data-view-group-by]');
-    if (!groupBy) return;
-    const update = () => {
-      const kanban = layout.value === 'kanban';
-      groupBy.disabled = !kanban;
-      groupBy.required = kanban;
-      if (!kanban) groupBy.value = '';
-    };
-    layout.addEventListener('change', update);
-    update();
-  });
-})();"#;
 
 fn render_kanban_board(
     view: &ViewDefinition,
@@ -4118,53 +4041,8 @@ fn render_kanban_board(
                 }
             }
         }
-        script { (PreEscaped(KANBAN_SCRIPT)) }
     }
 }
-
-const KANBAN_SCRIPT: &str = r#"(() => {
-  const board = document.querySelector('[data-kanban-board]');
-  if (!board) return;
-  let draggedCard = null;
-
-  board.querySelectorAll('[data-kanban-card="true"]').forEach((card) => {
-    card.addEventListener('dragstart', () => {
-      draggedCard = card;
-      card.classList.add('opacity-50');
-    });
-    card.addEventListener('dragend', () => {
-      draggedCard = null;
-      card.classList.remove('opacity-50');
-      board.querySelectorAll('[data-kanban-lane]').forEach((lane) => lane.classList.remove('ring-2', 'ring-blue-400'));
-    });
-  });
-
-  board.querySelectorAll('[data-kanban-lane]').forEach((lane) => {
-    lane.addEventListener('dragover', (event) => {
-      event.preventDefault();
-      lane.classList.add('ring-2', 'ring-blue-400');
-    });
-    lane.addEventListener('dragleave', () => lane.classList.remove('ring-2', 'ring-blue-400'));
-    lane.addEventListener('drop', (event) => {
-      event.preventDefault();
-      if (!draggedCard) return;
-      const form = document.createElement('form');
-      form.method = 'post';
-      form.action = draggedCard.dataset.moveUrl;
-      const append = (name, value) => {
-        const input = document.createElement('input');
-        input.type = 'hidden';
-        input.name = name;
-        input.value = value;
-        form.appendChild(input);
-      };
-      append('_csrf', lane.dataset.kanbanCsrf);
-      append('target', lane.dataset.kanbanTarget);
-      document.body.appendChild(form);
-      form.submit();
-    });
-  });
-})();"#;
 
 fn kanban_lanes<'a>(
     records: &'a [Record],
@@ -5445,6 +5323,11 @@ fn page_layout(
                 link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='1' y='1' width='30' height='30' rx='7' fill='%23fff' stroke='%23d4d4d0'/%3E%3Cpath d='M20.5 20.2c-1.1 1-2.4 1.5-4 1.5-3.5 0-6-2.4-6-5.8s2.5-5.8 6-5.8c1.6 0 3 .5 4 1.5l-1.7 2a3.2 3.2 0 0 0-2.2-.8c-1.8 0-3 1.2-3 3.1s1.2 3.1 3 3.1c.9 0 1.6-.3 2.2-.8l1.7 2z' fill='%23242424'/%3E%3C/svg%3E";
                 title { (title) " · cr" }
                 script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4" {}
+                // `defer` keeps the previous execution order: the blocks used
+                // to be emitted below the markup they enhance, so they ran
+                // against a parsed document, and a deferred head script runs at
+                // the same point without blocking the parse to get there.
+                script src=(UI_SCRIPT_PATH.as_str()) defer {}
                 style { (PreEscaped(GLOBAL_STYLES)) }
             }
             body class="cr-app min-h-full antialiased" data-design-system="cr-workspace" {

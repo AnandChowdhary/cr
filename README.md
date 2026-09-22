@@ -1940,7 +1940,7 @@ page_size: 200
 
 You can edit these files directly. The server reloads them on each request. Persisted `filters` in view definitions use typed `KEY=YAML` equality; the page's ad hoc filter builder adds comparisons and all/any composition without changing the saved scope.
 
-The UI is plain server-rendered HTML—there is no React, Next.js, client-side application state, or JavaScript data API. Kanban adds a small vanilla-JavaScript drag-and-drop enhancement over native HTML move forms, so the board remains usable without dragging. Templates escape database, schema, and audit values; mutating forms carry a per-server CSRF token; and successful POSTs return `303 See Other` before the browser reloads the view. Styling currently uses Tailwind's Play CDN as requested; the official Tailwind documentation labels that browser CDN development-only, so compiling and bundling CSS is tracked in `TODO.md`.
+The UI is plain server-rendered HTML—there is no React, Next.js, client-side application state, or JavaScript data API. What JavaScript there is—the filter builder's control swapping, the save-as-view layout control, and Kanban drag and drop over the native HTML move forms—is one file compiled into the binary and served from `/static/cr-<digest>.js`, not a script block inlined into each page and not a CDN fetch. The file name is a hash of its contents, so the response is cached for a year and a change to the script changes its URL. The route is public like `/health`, because a `<script src>` cannot carry the bearer token `CR_API_TOKEN` requires and the file holds no database data. Every one of those enhancements is optional: the board remains usable without dragging, and the filter panel submits as an ordinary form. Templates escape database, schema, and audit values; mutating forms carry a per-server CSRF token; and successful POSTs return `303 See Other` before the browser reloads the view. Styling currently uses Tailwind's Play CDN as requested; the official Tailwind documentation labels that browser CDN development-only, so compiling and bundling CSS is tracked in `TODO.md`.
 
 ### Authentication and identity
 
@@ -1958,8 +1958,10 @@ curl http://127.0.0.1:3000/api/v1/identity \
   -H "Authorization: Bearer $CR_API_TOKEN"
 ```
 
-`GET /health` remains public so process supervisors can check readiness. For a
-database without RBAC, binding to a non-loopback address without a token prints
+`GET /health` remains public so process supervisors can check readiness, and so
+is `GET /static/<name>` for the UI's embedded script: a `<script src>` tag has
+no way to send a bearer header, and the file is part of the binary rather than
+part of the database. For a database without RBAC, binding to a non-loopback address without a token prints
 a warning. An RBAC-enabled server refuses every non-loopback bind because its
 user switcher is an owner impersonation console, not a network authentication
 boundary. The built-in server does not terminate TLS; use a trusted reverse

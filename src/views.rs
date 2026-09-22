@@ -34,6 +34,11 @@ const RESERVED_VIEW_NAMES: &[&str] = &[
     "health",
     "openapi.json",
     "perspective",
+    // The server's embedded UI assets live under `/static/<name>`, so a view
+    // or collection of this name would keep its own root page but lose every
+    // route below it to the asset handler. Reserving the name refuses that
+    // half-working state up front, as the entries above do.
+    "static",
     "users",
 ];
 
