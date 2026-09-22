@@ -141,10 +141,10 @@ impl Database {
             return Err(invalid("a pinned path cannot contain a NUL byte"));
         }
         let location = normalize(&self.root().join(requested));
-        let stored = match location.strip_prefix(self.root()) {
-            Ok(relative) if relative.as_os_str().is_empty() => Path::new("."),
-            Ok(relative) => relative,
-            Err(_) => location.as_path(),
+        let stored = match self.inside_database(&location) {
+            Some(relative) if relative.as_os_str().is_empty() => Path::new("."),
+            Some(relative) => relative,
+            None => location.as_path(),
         };
         // The browser addresses locations by URL, which has no spelling for a
         // path that is not UTF-8; a pin that could never be opened is refused
@@ -153,6 +153,28 @@ impl Database {
             .to_str()
             .map(str::to_owned)
             .ok_or_else(|| invalid("a pinned path must be valid UTF-8"))
+    }
+
+    /// Where `location` lies inside the database, if it does.
+    ///
+    /// The root is canonical, but the path someone types need not spell it that
+    /// way: macOS reaches every temporary directory through `/var`, a link to
+    /// `/private/var`, and a home directory can sit behind a link too. So after
+    /// the plain prefix test, each ancestor is canonicalized in turn and the
+    /// first that *is* the root marks where the in-database part begins. Only
+    /// that prefix is resolved; a link inside the database stays a link.
+    fn inside_database<'a>(&self, location: &'a Path) -> Option<&'a Path> {
+        if let Ok(relative) = location.strip_prefix(self.root()) {
+            return Some(relative);
+        }
+        location.ancestors().find_map(|ancestor| {
+            let canonical = std::fs::canonicalize(ancestor).ok()?;
+            if canonical == self.root() {
+                location.strip_prefix(ancestor).ok()
+            } else {
+                None
+            }
+        })
     }
 
     fn read_pins(&self) -> Result<Vec<Pin>> {

@@ -58,6 +58,27 @@ fn locations_inside_the_database_are_stored_relative_to_it() {
     assert_eq!(pins[3].location(&root), outside);
 }
 
+/// The database root reached through a link — as macOS spells every temporary
+/// directory, `/var` for `/private/var` — is still the database root.
+#[cfg(unix)]
+#[test]
+fn the_root_spelled_through_a_link_is_still_the_root() {
+    let (temporary, database) = database("pins-linked-root");
+    let link = temporary.path().join("linked");
+    std::os::unix::fs::symlink(database.root(), &link).unwrap();
+
+    database
+        .pin(link.join("docs").to_str().unwrap(), None)
+        .unwrap();
+    database.pin(link.to_str().unwrap(), None).unwrap();
+    assert_eq!(stored(&database), vec!["docs".to_owned(), ".".to_owned()]);
+
+    // A link *inside* the database is a location of its own, not resolved.
+    std::os::unix::fs::symlink(temporary.path(), database.root().join("out")).unwrap();
+    database.pin("out", None).unwrap();
+    assert_eq!(stored(&database)[2], "out");
+}
+
 /// One location is one pin however it is spelled, and it need not exist yet.
 #[test]
 fn spellings_of_one_location_are_one_pin() {

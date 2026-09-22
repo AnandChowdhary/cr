@@ -1774,7 +1774,10 @@ async fn owners_pin_browse_locations_to_their_own_sidebar_section() {
     let section = &text[browse..internal];
     assert!(section.contains("All files"));
     assert!(section.contains(">Notes<"));
-    assert!(section.contains(&browse_uri(&outside).replace('&', "&amp;")));
+    // Linked by canonical location, which on macOS differs from the temporary
+    // path as spelled (`/var` is a link to `/private/var`).
+    let canonical_outside = fs::canonicalize(&outside).unwrap();
+    assert!(section.contains(&browse_uri(&canonical_outside).replace('&', "&amp;")));
     assert!(section.contains(">not-yet-created<"));
     assert!(section.contains(">missing<"));
     // Internal ends where the sidebar's primary navigation does; the mobile
