@@ -10,11 +10,19 @@
 //! for a JSON representation says `hx-boost="false"`, because htmx would change
 //! how a `303` or a rendered error page behaves and phase 3 of
 //! `.context/htmx-plan.md` is where that contract is redesigned. The second is
-//! that no handler learned anything: an htmx request and a plain browser
-//! request get byte-identical answers, which is what makes the rest of the HTTP
-//! suite — which never sends an htmx header — a real no-JavaScript regression
-//! suite. Phase 2 deliberately breaks that second property, and the assertion
-//! below is where it has to say so.
+//! that a boosted navigation is still a request for a whole document: htmx
+//! swaps the response into `<body>`, so anything less than a document would
+//! leave the page without its shell.
+//!
+//! That second property used to be stated as "an htmx request and a plain
+//! browser request get byte-identical answers", because phase 1 gave the server
+//! no representation to negotiate. Phase 2 gives it one — an htmx request that
+//! names a region in `HX-Target` is answered with that region alone — so the
+//! property is now narrower and is asserted as what it always meant: a boost
+//! targets `<body>`, `<body>` has no id, htmx therefore sends no `HX-Target`,
+//! and the answer is the same document a browser gets. The seam's own contract,
+//! including what keeps a fragment out of a document's context, lives in
+//! `tests/fragment_seam_http.rs`.
 
 use std::str::FromStr;
 
@@ -282,31 +290,40 @@ async fn the_progress_indicator_is_driven_by_htmx_classes_and_honours_reduced_mo
 }
 
 #[tokio::test]
-async fn an_htmx_request_and_a_browser_request_get_the_same_answer() {
+async fn a_boosted_navigation_gets_the_same_document_a_browser_gets() {
     let (_temporary, database) = database_with_a_board("boost-no-seam");
     let app = router(database, ServerConfig::default()).unwrap();
 
     for uri in PAGES {
         let (plain_status, plain) = get(&app, uri, &[]).await;
-        let (boosted_status, boosted) = get(
-            &app,
-            uri,
-            &[
+        for headers in [
+            // What htmx actually sends for a boosted link: no `HX-Target`,
+            // because the target is `<body>` and `<body>` carries no id.
+            vec![
+                ("hx-request", "true"),
+                ("hx-boosted", "true"),
+                ("hx-current-url", "http://127.0.0.1/"),
+            ],
+            // And with a target the server renders no content for, which is the
+            // shape a hand-written request or a future markup mistake takes. The
+            // fragment seam answers only for ids it renders; everything else
+            // gets the page, because a document arriving where a fragment was
+            // expected is visibly wrong, while a fragment arriving where a
+            // document was expected has silently deleted the navigation.
+            vec![
                 ("hx-request", "true"),
                 ("hx-boosted", "true"),
                 ("hx-current-url", "http://127.0.0.1/"),
                 ("hx-target", "cr-shell"),
             ],
-        )
-        .await;
-        // Byte for byte. Phase 1 added no representation to negotiate, which is
-        // why the rest of this suite — which never sends these headers — still
-        // exercises the code every browser runs. Phase 2 introduces the fragment
-        // seam and has to change this assertion, and add `HX-Request` to `Vary`
-        // in the same commit, because a response that varies on a header a cache
-        // is not told about is a cache-poisoning bug.
-        assert_eq!(plain_status, boosted_status, "{uri}");
-        assert_eq!(plain, boosted, "{uri} answers an htmx request differently");
+        ] {
+            let (boosted_status, boosted) = get(&app, uri, &headers).await;
+            assert_eq!(plain_status, boosted_status, "{uri}");
+            assert_eq!(
+                plain, boosted,
+                "{uri} answers a boosted navigation with something other than the page"
+            );
+        }
         assert!(plain.starts_with("<!DOCTYPE html>"), "{uri}");
     }
 }

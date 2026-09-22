@@ -105,6 +105,9 @@ Priorities:
 - [ ] **P2 — Preserve submitted form values on validation errors.**
   HTML mutations correctly remain atomic and audit-neutral on failure, but the generic error page requires navigating back and may lose unsaved browser input. Re-render the form with escaped submitted values and field-level schema diagnostics. This is also what unblocks boosting the mutating forms: they opt out of `hx-boost` today because htmx cannot act on either shape a mutation currently answers with — a `303` it would follow invisibly while pushing the posted path into the address bar, or an error page with a status it declines to swap. Answering `422` with the re-rendered form and `HX-Location` on success settles both at once, and lets `hx-confirm` replace the delete form's inline `onsubmit`.
 
+- [ ] **P2 — Swap a view's results in place instead of its whole body.**
+  Pagination, column sort, filter apply, and search are boosted, so they swap the whole page body and close the filter panel on the way. The server already answers `HX-Target: cr-view-table` with just the view's results region, so this is a markup change on those controls — `hx-target`, `hx-swap="outerHTML"` and `hx-push-url="true"` so every state stays shareable — plus deciding what a swap that changes the record count does about the heading, and what the address bar should say when a fragment carries no `<title>`.
+
 - [ ] **P2 — Define large-board Kanban loading and ordering.**
   Kanban lanes group the current bounded result page so the server never loads an unbounded collection. Define cursor-based incremental loading or an explicit board-size policy for pipelines larger than the configured page limit, plus optional card sorting within lanes.
 
@@ -336,4 +339,5 @@ Priorities:
 - [x] Versioned subprocess sync adapters with JSONL upsert/delete/checkpoint messages, clean-state verification, limits, overlap locks, checkpointing, and `source: sync` audit provenance.
 - [x] The UI's progressive-enhancement script served as one `include_str!`-embedded asset from a filesystem-free, content-addressed, publicly cacheable `/static/{file}` route, linked with `defer` from `<head>` instead of inlined into every page.
 - [x] Boosted navigation through a vendored, content-addressed htmx served from the same route: a same-origin link swaps the body instead of reloading the document, `<title>`, the address bar and history follow the response, a reduced-motion-aware progress bar reports the wait, enhancements rebind on every swap, and every route still works with JavaScript disabled because no handler changed.
+- [x] A fragment seam under the same handlers: one URL answers with the whole workspace document or, for an htmx request naming a region it renders in `HX-Target`, with just that region's markup — a page's content, or a view's table and pager — from the same renderer and the same data, while a browser, a `curl`, a boosted navigation, a history restore, and an unrecognised target all keep getting the complete page, and every HTML answer declares the headers it varies on.
 - [x] Unit, CLI, concurrency, direct-edit, in-process HTTP, and real TCP server tests.
