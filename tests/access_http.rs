@@ -408,7 +408,19 @@ async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
     assert!(!reader_view.text().contains("secret"));
     assert!(!reader_view.text().contains("New record"));
     assert!(!reader_view.text().contains("Audit log"));
-    assert_eq!(reader_view.headers[header::VARY], "Cookie");
+    // The perspective is a cookie, so the same URL renders different records
+    // for different principals and `Vary` has to say `Cookie`. It says more
+    // than that: an HTML answer also varies on the htmx headers that choose
+    // between a document and a fragment (`tests/fragment_seam_http.rs`), and
+    // `Cookie` arriving from the authorization layer must be appended to that
+    // list rather than replace it.
+    assert_eq!(
+        reader_view.headers[header::VARY],
+        "Cookie, HX-Request, HX-Target, HX-History-Restore-Request"
+    );
+    // One `Vary` header, not two: both layers have something to add and the
+    // second one to run finds `Cookie` already listed.
+    assert_eq!(reader_view.headers.get_all(header::VARY).iter().count(), 1);
 
     let reader_record = request(
         &app,

@@ -1143,11 +1143,38 @@ async fn authorize(State(state): State<AppState>, request: Request<Body>, next: 
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        response
-            .headers_mut()
-            .insert(header::VARY, HeaderValue::from_static("Cookie"));
+        // Appended rather than inserted: an HTML answer has already named the
+        // headers its representation depends on (see `HTML_VARY`), and an
+        // `insert` here would delete that list on its way past. A response
+        // whose body depends on a header no cache was told about is a
+        // cache-poisoning bug, and this layer sees every route, so it is the
+        // one place where clobbering would be silent.
+        vary_on(response.headers_mut(), "Cookie");
     }
     response
+}
+
+/// Declare that a response body depends on the named request header, without
+/// disturbing the names something else already declared.
+///
+/// `Vary` is a list, two layers have entries in it — `html_response` names the
+/// htmx headers that choose between a document and a fragment, the
+/// authorization layer above names `Cookie` when a perspective can change what
+/// a principal may see — and neither runs knowing whether the other did. The
+/// membership test is what keeps the append idempotent: `HeaderMap::append`
+/// would otherwise emit `Vary: Cookie` twice for an HTML answer under access
+/// control, which is legal and useless.
+fn vary_on(headers: &mut HeaderMap, name: &'static str) {
+    let listed = headers.get_all(header::VARY).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .any(|listed| listed.trim().eq_ignore_ascii_case(name))
+        })
+    });
+    if !listed {
+        headers.append(header::VARY, HeaderValue::from_static(name));
+    }
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -1338,7 +1365,12 @@ async fn views_home(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let result: ApiResult<Markup> = async {
         let views = run_database(&state, &headers, Database::views).await?;
         let ui = ui_context(&state, &headers).await?;
-        Ok(render_views_home(&views, ui.as_ref(), &state.csrf_token))
+        Ok(render_views_home(
+            &Representation::requested(&headers),
+            &views,
+            ui.as_ref(),
+            &state.csrf_token,
+        ))
     }
     .await;
     html_result(result)
@@ -1395,6 +1427,7 @@ async fn audit_view(
         let navigation = run_database(&state, &headers, Database::views).await?;
         let ui = ui_context(&state, &headers).await?;
         Ok(render_audit_view(
+            &Representation::requested(&headers),
             &page,
             &query,
             &navigation,
@@ -1424,6 +1457,7 @@ async fn users_view(State(state): State<AppState>, headers: HeaderMap) -> Respon
         .await?;
         let ui = ui_context(&state, &headers).await?;
         Ok(render_users_view(
+            &Representation::requested(&headers),
             &users,
             &navigation,
             ui.as_ref(),
@@ -1476,6 +1510,7 @@ async fn browse_view(
                 })??;
         let ui = ui_context(&state, &headers).await?;
         Ok(render_browse_view(
+            &Representation::requested(&headers),
             &page,
             &navigation,
             ui.as_ref(),
@@ -1837,6 +1872,7 @@ async fn view_records(
         let page = paginate_view(records, bounds.limit, view_position(&query, bounds.offset));
         let ui = ui_context(&state, &headers).await?;
         Ok(render_view_records(
+            &Representation::requested(&headers),
             &view,
             &columns,
             &available_columns,
@@ -1966,6 +2002,7 @@ async fn new_record_form(
         }
         let ui = ui_context(&state, &headers).await?;
         Ok(render_record_form(
+            &Representation::requested(&headers),
             &view,
             None,
             &[],
@@ -2012,6 +2049,7 @@ async fn edit_record_form(
             .await?;
         let ui = ui_context(&state, &headers).await?;
         Ok(render_record_form(
+            &Representation::requested(&headers),
             &view,
             Some(&record),
             &audit_entries,
@@ -3401,8 +3439,14 @@ fn json_body(schema: &str) -> JsonValue {
     json!({ "required": true, "content": { "application/json": { "schema": { "$ref": schema } } } })
 }
 
-fn render_views_home(views: &[ViewDefinition], ui: Option<&UiContext>, csrf_token: &str) -> Markup {
-    page_layout(
+fn render_views_home(
+    representation: &Representation,
+    views: &[ViewDefinition],
+    ui: Option<&UiContext>,
+    csrf_token: &str,
+) -> Markup {
+    page_or_content(
+        representation,
         "Database views",
         "/",
         views,
@@ -3510,6 +3554,7 @@ fn render_views_home(views: &[ViewDefinition], ui: Option<&UiContext>, csrf_toke
 }
 
 fn render_users_view(
+    representation: &Representation,
     users: &[(String, User)],
     views: &[ViewDefinition],
     ui: Option<&UiContext>,
@@ -3519,7 +3564,8 @@ fn render_users_view(
     // appears when some principal actually carries it.
     let show_profile = users.iter().any(|(_, user)| !user.profile.is_empty());
     let columns = if show_profile { 7 } else { 6 };
-    page_layout(
+    page_or_content(
+        representation,
         "Users",
         "/users",
         views,
@@ -3631,13 +3677,15 @@ fn render_users_view(
 }
 
 fn render_browse_view(
+    representation: &Representation,
     page: &BrowserPage,
     views: &[ViewDefinition],
     ui: Option<&UiContext>,
     csrf_token: &str,
 ) -> Markup {
     let location = page.location.to_string_lossy();
-    page_layout(
+    page_or_content(
+        representation,
         "Browse files",
         "/browse",
         views,
@@ -3806,6 +3854,7 @@ fn user_kind_label(kind: UserKind) -> &'static str {
 }
 
 fn render_audit_view(
+    representation: &Representation,
     page: &Page<AuditEntry>,
     query: &AuditViewQuery,
     views: &[ViewDefinition],
@@ -3819,7 +3868,8 @@ fn render_audit_view(
         page.pagination.offset + 1
     };
     let last = page.pagination.offset + page.pagination.returned;
-    page_layout(
+    page_or_content(
+        representation,
         "Audit log",
         "/audit",
         views,
@@ -4201,6 +4251,7 @@ fn render_filter_row(
 
 #[allow(clippy::too_many_arguments)]
 fn render_view_records(
+    representation: &Representation,
     view: &ViewDefinition,
     columns: &[String],
     available_columns: &[String],
@@ -4217,12 +4268,6 @@ fn render_view_records(
 ) -> Markup {
     let new_url = format!("/{}/new", encode_segment(&view.name));
     let reset_url = format!("/{}", encode_segment(&view.name));
-    let first = if page.records.is_empty() {
-        0
-    } else {
-        page.start + 1
-    };
-    let last = page.start + page.records.len();
     let filter_fields = view_filter_fields(schema, available_columns);
     let mut filter_rows = query
         .filter_field
@@ -4248,7 +4293,18 @@ fn render_view_records(
         .iter()
         .filter(|(field, _, value)| !field.is_empty() || !value.is_empty())
         .count();
-    page_layout(
+    let results = view_results(
+        view, columns, page, activity, query, schema, csrf_token, updatable,
+    );
+    // The one route that can answer with something smaller than its content.
+    // It comes first because it is the narrower answer: everything below builds
+    // the heading, the search box and the filter panel, none of which the
+    // request asked for.
+    if representation.wants(VIEW_TABLE_REGION) {
+        return results;
+    }
+    page_or_content(
+        representation,
         &view.title,
         &format!("/{}", encode_segment(&view.name)),
         navigation,
@@ -4407,6 +4463,48 @@ fn render_view_records(
             @if let Some(notice) = query.notice.as_deref() {
                 div role="status" class="mb-5 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800" { (notice) }
             }
+            (results)
+        },
+        ui,
+        csrf_token,
+    )
+}
+
+/// The region of a view page that a page turn, a re-sort, a filter or a search
+/// replaces, and the only part of the page any of them change.
+///
+/// Split out of `render_view_records` so that one URL can answer with either
+/// the whole page or just this, from the same data and the same markup. Phase 4
+/// of `.context/htmx-plan.md` is what will ask for it: the pagination, sort,
+/// filter and search controls become targeted swaps, and a filter panel that
+/// survives an apply — which today closes, because applying reloads the page —
+/// falls out of not re-rendering it.
+///
+/// The fragment carries its own root element, id and all, which is what lets a
+/// swap be `outerHTML`: the response is the element it replaces rather than a
+/// bag of children whose container the client has to already have right. The
+/// root is a wrapper rather than the table shell itself because a Kanban view's
+/// results are two sibling elements — the grouping caption and the board — and
+/// the id has to name the same region in both layouts.
+#[allow(clippy::too_many_arguments)]
+fn view_results(
+    view: &ViewDefinition,
+    columns: &[String],
+    page: &ViewPage,
+    activity: &BTreeMap<String, RecordActivity>,
+    query: &ViewQuery,
+    schema: Option<&JsonValue>,
+    csrf_token: &str,
+    updatable: &BTreeSet<String>,
+) -> Markup {
+    let first = if page.records.is_empty() {
+        0
+    } else {
+        page.start + 1
+    };
+    let last = page.start + page.records.len();
+    html! {
+        div id=(VIEW_TABLE_REGION) {
             @if view.layout == ViewLayout::Kanban {
                 (render_kanban_board(view, columns, page, query, schema, csrf_token, updatable))
             } @else {
@@ -4488,10 +4586,8 @@ fn render_view_records(
                 }
             }
             }
-        },
-        ui,
-        csrf_token,
-    )
+        }
+    }
 }
 
 fn render_save_view_control(
@@ -5088,6 +5184,7 @@ fn schema_allows_additional_attributes(schema: &JsonValue) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn render_record_form(
+    representation: &Representation,
     view: &ViewDefinition,
     record: Option<&Record>,
     audit_entries: &[AuditEntry],
@@ -5132,7 +5229,8 @@ fn render_record_form(
     let allows_additional = schema.is_some_and(schema_allows_additional_attributes);
     let markdown = record.map(|record| record.body.as_str()).unwrap_or("");
     let back = format!("/{}", encode_segment(&view.name));
-    page_layout(
+    page_or_content(
+        representation,
         &title,
         &back,
         navigation,
@@ -6003,6 +6101,107 @@ fn mobile_navigation(
     }
 }
 
+/// The DOM id of the element that holds a page's content.
+///
+/// It is the `<main>` `page_layout` renders, so "the content of this page" and
+/// "the element htmx swaps a content fragment into" are one element with one
+/// name rather than two that have to be kept in step. The id was already there
+/// as the skip link's destination; naming it once means a rename cannot leave
+/// the seam pointing at an element that no longer exists.
+const CONTENT_REGION: &str = "main-content";
+
+/// The DOM id of a view's results region: the table and its pager, or the
+/// Kanban board, whichever the view's layout renders.
+///
+/// One id for both layouts because it names a role rather than a shape — the
+/// part of a view page that turning the page, re-sorting, filtering or
+/// searching replaces, and nothing else — and the search and filter controls
+/// that phase 4 of `.context/htmx-plan.md` points at that role are shared by
+/// both layouts.
+const VIEW_TABLE_REGION: &str = "cr-view-table";
+
+/// Which representation of a page a request is asking for: the whole document,
+/// or one region of it.
+///
+/// Every URL in the HTML UI answers with a complete document unless the request
+/// asks, in htmx's vocabulary, for something smaller. Asking takes all of:
+///
+/// * `HX-Request: true`, so a browser navigation, a `curl`, a feed reader and
+///   the HTTP test suite — none of which send it — keep getting the page they
+///   get today;
+/// * no `HX-History-Restore-Request`, because a restore swaps the response into
+///   `<body>` regardless of what it asked for, and a fragment there would
+///   silently delete the sidebar. `cr.js` sets `historyRestoreAsHxRequest` to
+///   `false` so a restore does not claim to be an htmx request in the first
+///   place, and htmx sends no `HX-Target` on one either, so this check is the
+///   third of three independent reasons a restore gets a document. It is here
+///   because it costs a header lookup and removes the coupling: whoever turns
+///   that configuration back on, for whatever reason, does not also have to
+///   know that this file depends on it;
+/// * an `HX-Target` naming a region *this route renders*. htmx sets that header
+///   from the `id` of the element it will swap into, so the request states the
+///   context the answer lands in, and the server can refuse to send a fragment
+///   into a context it does not recognise. `hx-boost` targets `<body>`, which
+///   has no id and therefore no header, which is why phase 1's boosted
+///   navigation still gets whole documents.
+///
+/// Anything short of that is a document. That direction matters: a document
+/// swapped where a fragment was expected is a visibly broken page, whereas the
+/// reverse — a fragment swapped into `<body>` — is a page that has quietly lost
+/// its navigation, and a shared cache is capable of doing it to a request that
+/// never asked. `html_response` names these headers in `Vary` so it cannot.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Representation {
+    /// The `HX-Target` of an htmx request that may be answered with a fragment,
+    /// verbatim. `None` means "send the whole document"; a target no route
+    /// recognises is stored and simply matches nothing.
+    region: Option<String>,
+}
+
+impl Representation {
+    /// Read what the request asked for. The only place these headers are
+    /// interpreted, so every route negotiates identically.
+    fn requested(headers: &HeaderMap) -> Self {
+        let header = |name: &'static str| headers.get(name).and_then(|value| value.to_str().ok());
+        if header("hx-request") != Some("true") || header("hx-history-restore-request").is_some() {
+            return Self::default();
+        }
+        Self {
+            region: header("hx-target").map(str::to_owned),
+        }
+    }
+
+    /// Whether this request asked for the named region, which a route may only
+    /// answer with markup that really is that region's contents.
+    fn wants(&self, region: &str) -> bool {
+        self.region.as_deref() == Some(region)
+    }
+}
+
+/// Send a page's content in the envelope the request asked for.
+///
+/// Two envelopes, one set of markup: the content on its own when the request
+/// targeted the content region, and otherwise the same content inside the same
+/// shell every page has always had. Every renderer ends here rather than at
+/// `page_layout` so that no route can grow its own idea of what a fragment is,
+/// and so that adding a page needs no thought about the seam at all — a
+/// renderer that never sees a matching `HX-Target` simply keeps rendering
+/// documents.
+fn page_or_content(
+    representation: &Representation,
+    title: &str,
+    current_path: &str,
+    views: &[ViewDefinition],
+    content: Markup,
+    ui: Option<&UiContext>,
+    csrf_token: &str,
+) -> Markup {
+    if representation.wants(CONTENT_REGION) {
+        return content;
+    }
+    page_layout(title, current_path, views, content, ui, csrf_token)
+}
+
 fn page_layout(
     title: &str,
     current_path: &str,
@@ -6051,7 +6250,7 @@ fn page_layout(
             // see `UNBOOSTED` for which ones and why.
             body class="cr-app min-h-full antialiased" data-design-system="cr-workspace"
                 hx-boost="true" hx-indicator="#cr-progress" {
-                a href="#main-content" class="cr-skip-link" { "Skip to content" }
+                a href=(format!("#{CONTENT_REGION}")) class="cr-skip-link" { "Skip to content" }
                 // The navigation progress bar. htmx adds its `htmx-request`
                 // class to whatever `hx-indicator` names for exactly as long as
                 // a request is in flight, and `.cr-progress` in `GLOBAL_STYLES`
@@ -6083,7 +6282,10 @@ fn page_layout(
                                 }
                             }
                         }
-                        main id="main-content" class="cr-main w-full px-4 py-5 sm:px-6 sm:py-6 xl:px-8" tabindex="-1" { (content) }
+                        // The one element whose contents a content fragment
+                        // replaces, which is why its id is a constant: the
+                        // shell and the seam have to agree on the name.
+                        main id=(CONTENT_REGION) class="cr-main w-full px-4 py-5 sm:px-6 sm:py-6 xl:px-8" tabindex="-1" { (content) }
                     }
                 }
             }
@@ -7048,6 +7250,17 @@ fn html_result(result: ApiResult<Markup>) -> Response {
     }
 }
 
+/// The rendered error page, always as a whole document.
+///
+/// Deliberately outside the fragment seam. htmx refuses to swap a non-2xx
+/// response unless something says otherwise, and the only thing that does is
+/// the `htmx:beforeSwap` listener in `cr.js`, which allows it for boosted
+/// navigation alone — a boosted click on a link to a deleted record has to be
+/// able to land on the 404 page the browser would have shown. A targeted
+/// request that fails therefore swaps nothing, leaves the region it asked for
+/// as it was, and never has a chance to paste an error page into a table cell.
+/// Phase 3 of `.context/htmx-plan.md` gives *validation* failures a different
+/// answer, which is a re-rendered form and not this page.
 fn html_error(error: ApiError) -> Response {
     let error = error.publish();
     let status = error.status;
@@ -7070,11 +7283,33 @@ fn html_error(error: ApiError) -> Response {
     html_response(status, markup)
 }
 
+/// Every request header an HTML answer's body depends on, as one `Vary` value.
+///
+/// `Cookie` is the perspective: with access control on, the same URL renders
+/// what a different principal may see. The three htmx headers are the fragment
+/// seam — `Representation::requested` reads exactly those, and reading is the
+/// only thing that makes a representation negotiable — so they belong here for
+/// the same reason `Cookie` does. `HX-Target` in particular: two htmx requests
+/// for one URL with different targets get different bodies, and a cache told
+/// only about `HX-Request` would serve one to the other.
+///
+/// Every HTML answer also carries `Cache-Control: no-store`, so nothing may
+/// store these responses and this list describes a negotiation no cache should
+/// be performing anyway. It is stated regardless. `no-store` is a rule about
+/// storage that a future caching policy may relax; `Vary` is a fact about the
+/// response that would still be true afterwards, and the failure it prevents —
+/// a browser being handed a headless fragment for a page it asked for — is
+/// invisible until someone puts a proxy in front of `cr serve`.
+const HTML_VARY: &str = "Cookie, HX-Request, HX-Target, HX-History-Restore-Request";
+
 fn html_response(status: StatusCode, markup: Markup) -> Response {
     let mut response = (status, Html(markup.into_string())).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static(HTML_VARY));
     response.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),

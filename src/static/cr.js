@@ -256,12 +256,20 @@ if (window.htmx) {
 
   // Because the cache is off, every back and forward is one of those
   // re-requests, and htmx would by default label it `HX-Request: true` while
-  // still expecting a whole document to swap into <body>. That header means
-  // nothing to the server today, but phase 2 of `.context/htmx-plan.md` gives
-  // it a meaning — "answer with the content fragment" — and a fragment swapped
-  // into <body> on a history restore would silently delete the sidebar. Turning
-  // the label off makes a restore indistinguishable from an ordinary
-  // navigation, which is exactly what it is.
+  // still expecting a whole document to swap into <body>. That header now
+  // means something to the server — with an `HX-Target` naming a region it
+  // renders, it answers with that region alone — and a fragment swapped into
+  // <body> on a history restore would silently delete the sidebar. Turning the
+  // label off makes a restore indistinguishable from an ordinary navigation,
+  // which is exactly what it is.
+  //
+  // Belt and braces, in both directions. htmx sends no `HX-Target` on a
+  // restore, so the server would answer with a document even if this were
+  // `true`, and `Representation::requested` in `src/server.rs` additionally
+  // refuses a fragment to any request carrying `HX-History-Restore-Request`.
+  // Three independent reasons, because the failure is silent: a restore that
+  // landed a fragment in <body> would leave a page with no navigation and
+  // nothing left to boost from.
   window.htmx.config.historyRestoreAsHxRequest = false;
 }
 
