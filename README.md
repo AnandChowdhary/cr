@@ -1700,30 +1700,71 @@ http://127.0.0.1:3000/deals
 ```
 
 The default UI uses a compact workspace shell rather than a documentation-style
-page frame. On desktop, collections and saved views stay visible in a persistent
-sidebar with audit, OpenAPI, and the RBAC perspective control anchored below;
+page frame. On desktop, saved views, then collections, then internal records
+stay visible in a persistent sidebar with audit, OpenAPI, and the RBAC
+perspective control anchored below;
 the active route remains highlighted on list, board, and record pages. Narrow
 screens collapse the same hierarchy into a sticky top bar and horizontally
 scrollable view strip. The main workspace uses short breadcrumbs, one-line
 context, restrained borders, and compact controls so records begin near the top
 of the viewport without losing labels or accessible fallbacks.
 
-The table infers columns from the collection schema and current front matter.
-Its dense header keeps search and its submit action immediately available.
+Every table opens with two columns the database derives rather than stores:
+**Created** and **Updated**, read from the audit journal and shown right after
+the record ID. Nothing in front matter records a record's age, and a field that
+claimed to would be a second copy a direct edit could contradict, so the journal
+stays the only source. A record written directly and not yet saved has no
+audited age and shows `—`. Both columns sort like any other, and both follow
+audit-read permission: a principal sees a timestamp exactly where `cr audit log`
+would show it the event.
+
+Views are ordered newest first by default — `$created_at` descending — so the
+first page answers "what changed?" before it answers "what exists?". A view
+definition's own `sort_by` still wins, and any column heading or the sorting
+panel overrides both for the current URL.
+
+The table infers other columns from the collection schema and current front
+matter. Its dense header keeps search and its submit action immediately
+available.
 **Filter** opens the complete schema-aware condition, column, and sorting panel
 only when needed, and shows the number of active ad hoc conditions. Rows use the
 entire available workspace and keep the stable ID, every selected value, and a
 small open action visible without a separate oversized action column. The view
-also includes bounded pagination, create and edit forms, and audited deletion.
+also includes cursor pagination, create and edit forms, and audited deletion.
 Click a record ID, field value, or its row action to open the record editor.
 Saved views can switch the same query to a Kanban layout. Every mutation is
 schema-validated and recorded with `source: api`.
 
 The filter builder combines up to 20 conditions with either **all** (AND) or **any** (OR) matching. Each row has schema-aware operators: equality and inequality for every type; numeric and ISO string/date comparisons; string and array containment; starts/ends-with; and explicit empty/not-empty checks. Enum, boolean, and multi-select values use constrained dropdowns, numeric fields use numeric inputs, formatted strings use their matching input type, and other values accept typed YAML. Add or remove rows in the browser; the match mode and filters stay in the URL as `filter_match` plus repeated `filter_field`, `filter_operator`, and `filter_value` triples, including through pagination. Saved-view predicates always remain required, so choosing **any** cannot escape the view's underlying scope. Missing values match `is empty`, but do not silently match negative operators such as `is not` or `does not contain`.
 
-Every generated page also has schema-aware sorting. Choose a field and direction in the query panel, or click a table column heading to toggle ascending and descending order. Numbers sort numerically, strings and normalized ISO dates sort lexicographically, missing values stay last in both directions, and record ID is the deterministic tie-breaker. Sorting happens before pagination and remains in pagination URLs; Kanban uses the same order for cards inside each lane.
+Every generated page also has schema-aware sorting. Choose a field and direction in the query panel, or click a table column heading to toggle ascending and descending order. Numbers sort numerically, strings and normalized ISO dates sort lexicographically, missing values stay last in both directions, and record ID is the deterministic tie-breaker. The audit-derived `$created_at` and `$updated_at` sort by journal sequence rather than by formatted instant, so two events in the same second still order exactly as they happened, and records with no history stay last. Sorting happens before pagination and remains in pagination URLs; Kanban uses the same order for cards inside each lane.
+
+Pages hold 10 rows unless a view or the URL's `limit` says otherwise, and **Next** and **Previous** are cursors rather than offsets. Each link names the record the next page continues after (`after=<id>`) or ends before (`before=<id>`), so creating a record while someone is paging does not push a row they have already seen onto the next page. The footer still reports an exact position and total, because the ordered result is assembled before the page is cut from it. A cursor naming a record that no longer matches — deleted, or filtered out by an edited query — starts again from the first page, and `offset` remains accepted so links shared before cursors existed still resolve.
 
 Open **Columns** in the same panel to choose the visible table fields or Kanban card details. The selection is encoded as `columns=custom` plus repeated `column` parameters, so it survives sorting and pagination and can be shared as part of the URL. At least one of the fields available from the saved view, schema, or current records must remain selected. The record ID stays visible as the stable link in tables and is not part of the field selection.
+
+### Inspect internal records
+
+CR's own `users` registry is not application data, so it is deliberately absent
+from **Collections**. It is still worth seeing, so an RBAC-enabled server lists
+it under **Internal** in the sidebar and in its own section of the view index:
+
+```text
+http://127.0.0.1:3000/users
+```
+
+The page shows every registered principal, its name, email, kind, status,
+direct grants, and any application-owned profile fields. It is strictly
+read-only: there is no create, edit, or delete control anywhere on it, and the
+record routes that serve collection views never reach `users`. Register a
+principal, change a role, or disable an identity with `cr user` and `cr access`
+(see [Control record access](#control-record-access)), or through the REST API.
+Those paths enforce the reserved-field rules browser forms cannot express.
+
+The section only appears for a perspective that may read access policy—database
+owners and access managers—and `/users` itself answers `403 Forbidden` to
+anyone else. Without RBAC the page stays reachable but unlinked, and explains
+that `cr access init` bootstraps the registry.
 
 ### Use schema-driven record forms
 
@@ -1768,7 +1809,7 @@ fallback without making every card several controls taller.
 
 ### Create saved views
 
-A saved view gives a stable route a title, collection, reusable typed filters, explicit columns or card details, layout, default ordering, and page size. This CRM example makes `/deals` show only open deals worth at least 10,000, with the largest opportunities first:
+A saved view gives a stable route a title, collection, reusable typed filters, explicit columns or card details, layout, default ordering, and page size. Without `--sort-by` a view inherits the newest-first default; `--page-size` defaults to 10. This CRM example makes `/deals` show only open deals worth at least 10,000, with the largest opportunities first:
 
 ```sh
 cr view create deals \
@@ -2095,6 +2136,8 @@ curl 'http://127.0.0.1:3000/api/v1/search?q=%5Ewon%24&collection=deals&target=fi
 ```
 
 Allowed targets are `document`, `front_matter`, `field`, `body`, and `path`. The default target is `document`. The default maximum page size is 200 and can be changed with `cr serve --max-page-size N`. Offsets are deterministic because records are ordered by collection and ID.
+
+REST list, search, and `cr list --sort-by` sort stored record data only. The server-rendered views' `$created_at` and `$updated_at` are audit-derived, so asking a plain record scan for them is refused by name rather than quietly replaying the whole journal per request.
 
 Audit-log pages deliberately return `total: null`: the journal reads only the requested newest window rather than loading the entire segmented history to count it. `has_more` and `next_offset` remain available.
 

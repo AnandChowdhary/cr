@@ -27,7 +27,7 @@ pub use attribution::{
 };
 pub use audit::{
     AnchorReport, AnchorStatus, AuditAction, AuditAnchor, AuditChange, AuditEntry, AuditFilter,
-    AuditHead, AuditSource, AuditVerification, ChangePreview,
+    AuditHead, AuditSource, AuditVerification, ChangePreview, RecordActivity,
 };
 pub use check::{
     CheckReport, CheckScope, CheckSummary, Finding, FindingKind, Severity, parse_threshold,

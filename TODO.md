@@ -330,6 +330,8 @@ Priorities:
 - [x] Compact view header with always-available search and an on-demand filter, column, and sorting panel with active-condition count.
 - [x] Optional `.cr/config.yaml` overrides with `.cr/` discovery and safe built-in storage/audit defaults.
 - [x] Opt-in record RBAC through a fixed-schema, audited `users` collection with editor-writable profile fields, self-service names and profiles, human/service principals, atomic ensure/update/restore/delete workflows, guarded ID-reuse tombstones, database/collection/record inheritance, viewer/editor/access-manager/owner roles, current-principal CLI enforcement, filtered discovery and audit history, verified owner delegation, non-impersonable `--actor`, last-owner protection, and per-mutation access-decision evidence.
+- [x] Audit-derived `created_at` and `updated_at` table columns with sequence-exact ordering, newest-first defaults, audit-read scoping, and record-ID cursor pagination with exact positions and legacy offset links.
+- [x] Read-only internal `users` page under its own navigation section, showing every principal, grant, and profile field to perspectives that may read access policy, with no web mutation surface.
 - [x] Loopback-only owner RBAC perspective console with a live user switcher, cookie-scoped HTML and REST impersonation, permission-aware controls and Kanban movement, owner-attributed impersonation evidence, and no-store responses.
 - [x] Versioned subprocess sync adapters with JSONL upsert/delete/checkpoint messages, clean-state verification, limits, overlap locks, checkpointing, and `source: sync` audit provenance.
 - [x] Unit, CLI, concurrency, direct-edit, in-process HTTP, and real TCP server tests.

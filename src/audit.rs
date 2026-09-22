@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     ffi::OsStr,
     fs::File,
     io::{BufRead, BufReader},
@@ -326,6 +326,22 @@ pub struct AuditEntry {
     pub hash: String,
     #[serde(flatten)]
     pub payload: AuditPayload,
+}
+
+/// When a record first entered the journal and when it last changed.
+///
+/// Derived, not stored: the journal is the only place this exists, so it is
+/// recomputed from a verified chain rather than cached in front matter that a
+/// direct edit could contradict. Sequence numbers accompany the timestamps
+/// because they are the exact total order. Two events can share a formatted
+/// instant, and RFC 3339 fractional seconds do not sort lexicographically, so
+/// ordering by sequence is both cheaper and correct.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RecordActivity {
+    pub created_at: String,
+    pub created_sequence: u64,
+    pub updated_at: String,
+    pub updated_sequence: u64,
 }
 
 /// Which audit events a history read should return.
@@ -1577,6 +1593,45 @@ impl<'a> AuditLog<'a> {
         let (states, _) = self.states(false)?;
         self.verify_legacy_representation_heads(&states)?;
         Ok(states)
+    }
+
+    /// When each record in one collection was created and last changed.
+    ///
+    /// A deletion ends a record's lifecycle, so a later create with the same ID
+    /// starts a new `created_at` rather than inheriting the tombstoned one.
+    /// Records with no audit history at all are simply absent from the map;
+    /// the caller decides how to present an unaudited file.
+    pub(crate) fn record_activity(
+        &self,
+        collection: &str,
+    ) -> Result<BTreeMap<String, RecordActivity>> {
+        let mut activity: BTreeMap<String, RecordActivity> = BTreeMap::new();
+        self.verify_chain(|entry, _| {
+            if entry.payload.record.collection != collection {
+                return Ok(());
+            }
+            let id = entry.payload.record.id.as_str();
+            if entry.payload.action == AuditAction::Delete {
+                activity.remove(id);
+                return Ok(());
+            }
+            let at = entry.payload.timestamp.as_str();
+            let sequence = entry.payload.sequence;
+            activity
+                .entry(id.to_owned())
+                .and_modify(|activity| {
+                    activity.updated_at = at.to_owned();
+                    activity.updated_sequence = sequence;
+                })
+                .or_insert_with(|| RecordActivity {
+                    created_at: at.to_owned(),
+                    created_sequence: sequence,
+                    updated_at: at.to_owned(),
+                    updated_sequence: sequence,
+                });
+            Ok(())
+        })?;
+        Ok(activity)
     }
 
     /// Replay the chain once while also enforcing approval bindings.
