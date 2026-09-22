@@ -219,6 +219,21 @@ struct BrowserPage {
     item: BrowserItem,
 }
 
+/// A directory's README, previewed beneath its listing the way a code host
+/// shows one.
+///
+/// The preview is the same bounded, escaped `BrowserFile` that opening the
+/// file produces, so a README is never read or rendered by a looser rule than
+/// the file itself. A README that cannot be previewed keeps its public error
+/// message rather than failing the listing: the directory is what was asked
+/// for, and it is still readable.
+#[derive(Debug)]
+struct BrowserReadme {
+    name: String,
+    href: Option<String>,
+    preview: Result<BrowserFile, String>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RecordPermissions {
     update: bool,
@@ -1566,10 +1581,36 @@ async fn browse_view(
                 .map_err(|error| {
                     ApiError::internal(anyhow!(error).context("filesystem browser task failed"))
                 })??;
+        let readme = match &page.item {
+            BrowserItem::Directory(entries) => match directory_readme(entries) {
+                Some(entry) => {
+                    let path = page.location.join(&entry.name);
+                    let preview = tokio::task::spawn_blocking(move || browse_file(&path))
+                        .await
+                        .map_err(|error| {
+                            ApiError::internal(
+                                anyhow!(error).context("filesystem browser task failed"),
+                            )
+                        })?;
+                    Some(BrowserReadme {
+                        name: entry.name.clone(),
+                        href: entry.href.clone(),
+                        // Published here rather than on the blocking worker:
+                        // publishing logs the full chain under this request's
+                        // ID, and that ID only exists on the request's own
+                        // task. The page shows the public message alone.
+                        preview: preview.map_err(|error| error.publish().message),
+                    })
+                }
+                None => None,
+            },
+            _ => None,
+        };
         let ui = ui_context(&state, &headers).await?;
         Ok(render_browse_view(
             &Representation::requested(&headers),
             &page,
+            readme.as_ref(),
             &navigation,
             ui.as_ref(),
             &state.csrf_token,
@@ -1661,6 +1702,28 @@ fn browse_directory(path: &FilePath) -> ApiResult<Vec<BrowserEntry>> {
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(entries)
+}
+
+/// README names in the order a code host prefers them when several exist.
+///
+/// Matching ignores case, as on GitHub, so `readme.md` and `README.MD` both
+/// qualify. Markdown comes first because it is what a README almost always is;
+/// the plain-text and extensionless forms follow because older projects and
+/// tool directories still ship them.
+const README_NAMES: [&str; 4] = ["readme.md", "readme.markdown", "readme.txt", "readme"];
+
+/// The entry to preview beneath a directory listing, if the directory has one.
+///
+/// Only regular files qualify. A symbolic link named `README.md` is listed as a
+/// link and left alone: previews open with `O_NOFOLLOW`, so it would fail, and
+/// following it silently would show a file from somewhere the listing does not
+/// say.
+fn directory_readme(entries: &[BrowserEntry]) -> Option<&BrowserEntry> {
+    README_NAMES.iter().find_map(|name| {
+        entries.iter().find(|entry| {
+            entry.kind == BrowserEntryKind::File && entry.name.eq_ignore_ascii_case(name)
+        })
+    })
 }
 
 fn browse_file(path: &FilePath) -> ApiResult<BrowserFile> {
@@ -3996,6 +4059,7 @@ fn render_users_view(
 fn render_browse_view(
     representation: &Representation,
     page: &BrowserPage,
+    readme: Option<&BrowserReadme>,
     views: &[ViewDefinition],
     ui: Option<&UiContext>,
     csrf_token: &str,
@@ -4102,31 +4166,24 @@ fn render_browse_view(
                             (entries.len()) " entries · directories first · hidden files included"
                         }
                     }
-                }
-                BrowserItem::File(file) => {
-                    div class="cr-table-shell overflow-hidden" {
-                        div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600" {
-                            div class="flex flex-wrap items-center gap-2" {
-                                @match &file.contents {
-                                    BrowserFileContents::Text(_) => { span class="cr-pill" { "text preview" } }
-                                    BrowserFileContents::Binary(_) => { span class="cr-pill" { "binary · hex preview" } }
+                    @if let Some(readme) = readme {
+                        section id="readme" aria-label=(&readme.name) class="mt-6" {
+                            @match &readme.preview {
+                                Ok(file) => {
+                                    (render_file_preview(file, Some((&readme.name, readme.href.as_deref()))))
                                 }
-                                span { (format_file_size(file.total_bytes)) }
-                            }
-                            span {
-                                "Showing " (format_file_size(file.bytes_shown as u64))
-                                @if file.truncated { " · preview truncated" }
-                            }
-                        }
-                        pre class="max-h-[70vh] overflow-auto bg-slate-950 p-4 font-mono text-xs leading-5 text-slate-100" tabindex="0" {
-                            code {
-                                @match &file.contents {
-                                    BrowserFileContents::Text(contents) => { (contents) }
-                                    BrowserFileContents::Binary(contents) => { (contents) }
+                                Err(message) => {
+                                    div class="cr-table-shell px-4 py-3 text-sm text-slate-600" {
+                                        span class="font-mono font-semibold text-slate-900" { (&readme.name) }
+                                        " could not be previewed: " (message)
+                                    }
                                 }
                             }
                         }
                     }
+                }
+                BrowserItem::File(file) => {
+                    (render_file_preview(file, None))
                 }
                 BrowserItem::Other => {
                     div class="cr-empty-state" {
@@ -4141,6 +4198,52 @@ fn render_browse_view(
         ui,
         csrf_token,
     )
+}
+
+/// One bounded file preview: the panel an opened file gets, and the panel a
+/// directory's README gets beneath its listing.
+///
+/// A README passes its name and link so the header says which file is being
+/// shown and opens it on its own, as a code host's README header does; an
+/// opened file already names itself in the breadcrumb and path above.
+///
+/// Text wraps; hexadecimal does not. A long line of prose or configuration is
+/// read rather than scrolled to, and a minified file or a URL with no spaces
+/// still breaks instead of pushing the panel wider than the page. A hex dump is
+/// the opposite case: its value is in the aligned offset, byte, and character
+/// columns, which wrapping would scramble, so it keeps horizontal scrolling.
+fn render_file_preview(file: &BrowserFile, readme: Option<(&str, Option<&str>)>) -> Markup {
+    let (contents, class) = match &file.contents {
+        BrowserFileContents::Text(contents) => (contents, "cr-file-preview cr-file-preview-wrap"),
+        BrowserFileContents::Binary(contents) => (contents, "cr-file-preview"),
+    };
+    html! {
+        div class="cr-table-shell overflow-hidden" {
+            div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600" {
+                div class="flex flex-wrap items-center gap-2" {
+                    @if let Some((name, href)) = readme {
+                        @if let Some(href) = href {
+                            a href=(href) class="font-mono text-sm font-semibold text-slate-900 hover:text-blue-700" { (name) }
+                        } @else {
+                            span class="font-mono text-sm font-semibold text-slate-900" { (name) }
+                        }
+                    }
+                    @match &file.contents {
+                        BrowserFileContents::Text(_) => { span class="cr-pill" { "text preview" } }
+                        BrowserFileContents::Binary(_) => { span class="cr-pill" { "binary · hex preview" } }
+                    }
+                    span { (format_file_size(file.total_bytes)) }
+                }
+                span {
+                    "Showing " (format_file_size(file.bytes_shown as u64))
+                    @if file.truncated { " · preview truncated" }
+                }
+            }
+            pre class=(class) tabindex="0" {
+                code { (contents) }
+            }
+        }
+    }
 }
 
 fn format_file_size(bytes: u64) -> String {
@@ -6788,6 +6891,25 @@ html {
 .cr-app textarea:focus { border-color: var(--cr-accent); box-shadow: 0 0 0 3px rgb(37 99 235 / 0.12); }
 
 .cr-table-shell { overflow: hidden; border: 1px solid var(--cr-line); border-radius: var(--cr-radius); background: white; }
+
+/* File previews in the filesystem browser. In this sheet rather than utility
+   classes because the sheet is server-rendered and the utilities are compiled
+   by a script, so the panel stays legible with JavaScript off. */
+.cr-file-preview {
+  max-height: 70vh;
+  margin: 0;
+  overflow: auto;
+  background: #020617;
+  color: #f1f5f9;
+  padding: 16px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.25rem;
+}
+
+/* Keep every space and newline, wrap at the panel edge, and break a token with
+   no spaces at all — a URL, a minified line — rather than overflow. */
+.cr-file-preview-wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
 .cr-table-shell table { font-variant-numeric: tabular-nums; }
 .cr-table-shell thead { background: var(--cr-surface-subtle); }
 .cr-table-shell th { padding: 8px 12px !important; color: #666561 !important; font-size: 0.72rem; font-weight: 620 !important; }

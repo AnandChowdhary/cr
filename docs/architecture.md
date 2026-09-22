@@ -529,7 +529,11 @@ descriptor, escaped into HTML, and bounded to 1 MiB (4 KiB for hex-rendered
 binary data). Devices, sockets, and FIFOs are never read. This prevents a file
 viewer click from becoming a server-worker hang or an unbounded response, but
 does not make the contents less sensitive: OS-level read permission remains the
-outer authority.
+outer authority. A directory's README is previewed through that same path —
+chosen only among regular entries, so a symbolic link named `README.md` is
+listed but never followed — and its failure is published on the request's own
+task so the log line carries the request ID, then shown in place of the preview
+rather than failing the listing.
 
 `audit verify` validates the chain and reconciles every latest record hash, including deleted-record absence and manually added untracked files. `audit baseline` explicitly introduces legacy records into the chain. It cannot silently baseline a record that already has history.
 

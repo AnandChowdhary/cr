@@ -1622,6 +1622,111 @@ async fn owners_can_browse_and_preview_the_filesystem_without_mutating_it() {
     );
 }
 
+/// A directory with a README shows it beneath the listing, in the same bounded,
+/// escaped panel opening the file would give, and text previews wrap while hex
+/// dumps keep their columns.
+#[tokio::test]
+async fn directories_preview_their_readme_and_text_previews_wrap() {
+    let (_temporary, database) = test_database("filesystem-readme");
+    let database = database.with_actor("Owner <owner@example.com>").unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    let docs = database.root().join("docs");
+    fs::create_dir(&docs).unwrap();
+    // Lower case on disk: a code host matches README names without case.
+    fs::write(
+        docs.join("readme.md"),
+        "# Docs\n<script>alert('readme')</script>\n",
+    )
+    .unwrap();
+    fs::write(
+        docs.join("README.txt"),
+        "the plain-text README loses to Markdown",
+    )
+    .unwrap();
+    fs::write(docs.join("data.bin"), [0_u8, 1, 2, 255]).unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let listing = request(&app, Method::GET, &browse_uri(&docs), None, &[]).await;
+    assert_eq!(listing.status, StatusCode::OK, "{}", listing.text());
+    let text = listing.text();
+    let table = text.find("data.bin").unwrap();
+    let readme = text.find("id=\"readme\"").unwrap();
+    assert!(table < readme, "the README renders beneath the listing");
+    assert!(text.contains("&lt;script&gt;alert('readme')&lt;/script&gt;"));
+    assert!(!text.contains("<script>alert('readme')</script>"));
+    assert!(!text.contains("the plain-text README loses to Markdown"));
+    // The README header opens the file itself.
+    assert!(text[readme..].contains(&browse_uri(&docs.join("readme.md")).replace('&', "&amp;")));
+    assert!(text[readme..].contains("cr-file-preview cr-file-preview-wrap"));
+
+    // Opening a text file wraps; opening a binary file keeps its hex columns.
+    let file = request(
+        &app,
+        Method::GET,
+        &browse_uri(&docs.join("README.txt")),
+        None,
+        &[],
+    )
+    .await;
+    assert!(
+        file.text()
+            .contains("class=\"cr-file-preview cr-file-preview-wrap\"")
+    );
+    let binary = request(
+        &app,
+        Method::GET,
+        &browse_uri(&docs.join("data.bin")),
+        None,
+        &[],
+    )
+    .await;
+    assert!(binary.text().contains("class=\"cr-file-preview\""));
+    assert!(
+        !binary
+            .text()
+            .contains("class=\"cr-file-preview cr-file-preview-wrap\"")
+    );
+
+    // A directory with no README is just a listing.
+    let root = request(&app, Method::GET, &browse_uri(database.root()), None, &[]).await;
+    assert!(!root.text().contains("id=\"readme\""));
+}
+
+/// A README the server cannot read is reported in place rather than taking the
+/// directory listing down with it.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_readme_does_not_hide_the_listing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_temporary, database) = test_database("filesystem-readme-unreadable");
+    let database = database.with_actor("Owner <owner@example.com>").unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    let docs = database.root().join("docs");
+    fs::create_dir(&docs).unwrap();
+    let readme = docs.join("README.md");
+    fs::write(&readme, "private").unwrap();
+    fs::write(docs.join("notes.txt"), "public").unwrap();
+    fs::set_permissions(&readme, fs::Permissions::from_mode(0o000)).unwrap();
+    // Permission bits do not bind a superuser, and then there is nothing to
+    // test: the README is simply readable.
+    if fs::read(&readme).is_ok() {
+        return;
+    }
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let listing = request(&app, Method::GET, &browse_uri(&docs), None, &[]).await;
+    fs::set_permissions(&readme, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(listing.status, StatusCode::OK, "{}", listing.text());
+    assert!(listing.text().contains("notes.txt"));
+    assert!(listing.text().contains("could not be previewed"));
+    assert!(!listing.text().contains("private"));
+}
+
 /// Without RBAC there is nothing in the internal registry to show, so the page
 /// stays reachable but unlinked and says how to bootstrap access control. The
 /// more sensitive filesystem browser is absent until RBAC can identify an
