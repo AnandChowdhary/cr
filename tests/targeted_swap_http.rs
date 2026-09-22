@@ -9,7 +9,7 @@
 //! apply leave the sidebar, the heading and — the visible win — an open filter
 //! panel exactly where they were.
 //!
-//! Four properties are load bearing, and this file is where each of them is a
+//! Five properties are load bearing, and this file is where each of them is a
 //! test rather than a claim.
 //!
 //! **Every control is still an ordinary link or form.** The `hx-` attributes are
@@ -30,6 +30,15 @@
 //! results fragment carries both as out-of-band elements, which are the document's
 //! own markup plus one attribute — asserted here by stripping the attribute and
 //! finding the remainder in the document verbatim.
+//!
+//! **The swap says what it did.** These four controls change which records are
+//! on screen and nothing else, which is invisible to a reader who was not
+//! looking at the table — after a filter apply, focus correctly stays on "Apply
+//! view" and the rows behind it silently become different rows. The fragment
+//! therefore carries a third out-of-band passenger: one sentence into the page's
+//! live region, patched as `innerHTML` so the element an assistive technology is
+//! watching survives the swap. It states the same range the pager prints, which
+//! is asserted here by taking the numbers out of both.
 //!
 //! **Back and forward still get documents.** `cr.js` sets `historyCacheSize` to
 //! zero, so every restore is a real request, and a restore swaps into `<body>`:
@@ -57,6 +66,7 @@ use tower::ServiceExt;
 const VIEW_TABLE_REGION: &str = "cr-view-table";
 const VIEW_COUNT_ID: &str = "cr-view-count";
 const VIEW_FILTER_SUMMARY_ID: &str = "cr-view-filter-summary";
+const ANNOUNCE_REGION: &str = "cr-announce";
 
 /// The three attributes a targeted control carries, and the two swap styles.
 ///
@@ -128,15 +138,17 @@ async fn swap(app: &Router, uri: &str) -> TestResponse {
 }
 
 /// A results answer, taken apart: the title htmx applies to the tab, the region it
-/// swaps, and the out-of-band elements it patches into the heading.
+/// swaps, the out-of-band elements it patches into the heading, and the sentence
+/// it patches into the page's live region.
 struct Results {
     title: String,
     region: String,
     count: String,
     summary: String,
+    announcement: String,
 }
 
-/// Split a results fragment into its four pieces, checking the shape as it goes.
+/// Split a results fragment into its five pieces, checking the shape as it goes.
 ///
 /// The shape is the contract, so this panics rather than returning an option: a
 /// fragment that had lost its title, its root element or one of its passengers
@@ -153,7 +165,11 @@ fn results(uri: &str, body: &str) -> Results {
     let summary_at = rest
         .find(&format!("<summary id=\"{VIEW_FILTER_SUMMARY_ID}\""))
         .unwrap_or_else(|| panic!("{uri} carries no filter-summary patch"));
-    let (count, summary) = rest.split_at(summary_at);
+    let (count, rest) = rest.split_at(summary_at);
+    let announcement_at = rest
+        .find(&format!("<div id=\"{ANNOUNCE_REGION}\""))
+        .unwrap_or_else(|| panic!("{uri} carries no announcement"));
+    let (summary, announcement) = rest.split_at(announcement_at);
     assert!(
         region.starts_with(&format!("<div id=\"{VIEW_TABLE_REGION}\">"))
             && region.ends_with("</div>"),
@@ -165,11 +181,22 @@ fn results(uri: &str, body: &str) -> Results {
             "{uri} sends the {name} without marking it out of band: {patch}"
         );
     }
+    // `innerHTML`, not `true`, and the distinction is the whole reason the
+    // announcement is a separate passenger: `true` replaces the element, and a
+    // live region announces because an assistive technology is watching the node
+    // it was given. Replacing that node with a new one carrying text is how a
+    // region goes quiet, so this patch changes the contents of the region the
+    // shell rendered and leaves the element — and the watcher — alone.
+    assert!(
+        announcement.contains(" hx-swap-oob=\"innerHTML\""),
+        "{uri} replaces the live region instead of its contents: {announcement}"
+    );
     Results {
         title: title.to_owned(),
         region: region.to_owned(),
         count: count.to_owned(),
         summary: summary.to_owned(),
+        announcement: announcement.to_owned(),
     }
 }
 
@@ -346,6 +373,21 @@ async fn each_control_answers_with_the_results_region_and_the_heading_it_changes
             );
         }
 
+        // The announcement and the footer are one fact in two renderings: the
+        // pager prints "Showing 1–2 of 5" for the eye and the live region is
+        // told "Showing records 1 to 2 of 5", which is the same three numbers
+        // spelled for a voice. Asserting the numbers rather than the sentence is
+        // what keeps the two from drifting without pinning either's wording.
+        let spoken = between(&answer.announcement, "\">", "</div>");
+        let printed = between(&answer.region, "Showing ", "</p>");
+        let (range, total) = printed.split_once(" of ").expect("pager states a total");
+        let (first, last) = range.split_once('–').expect("pager states a range");
+        assert_eq!(
+            spoken,
+            format!("Showing records {first} to {last} of {total}"),
+            "{control} tells the live region something the pager does not say"
+        );
+
         // The tab follows the swap because the fragment says what to call the
         // state. Nothing here changes it — every one of these URLs is the same
         // view with a different query — and that is the point: the title is sent
@@ -411,6 +453,11 @@ async fn the_same_urls_answer_a_browser_with_a_whole_page_and_no_patches() {
             "data-filter-builder=\"true\"",
             "data-filter-panel=\"true\"",
             "hx-boost=\"true\"",
+            // Present and empty. Arriving on a page is not a change to
+            // announce, and a region that already held a sentence when the
+            // reader got here would either be read out unprompted or make the
+            // next swap's identical sentence look like no change at all.
+            r#"<div id="cr-announce" class="cr-visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>"#,
         ] {
             assert!(document.body.contains(shell), "{control} lost {shell}");
         }

@@ -164,6 +164,49 @@ const enhanceFilterBuilder = () => {
   reindex();
 };
 
+// Say something in the page's one live region.
+//
+// The region is rendered empty by the server on every page (`live_region` in
+// `src/server.rs`) and is outside every fragment this UI swaps, so it is on the
+// page and being watched before anything asks it to speak. A view's results
+// swap fills it directly with an out-of-band swap and needs nothing from this
+// file; the one case that does is a message that arrives *with* a page, which
+// is the case a live region does not reliably announce — the region and its
+// contents are inserted together, and an assistive technology that was not
+// already watching the element has nothing to compare against.
+//
+// Hence the delay. Writing the text one task later makes it a change to a region
+// the browser has already registered, which is the only thing live regions are
+// specified to announce. A frame would do it in principle; 120ms is chosen to
+// also clear the settling window Chromium applies after a document load, because
+// the other half of this case is a plain navigation with no htmx involved at all
+// — a delete or a Kanban move still answers a browser with `303 See Other`.
+const announce = (message) => {
+  const region = document.getElementById('cr-announce');
+  if (!region || !message) return;
+  window.setTimeout(() => {
+    region.textContent = message;
+  }, 120);
+};
+
+// The success banner a mutation redirects to, said once.
+//
+// `claim` is what makes it once: the banner is a node, this runs on every
+// `htmx:load` a navigation produces, and the same banner must not be announced
+// twice because the sidebar happened to be inserted after it. A new navigation
+// renders a new node, which is a new claim and a new announcement.
+//
+// The banner itself carries no `role`, deliberately — see the comment beside it
+// in `render_view_records`. This is the page's only announcement of it, and with
+// JavaScript off there is none, which is correct: without htmx the notice
+// arrives at the top of a freshly loaded document, and the navigation is the
+// feedback.
+const enhanceNotice = () => {
+  const notice = document.querySelector('[data-notice]');
+  if (!claim(notice)) return;
+  announce(notice.textContent.trim());
+};
+
 // Save-as-view: a Kanban view needs a grouping field and a table view has no
 // use for one, so the control follows the chosen layout.
 const enhanceViewLayout = () => {
@@ -325,6 +368,7 @@ document.addEventListener('htmx:beforeSwap', (event) => {
 // every enhancement above working when htmx is absent, blocked, or still in
 // flight; it is not htmx that owns them.
 const enhanceAll = () => {
+  enhanceNotice();
   enhanceFilterBuilder();
   enhanceViewLayout();
   enhanceKanbanBoard();
