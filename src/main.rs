@@ -897,7 +897,8 @@ enum ViewCommand {
         #[arg(long, value_name = "FIELD")]
         group_by: Option<String>,
 
-        /// Default ordering field. Accepts dotted front matter, $id, $collection, or $path.
+        /// Default ordering field. Accepts dotted front matter, $id, $collection,
+        /// $path, or the audit-derived $created_at and $updated_at.
         #[arg(long, value_name = "FIELD")]
         sort_by: Option<String>,
 
@@ -906,7 +907,7 @@ enum ViewCommand {
         sort_direction: Option<ViewSortDirectionArgument>,
 
         /// Default records per page.
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 10)]
         page_size: usize,
     },
 

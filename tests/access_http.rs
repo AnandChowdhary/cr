@@ -233,6 +233,98 @@ async fn rest_reads_and_writes_enforce_record_owned_visibility() {
 }
 
 #[tokio::test]
+async fn internal_user_records_are_readable_without_any_web_mutation() {
+    let (_temporary, database) = seeded_database("internal-users");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let owner = request(&app, Method::GET, "/users", None, None, &[]).await;
+    assert_eq!(owner.status, StatusCode::OK, "{}", owner.text());
+    assert!(owner.text().contains("owner@example.com"));
+    assert!(owner.text().contains("reader@example.com"));
+    assert!(owner.text().contains("editor@example.com"));
+    assert!(owner.text().contains("owner · database"));
+    assert!(owner.text().contains("editor · collection:deals"));
+    assert!(owner.text().contains("viewer · record:deals/public"));
+    // Read-only means no create, edit, or delete affordance at all.
+    assert!(owner.text().contains("read-only"));
+    assert!(!owner.text().contains("New record"));
+    assert!(!owner.text().contains("Save changes"));
+    assert!(!owner.text().contains("Delete this record"));
+    assert!(!owner.text().contains("href=\"/users/records"));
+
+    // `users` is not a view, so the record routes never reach it.
+    let record = request(
+        &app,
+        Method::GET,
+        "/users/records/reader@example.com",
+        None,
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(record.status, StatusCode::NOT_FOUND);
+
+    let home = request(&app, Method::GET, "/", None, None, &[]).await;
+    let csrf = csrf(home.text()).to_owned();
+    let selected_editor = request(
+        &app,
+        Method::POST,
+        "/perspective",
+        Some(form(&[
+            ("_csrf", &csrf),
+            ("principal", "editor@example.com"),
+        ])),
+        Some("application/x-www-form-urlencoded"),
+        &[],
+    )
+    .await;
+    let editor_cookie = perspective_cookie(&selected_editor);
+
+    // Editing records is not reading access policy: the section is hidden and
+    // the page itself stays refused.
+    let editor_home = request(
+        &app,
+        Method::GET,
+        "/",
+        None,
+        None,
+        &[("cookie", &editor_cookie)],
+    )
+    .await;
+    assert_eq!(editor_home.status, StatusCode::OK);
+    assert!(!editor_home.text().contains("href=\"/users\""));
+    let editor_users = request(
+        &app,
+        Method::GET,
+        "/users",
+        None,
+        None,
+        &[("cookie", &editor_cookie)],
+    )
+    .await;
+    assert_eq!(editor_users.status, StatusCode::FORBIDDEN);
+
+    database
+        .grant_access(
+            "editor@example.com",
+            AccessResource::Database,
+            Role::AccessManager,
+        )
+        .unwrap();
+    let managed = request(
+        &app,
+        Method::GET,
+        "/users",
+        None,
+        None,
+        &[("cookie", &editor_cookie)],
+    )
+    .await;
+    assert_eq!(managed.status, StatusCode::OK, "{}", managed.text());
+    assert!(managed.text().contains("reader@example.com"));
+}
+
+#[tokio::test]
 async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
     let (_temporary, database) = seeded_database("perspective-ui");
     let app = router(database.clone(), ServerConfig::default()).unwrap();
@@ -242,7 +334,19 @@ async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
     assert!(home.text().contains("aria-label=\"View as user\""));
     assert!(home.text().contains("Owner — owner"));
     assert!(home.text().contains("Reader — viewer · scoped"));
-    assert!(!home.text().contains("records/users"));
+    // The reserved `users` collection is internal: it stays out of collection
+    // navigation and the view index, and is offered separately instead.
+    let (navigation, _) = home
+        .text()
+        .split_once("cr-sidebar-label\">Internal<")
+        .unwrap();
+    assert!(!navigation.contains("href=\"/users\""));
+    let (index, _) = home
+        .text()
+        .split_once("aria-label=\"Internal records\"")
+        .unwrap();
+    assert!(!index.contains("records/users"));
+    assert!(home.text().contains("href=\"/users\""));
     let csrf = csrf(home.text()).to_owned();
 
     let selected_reader = request(

@@ -470,7 +470,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(
         sorted_page
             .text()
-            .contains("sort_field=value&amp;sort_direction=asc&amp;limit=1&amp;offset=1")
+            .contains("sort_field=value&amp;sort_direction=asc&amp;limit=1&amp;after=beta")
     );
 
     let invalid_sort = request(
@@ -503,7 +503,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(
         projected
             .text()
-            .contains("columns=custom&amp;column=name&amp;column=value&amp;limit=1&amp;offset=1")
+            .contains("columns=custom&amp;column=name&amp;column=value&amp;limit=1&amp;after=beta")
     );
 
     let empty_projection = request(&app, Method::GET, "/deals?columns=custom", None, &[]).await;
@@ -660,7 +660,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
             .text()
             .contains("filter_match=any&amp;filter_field=status")
     );
-    assert!(any_first_page.text().contains("limit=1&amp;offset=1"));
+    assert!(any_first_page.text().contains("limit=1&amp;after=beta"));
 
     let invalid_match = request(&app, Method::GET, "/deals?filter_match=neither", None, &[]).await;
     assert_eq!(invalid_match.status, StatusCode::BAD_REQUEST);
@@ -680,13 +680,24 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert_eq!(browser_search.status, StatusCode::OK);
     assert!(browser_search.text().contains("alpha"));
 
+    // Tables open newest first, and each page names the record the next one
+    // continues after instead of an offset that a new record would shift.
     let first_page = request(&app, Method::GET, "/deals?limit=1", None, &[]).await;
-    assert!(first_page.text().contains("alpha"));
-    assert!(!first_page.text().contains("beta"));
-    assert!(first_page.text().contains("limit=1&amp;offset=1"));
-    let second_page = request(&app, Method::GET, "/deals?limit=1&offset=1", None, &[]).await;
-    assert!(!second_page.text().contains("alpha"));
-    assert!(second_page.text().contains("beta"));
+    assert!(first_page.text().contains("/deals/records/beta"));
+    assert!(!first_page.text().contains("/deals/records/alpha"));
+    assert!(first_page.text().contains("limit=1&amp;after=beta"));
+    let second_page = request(&app, Method::GET, "/deals?limit=1&after=beta", None, &[]).await;
+    assert!(second_page.text().contains("/deals/records/alpha"));
+    assert!(!second_page.text().contains("/deals/records/beta"));
+    assert!(second_page.text().contains("limit=1&amp;before=alpha"));
+    assert!(second_page.text().contains("Showing 2\u{2013}2 of 2"));
+    // Links shared before cursors existed still resolve.
+    let offset_page = request(&app, Method::GET, "/deals?limit=1&offset=1", None, &[]).await;
+    assert!(offset_page.text().contains("/deals/records/alpha"));
+    // A cursor naming a record that no longer matches starts over rather than
+    // stranding the reader on an empty page.
+    let stale = request(&app, Method::GET, "/deals?limit=1&after=removed", None, &[]).await;
+    assert!(stale.text().contains("/deals/records/beta"));
 }
 
 #[tokio::test]
@@ -1451,6 +1462,99 @@ async fn global_audit_view_renders_filters_and_paginates_field_changes() {
     let invalid = request(&app, Method::GET, "/audit?id=alpha", None, &[]).await;
     assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
     assert!(invalid.text().contains("collection is required"));
+}
+
+/// The first two table columns are derived from the audit journal, and a view
+/// opens newest-first without anyone configuring a sort.
+#[tokio::test]
+async fn tables_show_audited_creation_and_update_times_and_open_newest_first() {
+    let (_temporary, database) = test_database("views-activity");
+    database
+        .create(
+            "deals",
+            "alpha",
+            &[Assignment::from_str("status=open").unwrap()],
+            "",
+        )
+        .unwrap();
+    database
+        .create(
+            "deals",
+            "beta",
+            &[Assignment::from_str("status=open").unwrap()],
+            "",
+        )
+        .unwrap();
+    // Written directly and never saved: no audited age to show.
+    fs::write(
+        database.root().join("records/deals/manual.md"),
+        "---\nstatus: open\n---\n",
+    )
+    .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/deals", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.text().contains(">Created<"));
+    assert!(page.text().contains(">Updated<"));
+    assert!(page.text().contains("<time datetime="));
+    assert!(
+        page.text()
+            .contains("<option value=\"$created_at\" selected>")
+    );
+    // Newest first, with the unaudited record last in the ordering.
+    let beta = page.text().find("/deals/records/beta").unwrap();
+    let alpha = page.text().find("/deals/records/alpha").unwrap();
+    let manual = page.text().find("/deals/records/manual").unwrap();
+    assert!(beta < alpha && alpha < manual);
+    assert!(page.text().contains("aria-sort=\"descending\""));
+
+    // Changing a record moves it to the top of the update ordering without
+    // disturbing the creation ordering.
+    database
+        .update(
+            "deals",
+            "alpha",
+            &[Assignment::from_str("status=won").unwrap()],
+            None,
+        )
+        .unwrap();
+    let by_update = request(
+        &app,
+        Method::GET,
+        "/deals?sort_field=%24updated_at&sort_direction=desc",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(by_update.status, StatusCode::OK);
+    assert!(
+        by_update.text().find("/deals/records/alpha").unwrap()
+            < by_update.text().find("/deals/records/beta").unwrap()
+    );
+    let by_creation = request(&app, Method::GET, "/deals", None, &[]).await;
+    assert!(
+        by_creation.text().find("/deals/records/beta").unwrap()
+            < by_creation.text().find("/deals/records/alpha").unwrap()
+    );
+}
+
+/// Without RBAC there is nothing in the internal registry to show, so the page
+/// stays reachable but unlinked and says how to bootstrap access control.
+#[tokio::test]
+async fn the_internal_users_page_is_unlinked_until_access_control_exists() {
+    let (_temporary, database) = test_database("views-internal-users");
+    database.create("deals", "one", &[], "").unwrap();
+    let app = router(database, ServerConfig::default()).unwrap();
+
+    let home = request(&app, Method::GET, "/", None, &[]).await;
+    assert_eq!(home.status, StatusCode::OK);
+    assert!(!home.text().contains("href=\"/users\""));
+
+    let users = request(&app, Method::GET, "/users", None, &[]).await;
+    assert_eq!(users.status, StatusCode::OK, "{}", users.text());
+    assert!(users.text().contains("no registered principals"));
+    assert!(users.text().contains("cr access init"));
 }
 
 #[tokio::test]

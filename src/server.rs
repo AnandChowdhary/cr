@@ -33,9 +33,9 @@ use crate::{
     AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
     AuditIntentPart, AuditSource, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary,
     CollectionModel, Database, DomainError, FilterExpression, FilterOperator, Finding,
-    RECORD_ACCESS_FIELD, Record, RecordPrecondition, SearchQuery, SearchTarget, SortDirection,
-    UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
-    audit::AuditChange, sort_records_by_field,
+    RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SearchQuery, SearchTarget,
+    SortDirection, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout,
+    ViewPredicateMatch, audit::AuditChange, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -128,6 +128,9 @@ struct UiContext {
     selected_name: String,
     selected_status: UserStatus,
     can_view_global_audit: bool,
+    /// Whether this perspective may read the reserved `users` collection, and
+    /// therefore whether the internal navigation section is offered at all.
+    can_read_users: bool,
     users: Vec<UiUser>,
 }
 
@@ -266,6 +269,15 @@ struct ViewQuery {
     #[serde(default)]
     column: Vec<String>,
     limit: Option<usize>,
+    /// The record this page continues after, and the one it ends before.
+    ///
+    /// Views open newest-first, where an offset is the wrong address: creating
+    /// a record shifts every later row down one, so a reader paging by offset
+    /// sees a row twice. Naming the record a page continues from survives
+    /// concurrent writes. `offset` remains accepted so links shared before
+    /// cursors existed still resolve.
+    after: Option<String>,
+    before: Option<String>,
     offset: Option<usize>,
     notice: Option<String>,
 }
@@ -903,6 +915,9 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         .route("/", get(views_home))
         .route("/perspective", post(switch_perspective))
         .route("/audit", get(audit_view))
+        // Static before dynamic: `users` is an internal collection with its own
+        // read-only page, not one of the views `/{view}` serves.
+        .route("/users", get(users_view))
         .route("/{view}", get(view_records))
         .route("/{view}/save-view", post(save_view_form))
         .route("/{view}/new", get(new_record_form))
@@ -1145,6 +1160,34 @@ async fn audit_view(
     html_result(result)
 }
 
+/// The read-only page for the reserved `users` collection.
+///
+/// `users` is CR's own access-control registry rather than application data, so
+/// it is deliberately absent from the collection views `/{view}` serves. It is
+/// still worth seeing: this page lists the registry for any perspective allowed
+/// to read access policy, and offers no mutation at all. Editing a principal or
+/// its grants stays with `cr access` and the REST API, which enforce the
+/// reserved-field rules the browser forms cannot express.
+async fn users_view(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let result: ApiResult<Markup> = async {
+        let (users, navigation) = run_database(&state, &headers, |database| {
+            let users = database.users()?;
+            let navigation = database.views()?;
+            Ok((users, navigation))
+        })
+        .await?;
+        let ui = ui_context(&state, &headers).await?;
+        Ok(render_users_view(
+            &users,
+            &navigation,
+            ui.as_ref(),
+            &state.csrf_token,
+        ))
+    }
+    .await;
+    html_result(result)
+}
+
 async fn view_records(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1156,90 +1199,113 @@ async fn view_records(
         let ad_hoc_filters = view_filter_expressions(&query)?;
         let query_for_database = query.clone();
         let requested_view = view_name.clone();
-        let (view, mut records, schema, navigation, can_create, can_manage_views, updatable) =
-            run_database(&state, &headers, move |database| {
-                let view = database.view(&requested_view)?;
-                let view_filters = view
-                    .filters
-                    .iter()
-                    .map(|filter| Assignment::from_str(filter))
-                    .collect::<Result<Vec<_>>>()?;
-                let view_expressions = view
-                    .where_expr
-                    .iter()
-                    .map(|expression| FilterExpression::from_str(expression))
-                    .collect::<Result<Vec<_>>>()?;
-                let view_filter_groups = view
-                    .filter_groups
-                    .iter()
-                    .map(|group| {
-                        let expressions = group
-                            .expressions
-                            .iter()
-                            .map(|expression| FilterExpression::from_str(expression))
-                            .collect::<Result<Vec<_>>>()?;
-                        Ok((group.match_mode, expressions))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let mut records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
-                    Some(pattern) => {
-                        let search =
-                            SearchQuery::new(pattern, SearchTarget::Document, false, true)?;
-                        database.search(Some(&view.collection), &view_filters, &search)?
-                    }
-                    None => database.list(&view.collection, &view_filters)?,
-                };
-                records.retain(|record| {
-                    view_expressions
+        let (
+            view,
+            mut records,
+            activity,
+            schema,
+            navigation,
+            can_create,
+            can_manage_views,
+            updatable,
+        ) = run_database(&state, &headers, move |database| {
+            let view = database.view(&requested_view)?;
+            let view_filters = view
+                .filters
+                .iter()
+                .map(|filter| Assignment::from_str(filter))
+                .collect::<Result<Vec<_>>>()?;
+            let view_expressions = view
+                .where_expr
+                .iter()
+                .map(|expression| FilterExpression::from_str(expression))
+                .collect::<Result<Vec<_>>>()?;
+            let view_filter_groups = view
+                .filter_groups
+                .iter()
+                .map(|group| {
+                    let expressions = group
+                        .expressions
                         .iter()
-                        .all(|expression| expression.matches(&record.attributes))
-                        && view_filter_groups.iter().all(|(match_mode, expressions)| {
-                            saved_filter_group_matches(*match_mode, expressions, &record.attributes)
-                        })
-                        && query_for_database
-                            .filter_match
-                            .matches(&ad_hoc_filters, &record.attributes)
-                });
-                let schema = database
-                    .collection_models()?
-                    .into_iter()
-                    .find(|model| model.name == view.collection)
-                    .and_then(|model| model.schema);
-                let navigation = database.views()?;
-                let can_create = can_create_in_collection(database, &view.collection)?;
-                let can_manage_views = database.owner_access_allowed(&AccessResource::Database)?;
-                let mut updatable = BTreeSet::new();
-                for record in &records {
-                    if database.access_allowed(
-                        AccessAction::Update,
-                        &AccessResource::record(&record.collection, &record.id),
-                    )? {
-                        updatable.insert(record.id.clone());
-                    }
+                        .map(|expression| FilterExpression::from_str(expression))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok((group.match_mode, expressions))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
+                Some(pattern) => {
+                    let search = SearchQuery::new(pattern, SearchTarget::Document, false, true)?;
+                    database.search(Some(&view.collection), &view_filters, &search)?
                 }
-                Ok((
-                    view,
-                    records,
-                    schema,
-                    navigation,
-                    can_create,
-                    can_manage_views,
-                    updatable,
-                ))
-            })
-            .await?;
+                None => database.list(&view.collection, &view_filters)?,
+            };
+            records.retain(|record| {
+                view_expressions
+                    .iter()
+                    .all(|expression| expression.matches(&record.attributes))
+                    && view_filter_groups.iter().all(|(match_mode, expressions)| {
+                        saved_filter_group_matches(*match_mode, expressions, &record.attributes)
+                    })
+                    && query_for_database
+                        .filter_match
+                        .matches(&ad_hoc_filters, &record.attributes)
+            });
+            // One verified journal walk per page: the created and updated
+            // columns are derived from history, and the sort default reads
+            // them, so this is not optional work the renderer can skip.
+            let activity = database.record_activity(&view.collection)?;
+            let schema = database
+                .collection_models()?
+                .into_iter()
+                .find(|model| model.name == view.collection)
+                .and_then(|model| model.schema);
+            let navigation = database.views()?;
+            let can_create = can_create_in_collection(database, &view.collection)?;
+            let can_manage_views = database.owner_access_allowed(&AccessResource::Database)?;
+            let mut updatable = BTreeSet::new();
+            for record in &records {
+                if database.access_allowed(
+                    AccessAction::Update,
+                    &AccessResource::record(&record.collection, &record.id),
+                )? {
+                    updatable.insert(record.id.clone());
+                }
+            }
+            Ok((
+                view,
+                records,
+                activity,
+                schema,
+                navigation,
+                can_create,
+                can_manage_views,
+                updatable,
+            ))
+        })
+        .await?;
 
         if query.sort_field.is_none() {
-            query.sort_field = view.sort_by.clone();
-            query.sort_direction = match view.sort_direction {
-                SortDirection::Asc => ViewSortDirection::Asc,
-                SortDirection::Desc => ViewSortDirection::Desc,
-            };
+            match view.sort_by.clone() {
+                Some(field) => {
+                    query.sort_field = Some(field);
+                    query.sort_direction = match view.sort_direction {
+                        SortDirection::Asc => ViewSortDirection::Asc,
+                        SortDirection::Desc => ViewSortDirection::Desc,
+                    };
+                }
+                // Newest first. Making the default explicit in the query keeps
+                // the header indicator, the sort control, and every generated
+                // link agreeing about what the page is actually ordered by.
+                None => {
+                    query.sort_field = Some(DEFAULT_VIEW_SORT_FIELD.to_owned());
+                    query.sort_direction = ViewSortDirection::Desc;
+                }
+            }
         }
 
         let available_columns = view_available_columns(&view, &records, schema.as_ref());
         let columns = selected_view_columns(&view, &query, &available_columns)?;
-        sort_view_records(&mut records, &query)?;
+        sort_view_records(&mut records, &query, &activity)?;
         let bounds = page_bounds(
             query
                 .limit
@@ -1247,13 +1313,14 @@ async fn view_records(
             query.offset,
             state.max_page_size,
         )?;
-        let page = paginate(records, bounds);
+        let page = paginate_view(records, bounds.limit, view_position(&query, bounds.offset));
         let ui = ui_context(&state, &headers).await?;
         Ok(render_view_records(
             &view,
             &columns,
             &available_columns,
             &page,
+            &activity,
             &query,
             schema.as_ref(),
             &state.csrf_token,
@@ -2880,10 +2947,161 @@ fn render_views_home(views: &[ViewDefinition], ui: Option<&UiContext>, csrf_toke
                     }
                 }
             }
+            @if ui.is_some_and(|ui| ui.can_read_users) {
+                section class="cr-view-index mt-6" aria-label="Internal records" {
+                    div class="cr-view-index-header" aria-hidden="true" {
+                        span { "Internal" }
+                        span { "Type" }
+                        span { "Open" }
+                    }
+                    a href="/users" class="cr-view-row group" {
+                        div class="min-w-0" {
+                            h2 class="truncate text-[0.95rem] font-semibold text-slate-950" { "Users" }
+                            p class="cr-path mt-1 truncate" { "records/users" }
+                        }
+                        div class="flex min-w-0 flex-wrap items-center gap-2" {
+                            span class="cr-pill" { "access control" }
+                            span class="cr-pill cr-pill-warn" { "read-only" }
+                            span class="text-xs text-slate-500" { "Registered principals and their grants" }
+                        }
+                        span class="cr-view-arrow" aria-hidden="true" { "→" }
+                    }
+                }
+            }
         },
         ui,
         csrf_token,
     )
+}
+
+fn render_users_view(
+    users: &[(String, User)],
+    views: &[ViewDefinition],
+    ui: Option<&UiContext>,
+    csrf_token: &str,
+) -> Markup {
+    // Profile metadata is optional and usually absent, so the column only
+    // appears when some principal actually carries it.
+    let show_profile = users.iter().any(|(_, user)| !user.profile.is_empty());
+    let columns = if show_profile { 7 } else { 6 };
+    page_layout(
+        "Users",
+        "/users",
+        views,
+        html! {
+            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-slate-500" {
+                a href="/" class="font-medium hover:text-blue-700" { "Views" }
+                span aria-hidden="true" { "/" }
+                span class="text-slate-900" { "Users" }
+            }
+            div class="cr-page-heading mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
+                div {
+                    p class="cr-eyebrow" { "Internal record" }
+                    h1 class="cr-title mt-1" { "Users" }
+                    p class="cr-lede mt-1 max-w-2xl" {
+                        "Every principal registered in the reserved "
+                        code class="rounded bg-slate-100 px-1.5 py-0.5 text-xs" { "users" }
+                        " collection. CR owns this collection's schema and history, so the web UI keeps it read-only: register a principal, change a role, or disable an identity with "
+                        code class="rounded bg-slate-100 px-1.5 py-0.5 text-xs" { "cr access" }
+                        " or the REST API."
+                    }
+                }
+                div class="flex flex-wrap items-center gap-2" {
+                    span class="cr-pill" { (users.len()) " principals" }
+                    span class="cr-pill cr-pill-warn" { "read-only" }
+                    a href="/api/v1/collections/users/records" class="cr-button" { "JSON API" span aria-hidden="true" { " ↗" } }
+                }
+            }
+            div class="cr-table-shell" {
+                div class="overflow-x-auto" {
+                    table class="min-w-full divide-y divide-slate-200 text-left text-sm" {
+                        thead {
+                            tr {
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Principal" }
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Name" }
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Email" }
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Kind" }
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Status" }
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Access" }
+                                @if show_profile {
+                                    th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Profile" }
+                                }
+                            }
+                        }
+                        tbody class="divide-y divide-slate-100" {
+                            @if users.is_empty() {
+                                tr {
+                                    td colspan=(columns) class="px-4 py-12 text-center text-slate-500" {
+                                        "This database has no registered principals. Run "
+                                        code class="rounded bg-slate-100 px-1.5 py-0.5 text-xs" { "cr access init" }
+                                        " to bootstrap access control."
+                                    }
+                                }
+                            } @else {
+                                @for (id, user) in users {
+                                    tr {
+                                        td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold text-slate-900" { (id) }
+                                        td class="px-4 py-3 text-slate-700" { (&user.name) }
+                                        td class="px-4 py-3 text-slate-700" { (user.email.as_deref().unwrap_or("—")) }
+                                        td class="whitespace-nowrap px-4 py-3 text-slate-700" { (user_kind_label(user.kind)) }
+                                        td class="whitespace-nowrap px-4 py-3" {
+                                            @if user.status == UserStatus::Disabled {
+                                                span class="cr-pill cr-pill-warn" { "disabled" }
+                                            } @else {
+                                                span class="cr-pill" { "active" }
+                                            }
+                                        }
+                                        td class="px-4 py-3" {
+                                            @if user.access.is_empty() {
+                                                span class="text-slate-500" { "no access" }
+                                            } @else {
+                                                div class="flex flex-wrap gap-1.5" {
+                                                    @for grant in &user.access {
+                                                        span class="cr-pill" title=(format!("{} at {}", grant.role, grant.resource)) {
+                                                            (grant.role) " · " (grant.resource)
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        @if show_profile {
+                                            td class="px-4 py-3 text-slate-700" {
+                                                @if user.profile.is_empty() {
+                                                    "—"
+                                                } @else {
+                                                    ul class="cr-data space-y-0.5" {
+                                                        @for (key, value) in &user.profile {
+                                                            li { span class="font-semibold" { (yaml_value(key)) } ": " (yaml_value(value)) }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                div class="border-t border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600" {
+                    "Records live in "
+                    code { "records/users/" }
+                    " and every change to them is audited like any other record."
+                }
+            }
+        },
+        ui,
+        csrf_token,
+    )
+}
+
+/// The label for a principal kind. `UserKind` has no `Display`: its serialized
+/// form belongs to the on-disk schema, not to the UI.
+fn user_kind_label(kind: UserKind) -> &'static str {
+    match kind {
+        UserKind::Human => "human",
+        UserKind::Service => "service",
+    }
 }
 
 fn render_audit_view(
@@ -3405,7 +3623,8 @@ fn render_view_records(
     view: &ViewDefinition,
     columns: &[String],
     available_columns: &[String],
-    page: &Page<Record>,
+    page: &ViewPage,
+    activity: &BTreeMap<String, RecordActivity>,
     query: &ViewQuery,
     schema: Option<&JsonValue>,
     csrf_token: &str,
@@ -3417,12 +3636,12 @@ fn render_view_records(
 ) -> Markup {
     let new_url = format!("/{}/new", encode_segment(&view.name));
     let reset_url = format!("/{}", encode_segment(&view.name));
-    let first = if page.pagination.returned == 0 {
+    let first = if page.records.is_empty() {
         0
     } else {
-        page.pagination.offset + 1
+        page.start + 1
     };
-    let last = page.pagination.offset + page.pagination.returned;
+    let last = page.start + page.records.len();
     let filter_fields = view_filter_fields(schema, available_columns);
     let mut filter_rows = query
         .filter_field
@@ -3468,9 +3687,7 @@ fn render_view_records(
                         @if view.layout == ViewLayout::Kanban {
                             span class="cr-pill cr-pill-accent" { "kanban" }
                         }
-                        @if let Some(total) = page.pagination.total {
-                            span class="cr-pill" { (total) " records" }
-                        }
+                        span class="cr-pill" { (page.total) " records" }
                     }
                     p class="cr-lede mt-1" {
                         "Collection " code class="cr-filter-tag" { (&view.collection) }
@@ -3568,13 +3785,15 @@ fn render_view_records(
                                 div class="border-t border-slate-100 pt-4" {
                                     div class="mb-3" {
                                         h2 class="text-sm font-bold text-slate-900" { "Sorting" }
-                                        p class="mt-1 text-xs text-slate-500" { "Missing values stay last; record ID breaks ties." }
+                                        p class="mt-1 text-xs text-slate-500" { "Newest first by default. Missing values stay last; record ID breaks ties." }
                                     }
                                     div class="grid gap-3 sm:grid-cols-2" {
                                         label {
                                             span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Sort by" }
                                             select name="sort_field" aria-label="Sort by" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
-                                                option value="" selected[view_sort_field(query).is_none()] { "Default (record ID)" }
+                                                option value="" selected[view_sort_field(query).is_none()] { "None (record ID order)" }
+                                                option value="$created_at" selected[view_sort_field(query) == Some("$created_at")] { "Created (default)" }
+                                                option value="$updated_at" selected[view_sort_field(query) == Some("$updated_at")] { "Updated" }
                                                 option value="$id" selected[view_sort_field(query) == Some("$id")] { "Record ID" }
                                                 @for field in &filter_fields {
                                                     option value=(&field.key) selected[view_sort_field(query) == Some(field.key.as_str())] { (&field.label) }
@@ -3617,13 +3836,20 @@ fn render_view_records(
                         thead {
                             tr {
                                 th scope="col" aria-sort=(sort_aria_state(query, "$id")) class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" {
-                                    a href=(view_sort_url(view, query, "$id", page.pagination.limit)) aria-label=(sort_link_label(query, "record ID", "$id")) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
+                                    a href=(view_sort_url(view, query, "$id", page.limit)) aria-label=(sort_link_label(query, "record ID", "$id")) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
                                         "ID" span aria-hidden="true" class="text-slate-400" { (sort_indicator(query, "$id")) }
+                                    }
+                                }
+                                @for (field, label) in ACTIVITY_COLUMNS {
+                                    th scope="col" aria-sort=(sort_aria_state(query, field)) class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" {
+                                        a href=(view_sort_url(view, query, field, page.limit)) aria-label=(sort_link_label(query, label, field)) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
+                                            (humanize_field_name(label)) span aria-hidden="true" class="text-slate-400" { (sort_indicator(query, field)) }
+                                        }
                                     }
                                 }
                                 @for column in columns {
                                     th scope="col" aria-sort=(sort_aria_state(query, column)) class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" {
-                                        a href=(view_sort_url(view, query, column, page.pagination.limit)) aria-label=(sort_link_label(query, &humanize_field_name(column), column)) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
+                                        a href=(view_sort_url(view, query, column, page.limit)) aria-label=(sort_link_label(query, &humanize_field_name(column), column)) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
                                             (column) span aria-hidden="true" class="text-slate-400" { (sort_indicator(query, column)) }
                                         }
                                     }
@@ -3632,13 +3858,20 @@ fn render_view_records(
                             }
                         }
                         tbody class="divide-y divide-slate-100" {
-                            @if page.data.is_empty() {
-                                tr { td colspan=(columns.len() + 2) class="px-4 py-12 text-center text-slate-500" { "No records match this view." } }
+                            @if page.records.is_empty() {
+                                tr { td colspan=(columns.len() + ACTIVITY_COLUMNS.len() + 2) class="px-4 py-12 text-center text-slate-500" { "No records match this view." } }
                             } @else {
-                                @for record in &page.data {
+                                @for record in &page.records {
+                                    @let record_activity = activity.get(&record.id);
                                     tr {
                                         td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold" {
                                             a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="text-slate-900 hover:text-indigo-700 hover:underline" { (&record.id) }
+                                        }
+                                        td class="whitespace-nowrap px-4 py-3" {
+                                            (render_timestamp(record_activity.map(|activity| activity.created_at.as_str())))
+                                        }
+                                        td class="whitespace-nowrap px-4 py-3" {
+                                            (render_timestamp(record_activity.map(|activity| activity.updated_at.as_str())))
                                         }
                                         @for column in columns {
                                             td class="max-w-sm px-4 py-3 text-slate-700" {
@@ -3659,15 +3892,17 @@ fn render_view_records(
                 }
                 div class="flex flex-col gap-2 border-t border-slate-200 bg-slate-50 px-3 py-2 text-xs sm:flex-row sm:items-center sm:justify-between" {
                     p class="text-slate-600" {
-                        "Showing " (first) "–" (last)
-                        @if let Some(total) = page.pagination.total { " of " (total) }
+                        "Showing " (first) "–" (last) " of " (page.total)
                     }
                     div class="flex items-center gap-2" {
-                        @if let Some(offset) = page.pagination.previous_offset {
-                            a href=(view_page_url(view, query, page.pagination.limit, offset)) class="cr-button" { "Previous" }
+                        @if page.records.is_empty() && page.start > 0 {
+                            a href=(view_page_url(view, query, page.limit, ViewPosition::Start)) class="cr-button" { "First page" }
                         }
-                        @if let Some(offset) = page.pagination.next_offset {
-                            a href=(view_page_url(view, query, page.pagination.limit, offset)) class="cr-button" { "Next" }
+                        @if let Some(cursor) = page.previous.as_deref() {
+                            a href=(view_page_url(view, query, page.limit, ViewPosition::Before(cursor))) rel="prev" class="cr-button" { "Previous" }
+                        }
+                        @if let Some(cursor) = page.next.as_deref() {
+                            a href=(view_page_url(view, query, page.limit, ViewPosition::After(cursor))) rel="next" class="cr-button" { "Next" }
                         }
                     }
                 }
@@ -3766,7 +4001,7 @@ const SAVE_VIEW_LAYOUT_SCRIPT: &str = r#"(() => {
 fn render_kanban_board(
     view: &ViewDefinition,
     columns: &[String],
-    page: &Page<Record>,
+    page: &ViewPage,
     query: &ViewQuery,
     schema: Option<&JsonValue>,
     csrf_token: &str,
@@ -3776,18 +4011,18 @@ fn render_kanban_board(
         .group_by
         .as_deref()
         .expect("validated Kanban views have a group_by field");
-    let lanes = kanban_lanes(&page.data, group_by, schema);
+    let lanes = kanban_lanes(&page.records, group_by, schema);
     let card_columns = columns
         .iter()
         .filter(|column| column.as_str() != group_by)
         .take(5)
         .collect::<Vec<_>>();
-    let first = if page.pagination.returned == 0 {
+    let first = if page.records.is_empty() {
         0
     } else {
-        page.pagination.offset + 1
+        page.start + 1
     };
-    let last = page.pagination.offset + page.pagination.returned;
+    let last = page.start + page.records.len();
 
     html! {
         div class="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600" {
@@ -3869,15 +4104,17 @@ fn render_kanban_board(
         }
         div class="cr-surface mt-1 flex flex-col gap-2 px-3 py-2 text-xs sm:flex-row sm:items-center sm:justify-between" {
             p class="text-slate-600" {
-                "Showing " (first) "–" (last)
-                @if let Some(total) = page.pagination.total { " of " (total) }
+                "Showing " (first) "–" (last) " of " (page.total)
             }
             div class="flex items-center gap-2" {
-                @if let Some(offset) = page.pagination.previous_offset {
-                    a href=(view_page_url(view, query, page.pagination.limit, offset)) class="cr-button" { "Previous" }
+                @if page.records.is_empty() && page.start > 0 {
+                    a href=(view_page_url(view, query, page.limit, ViewPosition::Start)) class="cr-button" { "First page" }
                 }
-                @if let Some(offset) = page.pagination.next_offset {
-                    a href=(view_page_url(view, query, page.pagination.limit, offset)) class="cr-button" { "Next" }
+                @if let Some(cursor) = page.previous.as_deref() {
+                    a href=(view_page_url(view, query, page.limit, ViewPosition::Before(cursor))) rel="prev" class="cr-button" { "Previous" }
+                }
+                @if let Some(cursor) = page.next.as_deref() {
+                    a href=(view_page_url(view, query, page.limit, ViewPosition::After(cursor))) rel="next" class="cr-button" { "Next" }
                 }
             }
         }
@@ -4704,6 +4941,16 @@ html {
   border-radius: 3px;
 }
 
+.cr-nav-glyph-internal {
+  width: 13px;
+  height: 13px;
+  flex-basis: 13px;
+  border: 1px dashed #aaa9a5;
+  border-radius: 999px;
+}
+
+.cr-nav-note { margin-left: auto; color: #aaa9a5; font-size: 0.62rem; font-weight: 550; }
+
 .cr-nav-glyph-collection::after { content: ""; width: 5px; border-top: 1px solid #aaa9a5; border-bottom: 1px solid #aaa9a5; height: 4px; }
 .cr-nav-glyph-view::after { content: ""; width: 7px; border-top: 1px solid #aaa9a5; }
 .cr-nav-glyph-kanban::after { content: ""; width: 7px; height: 7px; border-left: 2px solid #aaa9a5; border-right: 2px solid #aaa9a5; }
@@ -4889,6 +5136,7 @@ html {
 }
 
 .cr-pill-accent { border-color: #bfdbfe; background: var(--cr-accent-soft); color: #1d4ed8; }
+.cr-pill-warn { border-color: #fcd34d; background: #fffbeb; color: #92400e; }
 
 .cr-filter-tag {
   border-radius: 5px;
@@ -5078,6 +5326,16 @@ fn sidebar_navigation(
                     span class="cr-nav-glyph" aria-hidden="true" { "⌂" }
                     span { "All views" }
                 }
+                @if views.iter().any(|view| view.saved) {
+                    p class="cr-sidebar-label" { "Saved views" }
+                    @for view in views.iter().filter(|view| view.saved) {
+                        @let path = format!("/{}", encode_segment(&view.name));
+                        a href=(&path) class=(if current_path == path { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == path).then_some("page")] title=(&view.title) {
+                            span class=(if view.layout == ViewLayout::Kanban { "cr-nav-glyph cr-nav-glyph-kanban" } else { "cr-nav-glyph cr-nav-glyph-view" }) aria-hidden="true" { "" }
+                            span class="truncate" { (&view.title) }
+                        }
+                    }
+                }
                 @if views.iter().any(|view| !view.saved) {
                     p class="cr-sidebar-label" { "Collections" }
                     @for view in views.iter().filter(|view| !view.saved) {
@@ -5088,14 +5346,12 @@ fn sidebar_navigation(
                         }
                     }
                 }
-                @if views.iter().any(|view| view.saved) {
-                    p class="cr-sidebar-label" { "Saved views" }
-                    @for view in views.iter().filter(|view| view.saved) {
-                        @let path = format!("/{}", encode_segment(&view.name));
-                        a href=(&path) class=(if current_path == path { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == path).then_some("page")] title=(&view.title) {
-                            span class=(if view.layout == ViewLayout::Kanban { "cr-nav-glyph cr-nav-glyph-kanban" } else { "cr-nav-glyph cr-nav-glyph-view" }) aria-hidden="true" { "" }
-                            span class="truncate" { (&view.title) }
-                        }
+                @if ui.is_some_and(|ui| ui.can_read_users) {
+                    p class="cr-sidebar-label" { "Internal" }
+                    a href="/users" class=(if current_path == "/users" { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == "/users").then_some("page")] title="Users · read-only" {
+                        span class="cr-nav-glyph cr-nav-glyph-internal" aria-hidden="true" { "" }
+                        span class="truncate" { "Users" }
+                        span class="cr-nav-note" { "read-only" }
                     }
                 }
             }
@@ -5149,9 +5405,14 @@ fn mobile_navigation(
             }
             nav aria-label="Views" class="cr-mobile-view-strip" {
                 a href="/" class=(if current_path == "/" { "is-active" } else { "" }) { "All views" }
-                @for view in views {
+                // Same order as the desktop sidebar: saved views, then
+                // collections, then the internal registry.
+                @for view in views.iter().filter(|view| view.saved).chain(views.iter().filter(|view| !view.saved)) {
                     @let path = format!("/{}", encode_segment(&view.name));
                     a href=(&path) class=(if current_path == path { "is-active" } else { "" }) { (&view.title) }
+                }
+                @if ui.is_some_and(|ui| ui.can_read_users) {
+                    a href="/users" class=(if current_path == "/users" { "is-active" } else { "" }) { "Users" }
                 }
                 @if ui.is_none_or(|ui| ui.can_view_global_audit) {
                     a href="/audit" class=(if current_path == "/audit" { "is-active" } else { "" }) { "Audit" }
@@ -5574,15 +5835,159 @@ fn view_sort_field(query: &ViewQuery) -> Option<&str> {
         .filter(|field| !field.is_empty())
 }
 
-fn sort_view_records(records: &mut [Record], query: &ViewQuery) -> ApiResult<()> {
+/// The audit-derived columns every table shows between the ID and the fields.
+///
+/// Fixed rather than selectable: they are not record data, they cost nothing
+/// extra once the activity map is loaded, and "when did this happen?" is the
+/// question a reader brings to a newest-first table.
+const ACTIVITY_COLUMNS: [(&str, &str); 2] =
+    [("$created_at", "created"), ("$updated_at", "updated")];
+
+/// Render one audit timestamp compactly while keeping the exact value.
+///
+/// The table shows minutes; the `datetime` attribute and tooltip keep the
+/// stored RFC 3339 instant, which is what a reader correlating a row with
+/// `cr audit log` actually needs.
+fn render_timestamp(value: Option<&str>) -> Markup {
+    match value {
+        Some(value) => html! {
+            time datetime=(value) title=(value) class="cr-data" { (compact_timestamp(value)) }
+        },
+        // No audit history: a file created outside `cr` and not yet saved.
+        None => html! { span class="text-slate-400" { "—" } },
+    }
+}
+
+/// `2026-09-22T09:16:14.123456789Z` becomes `2026-09-22 09:16`.
+fn compact_timestamp(value: &str) -> String {
+    match value.split_once('T') {
+        Some((date, time)) => format!("{date} {}", time.get(..5).unwrap_or(time)),
+        None => value.to_owned(),
+    }
+}
+
+/// The ordering a view uses when neither the URL nor the definition names one.
+///
+/// Newest first, because a table is read to answer "what changed?" before it is
+/// read to answer "what exists?". Record ID order answers neither.
+const DEFAULT_VIEW_SORT_FIELD: &str = "$created_at";
+
+fn sort_view_records(
+    records: &mut [Record],
+    query: &ViewQuery,
+    activity: &BTreeMap<String, RecordActivity>,
+) -> ApiResult<()> {
     let Some(field) = view_sort_field(query) else {
         return Ok(());
     };
-    sort_records_by_field(records, field, query.sort_direction.into())
-        .map_err(ApiError::from_domain)
+    // Audit-derived fields are not on the record, so they sort here rather
+    // than in the shared record comparator. Sequence numbers are the journal's
+    // exact total order; formatted instants can tie or, with fractional
+    // seconds, compare in the wrong order as text.
+    let sequence = match field {
+        "$created_at" => |activity: &RecordActivity| activity.created_sequence,
+        "$updated_at" => |activity: &RecordActivity| activity.updated_sequence,
+        _ => {
+            return sort_records_by_field(records, field, query.sort_direction.into())
+                .map_err(ApiError::from_domain);
+        }
+    };
+    let descending = query.sort_direction == ViewSortDirection::Desc;
+    records.sort_by(|left, right| {
+        let left_sequence = activity.get(&left.id).map(sequence);
+        let right_sequence = activity.get(&right.id).map(sequence);
+        // Records with no audit history stay last in both directions, exactly
+        // like a missing front matter value.
+        let ordering = match (left_sequence, right_sequence) {
+            (Some(left), Some(right)) if descending => right.cmp(&left),
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        ordering.then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(())
 }
 
-fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset: usize) -> String {
+/// One page of a server-rendered view, positioned by record ID.
+///
+/// The complete ordered result is already in memory, which is what lets a
+/// cursor page still report an exact position and total: `start` is the index
+/// of the first row, so the footer can say `11–20 of 84` while Next and
+/// Previous remain stable under concurrent writes.
+struct ViewPage {
+    records: Vec<Record>,
+    limit: usize,
+    start: usize,
+    total: usize,
+    next: Option<String>,
+    previous: Option<String>,
+}
+
+/// Where a view page begins.
+#[derive(Clone, Copy, Debug)]
+enum ViewPosition<'a> {
+    Start,
+    After(&'a str),
+    Before(&'a str),
+    Offset(usize),
+}
+
+/// Read the requested position, preferring a cursor over a legacy offset.
+fn view_position<'a>(query: &'a ViewQuery, offset: usize) -> ViewPosition<'a> {
+    if let Some(after) = query.after.as_deref().filter(|id| !id.is_empty()) {
+        return ViewPosition::After(after);
+    }
+    if let Some(before) = query.before.as_deref().filter(|id| !id.is_empty()) {
+        return ViewPosition::Before(before);
+    }
+    if offset > 0 {
+        return ViewPosition::Offset(offset);
+    }
+    ViewPosition::Start
+}
+
+/// Cut one page out of the ordered result.
+///
+/// A cursor naming a record that is no longer in the result — deleted, or
+/// filtered out by a change to the query — resolves to the first page rather
+/// than failing: the reader asked for records, and the honest answer to "the
+/// row you were at is gone" is the beginning of the current ordering.
+fn paginate_view(records: Vec<Record>, limit: usize, position: ViewPosition<'_>) -> ViewPage {
+    let total = records.len();
+    let locate = |id: &str| records.iter().position(|record| record.id == id);
+    let start = match position {
+        ViewPosition::Start => 0,
+        ViewPosition::After(id) => locate(id).map_or(0, |at| at.saturating_add(1)),
+        ViewPosition::Before(id) => locate(id).map_or(0, |at| at.saturating_sub(limit)),
+        ViewPosition::Offset(offset) => offset,
+    }
+    .min(total);
+    let records: Vec<_> = records.into_iter().skip(start).take(limit).collect();
+    let returned = records.len();
+    let next = (start.saturating_add(returned) < total)
+        .then(|| records.last().map(|record| record.id.clone()))
+        .flatten();
+    let previous = (start > 0)
+        .then(|| records.first().map(|record| record.id.clone()))
+        .flatten();
+    ViewPage {
+        records,
+        limit,
+        start,
+        total,
+        next,
+        previous,
+    }
+}
+
+fn view_page_url(
+    view: &ViewDefinition,
+    query: &ViewQuery,
+    limit: usize,
+    position: ViewPosition<'_>,
+) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     if let Some(q) = query.q.as_deref().filter(|value| !value.is_empty()) {
         serializer.append_pair("q", q);
@@ -5625,7 +6030,18 @@ fn view_page_url(view: &ViewDefinition, query: &ViewQuery, limit: usize, offset:
         }
     }
     serializer.append_pair("limit", &limit.to_string());
-    serializer.append_pair("offset", &offset.to_string());
+    match position {
+        ViewPosition::Start => {}
+        ViewPosition::After(id) => {
+            serializer.append_pair("after", id);
+        }
+        ViewPosition::Before(id) => {
+            serializer.append_pair("before", id);
+        }
+        ViewPosition::Offset(offset) => {
+            serializer.append_pair("offset", &offset.to_string());
+        }
+    }
     format!("/{}?{}", encode_segment(&view.name), serializer.finish())
 }
 
@@ -5639,7 +6055,9 @@ fn view_sort_url(view: &ViewDefinition, query: &ViewQuery, field: &str, limit: u
         ViewSortDirection::Asc
     };
     next.sort_field = Some(field.to_owned());
-    view_page_url(view, &next, limit, 0)
+    // Re-sorting starts the reader at the top of the new ordering: a cursor
+    // from the previous one names a row that is now somewhere else entirely.
+    view_page_url(view, &next, limit, ViewPosition::Start)
 }
 
 fn sort_indicator(query: &ViewQuery, field: &str) -> &'static str {
@@ -6175,6 +6593,8 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
         let selected_database = database.impersonate_verified(&selected)?;
         let can_view_global_audit =
             selected_database.owner_access_allowed(&AccessResource::Database)?;
+        let can_read_users = selected_database
+            .access_allowed(AccessAction::ReadAccess, &AccessResource::Database)?;
         let users = users
             .into_iter()
             .map(|(id, user)| UiUser {
@@ -6193,6 +6613,7 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
             selected_name,
             selected_status,
             can_view_global_audit,
+            can_read_users,
             users,
         })
     })

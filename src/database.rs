@@ -27,7 +27,7 @@ use crate::{
     audit::{
         AuditEncryptionTransition, AuditFilter, AuditHistory, AuditIdempotency,
         AuditIdempotencyResult, AuditLog, AuditMutation, AuditedRecordStates, ChangePreview,
-        ReconciledMutation, record_hash,
+        ReconciledMutation, RecordActivity, record_hash,
     },
     check::{CheckReport, CheckScope},
     encryption::{
@@ -435,6 +435,15 @@ pub fn sort_records_by_field(
     let field = field.trim();
     if field.is_empty() {
         return Err(invalid("sort field cannot be empty"));
+    }
+    if matches!(field, "$created_at" | "$updated_at") {
+        // These exist only in the audit journal, and reading them is a
+        // history read with its own permission. Sorting a plain record scan by
+        // one would quietly replay the whole chain, so the server-rendered
+        // views that already hold an activity map are the only place they sort.
+        return Err(invalid(format!(
+            "sort field '{field}' comes from audit history and is only available in server-rendered views"
+        )));
     }
     if !matches!(field, "$id" | "$collection" | "$path") {
         parse_path(field)?;
@@ -3724,6 +3733,45 @@ impl Database {
             (None, Some(_)) => unreachable!(),
         }
         self.reveal_audit_history(audit.recent_history(limit, filter)?)
+    }
+
+    /// When each readable record in a collection was created and last changed.
+    ///
+    /// The journal is the only source for this: nothing on disk records a
+    /// record's age, and front matter that claimed to would be a second copy a
+    /// direct edit could contradict. Visibility follows audit history rather
+    /// than record readability, so a principal never learns from a timestamp
+    /// what `cr audit log` would refuse to tell it. Records with no history —
+    /// a file created outside `cr` and not yet saved — are simply absent.
+    pub fn record_activity(&self, collection: &str) -> Result<BTreeMap<String, RecordActivity>> {
+        validate_component(collection, "collection")?;
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let activity = audit.record_activity(collection)?;
+        if !self.access_enabled()? {
+            return Ok(activity);
+        }
+        if collection == USERS_COLLECTION {
+            let registry = self.can_access(AccessAction::ReadAccess, &AccessResource::Database)?;
+            return Ok(activity
+                .into_iter()
+                .filter(|(id, _)| registry || id == &self.principal)
+                .collect());
+        }
+        let Some((user, policy_hash)) = self.user_unchecked_optional(&self.principal)? else {
+            return Err(forbidden(format!(
+                "principal '{}' is not registered in the users collection",
+                self.principal
+            )));
+        };
+        let mut readable = BTreeMap::new();
+        for (id, record) in activity {
+            if self.user_can_read_record_audit(&user, &policy_hash, collection, &id)? {
+                readable.insert(id, record);
+            }
+        }
+        Ok(readable)
     }
 
     pub fn audit_head(&self) -> Result<AuditHead> {

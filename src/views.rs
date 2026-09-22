@@ -19,7 +19,12 @@ use crate::{
 pub(crate) const VIEW_DIRECTORY: &str = ".cr/views";
 const VIEW_DIRECTORY_LABEL: &str = "the view directory";
 const VIEW_FORMAT_VERSION: u32 = 1;
-const DEFAULT_VIEW_PAGE_SIZE: usize = 50;
+/// Rows per page before a view or URL asks for more.
+///
+/// Small on purpose: tables open newest-first, so the first page is the answer
+/// to "what changed?" and the cursor links carry a reader further back without
+/// loading a collection's whole history into one response.
+const DEFAULT_VIEW_PAGE_SIZE: usize = 10;
 const MAX_VIEW_PAGE_SIZE: usize = 1_000;
 const MAX_VIEW_FILTER_GROUPS: usize = 20;
 const MAX_VIEW_GROUP_EXPRESSIONS: usize = 20;
@@ -387,7 +392,12 @@ fn validate_stored(name: &str, view: &StoredViewDefinition) -> Result<()> {
         (Some(field), _) if field.trim().is_empty() => {
             return Err(invalid(format!("view '{name}' sort_by cannot be empty")));
         }
-        (Some(field), _) if !matches!(field, "$id" | "$collection" | "$path") => {
+        (Some(field), _)
+            if !matches!(
+                field,
+                "$id" | "$collection" | "$path" | "$created_at" | "$updated_at"
+            ) =>
+        {
             parse_path(field).with_context(|| {
                 DomainError::Invalid(format!("view '{name}' has invalid sort_by field '{field}'"))
             })?;
