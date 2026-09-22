@@ -1,4 +1,4 @@
-use std::{fs, str::FromStr};
+use std::{fs, path::Path, str::FromStr};
 
 use axum::{
     Router,
@@ -72,6 +72,12 @@ fn form(pairs: &[(&str, &str)]) -> String {
         serializer.append_pair(name, value);
     }
     serializer.finish()
+}
+
+fn browse_uri(path: &Path) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("path", path.to_str().unwrap());
+    format!("/browse?{}", serializer.finish())
 }
 
 fn csrf(html: &str) -> &str {
@@ -1542,8 +1548,78 @@ async fn tables_show_audited_creation_and_update_times_and_open_newest_first() {
     );
 }
 
+#[tokio::test]
+async fn owners_can_browse_and_preview_the_filesystem_without_mutating_it() {
+    let (temporary, database) = test_database("filesystem-browser");
+    let database = database.with_actor("Owner <owner@example.com>").unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    let notes = database.root().join("notes");
+    fs::create_dir(&notes).unwrap();
+    let text = notes.join("unsafe # name.txt");
+    fs::write(&text, "<script>alert('escaped')</script>\nhello").unwrap();
+    let binary = notes.join("bytes.bin");
+    fs::write(&binary, [0_u8, 1, 2, 255]).unwrap();
+    let outside = temporary.path().join("outside.txt");
+    fs::write(&outside, "visible above the database root").unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let home = request(&app, Method::GET, "/", None, &[]).await;
+    assert_eq!(home.status, StatusCode::OK);
+    assert!(home.text().contains("href=\"/browse\""));
+    assert!(home.text().contains("Files visible to the server process"));
+
+    let root = request(&app, Method::GET, "/browse", None, &[]).await;
+    assert_eq!(root.status, StatusCode::OK, "{}", root.text());
+    assert!(root.text().contains("Filesystem browser"));
+    assert!(root.text().contains("owner only"));
+    assert!(root.text().contains("read-only"));
+    assert!(root.text().contains("notes"));
+    assert!(root.text().contains(".."));
+    assert!(root.text().contains("hidden files included"));
+
+    let directory = request(&app, Method::GET, &browse_uri(&notes), None, &[]).await;
+    assert_eq!(directory.status, StatusCode::OK, "{}", directory.text());
+    assert!(directory.text().contains("unsafe # name.txt"));
+    assert!(directory.text().contains("bytes.bin"));
+
+    let file = request(&app, Method::GET, &browse_uri(&text), None, &[]).await;
+    assert_eq!(file.status, StatusCode::OK, "{}", file.text());
+    assert!(file.text().contains("text preview"));
+    assert!(
+        file.text()
+            .contains("&lt;script&gt;alert('escaped')&lt;/script&gt;")
+    );
+    assert!(!file.text().contains("<script>alert('escaped')</script>"));
+
+    let binary_file = request(&app, Method::GET, &browse_uri(&binary), None, &[]).await;
+    assert_eq!(binary_file.status, StatusCode::OK, "{}", binary_file.text());
+    assert!(binary_file.text().contains("binary · hex preview"));
+    assert!(binary_file.text().contains("00000000  00 01 02 ff"));
+
+    // The parent entry is intentionally not a database-root sandbox: an owner
+    // can inspect the rest of the filesystem visible to the service account.
+    let parent = request(&app, Method::GET, &browse_uri(temporary.path()), None, &[]).await;
+    assert_eq!(parent.status, StatusCode::OK, "{}", parent.text());
+    assert!(parent.text().contains("outside.txt"));
+
+    let relative = request(&app, Method::GET, "/browse?path=notes", None, &[]).await;
+    assert_eq!(relative.status, StatusCode::BAD_REQUEST);
+    assert!(relative.text().contains("must be absolute"));
+
+    let post = request(&app, Method::POST, "/browse", None, &[]).await;
+    assert_eq!(post.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        fs::read_to_string(&text).unwrap(),
+        "<script>alert('escaped')</script>\nhello"
+    );
+}
+
 /// Without RBAC there is nothing in the internal registry to show, so the page
-/// stays reachable but unlinked and says how to bootstrap access control.
+/// stays reachable but unlinked and says how to bootstrap access control. The
+/// more sensitive filesystem browser is absent until RBAC can identify an
+/// actual database owner.
 #[tokio::test]
 async fn the_internal_users_page_is_unlinked_until_access_control_exists() {
     let (_temporary, database) = test_database("views-internal-users");
@@ -1553,6 +1629,10 @@ async fn the_internal_users_page_is_unlinked_until_access_control_exists() {
     let home = request(&app, Method::GET, "/", None, &[]).await;
     assert_eq!(home.status, StatusCode::OK);
     assert!(!home.text().contains("href=\"/users\""));
+    assert!(!home.text().contains("href=\"/browse\""));
+
+    let browse = request(&app, Method::GET, "/browse", None, &[]).await;
+    assert_eq!(browse.status, StatusCode::NOT_FOUND);
 
     let users = request(&app, Method::GET, "/users", None, &[]).await;
     assert_eq!(users.status, StatusCode::OK, "{}", users.text());

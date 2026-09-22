@@ -1,13 +1,18 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Write,
+    fs::{File, OpenOptions},
+    io::{self, Read, Write},
     net::SocketAddr,
+    path::{Path as FilePath, PathBuf},
     str::FromStr,
     sync::{
         Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::{
@@ -44,6 +49,11 @@ const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PAGE_OFFSET: usize = 1_000_000;
 const MAX_VIEW_FILTERS: usize = 20;
 const MAX_VIEW_COLUMNS: usize = 50;
+/// A browser page is for inspection, not bulk file transfer. Bounding previews
+/// keeps a click on a log or disk image from turning into an enormous HTML
+/// response while still making ordinary source and configuration files useful.
+const MAX_FILE_PREVIEW_BYTES: usize = 1024 * 1024;
+const MAX_BINARY_PREVIEW_BYTES: usize = 4 * 1024;
 const ACTOR_HEADER: &str = "x-cr-actor";
 /// Attribution headers. Like `X-CR-Actor`, every one of them is an assertion by
 /// the caller: the server records what it is told and authenticates none of it.
@@ -131,7 +141,82 @@ struct UiContext {
     /// Whether this perspective may read the reserved `users` collection, and
     /// therefore whether the internal navigation section is offered at all.
     can_read_users: bool,
+    /// Whole-filesystem access is deliberately narrower than policy access:
+    /// only a database owner may use the browser, and the route is absent when
+    /// RBAC is disabled because there is then no authenticated administrator.
+    can_browse_files: bool,
     users: Vec<UiUser>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserEntryKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
+impl BrowserEntryKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Directory => "directory",
+            Self::File => "file",
+            Self::Symlink => "symlink",
+            Self::Other => "other",
+        }
+    }
+
+    fn sort_rank(self) -> u8 {
+        match self {
+            Self::Directory => 0,
+            Self::File => 1,
+            Self::Symlink => 2,
+            Self::Other => 3,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BrowserEntry {
+    name: String,
+    href: Option<String>,
+    kind: BrowserEntryKind,
+    size: Option<u64>,
+}
+
+#[derive(Debug)]
+struct BrowserCrumb {
+    label: String,
+    href: String,
+}
+
+#[derive(Debug)]
+enum BrowserFileContents {
+    Text(String),
+    Binary(String),
+}
+
+#[derive(Debug)]
+struct BrowserFile {
+    contents: BrowserFileContents,
+    bytes_shown: usize,
+    total_bytes: u64,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+enum BrowserItem {
+    Directory(Vec<BrowserEntry>),
+    File(BrowserFile),
+    Other,
+}
+
+#[derive(Debug)]
+struct BrowserPage {
+    location: PathBuf,
+    parent: Option<PathBuf>,
+    crumbs: Vec<BrowserCrumb>,
+    item: BrowserItem,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -224,6 +309,12 @@ struct PreviewQuery {
 struct PageQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowseQuery {
+    path: Option<String>,
 }
 
 /// Scope and window for an integrity report.
@@ -915,9 +1006,10 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         .route("/", get(views_home))
         .route("/perspective", post(switch_perspective))
         .route("/audit", get(audit_view))
-        // Static before dynamic: `users` is an internal collection with its own
-        // read-only page, not one of the views `/{view}` serves.
+        // Static before dynamic: these are internal read-only pages, not views
+        // served by the `/{view}` route.
         .route("/users", get(users_view))
+        .route("/browse", get(browse_view))
         .route("/{view}", get(view_records))
         .route("/{view}/save-view", post(save_view_form))
         .route("/{view}/new", get(new_record_form))
@@ -1247,6 +1339,281 @@ async fn users_view(State(state): State<AppState>, headers: HeaderMap) -> Respon
     }
     .await;
     html_result(result)
+}
+
+/// Owner-only, read-only inspection of the filesystem visible to this process.
+///
+/// The database root is the landing point, but the parent entry is intentional:
+/// an owner can navigate to `/` and inspect files outside the database. This is
+/// an administrative fallback, not a database-relative sandbox. Only regular
+/// files are opened and previews are bounded so devices, pipes, and very large
+/// files cannot turn one GET into an unbounded response.
+async fn browse_view(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let result: ApiResult<Markup> = async {
+        if !state.access_controlled {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "route_not_found",
+                "route not found",
+            ));
+        }
+        let query: BrowseQuery = parse_query(raw)?;
+        let (start, navigation) = run_database(&state, &headers, |database| {
+            if !database.owner_access_allowed(&AccessResource::Database)? {
+                return Err(DomainError::Forbidden(
+                    "principal cannot browse server files".to_owned(),
+                )
+                .into());
+            }
+            let start = database.root().to_path_buf();
+            let navigation = database.views()?;
+            Ok((start, navigation))
+        })
+        .await?;
+        let requested = query.path;
+        let page =
+            tokio::task::spawn_blocking(move || browse_filesystem(&start, requested.as_deref()))
+                .await
+                .map_err(|error| {
+                    ApiError::internal(anyhow!(error).context("filesystem browser task failed"))
+                })??;
+        let ui = ui_context(&state, &headers).await?;
+        Ok(render_browse_view(
+            &page,
+            &navigation,
+            ui.as_ref(),
+            &state.csrf_token,
+        ))
+    }
+    .await;
+    html_result(result)
+}
+
+fn browse_filesystem(start: &FilePath, requested: Option<&str>) -> ApiResult<BrowserPage> {
+    let candidate = match requested.filter(|value| !value.is_empty()) {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err(ApiError::bad_request(
+                    "invalid_browse_path",
+                    "filesystem browser paths must be absolute",
+                ));
+            }
+            path
+        }
+        None => start.to_path_buf(),
+    };
+    let location = std::fs::canonicalize(&candidate).map_err(|error| {
+        browse_io_error(error, "could not resolve the requested filesystem location")
+    })?;
+    let metadata = std::fs::metadata(&location).map_err(|error| {
+        browse_io_error(error, "could not inspect the requested filesystem location")
+    })?;
+    let parent = location
+        .parent()
+        .filter(|parent| *parent != location)
+        .map(FilePath::to_path_buf);
+    let crumbs = browse_crumbs(&location);
+    let item = if metadata.is_dir() {
+        BrowserItem::Directory(browse_directory(&location)?)
+    } else if metadata.is_file() {
+        BrowserItem::File(browse_file(&location)?)
+    } else {
+        BrowserItem::Other
+    };
+    Ok(BrowserPage {
+        location,
+        parent,
+        crumbs,
+        item,
+    })
+}
+
+fn browse_directory(path: &FilePath) -> ApiResult<Vec<BrowserEntry>> {
+    let directory = std::fs::read_dir(path)
+        .map_err(|error| browse_io_error(error, "could not read the requested directory"))?;
+    let mut entries = Vec::new();
+    for entry in directory {
+        let entry = entry.map_err(|error| {
+            browse_io_error(error, "could not read an entry in the requested directory")
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            browse_io_error(
+                error,
+                "could not inspect an entry in the requested directory",
+            )
+        })?;
+        let kind = if file_type.is_dir() {
+            BrowserEntryKind::Directory
+        } else if file_type.is_file() {
+            BrowserEntryKind::File
+        } else if file_type.is_symlink() {
+            BrowserEntryKind::Symlink
+        } else {
+            BrowserEntryKind::Other
+        };
+        let size = (kind == BrowserEntryKind::File)
+            .then(|| entry.metadata().ok().map(|metadata| metadata.len()))
+            .flatten();
+        let entry_path = entry.path();
+        entries.push(BrowserEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            href: entry_path.to_str().map(browse_url),
+            kind,
+            size,
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.kind
+            .sort_rank()
+            .cmp(&right.kind.sort_rank())
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(entries)
+}
+
+fn browse_file(path: &FilePath) -> ApiResult<BrowserFile> {
+    let mut file = open_browser_file(path)
+        .map_err(|error| browse_io_error(error, "could not open the requested file"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| browse_io_error(error, "could not inspect the requested file"))?;
+    if !metadata.is_file() {
+        return Err(ApiError::unprocessable(
+            "the requested filesystem location is not a regular file",
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(MAX_FILE_PREVIEW_BYTES.saturating_add(1));
+    (&mut file)
+        .take(MAX_FILE_PREVIEW_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| browse_io_error(error, "could not read the requested file"))?;
+    let read_bytes = bytes.len();
+    let mut truncated = read_bytes > MAX_FILE_PREVIEW_BYTES;
+    bytes.truncate(MAX_FILE_PREVIEW_BYTES);
+    let total_bytes = metadata.len().max(read_bytes as u64);
+
+    if let Some((text, bytes_shown)) = text_file_preview(&bytes, truncated) {
+        truncated |= bytes_shown < bytes.len();
+        return Ok(BrowserFile {
+            contents: BrowserFileContents::Text(text),
+            bytes_shown,
+            total_bytes,
+            truncated,
+        });
+    }
+
+    let binary_bytes = bytes.len().min(MAX_BINARY_PREVIEW_BYTES);
+    truncated |= binary_bytes < bytes.len();
+    Ok(BrowserFile {
+        contents: BrowserFileContents::Binary(hex_preview(&bytes[..binary_bytes])),
+        bytes_shown: binary_bytes,
+        total_bytes,
+        truncated,
+    })
+}
+
+/// Open a preview without letting a FIFO block a server worker indefinitely or
+/// a last-moment symlink replacement redirect the checked path. Regular files
+/// ignore `O_NONBLOCK`; special files are rejected after `fstat` above.
+fn open_browser_file(path: &FilePath) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    options.open(path)
+}
+
+/// A preview cut through the middle of its last UTF-8 character is still text.
+/// Other invalid UTF-8 and NUL bytes are treated as binary.
+fn text_file_preview(bytes: &[u8], truncated: bool) -> Option<(String, usize)> {
+    if bytes.contains(&0) {
+        return None;
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some((text.to_owned(), bytes.len())),
+        Err(error) if truncated && error.error_len().is_none() => {
+            let valid = error.valid_up_to();
+            std::str::from_utf8(&bytes[..valid])
+                .ok()
+                .map(|text| (text.to_owned(), valid))
+        }
+        Err(_) => None,
+    }
+}
+
+fn hex_preview(bytes: &[u8]) -> String {
+    let mut preview = String::new();
+    for (line, chunk) in bytes.chunks(16).enumerate() {
+        preview.push_str(&format!("{:08x}  ", line * 16));
+        for index in 0..16 {
+            if let Some(byte) = chunk.get(index) {
+                preview.push_str(&format!("{byte:02x} "));
+            } else {
+                preview.push_str("   ");
+            }
+            if index == 7 {
+                preview.push(' ');
+            }
+        }
+        preview.push_str(" |");
+        for byte in chunk {
+            preview.push(if byte.is_ascii_graphic() || *byte == b' ' {
+                char::from(*byte)
+            } else {
+                '.'
+            });
+        }
+        preview.push_str("|\n");
+    }
+    preview
+}
+
+fn browse_crumbs(path: &FilePath) -> Vec<BrowserCrumb> {
+    let mut ancestors = path
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    ancestors.reverse();
+    ancestors
+        .into_iter()
+        .filter_map(|ancestor| {
+            let encoded = ancestor.to_str().map(browse_url)?;
+            let label = ancestor
+                .file_name()
+                .map_or_else(|| "root".to_owned(), |name| name.to_string_lossy().into());
+            Some(BrowserCrumb {
+                label,
+                href: encoded,
+            })
+        })
+        .collect()
+}
+
+fn browse_io_error(error: io::Error, context: &'static str) -> ApiError {
+    let kind = error.kind();
+    let detail = anyhow!(error).context(context);
+    match kind {
+        io::ErrorKind::NotFound => ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "filesystem_not_found",
+            message: "the requested filesystem location does not exist".to_owned(),
+            detail: Some(detail),
+        },
+        io::ErrorKind::PermissionDenied => ApiError {
+            status: StatusCode::FORBIDDEN,
+            code: "filesystem_permission_denied",
+            message: "the CR server process cannot read this filesystem location".to_owned(),
+            detail: Some(detail),
+        },
+        _ => ApiError::internal(detail),
+    }
 }
 
 async fn view_records(
@@ -3027,6 +3394,20 @@ fn render_views_home(views: &[ViewDefinition], ui: Option<&UiContext>, csrf_toke
                         }
                         span class="cr-view-arrow" aria-hidden="true" { "→" }
                     }
+                    @if ui.is_some_and(|ui| ui.can_browse_files) {
+                        a href="/browse" class="cr-view-row group" {
+                            div class="min-w-0" {
+                                h2 class="truncate text-[0.95rem] font-semibold text-slate-950" { "Browse" }
+                                p class="cr-path mt-1 truncate" { "filesystem" }
+                            }
+                            div class="flex min-w-0 flex-wrap items-center gap-2" {
+                                span class="cr-pill" { "owner only" }
+                                span class="cr-pill cr-pill-warn" { "read-only" }
+                                span class="text-xs text-slate-500" { "Files visible to the server process" }
+                            }
+                            span class="cr-view-arrow" aria-hidden="true" { "→" }
+                        }
+                    }
                 }
             }
         },
@@ -3154,6 +3535,172 @@ fn render_users_view(
         ui,
         csrf_token,
     )
+}
+
+fn render_browse_view(
+    page: &BrowserPage,
+    views: &[ViewDefinition],
+    ui: Option<&UiContext>,
+    csrf_token: &str,
+) -> Markup {
+    let location = page.location.to_string_lossy();
+    page_layout(
+        "Browse files",
+        "/browse",
+        views,
+        html! {
+            nav aria-label="Breadcrumb" class="mb-3 flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-500" {
+                a href="/" class="font-medium hover:text-blue-700" { "Views" }
+                span aria-hidden="true" { "/" }
+                a href="/browse" class="font-medium hover:text-blue-700" { "Browse" }
+                @for crumb in &page.crumbs {
+                    span aria-hidden="true" { "/" }
+                    a href=(&crumb.href) class="max-w-48 truncate font-mono hover:text-blue-700" { (&crumb.label) }
+                }
+            }
+            div class="cr-page-heading mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between" {
+                div class="min-w-0" {
+                    p class="cr-eyebrow" { "Internal · owner only" }
+                    h1 class="cr-title mt-1" { "Filesystem browser" }
+                    p class="cr-lede mt-1 max-w-3xl" {
+                        "Read-only access to files visible to the CR server process. Browsing starts at the database root; use "
+                        code class="rounded bg-slate-100 px-1.5 py-0.5 text-xs" { ".." }
+                        " to move toward the filesystem root."
+                    }
+                    p class="cr-path mt-3 break-all" { (&location) }
+                }
+                div class="flex shrink-0 flex-wrap items-center gap-2" {
+                    span class="cr-pill cr-pill-warn" { "read-only" }
+                    a href="/browse" class="cr-button" { "Database root" }
+                    @if let Some(parent) = &page.parent {
+                        a href=(browse_url(parent.to_string_lossy().as_ref())) class="cr-button" { "Up" }
+                    }
+                }
+            }
+            @match &page.item {
+                BrowserItem::Directory(entries) => {
+                    div class="cr-table-shell" {
+                        div class="overflow-x-auto" {
+                            table class="min-w-full divide-y divide-slate-200 text-left text-sm" {
+                                thead {
+                                    tr {
+                                        th scope="col" class="px-4 py-3 font-semibold text-slate-700" { "Name" }
+                                        th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Type" }
+                                        th scope="col" class="whitespace-nowrap px-4 py-3 text-right font-semibold text-slate-700" { "Size" }
+                                        th scope="col" class="w-14 px-4 py-3" { span class="sr-only" { "Open" } }
+                                    }
+                                }
+                                tbody class="divide-y divide-slate-100" {
+                                    @if let Some(parent) = &page.parent {
+                                        @let href = browse_url(parent.to_string_lossy().as_ref());
+                                        tr {
+                                            td class="px-4 py-3" {
+                                                a href=(&href) class="font-mono font-semibold text-slate-900 hover:text-blue-700" {
+                                                    ".."
+                                                }
+                                            }
+                                            td class="px-4 py-3" { span class="cr-pill" { "parent" } }
+                                            td class="px-4 py-3 text-right text-slate-400" { "—" }
+                                            td class="px-4 py-3 text-right" { a href=(&href) aria-label="Open parent directory" class="font-semibold text-blue-700 hover:text-blue-900" { "→" } }
+                                        }
+                                    }
+                                    @if entries.is_empty() && page.parent.is_none() {
+                                        tr {
+                                            td colspan="4" class="px-4 py-12 text-center text-slate-500" { "This directory is empty." }
+                                        }
+                                    } @else {
+                                        @for entry in entries {
+                                            tr {
+                                                td class="px-4 py-3" {
+                                                    @if let Some(href) = &entry.href {
+                                                        a href=(href) class="font-mono font-semibold text-slate-900 hover:text-blue-700" {
+                                                            @if entry.kind == BrowserEntryKind::Directory {
+                                                                span aria-hidden="true" { "▸ " }
+                                                            } @else {
+                                                                span aria-hidden="true" { "· " }
+                                                            }
+                                                            (&entry.name)
+                                                        }
+                                                    } @else {
+                                                        span class="font-mono text-slate-500" title="This name is not valid UTF-8 and cannot be put in a browser URL" { (&entry.name) }
+                                                    }
+                                                }
+                                                td class="px-4 py-3" { span class="cr-pill" { (entry.kind.label()) } }
+                                                td class="whitespace-nowrap px-4 py-3 text-right cr-data" {
+                                                    @if let Some(size) = entry.size { (format_file_size(size)) } @else { "—" }
+                                                }
+                                                td class="px-4 py-3 text-right" {
+                                                    @if let Some(href) = &entry.href {
+                                                        a href=(href) aria-label=(format!("Open {}", entry.name)) class="font-semibold text-blue-700 hover:text-blue-900" { "→" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div class="border-t border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600" {
+                            (entries.len()) " entries · directories first · hidden files included"
+                        }
+                    }
+                }
+                BrowserItem::File(file) => {
+                    div class="cr-table-shell overflow-hidden" {
+                        div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600" {
+                            div class="flex flex-wrap items-center gap-2" {
+                                @match &file.contents {
+                                    BrowserFileContents::Text(_) => { span class="cr-pill" { "text preview" } }
+                                    BrowserFileContents::Binary(_) => { span class="cr-pill" { "binary · hex preview" } }
+                                }
+                                span { (format_file_size(file.total_bytes)) }
+                            }
+                            span {
+                                "Showing " (format_file_size(file.bytes_shown as u64))
+                                @if file.truncated { " · preview truncated" }
+                            }
+                        }
+                        pre class="max-h-[70vh] overflow-auto bg-slate-950 p-4 font-mono text-xs leading-5 text-slate-100" tabindex="0" {
+                            code {
+                                @match &file.contents {
+                                    BrowserFileContents::Text(contents) => { (contents) }
+                                    BrowserFileContents::Binary(contents) => { (contents) }
+                                }
+                            }
+                        }
+                    }
+                }
+                BrowserItem::Other => {
+                    div class="cr-empty-state" {
+                        h2 class="text-lg font-semibold text-slate-900" { "Preview unavailable" }
+                        p class="mt-2 text-sm text-slate-600" {
+                            "This location is not a regular file or directory. Devices, sockets, and named pipes are never opened by the browser."
+                        }
+                    }
+                }
+            }
+        },
+        ui,
+        csrf_token,
+    )
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 4] = [
+        ("GiB", 1024 * 1024 * 1024),
+        ("MiB", 1024 * 1024),
+        ("KiB", 1024),
+        ("B", 1),
+    ];
+    for (unit, divisor) in UNITS {
+        if bytes >= divisor || divisor == 1 {
+            if divisor == 1 {
+                return format!("{bytes} B");
+            }
+            return format!("{:.1} {unit}", bytes as f64 / divisor as f64);
+        }
+    }
+    unreachable!("the byte unit table always contains bytes")
 }
 
 /// The label for a principal kind. `UserKind` has no `Display`: its serialized
@@ -5224,12 +5771,21 @@ fn sidebar_navigation(
                         }
                     }
                 }
-                @if ui.is_some_and(|ui| ui.can_read_users) {
+                @if ui.is_some_and(|ui| ui.can_read_users || ui.can_browse_files) {
                     p class="cr-sidebar-label" { "Internal" }
-                    a href="/users" class=(if current_path == "/users" { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == "/users").then_some("page")] title="Users · read-only" {
-                        span class="cr-nav-glyph cr-nav-glyph-internal" aria-hidden="true" { "" }
-                        span class="truncate" { "Users" }
-                        span class="cr-nav-note" { "read-only" }
+                    @if ui.is_some_and(|ui| ui.can_read_users) {
+                        a href="/users" class=(if current_path == "/users" { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == "/users").then_some("page")] title="Users · read-only" {
+                            span class="cr-nav-glyph cr-nav-glyph-internal" aria-hidden="true" { "" }
+                            span class="truncate" { "Users" }
+                            span class="cr-nav-note" { "read-only" }
+                        }
+                    }
+                    @if ui.is_some_and(|ui| ui.can_browse_files) {
+                        a href="/browse" class=(if current_path == "/browse" { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == "/browse").then_some("page")] title="Browse files · owner only · read-only" {
+                            span class="cr-nav-glyph cr-nav-glyph-internal" aria-hidden="true" { "" }
+                            span class="truncate" { "Browse" }
+                            span class="cr-nav-note" { "read-only" }
+                        }
                     }
                 }
             }
@@ -5291,6 +5847,9 @@ fn mobile_navigation(
                 }
                 @if ui.is_some_and(|ui| ui.can_read_users) {
                     a href="/users" class=(if current_path == "/users" { "is-active" } else { "" }) { "Users" }
+                }
+                @if ui.is_some_and(|ui| ui.can_browse_files) {
+                    a href="/browse" class=(if current_path == "/browse" { "is-active" } else { "" }) { "Browse" }
                 }
                 @if ui.is_none_or(|ui| ui.can_view_global_audit) {
                     a href="/audit" class=(if current_path == "/audit" { "is-active" } else { "" }) { "Audit" }
@@ -5586,6 +6145,12 @@ fn audit_filter_url(collection: &str, id: &str) -> String {
     serializer.append_pair("collection", collection);
     serializer.append_pair("id", id);
     format!("/audit?{}", serializer.finish())
+}
+
+fn browse_url(path: &str) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("path", path);
+    format!("/browse?{}", serializer.finish())
 }
 
 fn audit_page_url(query: &AuditViewQuery, limit: usize, offset: usize) -> String {
@@ -6478,6 +7043,7 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
             selected_database.owner_access_allowed(&AccessResource::Database)?;
         let can_read_users = selected_database
             .access_allowed(AccessAction::ReadAccess, &AccessResource::Database)?;
+        let can_browse_files = selected_database.owner_access_allowed(&AccessResource::Database)?;
         let users = users
             .into_iter()
             .map(|(id, user)| UiUser {
@@ -6497,6 +7063,7 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
             selected_status,
             can_view_global_audit,
             can_read_users,
+            can_browse_files,
             users,
         })
     })
