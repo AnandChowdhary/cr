@@ -88,7 +88,7 @@ Priorities:
   `CR_API_TOKEN` protects HTML routes with a bearer header, which ordinary address-bar navigation and native forms cannot attach. Add an explicit login/session design with secure cookie rotation, logout, CSRF binding, expiry, and brute-force controls, or document a supported identity-aware proxy contract.
 
 - [ ] **P1 — Replace Tailwind Play CDN with compiled, pinned CSS.**
-  The server-rendered UI currently follows the requested CDN-only setup, but Tailwind documents the Play CDN as development-only. Bundle a reproducible stylesheet for production, offline use, tighter content security policy, and immunity to CDN changes. The UI's JavaScript already ships from `/static/`, so this CDN script tag and the inline `<style>` block are what still stand between the pages and a `default-src 'self'` policy.
+  The server-rendered UI currently follows the requested CDN-only setup, but Tailwind documents the Play CDN as development-only. Bundle a reproducible stylesheet for production, offline use, tighter content security policy, and immunity to CDN changes. Both of the UI's scripts — its own enhancements and the vendored htmx — already ship from `/static/`, so this CDN script tag, the inline `<style>` block, and the two remaining inline `onchange`/`onsubmit` attributes on the perspective selector and the delete form are what still stand between the pages and a `default-src 'self'` policy.
 
 - [ ] **P2 — Add configuration history for schemas, views, and syncs.**
   View definitions, collection schemas, sync definitions, and mutable sync checkpoints are Git-friendly files but are not record audit events. Define configuration and operational-state history without confusing either with record history or exposing adapter secrets.
@@ -103,7 +103,7 @@ Priorities:
   Sync stdout is bounded on disk but then read and parsed into memory before application. Preserve all-before-first-mutation validation while supporting larger imports through a validated spool/index or another bounded two-pass design.
 
 - [ ] **P2 — Preserve submitted form values on validation errors.**
-  HTML mutations correctly remain atomic and audit-neutral on failure, but the generic error page requires navigating back and may lose unsaved browser input. Re-render the form with escaped submitted values and field-level schema diagnostics.
+  HTML mutations correctly remain atomic and audit-neutral on failure, but the generic error page requires navigating back and may lose unsaved browser input. Re-render the form with escaped submitted values and field-level schema diagnostics. This is also what unblocks boosting the mutating forms: they opt out of `hx-boost` today because htmx cannot act on either shape a mutation currently answers with — a `303` it would follow invisibly while pushing the posted path into the address bar, or an error page with a status it declines to swap. Answering `422` with the re-rendered form and `HX-Location` on success settles both at once, and lets `hx-confirm` replace the delete form's inline `onsubmit`.
 
 - [ ] **P2 — Define large-board Kanban loading and ordering.**
   Kanban lanes group the current bounded result page so the server never loads an unbounded collection. Define cursor-based incremental loading or an explicit board-size policy for pipelines larger than the configured page limit, plus optional card sorting within lanes.
@@ -335,4 +335,5 @@ Priorities:
 - [x] Loopback-only owner RBAC perspective console with a live user switcher, cookie-scoped HTML and REST impersonation, permission-aware controls and Kanban movement, owner-attributed impersonation evidence, and no-store responses.
 - [x] Versioned subprocess sync adapters with JSONL upsert/delete/checkpoint messages, clean-state verification, limits, overlap locks, checkpointing, and `source: sync` audit provenance.
 - [x] The UI's progressive-enhancement script served as one `include_str!`-embedded asset from a filesystem-free, content-addressed, publicly cacheable `/static/{file}` route, linked with `defer` from `<head>` instead of inlined into every page.
+- [x] Boosted navigation through a vendored, content-addressed htmx served from the same route: a same-origin link swaps the body instead of reloading the document, `<title>`, the address bar and history follow the response, a reduced-motion-aware progress bar reports the wait, enhancements rebind on every swap, and every route still works with JavaScript disabled because no handler changed.
 - [x] Unit, CLI, concurrency, direct-edit, in-process HTTP, and real TCP server tests.
