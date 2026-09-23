@@ -287,13 +287,16 @@ jobs:
 
       # One directory per archive, owned by root rather than by the runner's
       # account, so extracting as root never leaves files owned by a stranger.
+      # The guides in docs/ ship beside the README so its links resolve in an
+      # unpacked archive; the screenshots do not.
       - name: Package
         run: |
           name="cr-$TAG-$TARGET"
-          mkdir -p "dist/$name"
+          mkdir -p "dist/$name/docs"
           cp "target/$TARGET/release/cr" README.md LICENSE "dist/$name/"
-          chmod 0755 "dist/$name" "dist/$name/cr"
-          chmod 0644 "dist/$name/README.md" "dist/$name/LICENSE"
+          cp docs/*.md "dist/$name/docs/"
+          chmod 0755 "dist/$name" "dist/$name/docs" "dist/$name/cr"
+          chmod 0644 "dist/$name/README.md" "dist/$name/LICENSE" "dist/$name/docs/"*.md
           if [ "$RUNNER_OS" = macOS ]; then
             COPYFILE_DISABLE=1 tar --no-mac-metadata --uid 0 --gid 0 --numeric-owner \
               -C dist -czf "dist/$name.tar.gz" "$name"
