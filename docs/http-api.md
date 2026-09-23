@@ -144,7 +144,7 @@ curl -X PUT http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal 
 without writing, and `X-CR-Approved-Changes` remains an independent guard over
 the resulting audit change set.
 
-Create a relation or delete a record:
+Create a relation, remove it, or delete a record:
 
 ```sh
 curl -X POST http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal/links \
@@ -155,8 +155,14 @@ curl -X POST http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal
     "target_id": "acme"
   }'
 
+curl -X DELETE http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal/links/company/companies/acme
+
 curl -X DELETE http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal
 ```
+
+Removing a relation accepts the same `If-Match`, `Idempotency-Key`, and
+`preview=true` as adding one. Removing a reference that is not there changes
+nothing, and the target does not have to exist.
 
 ## Filtering, search, and pagination
 
@@ -257,6 +263,7 @@ GET    /api/v1/collections/{collection}/records/{id}
 PATCH  /api/v1/collections/{collection}/records/{id}
 DELETE /api/v1/collections/{collection}/records/{id}
 POST   /api/v1/collections/{collection}/records/{id}/links
+DELETE /api/v1/collections/{collection}/records/{id}/links/{relation}/{target_collection}/{target_id}
 GET    /api/v1/search
 ```
 

@@ -23,9 +23,11 @@ cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]...
                   [--front-matter | --field KEY | --body | --path]
                   [--ignore-case] [--regex]
 cr update COLLECTION ID [--set KEY=YAML]... [--set-env KEY=ENV]...
-                        [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
+                        [--unset KEY]... [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
                         [--preview [--json]]
 cr link SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
+              [-m MESSAGE] [ATTRIBUTION] [--preview [--json]]
+cr unlink SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
               [-m MESSAGE] [ATTRIBUTION] [--preview [--json]]
 cr delete COLLECTION ID --yes [-m MESSAGE] [ATTRIBUTION]
 cr delete COLLECTION ID --preview [--json]

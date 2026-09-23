@@ -165,6 +165,7 @@ fn update_preconditions_and_audit_context_are_part_of_the_request_digest() {
             "items",
             "one",
             &[assignment("stage=interview")],
+            &[],
             None,
             Some(&precondition),
         )
@@ -180,6 +181,7 @@ fn update_preconditions_and_audit_context_are_part_of_the_request_digest() {
             "items",
             "one",
             &[assignment("stage=interview")],
+            &[],
             None,
             Some(&precondition),
         )
