@@ -1,6 +1,6 @@
 [package]
 name = "cr"
-version = "0.2.4"
+version = "0.2.5"
 # Edition 2024 needs Rust 1.85, and the let-chains it enables (`src/audit.rs`,
 # `src/server.rs`, `tests/server_api.rs`) need 1.88. Both sit under the floor
 # below, so neither is what sets it.
