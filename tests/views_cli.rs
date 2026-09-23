@@ -249,3 +249,134 @@ fn view_cli_rejects_invalid_duplicate_reserved_and_malformed_definitions() {
     );
     assert!(unknown.contains("unknown field"));
 }
+
+#[test]
+fn collections_take_a_label_and_icon_from_their_schema() {
+    let database = TestDatabase::new("views-cli-presentation");
+    run_success(
+        database
+            .command()
+            .args(["create", "inbound-ratings", "one"]),
+    );
+
+    // Without a label, the directory name is sentence-cased.
+    let automatic: Value = serde_json::from_str(&run_success(database.command().args([
+        "view",
+        "show",
+        "inbound-ratings",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(automatic["title"], "Inbound ratings");
+    assert!(automatic.get("icon").is_none());
+
+    assert_eq!(
+        run_success(database.command().args([
+            "schema",
+            "label",
+            "inbound-ratings",
+            " Ratings we received "
+        ])),
+        "Labeled inbound-ratings as Ratings we received\n"
+    );
+    assert_eq!(
+        run_success(
+            database
+                .command()
+                .args(["schema", "icon", "inbound-ratings", "⭐"])
+        ),
+        "Set the icon for inbound-ratings to ⭐\n"
+    );
+    assert_eq!(
+        run_success(
+            database
+                .command()
+                .args(["schema", "icon", "inbound-ratings", "⭐"])
+        ),
+        "inbound-ratings already uses the icon ⭐\n"
+    );
+    // A schema-less collection gains a schema with no properties, so its record
+    // form stays the complete raw-YAML editor.
+    let schema: Value = serde_json::from_str(
+        &fs::read_to_string(database.root.join(".cr/schemas/inbound-ratings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        schema["x-cr-ui"],
+        serde_json::json!({ "label": "Ratings we received", "icon": "⭐" })
+    );
+    assert!(schema.get("properties").is_none());
+
+    let labeled: Value = serde_json::from_str(&run_success(database.command().args([
+        "view",
+        "show",
+        "inbound-ratings",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(labeled["title"], "Ratings we received");
+    assert_eq!(labeled["icon"], "⭐");
+
+    for (arguments, message) in [
+        (
+            vec!["schema", "icon", "inbound-ratings", "two words"],
+            "cannot contain spaces",
+        ),
+        (
+            vec!["schema", "icon", "inbound-ratings", "abcdefghi"],
+            "single emoji",
+        ),
+        (
+            vec!["schema", "label", "inbound-ratings", "  "],
+            "cannot be empty",
+        ),
+        (
+            vec!["schema", "label", "users", "People"],
+            "built-in schema",
+        ),
+    ] {
+        let stderr = run_failure(database.command().args(&arguments));
+        assert!(stderr.contains(message), "{arguments:?}: {stderr}");
+    }
+
+    run_success(
+        database
+            .command()
+            .args(["schema", "icon", "inbound-ratings", "--clear"]),
+    );
+    run_success(
+        database
+            .command()
+            .args(["schema", "label", "inbound-ratings", "--clear"]),
+    );
+    let schema: Value = serde_json::from_str(
+        &fs::read_to_string(database.root.join(".cr/schemas/inbound-ratings.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(schema.get("x-cr-ui").is_none());
+    let cleared: Value = serde_json::from_str(&run_success(database.command().args([
+        "view",
+        "show",
+        "inbound-ratings",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(cleared["title"], "Inbound ratings");
+
+    // Presentation is a hint: a hand-written value that does not fit is
+    // ignored rather than taking the database down.
+    fs::write(
+        database.root.join(".cr/schemas/inbound-ratings.json"),
+        r#"{ "x-cr-ui": { "label": "", "icon": "not an emoji" } }"#,
+    )
+    .unwrap();
+    let ignored: Value = serde_json::from_str(&run_success(database.command().args([
+        "view",
+        "show",
+        "inbound-ratings",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(ignored["title"], "Inbound ratings");
+    assert!(ignored.get("icon").is_none());
+}

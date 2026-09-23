@@ -401,6 +401,8 @@ async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
         .unwrap();
     assert!(!index.contains("records/users"));
     assert!(home.text().contains("href=\"/users\""));
+    // The owner can read both deals, and the index counts both.
+    assert!(index.contains("<span class=\"cr-view-count\">2<"));
     let csrf = csrf(home.text()).to_owned();
 
     let selected_reader = request(
@@ -418,6 +420,25 @@ async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
     assert_eq!(selected_reader.status, StatusCode::SEE_OTHER);
     assert_eq!(selected_reader.headers[header::LOCATION], "/");
     let reader_cookie = perspective_cookie(&selected_reader);
+
+    // A count is information too: the reader holds a grant on one deal, so the
+    // index must not reveal that the collection has another.
+    let reader_home = request(
+        &app,
+        Method::GET,
+        "/",
+        None,
+        None,
+        &[("cookie", &reader_cookie)],
+    )
+    .await;
+    assert_eq!(reader_home.status, StatusCode::OK);
+    assert!(
+        reader_home
+            .text()
+            .contains("<span class=\"cr-view-count\">1<")
+    );
+    assert!(!reader_home.text().contains("cr-view-count\">2<"));
 
     let reader_view = request(
         &app,

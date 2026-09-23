@@ -43,7 +43,7 @@ use crate::{
     paths,
     sync::{SYNC_DEFINITION_DIRECTORY, SYNC_LOCK_DIRECTORY, SYNC_STATE_DIRECTORY},
     value::{canonical_yaml_value, compare_yaml_values, get_path, parse_path, remove_path},
-    views::VIEW_DIRECTORY,
+    views::{UI_EXTENSION, VIEW_DIRECTORY, normalize_collection_icon, normalize_collection_label},
 };
 
 const CONFIG_PATH: &str = ".cr/config.yaml";
@@ -2525,16 +2525,7 @@ impl Database {
                 "invalid JSON Schema for collection '{collection}'"
             )))
         })?;
-        let mut rendered = serde_json::to_vec_pretty(&schema)
-            .context("could not serialize the collection JSON Schema")?;
-        rendered.push(b'\n');
-        let path = Path::new(SCHEMA_DIRECTORY).join(format!("{collection}.json"));
-        let label = schema_label(collection);
-        if existing.is_some() {
-            paths::write_replace(&self.root, &path, &rendered, &label)?;
-        } else {
-            paths::write_new(&self.root, &path, &rendered, &label)?;
-        }
+        self.write_collection_schema(collection, &schema, existing.is_some())?;
         Ok(true)
     }
 
@@ -2566,6 +2557,109 @@ impl Database {
             object.insert(BODY_EXTENSION.to_owned(), JsonValue::Bool(true));
             Ok(())
         })
+    }
+
+    /// Name a collection in navigation, or with `None` return it to the name
+    /// derived from its directory.
+    pub fn set_collection_label(&self, collection: &str, label: Option<&str>) -> Result<bool> {
+        let label = label.map(normalize_collection_label).transpose()?;
+        self.update_collection_presentation(collection, "label", label)
+    }
+
+    /// Give a collection its own navigation icon, or with `None` return it to
+    /// the default.
+    pub fn set_collection_icon(&self, collection: &str, icon: Option<&str>) -> Result<bool> {
+        let icon = icon.map(normalize_collection_icon).transpose()?;
+        self.update_collection_presentation(collection, "icon", icon)
+    }
+
+    /// Set or remove one `x-cr-ui` presentation hint.
+    ///
+    /// Unlike an encryption marker, a label changes nothing about storage, so
+    /// it may change at any age. It still takes the audit lock that every
+    /// schema writer takes, so two edits of the same file cannot lose one
+    /// another.
+    fn update_collection_presentation(
+        &self,
+        collection: &str,
+        key: &str,
+        value: Option<String>,
+    ) -> Result<bool> {
+        validate_component(collection, "collection")?;
+        if collection == USERS_COLLECTION {
+            return Err(invalid(
+                "the users collection has a built-in schema and cannot define a label or icon",
+            ));
+        }
+
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        if self.access_enabled()? {
+            self.assert_current_principal_policy(&audit)?;
+        }
+        self.authorize_owner(&AccessResource::collection(collection))?;
+
+        let existing = self.collection_schema(collection)?;
+        if existing.is_none() && value.is_none() {
+            return Ok(false);
+        }
+        let mut schema = existing.clone().unwrap_or_else(presentation_only_schema);
+        let object = schema.as_object_mut().ok_or_else(|| {
+            invalid(format!(
+                "the schema for collection '{collection}' is a boolean and cannot carry a label or icon"
+            ))
+        })?;
+        let hints = object
+            .entry(UI_EXTENSION)
+            .or_insert_with(|| JsonValue::Object(Default::default()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                invalid(format!(
+                    "the schema for collection '{collection}' has an {UI_EXTENSION} that is not an object"
+                ))
+            })?;
+        match value {
+            Some(value) => {
+                hints.insert(key.to_owned(), JsonValue::String(value));
+            }
+            None => {
+                hints.remove(key);
+            }
+        }
+        if hints.is_empty() {
+            object.remove(UI_EXTENSION);
+        }
+        if existing.as_ref() == Some(&schema) {
+            return Ok(false);
+        }
+
+        jsonschema::meta::validate(&schema).map_err(|error| {
+            anyhow!("{error}").context(DomainError::Invalid(format!(
+                "invalid JSON Schema for collection '{collection}'"
+            )))
+        })?;
+        self.write_collection_schema(collection, &schema, existing.is_some())?;
+        Ok(true)
+    }
+
+    fn write_collection_schema(
+        &self,
+        collection: &str,
+        schema: &JsonValue,
+        replace: bool,
+    ) -> Result<()> {
+        let mut rendered = serde_json::to_vec_pretty(schema)
+            .context("could not serialize the collection JSON Schema")?;
+        rendered.push(b'\n');
+        let path = Path::new(SCHEMA_DIRECTORY).join(format!("{collection}.json"));
+        let label = schema_label(collection);
+        if replace {
+            paths::write_replace(&self.root, &path, &rendered, &label)?;
+        } else {
+            paths::write_new(&self.root, &path, &rendered, &label)?;
+        }
+        Ok(())
     }
 
     fn update_encryption_schema(
@@ -2618,16 +2712,7 @@ impl Database {
             )));
         }
 
-        let mut rendered = serde_json::to_vec_pretty(&schema)
-            .context("could not serialize the collection JSON Schema")?;
-        rendered.push(b'\n');
-        let path = Path::new(SCHEMA_DIRECTORY).join(format!("{collection}.json"));
-        let label = schema_label(collection);
-        if existing.is_some() {
-            paths::write_replace(&self.root, &path, &rendered, &label)?;
-        } else {
-            paths::write_new(&self.root, &path, &rendered, &label)?;
-        }
+        self.write_collection_schema(collection, &schema, existing.is_some())?;
         Ok(true)
     }
 
@@ -3785,6 +3870,35 @@ impl Database {
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         let activity = audit.record_activity(collection)?;
+        self.readable_activity(collection, activity)
+    }
+
+    /// [`Self::record_activity`] for every collection, from one journal walk.
+    ///
+    /// A collection with no readable history is absent rather than empty.
+    pub fn collections_activity(
+        &self,
+    ) -> Result<BTreeMap<String, BTreeMap<String, RecordActivity>>> {
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let mut readable = BTreeMap::new();
+        for (collection, activity) in audit.collections_activity(|_| true)? {
+            let activity = self.readable_activity(&collection, activity)?;
+            if !activity.is_empty() {
+                readable.insert(collection, activity);
+            }
+        }
+        Ok(readable)
+    }
+
+    /// The part of a collection's activity whose audit history this principal
+    /// may read.
+    fn readable_activity(
+        &self,
+        collection: &str,
+        activity: BTreeMap<String, RecordActivity>,
+    ) -> Result<BTreeMap<String, RecordActivity>> {
         if !self.access_enabled()? {
             return Ok(activity);
         }
@@ -4829,6 +4943,17 @@ fn user_id_tombstoned(id: &str) -> anyhow::Error {
     conflict(format!(
         "user ID '{id}' was previously deleted; pass --reuse-deleted-id to reuse its audit identity"
     ))
+}
+
+/// The schema `cr schema label` and `cr schema icon` start from.
+///
+/// No `properties`, unlike the schema an encryption marker starts from: a
+/// collection that gains a name should keep its complete raw-YAML record form.
+fn presentation_only_schema() -> JsonValue {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object"
+    })
 }
 
 fn empty_collection_schema() -> JsonValue {

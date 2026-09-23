@@ -1555,6 +1555,106 @@ async fn tables_show_audited_creation_and_update_times_and_open_newest_first() {
 }
 
 #[tokio::test]
+async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
+    let (_temporary, database) = test_database("views-index");
+    for (id, status) in [("alpha", "open"), ("beta", "open"), ("gamma", "won")] {
+        database
+            .create(
+                "deals",
+                id,
+                &[Assignment::from_str(&format!("status={status}")).unwrap()],
+                "",
+            )
+            .unwrap();
+    }
+    database.create("inbound-ratings", "one", &[], "").unwrap();
+    database.create("zebras", "one", &[], "").unwrap();
+    database
+        .create_view(
+            "open-deals",
+            Some("Open deals"),
+            "deals",
+            vec!["status=open".into()],
+            vec![],
+            10,
+        )
+        .unwrap();
+    // A label sorts where it reads, not where its directory does.
+    assert!(
+        database
+            .set_collection_label("zebras", Some("Animals"))
+            .unwrap()
+    );
+    assert!(database.set_collection_icon("deals", Some("💼")).unwrap());
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let home = request(&app, Method::GET, "/", None, &[]).await;
+    assert_eq!(home.status, StatusCode::OK);
+    let (sidebar, index) = home
+        .text()
+        .split_once("aria-label=\"Available database views\"")
+        .unwrap();
+    // The index names collections rather than their storage paths.
+    assert!(!index.contains("records/deals"));
+    assert!(index.contains("<h2 class=\"truncate\">Inbound ratings</h2>"));
+    // Every collection count, and a saved view's count is the records it
+    // matches rather than the size of its collection.
+    let row = |title: &str| {
+        let title = index.find(&format!(">{title}</h2>")).unwrap();
+        let start = index[..title].rfind("<a ").unwrap();
+        let end = index[start..].find("</a>").unwrap();
+        &index[start..start + end]
+    };
+    assert!(row("Deals").contains("cr-view-count\">3<"));
+    assert!(row("Open deals").contains("cr-view-count\">2<"));
+    assert!(row("Open deals").contains("cr-view-source\">Deals<"));
+    assert!(row("Inbound ratings").contains("cr-view-count\">1<"));
+    assert!(row("Deals").contains("<time datetime="));
+    assert!(home.text().contains(">5 records<"));
+    // A saved view shares its collection's icon; the rest use the default.
+    assert!(row("Deals").contains(">💼<"));
+    assert!(row("Open deals").contains(">💼<"));
+    assert!(row("Inbound ratings").contains(">🗃️<"));
+    assert!(index.find(">Animals</h2>").unwrap() < index.find(">Deals</h2>").unwrap());
+    // The sidebar uses the same names and icons, in the same order.
+    assert!(sidebar.contains("aria-hidden=\"true\">💼</span><span class=\"truncate\">Deals<"));
+    assert!(
+        sidebar.contains("aria-hidden=\"true\">🗃️</span><span class=\"truncate\">Inbound ratings<")
+    );
+    assert!(sidebar.find(">Animals<").unwrap() < sidebar.find(">Deals<").unwrap());
+    assert!(sidebar.contains(">🏠</span><span>All views<"));
+    assert!(sidebar.contains(">📜</span><span>Audit log<"));
+
+    // A collection that cannot be read leaves a dash rather than an error
+    // page: the index is how a reader reaches the view that explains it.
+    fs::write(
+        database.root().join("records/inbound-ratings/broken.md"),
+        "---\n: [\n---\n",
+    )
+    .unwrap();
+    let degraded = request(&app, Method::GET, "/", None, &[]).await;
+    assert_eq!(degraded.status, StatusCode::OK);
+    let degraded_index = degraded
+        .text()
+        .split_once("Available database views")
+        .unwrap()
+        .1;
+    let start = degraded_index.find(">Inbound ratings</h2>").unwrap();
+    let broken_row = &degraded_index[start..start + degraded_index[start..].find("</a>").unwrap()];
+    assert!(broken_row.contains("cr-view-count\"><span class=\"text-slate-400\">—<"));
+    assert!(!degraded.text().contains(">5 records<"));
+
+    // Clearing a label returns the sentence-cased directory name.
+    assert!(database.set_collection_label("zebras", None).unwrap());
+    let cleared = request(&app, Method::GET, "/zebras", None, &[]).await;
+    assert!(
+        cleared
+            .text()
+            .contains("<h1 class=\"cr-title\">Zebras</h1>")
+    );
+}
+
+#[tokio::test]
 async fn owners_can_browse_and_preview_the_filesystem_without_mutating_it() {
     let (temporary, database) = test_database("filesystem-browser");
     let database = database.with_actor("Owner <owner@example.com>").unwrap();
@@ -1589,6 +1689,15 @@ async fn owners_can_browse_and_preview_the_filesystem_without_mutating_it() {
     assert_eq!(directory.status, StatusCode::OK, "{}", directory.text());
     assert!(directory.text().contains("unsafe # name.txt"));
     assert!(directory.text().contains("bytes.bin"));
+    assert!(
+        root.text()
+            .contains("<span class=\"cr-file-icon\" aria-hidden=\"true\">📁</span>notes<")
+    );
+    assert!(
+        directory
+            .text()
+            .contains("<span class=\"cr-file-icon\" aria-hidden=\"true\">📄</span>bytes.bin<")
+    );
 
     let file = request(&app, Method::GET, &browse_uri(&text), None, &[]).await;
     assert_eq!(file.status, StatusCode::OK, "{}", file.text());
@@ -1625,6 +1734,105 @@ async fn owners_can_browse_and_preview_the_filesystem_without_mutating_it() {
 /// A directory with a README or a `SKILL.md` shows it beneath the listing, in
 /// the same bounded, escaped panel opening the file would give, and text
 /// previews wrap while hex dumps keep their columns.
+#[tokio::test]
+async fn directory_listings_show_file_times_and_sort_by_column_within_kind_groups() {
+    use std::time::{Duration, SystemTime};
+
+    let (_temporary, database) = test_database("filesystem-browser-sorting");
+    let database = database.with_actor("Owner <owner@example.com>").unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    let skills = database.root().join("skills");
+    fs::create_dir(&skills).unwrap();
+    let day = Duration::from_secs(24 * 60 * 60);
+    let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_000_000);
+    // Name order, update order, and size order all disagree, so each sort is
+    // visible in the listing.
+    for (name, age_in_days, bytes) in [("alpha.md", 3, 30), ("beta.md", 1, 10), ("gamma.md", 2, 20)]
+    {
+        let file = fs::File::create(skills.join(name)).unwrap();
+        file.set_len(bytes).unwrap();
+        file.set_modified(base - day * age_in_days).unwrap();
+    }
+    for (name, age_in_days) in [("old-dir", 5), ("new-dir", 0)] {
+        fs::create_dir(skills.join(name)).unwrap();
+        fs::File::open(skills.join(name))
+            .unwrap()
+            .set_modified(base - day * age_in_days)
+            .unwrap();
+    }
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let order = |html: &str, names: &[&str]| {
+        let positions = names
+            .iter()
+            .map(|name| html.find(&format!("</span>{name}<")).unwrap())
+            .collect::<Vec<_>>();
+        positions.windows(2).all(|pair| pair[0] < pair[1])
+    };
+    let sorted = |field: &str, direction: &str| {
+        format!(
+            "{}&sort_field={field}&sort_direction={direction}",
+            browse_uri(&skills)
+        )
+    };
+
+    // Newest created first by default, like a view table.
+    let listing = request(&app, Method::GET, &browse_uri(&skills), None, &[]).await;
+    assert_eq!(listing.status, StatusCode::OK, "{}", listing.text());
+    assert!(listing.text().contains(">Created<"));
+    assert!(listing.text().contains(">Updated<"));
+    assert!(listing.text().contains("aria-sort=\"descending\""));
+    assert!(
+        listing
+            .text()
+            .contains("aria-label=\"Sort by created ascending\"")
+    );
+    assert!(listing.text().contains("<time datetime=\"2026-05-28T"));
+
+    // Updated, newest first: directories still lead, each group in order.
+    let updated = request(&app, Method::GET, &sorted("updated", "desc"), None, &[]).await;
+    assert_eq!(updated.status, StatusCode::OK, "{}", updated.text());
+    assert!(order(
+        updated.text(),
+        &["new-dir", "old-dir", "beta.md", "gamma.md", "alpha.md"]
+    ));
+    // The chosen order follows the reader into a directory, but the default
+    // order's links stay canonical so a pin still recognizes them.
+    let new_dir = skills.join("new-dir");
+    assert!(updated.text().contains(&format!(
+        "href=\"{}&amp;sort_field=updated&amp;sort_direction=desc\"",
+        browse_uri(&new_dir).replace('&', "&amp;")
+    )));
+    assert!(
+        listing
+            .text()
+            .contains(&format!("href=\"{}\"", browse_uri(&new_dir)))
+    );
+
+    let oldest = request(&app, Method::GET, &sorted("updated", "asc"), None, &[]).await;
+    assert!(order(
+        oldest.text(),
+        &["old-dir", "new-dir", "alpha.md", "gamma.md", "beta.md"]
+    ));
+    let by_name = request(&app, Method::GET, &sorted("name", "desc"), None, &[]).await;
+    assert!(order(
+        by_name.text(),
+        &["old-dir", "new-dir", "gamma.md", "beta.md", "alpha.md"]
+    ));
+    // Directories have no size, so the files carry the ordering.
+    let by_size = request(&app, Method::GET, &sorted("size", "asc"), None, &[]).await;
+    assert!(order(by_size.text(), &["beta.md", "gamma.md", "alpha.md"]));
+    assert!(
+        by_size
+            .text()
+            .contains("aria-label=\"Sort by size descending\"")
+    );
+
+    let unknown = request(&app, Method::GET, &sorted("type", "asc"), None, &[]).await;
+    assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn directories_preview_their_readme_and_skill_and_text_previews_wrap() {
     let (_temporary, database) = test_database("filesystem-readme");
