@@ -57,9 +57,13 @@ env:
   GLIBC_FLOOR: "2.35"
 
 jobs:
+  # Timeouts are several times each job's slowest recent run, so a hung step
+  # fails in minutes rather than after GitHub's six-hour default. Releases
+  # queue behind one another, so a hang would otherwise hold up every later one.
   plan:
     name: plan
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       # Releasing main pushes a version commit and its tag. Nothing else in
       # this job writes, and a pull request from a fork gets a read-only token
@@ -201,6 +205,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.build == 'true'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -320,6 +325,7 @@ jobs:
     needs: [plan, build]
     if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write # attach assets to the release
       id-token: write # sign the attestation with a Sigstore certificate
