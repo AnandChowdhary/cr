@@ -2082,3 +2082,103 @@ async fn rest_schema_routes_show_review_install_and_remove_a_schema() {
     assert_eq!(path["put"]["operationId"], "setCollectionSchema");
     assert_eq!(path["delete"]["operationId"], "removeCollectionSchema");
 }
+
+#[tokio::test]
+async fn rest_filter_parameter_applies_boolean_filters_to_list_search_and_backlinks() {
+    let (_temporary, database) = test_database("server-filter");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    database.create("companies", "acme", &[], "").unwrap();
+    for (id, stage, value) in [
+        ("alpha", "open", 5000),
+        ("beta", "won", 20000),
+        ("gamma", "lost", 15000),
+    ] {
+        database
+            .create(
+                "deals",
+                id,
+                &[
+                    Assignment::from_str(&format!("stage={stage}")).unwrap(),
+                    Assignment::from_str(&format!("value={value}")).unwrap(),
+                ],
+                "",
+            )
+            .unwrap();
+        database
+            .link("deals", id, "company", "companies", "acme")
+            .unwrap();
+    }
+    let filter = "filter=stage%20in%20%5Bopen%2C%20won%5D%20AND%20NOT%20value%20%3C%2010000";
+    let paths = |response: TestResponse| -> Vec<String> {
+        response.json()["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["path"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let listed = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/collections/deals/records?{filter}"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.text());
+    assert_eq!(paths(listed), ["records/deals/beta.md"]);
+    let searched = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/search?q=deals&target=path&{filter}"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(paths(searched), ["records/deals/beta.md"]);
+    let backlinks = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/collections/companies/records/acme/backlinks?{filter}"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(paths(backlinks), ["records/deals/beta.md"]);
+
+    let invalid = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/records?filter=stage%20%3D",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        invalid.json()["error"]["message"],
+        "expected a value after '=' at the end of the filter (column 8)"
+    );
+
+    let openapi = request(&app, Method::GET, "/openapi.json", None, &[])
+        .await
+        .json();
+    for (path, method) in [
+        ("/api/v1/collections/{collection}/records", "get"),
+        ("/api/v1/search", "get"),
+        (
+            "/api/v1/collections/{collection}/records/{id}/backlinks",
+            "get",
+        ),
+    ] {
+        assert!(
+            openapi["paths"][path][method]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|parameter| parameter["name"] == "filter"),
+            "{path} has no filter parameter"
+        );
+    }
+}

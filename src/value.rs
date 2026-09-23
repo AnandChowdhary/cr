@@ -191,64 +191,66 @@ impl FilterExpression {
     }
 
     pub fn matches(&self, attributes: &Mapping) -> bool {
-        let current = get_path(attributes, &self.path);
-        match self.operator {
-            FilterOperator::IsEmpty => value_is_empty(current),
-            FilterOperator::IsNotEmpty => !value_is_empty(current),
-            FilterOperator::Equal => current == self.value.as_ref(),
-            FilterOperator::NotEqual => current
-                .zip(self.value.as_ref())
-                .is_some_and(|(current, expected)| current != expected),
-            FilterOperator::GreaterThan => self
-                .ordering(current)
-                .is_some_and(|ordering| ordering == Ordering::Greater),
-            FilterOperator::GreaterThanOrEqual => self
-                .ordering(current)
-                .is_some_and(|ordering| ordering != Ordering::Less),
-            FilterOperator::LessThan => self
-                .ordering(current)
-                .is_some_and(|ordering| ordering == Ordering::Less),
-            FilterOperator::LessThanOrEqual => self
-                .ordering(current)
-                .is_some_and(|ordering| ordering != Ordering::Greater),
-            FilterOperator::Contains => self.contains(current),
-            FilterOperator::NotContains => current.is_some() && !self.contains(current),
-            FilterOperator::StartsWith => {
-                self.string_match(current, |current, expected| current.starts_with(expected))
-            }
-            FilterOperator::EndsWith => {
-                self.string_match(current, |current, expected| current.ends_with(expected))
-            }
-        }
+        operator_matches(
+            self.operator,
+            get_path(attributes, &self.path),
+            self.value.as_ref(),
+        )
     }
+}
 
-    fn ordering(&self, current: Option<&Value>) -> Option<Ordering> {
-        match (current?, self.value.as_ref()?) {
-            (Value::Number(left), Value::Number(right)) => {
-                number_as_f64(left).partial_cmp(&number_as_f64(right))
-            }
-            (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
-            _ => None,
+/// Whether `current`, a field's value or `None` when the field is missing,
+/// satisfies `operator` against `expected`.
+///
+/// The one definition every filter uses — `--where-expr`, saved views, and
+/// `--filter` — so an operator cannot mean two things in two places. Every
+/// operator except the emptiness tests is false for a missing field.
+pub(crate) fn operator_matches(
+    operator: FilterOperator,
+    current: Option<&Value>,
+    expected: Option<&Value>,
+) -> bool {
+    let ordering = || match (current?, expected?) {
+        (Value::Number(left), Value::Number(right)) => {
+            number_as_f64(left).partial_cmp(&number_as_f64(right))
         }
-    }
-
-    fn contains(&self, current: Option<&Value>) -> bool {
-        match (current, self.value.as_ref()) {
-            (Some(Value::String(current)), Some(Value::String(expected))) => {
-                current.contains(expected)
-            }
-            (Some(Value::Sequence(current)), Some(expected)) => current.contains(expected),
-            _ => false,
+        (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
+        _ => None,
+    };
+    let contains = || match (current, expected) {
+        (Some(Value::String(current)), Some(Value::String(expected))) => {
+            current.contains(expected.as_str())
         }
-    }
-
-    fn string_match(&self, current: Option<&Value>, predicate: fn(&str, &str) -> bool) -> bool {
-        match (current, self.value.as_ref()) {
-            (Some(Value::String(current)), Some(Value::String(expected))) => {
-                predicate(current, expected)
-            }
-            _ => false,
+        (Some(Value::Sequence(current)), Some(expected)) => current.contains(expected),
+        _ => false,
+    };
+    let string_match = |predicate: fn(&str, &str) -> bool| match (current, expected) {
+        (Some(Value::String(current)), Some(Value::String(expected))) => {
+            predicate(current, expected)
         }
+        _ => false,
+    };
+    match operator {
+        FilterOperator::IsEmpty => value_is_empty(current),
+        FilterOperator::IsNotEmpty => !value_is_empty(current),
+        FilterOperator::Equal => current.is_some() && current == expected,
+        FilterOperator::NotEqual => current
+            .zip(expected)
+            .is_some_and(|(current, expected)| current != expected),
+        FilterOperator::GreaterThan => ordering() == Some(Ordering::Greater),
+        FilterOperator::GreaterThanOrEqual => {
+            ordering().is_some_and(|ordering| ordering != Ordering::Less)
+        }
+        FilterOperator::LessThan => ordering() == Some(Ordering::Less),
+        FilterOperator::LessThanOrEqual => {
+            ordering().is_some_and(|ordering| ordering != Ordering::Greater)
+        }
+        FilterOperator::Contains => contains(),
+        FilterOperator::NotContains => current.is_some() && !contains(),
+        FilterOperator::StartsWith => {
+            string_match(|current, expected| current.starts_with(expected))
+        }
+        FilterOperator::EndsWith => string_match(|current, expected| current.ends_with(expected)),
     }
 }
 
@@ -294,7 +296,7 @@ impl FromStr for FilterExpression {
     }
 }
 
-fn parse_filter_value(raw_value: &str) -> Result<Value> {
+pub(crate) fn parse_filter_value(raw_value: &str) -> Result<Value> {
     if raw_value.is_empty() {
         Ok(Value::String(String::new()))
     } else {

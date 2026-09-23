@@ -143,11 +143,11 @@ Priorities:
 - [x] **P1 — Comparison expressions.**
   Support typed numeric, string, and date comparisons such as `value > 10000`, `score >= 80`, and `expected_close < 2027-12-31`.
 
-- [ ] **P1 — Boolean expressions.**
-  Add an expression grammar with `AND`, `OR`, `NOT`, parentheses, clear precedence, useful parse errors, and identical CLI/HTTP semantics.
+- [x] **P1 — Boolean expressions.**
+  `--filter` on `list`, `search`, and `backlinks`, and `filter` on the equivalent HTTP routes, take one expression with `AND`, `OR`, `NOT`, and parentheses, where `NOT` binds tighter than `AND` and `AND` tighter than `OR`. `src/query.rs` holds the only tokenizer, parser, and evaluator, so the CLI and HTTP cannot disagree, and every comparison delegates to the same `operator_matches` that `--where-expr` and saved views use. Parse errors name what was expected and the one-based column, including the common case of an unquoted value with a space in it. Saved views still store their AND/OR filter groups rather than a `filter` string; letting a view carry one is a small follow-up.
 
-- [ ] **P1 — Membership, containment, and existence operators.**
-  Support `in`, `not in`, array/string `contains`, field existence, and explicit distinctions among missing, `null`, empty string, and empty collection.
+- [x] **P1 — Membership, containment, and existence operators.**
+  The filter language adds `in [...]`, `not in [...]`, `exists`, `not exists`, `is null`, and `is not null` beside `contains`, `not-contains`, `starts-with`, `ends-with`, and the emptiness tests, and matches `$id`, `$collection`, and `$path`. Missing, `null`, `""`, `[]`, and `{}` are distinguishable: `exists` is presence, `is null` is presence with a null value, exact equality tells the empties apart, and `is-empty` covers all of them. Every other test is false for a missing field. Quoted values are always strings and bare values are YAML scalars, exactly as `--where` reads them.
 
 - [ ] **P1 — Sorting.**
   Single-field sorting now works across CLI, REST, and HTML for dotted fields, path, collection, or ID with stable missing-value and mixed-type rules before pagination. Add ordered multi-field keys and define a URL/CLI syntax that preserves deterministic ties.

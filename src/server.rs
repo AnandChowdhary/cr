@@ -39,7 +39,7 @@ use crate::{
     AccessAction, AccessIdentity, AccessResource, AgentEvidence, Assignment, Attribution,
     AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
     AuditIntentPart, AuditSource, Backlink, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary,
-    CollectionModel, CollectionPresentation, Database, DomainError, FilterExpression,
+    CollectionModel, CollectionPresentation, Database, DomainError, Filter, FilterExpression,
     FilterOperator, Finding, MAX_TRAVERSAL_DEPTH, RECORD_ACCESS_FIELD, Record, RecordActivity,
     RecordPrecondition, SchemaReview, SchemaViolation, SearchQuery, SearchTarget, SortDirection,
     USERS_COLLECTION, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout,
@@ -587,6 +587,7 @@ struct BacklinkQuery {
     filters: Vec<String>,
     #[serde(default)]
     where_expr: Vec<String>,
+    filter: Option<String>,
     sort: Option<String>,
     #[serde(default)]
     direction: SortDirectionParameter,
@@ -611,6 +612,7 @@ struct ListQuery {
     filters: Vec<String>,
     #[serde(default)]
     where_expr: Vec<String>,
+    filter: Option<String>,
     sort: Option<String>,
     #[serde(default)]
     direction: SortDirectionParameter,
@@ -1069,6 +1071,7 @@ struct SearchParameters {
     filters: Vec<String>,
     #[serde(default)]
     where_expr: Vec<String>,
+    filter: Option<String>,
     sort: Option<String>,
     #[serde(default)]
     direction: SortDirectionParameter,
@@ -3288,6 +3291,7 @@ async fn list_records(
     let bounds = page_bounds(query.limit, query.offset, state.max_page_size)?;
     let filters = parse_filters(query.filters)?;
     let expressions = parse_filter_expressions(query.where_expr)?;
+    let filter = parse_filter(query.filter)?;
     let sort = query.sort;
     let direction = query.direction.into();
     let records = run_database(&state, &headers, move |database| {
@@ -3296,6 +3300,7 @@ async fn list_records(
             expressions
                 .iter()
                 .all(|expression| expression.matches(&record.attributes))
+                && filter.as_ref().is_none_or(|filter| filter.matches(record))
         });
         if let Some(field) = sort {
             sort_records_by_field(&mut records, &field, direction)?;
@@ -3552,6 +3557,7 @@ async fn list_backlinks(
     let bounds = page_bounds(query.limit, query.offset, state.max_page_size)?;
     let filters = parse_filters(query.filters)?;
     let expressions = parse_filter_expressions(query.where_expr)?;
+    let filter = parse_filter(query.filter)?;
     let (from, relation, sort) = (query.from, query.relation, query.sort);
     let direction = query.direction.into();
     let backlinks = run_database(&state, &headers, move |database| {
@@ -3566,6 +3572,9 @@ async fn list_backlinks(
             expressions
                 .iter()
                 .all(|expression| expression.matches(&backlink.record.attributes))
+                && filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.matches(&backlink.record))
         });
         if let Some(field) = sort {
             sort_by_record_field(
@@ -3656,6 +3665,7 @@ async fn search_records(
     let bounds = page_bounds(parameters.limit, parameters.offset, state.max_page_size)?;
     let filters = parse_filters(parameters.filters)?;
     let expressions = parse_filter_expressions(parameters.where_expr)?;
+    let filter = parse_filter(parameters.filter)?;
     let sort = parameters.sort;
     let direction = parameters.direction.into();
     let target = search_target(parameters.target, parameters.field)?;
@@ -3673,6 +3683,7 @@ async fn search_records(
             expressions
                 .iter()
                 .all(|expression| expression.matches(&record.attributes))
+                && filter.as_ref().is_none_or(|filter| filter.matches(record))
         });
         if let Some(field) = sort {
             sort_records_by_field(&mut records, &field, direction)?;
@@ -4486,6 +4497,7 @@ fn openapi_paths() -> JsonValue {
                 "parameters": [collection.clone(),
                     json!({ "name": "where", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }),
                     json!({ "name": "where_expr", "in": "query", "description": "Typed expressions such as value>=10000, name contains Acme, or owner is-empty. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }),
+                    json!({ "name": "filter", "in": "query", "description": "A filter with AND, OR, NOT, parentheses, comparisons, contains, starts-with, ends-with, in [...], exists, is null, and is-empty, such as stage in [open, won] AND (value >= 10000 OR owner is null). Combined with the other filters by AND.", "schema": { "type": "string" } }),
                     json!({ "name": "sort", "in": "query", "description": "Dotted front matter field or $id, $collection, or $path. Missing fields remain last.", "schema": { "type": "string" } }),
                     json!({ "name": "direction", "in": "query", "description": "Sort direction. Record ID remains the ascending deterministic tie-breaker.", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } }),
                     json!({ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } }),
@@ -4531,6 +4543,7 @@ fn openapi_paths() -> JsonValue {
                 { "name": "relation", "in": "query", "description": "Only references held in this relation.", "schema": { "type": "string" } },
                 { "name": "where", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "where_expr", "in": "query", "description": "Typed expressions on the source record. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
+                { "name": "filter", "in": "query", "description": "A filter with AND, OR, NOT, parentheses, comparisons, contains, starts-with, ends-with, in [...], exists, is null, and is-empty, such as stage in [open, won] AND (value >= 10000 OR owner is null). Combined with the other filters by AND.", "schema": { "type": "string" } },
                 { "name": "sort", "in": "query", "description": "Dotted front matter field or $id, $collection, or $path. Missing fields remain last.", "schema": { "type": "string" } },
                 { "name": "direction", "in": "query", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } },
                 { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
@@ -4561,6 +4574,7 @@ fn openapi_paths() -> JsonValue {
                 { "name": "collection", "in": "query", "schema": { "type": "string" } },
                 { "name": "where", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "where_expr", "in": "query", "description": "Typed expressions such as value>=10000, name contains Acme, or owner is-empty. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
+                { "name": "filter", "in": "query", "description": "A filter with AND, OR, NOT, parentheses, comparisons, contains, starts-with, ends-with, in [...], exists, is null, and is-empty, such as stage in [open, won] AND (value >= 10000 OR owner is null). Combined with the other filters by AND.", "schema": { "type": "string" } },
                 { "name": "sort", "in": "query", "description": "Dotted front matter field or $id, $collection, or $path. Missing fields remain last.", "schema": { "type": "string" } },
                 { "name": "direction", "in": "query", "description": "Sort direction. Record ID remains the ascending deterministic tie-breaker.", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } },
                 { "name": "target", "in": "query", "schema": { "enum": ["document", "front_matter", "field", "body", "path"] } },
@@ -10382,6 +10396,12 @@ fn parse_filters(filters: Vec<String>) -> ApiResult<Vec<Assignment>> {
         .into_iter()
         .map(|filter| filter.parse().map_err(ApiError::from_domain))
         .collect()
+}
+
+fn parse_filter(filter: Option<String>) -> ApiResult<Option<Filter>> {
+    filter
+        .map(|filter| filter.parse().map_err(ApiError::from_domain))
+        .transpose()
 }
 
 fn parse_filter_expressions(expressions: Vec<String>) -> ApiResult<Vec<FilterExpression>> {

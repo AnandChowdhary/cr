@@ -201,7 +201,47 @@ cr list contacts --where-expr 'contact.email is-not-empty'
 cr list deals --where 'stage=open' --sort value --desc --json
 ```
 
-Supported operators are `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `not-contains`, `starts-with`, `ends-with`, `is-empty`, and `is-not-empty`. Ordering compares numbers numerically and strings lexicographically, which gives the expected ordering for normalized ISO dates and times. Missing fields count as empty but do not match negative operators. Use `--sort FIELD` on `list` or `search`, and add `--desc` for descending order. Dotted front matter paths and the special keys `$id`, `$collection`, and `$path` are supported; missing values remain last and record ID breaks equal-value ties. A full parenthesized `AND`/`OR`/`NOT` grammar, membership sets, multi-field sorting, and projections remain explicit roadmap work.
+Supported operators are `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `not-contains`, `starts-with`, `ends-with`, `is-empty`, and `is-not-empty`. Ordering compares numbers numerically and strings lexicographically, which gives the expected ordering for normalized ISO dates and times. Missing fields count as empty but do not match negative operators. Use `--sort FIELD` on `list` or `search`, and add `--desc` for descending order. Dotted front matter paths and the special keys `$id`, `$collection`, and `$path` are supported; missing values remain last and record ID breaks equal-value ties. Multi-field sorting and projections remain explicit roadmap work.
+
+### Boolean filters
+
+`--filter` takes one expression that can combine conditions with `AND`, `OR`,
+`NOT`, and parentheses. It works on `list`, `search`, and `backlinks`, and
+combines with `--where` and `--where-expr` by AND:
+
+```sh
+cr list deals --filter 'stage in [open, proposal] AND (value >= 10000 OR owner is null)'
+cr list contacts --filter 'NOT email exists OR email = ""'
+cr list deals --filter '$id starts-with acme AND tags contains enterprise'
+```
+
+`NOT` binds tighter than `AND`, and `AND` tighter than `OR`; keywords are
+case-insensitive. A field is a dotted front matter path or `$id`,
+`$collection`, or `$path`. The tests are:
+
+| Test | Matches when the field |
+| --- | --- |
+| `=`, `!=`, `>`, `>=`, `<`, `<=` | compares to the value, as in `--where-expr` |
+| `contains`, `not-contains` | is a string containing the text, or a list containing the item |
+| `starts-with`, `ends-with` | is a string with that prefix or suffix |
+| `in [a, b]`, `not in [a, b]` | equals one of the listed values, or none of them |
+| `exists`, `not exists` | is present at all, even as `null` |
+| `is null`, `is not null` | is present and `null`, or present and not `null` |
+| `is-empty` (`is empty`), `is-not-empty` (`is not empty`) | is missing, `null`, `""`, `[]`, or `{}` |
+
+A quoted value is always a string: `"Acme Corp"` or `'Acme Corp'`, with `\"`
+and `\'` for quotes inside. A bare value is read as YAML, exactly as `--where`
+reads it, so `10000` is a number, `true` a boolean, and `2027-06-30` a string
+that sorts as a date. Quote any value with spaces or punctuation.
+
+Missing, `null`, and empty are different things. Every test except `exists`,
+`not exists`, and the emptiness tests is false for a missing field, so
+`stage != won` skips a record with no stage, while `NOT stage = won` includes
+it. A filter that does not parse is refused with the column of the problem:
+
+```text
+error: expected a value after '=' at the end of the filter (column 8)
+```
 
 ## Search
 
