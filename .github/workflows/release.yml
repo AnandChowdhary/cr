@@ -1,13 +1,21 @@
 name: Release
 
 # Build cr for every supported platform and attach the archives, a SHA256SUMS
-# file, and a signed build-provenance attestation to the release for a tag, so
+# file, and a signed build-provenance attestation to a GitHub release, so
 # installing a release never needs a Rust toolchain. Every archive is named
 # `cr-<tag>-<target>.tar.gz`, which lets a script build the download URL from
 # the tag alone.
 on:
+  # Every push to main that changes what ships is released; the plan job picks
+  # the version. Documentation and CI changes are not. GitHub does not apply
+  # path filters to tag pushes, so a tag pushed by hand is always built.
   push:
+    branches: [main]
     tags: ["v*"]
+    paths:
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
   # Attach binaries to a release whose tag predates this workflow, or finish
   # one whose publish job failed. Assets already on the release are never
   # replaced; delete one first to rebuild it.
@@ -18,7 +26,7 @@ on:
         required: true
         type: string
   # A dry run: build, check, and package every target without publishing, so a
-  # change that breaks one platform is caught before a tag is pushed rather
+  # change that breaks one platform is caught before it reaches main rather
   # than after.
   pull_request:
     branches: [main]
@@ -27,10 +35,14 @@ on:
       - Cargo.toml
       - Cargo.lock
 
-# Only the publish job writes, and it asks for exactly what it needs.
+# Only the plan job, which pushes a release commit and tag, and the publish
+# job write, and each asks for exactly what it needs.
 permissions:
   contents: read
 
+# Releases from main queue rather than overlap: each one bumps the version
+# the next one reads. A queued run replaced by a newer one loses nothing,
+# because every run releases the tip of main.
 concurrency:
   group: ${{ github.workflow }}-${{ inputs.tag || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -48,25 +60,39 @@ jobs:
   plan:
     name: plan
     runs-on: ubuntu-latest
+    permissions:
+      # Releasing main pushes a version commit and its tag. Nothing else in
+      # this job writes, and a pull request from a fork gets a read-only token
+      # whatever this says.
+      contents: write
     outputs:
       tag: ${{ steps.version.outputs.tag }}
-      ref: ${{ steps.ref.outputs.ref }}
-      publish: ${{ steps.ref.outputs.publish }}
+      ref: ${{ steps.version.outputs.ref }}
+      build: ${{ steps.version.outputs.build }}
+      publish: ${{ steps.version.outputs.publish }}
     steps:
-      # The tag reaches shell commands and a release, so it is validated
-      # before it is used for anything.
-      - name: Resolve the tag to build
-        id: ref
+      # A tag reaches shell commands and a release, so it is validated before
+      # it is used for anything.
+      - name: Decide what to build
+        id: mode
         env:
           EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
           PUSHED_TAG: ${{ github.ref_name }}
           REQUESTED_TAG: ${{ inputs.tag }}
         run: |
-          case "$EVENT" in
-            push) tag="$PUSHED_TAG" ;;
-            workflow_dispatch) tag="$REQUESTED_TAG" ;;
+          case "$EVENT:$REF" in
+            push:refs/heads/main)
+              # The tip of main rather than the pushed commit: a later push
+              # may already have landed, and releasing the tip includes it.
+              echo "mode=main" >> "$GITHUB_OUTPUT"
+              echo "ref=main" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            push:refs/tags/*) tag="$PUSHED_TAG" ;;
+            workflow_dispatch:*) tag="$REQUESTED_TAG" ;;
             *)
-              echo "publish=false" >> "$GITHUB_OUTPUT"
+              echo "mode=dry-run" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
@@ -74,32 +100,106 @@ jobs:
             echo "::error::the tag to build must look like v1.2.3"
             exit 1
           fi
+          echo "mode=tag" >> "$GITHUB_OUTPUT"
           echo "ref=refs/tags/$tag" >> "$GITHUB_OUTPUT"
-          echo "publish=true" >> "$GITHUB_OUTPUT"
 
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ steps.ref.outputs.ref }}
-          persist-credentials: false
+          ref: ${{ steps.mode.outputs.ref }}
+          # Every tag, to tell whether a version is already released.
+          fetch-depth: 0
+          # Only a release from main pushes anything.
+          persist-credentials: ${{ steps.mode.outputs.mode == 'main' }}
+
+      # The version on main is released as-is when it has no tag yet, which is
+      # how a pull request asks for a minor or major release: it sets the
+      # version it wants. Otherwise the patch number goes up by one, committed
+      # to main so that Cargo.toml, Cargo.lock, `cr --version`, and the tag all
+      # agree. The commit and tag are pushed atomically, and if main moved in
+      # the meantime the whole cut is redone on top of it.
+      - name: Cut the next version
+        id: cut
+        if: steps.mode.outputs.mode == 'main'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tagged() { git rev-parse --quiet --verify "refs/tags/v$1" > /dev/null; }
+          for attempt in 1 2 3; do
+            git fetch --quiet --force --tags origin +refs/heads/main:refs/remotes/origin/main
+            git reset --quiet --hard origin/main
+            version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')"
+            if ! [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "::error file=Cargo.toml::main can only be released automatically with a plain X.Y.Z version, not $version"
+              exit 1
+            fi
+            major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}"
+            if tagged "$version"; then
+              if [ "$(git rev-parse "refs/tags/v$version^{commit}")" = "$(git rev-parse HEAD)" ]; then
+                echo "main is already released as v$version"
+                exit 0
+              fi
+              until ! tagged "$major.$minor.$patch"; do patch=$((patch + 1)); done
+              version="$major.$minor.$patch"
+              sed -i "0,/^version = \"[^\"]*\"/s//version = \"$version\"/" Cargo.toml
+              # Carries the new version into Cargo.lock's entry for cr.
+              cargo metadata --format-version 1 > /dev/null
+              if [ "$(git diff --numstat)" != "$(printf '1\t1\tCargo.lock\n1\t1\tCargo.toml')" ]; then
+                git diff
+                echo "::error::bumping the version changed more than the two version lines"
+                exit 1
+              fi
+              git commit --quiet --all --message "chore(release): v$version"
+            fi
+            git tag --annotate "v$version" --message "cr v$version"
+            if git push --atomic origin HEAD:refs/heads/main "refs/tags/v$version"; then
+              echo "tag=v$version" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git tag --delete "v$version"
+            echo "main moved while cutting v$version (attempt $attempt); starting again"
+          done
+          echo "::error::main kept moving; the next push to main will release it"
+          exit 1
 
       # A release named v1.2.3 must contain a binary that says it is 1.2.3.
       # A dry run takes its name from Cargo.toml.
       - name: Check the tag against the crate version
         id: version
         env:
-          REF: ${{ steps.ref.outputs.ref }}
+          MODE: ${{ steps.mode.outputs.mode }}
+          REF: ${{ steps.mode.outputs.ref }}
+          CUT_TAG: ${{ steps.cut.outputs.tag }}
         run: |
           version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')"
-          if [ -n "$REF" ] && [ "$REF" != "refs/tags/v$version" ]; then
+          build=true publish=true ref="$REF"
+          case "$MODE" in
+            dry-run) publish=false ref="" ;;
+            main)
+              if [ -n "$CUT_TAG" ]; then
+                ref="refs/tags/$CUT_TAG"
+              else
+                # main is already released; there is nothing to build.
+                build=false publish=false ref=""
+              fi
+              ;;
+          esac
+          if [ "$publish" = true ] && [ "$ref" != "refs/tags/v$version" ]; then
             echo "::error file=Cargo.toml::the tag does not match package.version $version"
             exit 1
           fi
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=v$version"
+            echo "ref=$ref"
+            echo "build=$build"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     name: build (${{ matrix.target }})
     needs: plan
+    if: needs.plan.outputs.build == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

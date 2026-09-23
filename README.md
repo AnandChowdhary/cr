@@ -51,9 +51,11 @@
 ## Quick start
 
 Download a prebuilt binary from the
-[latest release](https://github.com/AnandChowdhary/cr/releases/latest). Each
-release attaches `cr-<tag>-<target>.tar.gz` for these targets, together with
-a `SHA256SUMS` file and a signed build-provenance attestation:
+[latest release](https://github.com/AnandChowdhary/cr/releases/latest). Every
+change merged to `main` that affects the binary is released automatically, as
+a new patch version unless the change sets a version of its own. Each release
+attaches `cr-<tag>-<target>.tar.gz` for these targets, together with a
+`SHA256SUMS` file and a signed build-provenance attestation:
 
 | Target | Runs on |
 | --- | --- |
@@ -84,10 +86,10 @@ repository's release workflow built the archive, so a matching file uploaded
 from anywhere else fails verification. Each archive holds the `cr` binary, this
 README, and the license in a directory with the archive's name.
 
-To build from source instead, you need a current Rust toolchain:
+To build a release from source instead, you need a current Rust toolchain:
 
 ```sh
-cargo install --git https://github.com/AnandChowdhary/cr --tag v0.2.0
+cargo install --git https://github.com/AnandChowdhary/cr --tag "$tag"
 ```
 
 When developing a checkout, install that exact source tree instead:
