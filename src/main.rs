@@ -9,12 +9,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
-    AccessAction, AccessResource, AgentEvidence, Assignment, AttributionOverrides, AuditFilter,
-    CheckReport, CheckScope, CollectionAccessPolicy, CollectionPresentation, Database, DomainError,
-    Filter, FilterExpression, Projection, Record, RecordPrecondition, RecordVisibility, Role,
-    SchemaReview, SearchQuery, SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions,
-    UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout,
-    parse_threshold, sort_by_record_field, sort_records_by_field,
+    AccessAction, AccessResource, AgentEvidence, Aggregation, Assignment, AttributionOverrides,
+    AuditFilter, CheckReport, CheckScope, CollectionAccessPolicy, CollectionPresentation, Database,
+    DomainError, Filter, FilterExpression, Projection, Record, RecordPrecondition,
+    RecordVisibility, Role, SchemaReview, SearchQuery, SearchTarget, SortDirection,
+    SyncAttribution, UserDeleteOptions, UserEnsureOutcome, UserKind, UserRegistrationOptions,
+    UserStatus, UserUpdate, ViewLayout, parse_threshold, sort_by_record_field,
+    sort_records_by_field,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -410,6 +411,50 @@ enum Command {
         /// paths, or $path, $version, and $body. Comma-separated or repeated.
         #[arg(long = "select", value_name = "FIELDS", requires = "json")]
         select: Vec<String>,
+    },
+
+    /// Count records, optionally per value of a field, with sums, averages, minimums, and maximums.
+    ///
+    /// Plain output is a tab-separated table with a header row. sum and avg
+    /// use numeric values only; min and max order values as --sort does.
+    Count {
+        collection: String,
+
+        /// Match a field using KEY=YAML. Multiple filters are combined with AND.
+        #[arg(short = 'w', long = "where", value_name = "KEY=YAML")]
+        filters: Vec<Assignment>,
+
+        /// Match a typed expression such as value>=10000.
+        #[arg(long = "where-expr", value_name = "EXPRESSION")]
+        expressions: Vec<FilterExpression>,
+
+        /// Match a filter with AND, OR, NOT, parentheses, in, exists, and is null.
+        #[arg(long, value_name = "FILTER")]
+        filter: Option<Filter>,
+
+        /// Count once per distinct value of this field, with records missing it last.
+        #[arg(long, value_name = "FIELD")]
+        by: Option<String>,
+
+        /// Sum these numeric fields. Comma-separated or repeated.
+        #[arg(long, value_name = "FIELDS")]
+        sum: Vec<String>,
+
+        /// Average these numeric fields. Comma-separated or repeated.
+        #[arg(long, value_name = "FIELDS")]
+        avg: Vec<String>,
+
+        /// Report the smallest value of these fields. Comma-separated or repeated.
+        #[arg(long, value_name = "FIELDS")]
+        min: Vec<String>,
+
+        /// Report the largest value of these fields. Comma-separated or repeated.
+        #[arg(long, value_name = "FIELDS")]
+        max: Vec<String>,
+
+        /// Return the counts and results as JSON.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Search record paths, front matter, and Markdown bodies.
@@ -1616,6 +1661,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&rendered)?);
             } else {
                 print!("{}", traversal.render_text());
+            }
+        }
+        Command::Count {
+            collection,
+            filters,
+            expressions,
+            filter,
+            by,
+            sum,
+            avg,
+            min,
+            max,
+            json,
+        } => {
+            let aggregation = Aggregation::new(by.as_deref(), &sum, &avg, &min, &max)?;
+            let mut records = database.list(&collection, &filters)?;
+            records.retain(|record| {
+                expressions
+                    .iter()
+                    .all(|expression| expression.matches(&record.attributes))
+                    && filter.as_ref().is_none_or(|filter| filter.matches(record))
+            });
+            let summary = aggregation.run(&records);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary.json()?)?);
+            } else {
+                print!("{}", summary.table()?);
             }
         }
         Command::Search {

@@ -2243,3 +2243,63 @@ async fn rest_select_parameter_projects_records_on_every_read_route() {
     let unknown = get("/api/v1/collections/deals/records/alpha?nope=1").await;
     assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn rest_count_route_counts_groups_and_summarizes() {
+    let (_temporary, database) = test_database("server-count");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    for (id, stage, value) in [("a", "open", 1000), ("b", "won", 2500), ("c", "open", 4000)] {
+        database
+            .create(
+                "deals",
+                id,
+                &[
+                    Assignment::from_str(&format!("stage={stage}")).unwrap(),
+                    Assignment::from_str(&format!("value={value}")).unwrap(),
+                ],
+                "Body text that a count never returns\n",
+            )
+            .unwrap();
+    }
+    let response = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/count?by=stage&sum=value&avg=value&filter=value%20%3E%201000",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    assert_eq!(
+        response.json(),
+        json!({
+            "count": 2,
+            "by": "stage",
+            "sum": { "value": 6500 },
+            "avg": { "value": 3250.0 },
+            "groups": [
+                { "value": "open", "count": 1, "sum": { "value": 4000 }, "avg": { "value": 4000.0 } },
+                { "value": "won", "count": 1, "sum": { "value": 2500 }, "avg": { "value": 2500.0 } }
+            ]
+        })
+    );
+    assert!(!response.text().contains("Body text"));
+
+    let refused = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/count?by=%24id",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let openapi = request(&app, Method::GET, "/openapi.json", None, &[])
+        .await
+        .json();
+    assert_eq!(
+        openapi["paths"]["/api/v1/collections/{collection}/count"]["get"]["operationId"],
+        "countRecords"
+    );
+    assert!(openapi["components"]["schemas"]["CountSummary"].is_object());
+}
