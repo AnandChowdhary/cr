@@ -399,6 +399,10 @@ document.addEventListener('htmx:beforeSwap', (event) => {
   if (isHtml && xhr.getResponseHeader('CR-Form-Invalid') === 'true') {
     event.detail.shouldSwap = true;
   }
+  // Anything else that failed is loaded as a page instead; see `loadInstead`.
+  if (!event.detail.shouldSwap && xhr.status >= 400 && requestConfig.verb === 'get') {
+    loadInstead(event.detail);
+  }
 });
 
 // The unsaved-edits guard's two prompts. `htmx:confirm` fires before every
@@ -423,11 +427,40 @@ window.addEventListener('beforeunload', (event) => {
   event.returnValue = '';
 });
 
-// A submission that never reached the server wrote nothing, so the form is
-// unsaved again.
+// A request htmx could not complete. Behind an authenticating proxy —
+// Cloudflare Access, an OAuth proxy, a corporate gateway — an expired session
+// turns every request into a redirect to a sign-in page on another origin. A
+// page load follows that redirect and comes back signed in; an htmx request
+// cannot, because to XMLHttpRequest a cross-origin redirect is a network error,
+// and htmx answers a network error by doing nothing at all: no swap, no new
+// URL, no message. "Apply view", a re-sort, a page turn, even a sidebar link
+// looked dead until the page was reloaded by hand.
+//
+// So a GET htmx could not complete becomes the page load it stands in for.
+// Every htmx GET here is an ordinary link or `method="get"` form underneath,
+// so the URL it asked for is a page the server renders whole, and loading it is
+// exactly what the click does with no JavaScript. That covers both ways a GET
+// fails: no response at all (`htmx:sendError`), and an error status htmx
+// declines to swap into a region (the `htmx:beforeSwap` listener above) — a
+// proxy's 401, or the server refusing a filter it cannot read, whose error page
+// now says why instead of nothing happening.
+//
+// A failed write is not retried as a page load, which would either resend it
+// or drop it. The only write htmx makes is the record form, whose fields are
+// still on screen, so the reader is told and the form counts as unsaved again.
+const loadInstead = (detail) => {
+  const path = detail.pathInfo?.finalRequestPath;
+  if (path) window.location.assign(new URL(path, window.location.href).href);
+};
+
 document.addEventListener('htmx:sendError', (event) => {
+  if (event.detail.requestConfig?.verb === 'get') {
+    loadInstead(event.detail);
+    return;
+  }
   const form = event.detail.elt?.closest?.('form');
   if (form && form.id === 'cr-record-form') unsavedForms.add(form);
+  window.alert('The server could not be reached, so nothing was saved. What you typed is still in the form. If your sign-in has expired, sign in again in another tab, then save.');
 });
 
 // Run the enhancements now — this script is deferred, so the document is
