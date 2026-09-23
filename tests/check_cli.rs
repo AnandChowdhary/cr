@@ -67,7 +67,14 @@ impl CheckRun {
 fn check(database: &Path, arguments: &[&str]) -> CheckRun {
     let mut command = Command::new(binary());
     clear_attribution_environment(&mut command);
-    command.arg("--database").arg(database).arg("check");
+    command.arg("--database").arg(database);
+    check_with(command, arguments)
+}
+
+/// Run `cr check` from a command that already names its database and carries
+/// whatever else the check needs, such as an actor or encryption keys.
+fn check_with(mut command: Command, arguments: &[&str]) -> CheckRun {
+    command.arg("check");
     command.args(arguments);
     let output = command.output().expect("failed to run cr check");
     CheckRun {
@@ -329,6 +336,114 @@ fn an_unusable_schema_is_reported_once_rather_than_once_per_record() {
         "{}",
         run.stdout
     );
+}
+
+#[test]
+fn record_access_metadata_is_not_judged_by_a_closed_schema() {
+    assert_record_owned_records_are_checked_like_writes("check-record-owned", false);
+}
+
+#[test]
+fn record_access_metadata_is_not_judged_by_a_closed_schema_with_encrypted_fields() {
+    assert_record_owned_records_are_checked_like_writes("check-record-owned-encrypted", true);
+}
+
+/// A record-owned collection whose schema forbids unknown properties accepts
+/// the `$cr_access` metadata `cr` writes into every record, so `cr check` has to
+/// agree with the write that accepted it, while still judging the application
+/// fields around it.
+fn assert_record_owned_records_are_checked_like_writes(name: &str, encrypted: bool) {
+    let database = TestDatabase::new(name);
+    let command = || {
+        let mut command = database.command();
+        command.env("CR_ACTOR", "Owner <owner@example.com>");
+        if encrypted {
+            command.env("CR_ENCRYPTION_ACTIVE_KEY", "old").env(
+                "CR_ENCRYPTION_KEYS",
+                r#"{"old":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+            );
+        }
+        command
+    };
+    run_success(command().args([
+        "access",
+        "init",
+        "--name",
+        "Owner",
+        "--email",
+        "owner@example.com",
+    ]));
+    let schema_path = database.root.join(".cr/schemas/things.json");
+    let mut token = serde_json::json!({ "type": "string" });
+    if encrypted {
+        token["x-cr-encrypted"] = Value::Bool(true);
+    }
+    fs::write(
+        &schema_path,
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "name": { "type": "string" }, "token": token },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    run_success(command().args([
+        "access",
+        "policy",
+        "set",
+        "collection:things",
+        "--mode",
+        "record-owned",
+        "--default-visibility",
+        "private",
+    ]));
+    run_success(command().args([
+        "create",
+        "things",
+        "t1",
+        "--set",
+        "name=first",
+        "--set",
+        "token=first-secret",
+    ]));
+    let stored = fs::read_to_string(record_path(&database, "things", "t1")).unwrap();
+    assert!(stored.contains("$cr_access"), "{stored}");
+    assert_eq!(stored.contains("first-secret"), !encrypted, "{stored}");
+
+    let run = check_with(command(), &["--json"]);
+    assert_eq!(
+        run.status, 0,
+        "stdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(run.json()["findings"], serde_json::json!([]));
+
+    // Leaving the metadata out of the schema's view must not leave the record
+    // unjudged: a field the schema now requires is still reported, once.
+    let mut schema: Value = serde_json::from_str(&fs::read_to_string(&schema_path).unwrap())
+        .expect("the stored schema is JSON");
+    schema["required"] = serde_json::json!(["stage"]);
+    fs::write(&schema_path, schema.to_string()).unwrap();
+    let run = check_with(command(), &["--json"]);
+    assert_eq!(run.status, FOUND_PROBLEMS, "{}", run.stdout);
+    let finding = run.one("schema_violation");
+    assert_eq!(finding["collection"], "things");
+    assert_eq!(finding["id"], "t1");
+    let message = finding["message"].as_str().unwrap();
+    assert!(!message.contains("$cr_access"), "{finding:#?}");
+    if encrypted {
+        assert!(
+            message.contains("protected values redacted"),
+            "{finding:#?}"
+        );
+    } else {
+        assert!(
+            message.contains("\"stage\" is a required property"),
+            "{finding:#?}"
+        );
+    }
 }
 
 #[test]

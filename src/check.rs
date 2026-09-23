@@ -58,9 +58,11 @@ use serde::Serialize;
 use yaml_serde::{Mapping, Value};
 
 use crate::{
+    access::CollectionAccessPolicy,
     audit::{AnchorStatus, record_hash},
     database::{
-        CollectionEntry, Database, collection_directory_name, collection_entry, validate_component,
+        CollectionEntry, Database, collection_directory_name, collection_entry, schema_attributes,
+        validate_component,
     },
     error::{DomainError, invalid},
     frontmatter::Document,
@@ -659,8 +661,12 @@ fn scan_record(
     match schema_state {
         SchemaState::Absent => {}
         SchemaState::Unusable => unreachable!("returned above"),
-        SchemaState::Ready(validator) => {
-            let instance = serde_json::to_value(&document.attributes);
+        SchemaState::Ready(compiled) => {
+            let validator = &compiled.validator;
+            let instance = serde_json::to_value(schema_attributes(
+                &document.attributes,
+                compiled.record_owned,
+            ));
             match instance {
                 Ok(instance) => {
                     if database.collection_uses_encryption(collection)?
@@ -944,7 +950,16 @@ fn mark_blocked(scanned: &mut BTreeMap<(String, String), ScannedRecord>, finding
 enum SchemaState<'a> {
     Absent,
     Unusable,
-    Ready(&'a jsonschema::Validator),
+    Ready(&'a CompiledSchema),
+}
+
+/// A collection's schema, compiled, with what judging one record against it
+/// needs besides the validator.
+struct CompiledSchema {
+    validator: jsonschema::Validator,
+    /// Whether the collection stores creator-owned records, whose reserved
+    /// access metadata the schema does not own.
+    record_owned: bool,
 }
 
 /// One compiled validator per collection.
@@ -956,7 +971,7 @@ enum SchemaState<'a> {
 /// than once per record.
 #[derive(Default)]
 struct SchemaCache {
-    compiled: BTreeMap<String, Option<jsonschema::Validator>>,
+    compiled: BTreeMap<String, Option<CompiledSchema>>,
 }
 
 impl SchemaCache {
@@ -971,7 +986,7 @@ impl SchemaCache {
             self.compiled.insert(collection.to_owned(), compiled);
         }
         Ok(match &self.compiled[collection] {
-            Some(validator) => SchemaState::Ready(validator),
+            Some(compiled) => SchemaState::Ready(compiled),
             None => match schema_exists(database, collection)? {
                 true => SchemaState::Unusable,
                 false => SchemaState::Absent,
@@ -998,7 +1013,7 @@ fn compile_schema(
     database: &Database,
     collection: &str,
     findings: &mut Vec<Finding>,
-) -> Result<Option<jsonschema::Validator>> {
+) -> Result<Option<CompiledSchema>> {
     let label = format!("the JSON Schema for collection '{collection}'");
     let Some(serialized) =
         paths::read_to_string_optional(database.root(), &schema_path(collection), &label)?
@@ -1032,8 +1047,21 @@ fn compile_schema(
         )));
         return Ok(None);
     }
+    let record_owned = match CollectionAccessPolicy::from_schema(Some(&schema)) {
+        Ok(policy) => policy.is_some(),
+        Err(error) => {
+            findings.extend(unusable(format!(
+                "its access policy is invalid: {}",
+                safe(&error)
+            )));
+            return Ok(None);
+        }
+    };
     match jsonschema::validator_for(&schema) {
-        Ok(validator) => Ok(Some(validator)),
+        Ok(validator) => Ok(Some(CompiledSchema {
+            validator,
+            record_owned,
+        })),
         Err(error) => {
             findings.extend(unusable(format!("it could not be compiled: {error}")));
             Ok(None)

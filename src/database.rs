@@ -285,9 +285,8 @@ pub struct SchemaViolation {
 struct SchemaCheck {
     collection: String,
     schema: serde_json::Value,
-    /// The attributes the application schema applies to: CR-owned metadata such
-    /// as record access is reserved, excluded from the schema, and removed here
-    /// rather than at each call site.
+    /// The attributes the application schema applies to, as selected by
+    /// [`schema_attributes`] rather than at each call site.
     attributes: Mapping,
     /// What to call the schema in a diagnostic that could not compile it.
     label: String,
@@ -4178,15 +4177,11 @@ impl Database {
             return Ok(None);
         };
         let record_owned = CollectionAccessPolicy::from_schema(Some(&schema))?.is_some();
-        let mut application_attributes = attributes.clone();
-        if record_owned {
-            application_attributes.remove(Value::String(RECORD_ACCESS_FIELD.to_owned()));
-        }
         let redact_values = !EncryptionPolicy::from_schema(Some(&schema))?.is_empty();
         Ok(Some(SchemaCheck {
             collection: collection.to_owned(),
             schema,
-            attributes: application_attributes,
+            attributes: schema_attributes(attributes, record_owned),
             label: schema_label(collection),
             redact_values,
             record_owned,
@@ -5013,6 +5008,20 @@ fn mark_schema_field_encrypted(schema: &mut JsonValue, path: &[String]) -> Resul
         return Ok(());
     }
     mark_schema_field_encrypted(property, rest)
+}
+
+/// The part of a record's front matter its collection's application schema
+/// applies to.
+///
+/// CR-owned metadata such as record access is reserved and excluded from the
+/// schema. A write and `cr check` both select attributes here, so the two cannot
+/// disagree about which fields the schema owns.
+pub(crate) fn schema_attributes(attributes: &Mapping, record_owned: bool) -> Mapping {
+    let mut selected = attributes.clone();
+    if record_owned {
+        selected.remove(Value::String(RECORD_ACCESS_FIELD.to_owned()));
+    }
+    selected
 }
 
 /// Refuse attributes that do not satisfy their collection's schema.
