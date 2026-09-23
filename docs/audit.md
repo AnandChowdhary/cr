@@ -158,7 +158,8 @@ It reports:
 
 - **dangling links** — a relation pointing at a record that no longer exists;
 - **malformed relation values** — a `relations` entry that is not a `{ collection, id }` reference at all;
-- **schema failures** — records that no longer satisfy their collection's JSON Schema, which is what happens whenever a schema changes after its records were written, plus schema files that are themselves unusable;
+- **schema failures** — records that no longer satisfy their collection's JSON Schema, which is what happens whenever a schema changes after its records were written, plus schema files that are themselves unusable. `users` records are judged against the built-in users schema;
+- **invalid access metadata** — a record in a record-owned collection whose `$cr_access` value is missing or malformed, which every write refuses;
 - **invalid record names** — files and directories that cannot be a record ID or a collection. Every other command refuses such a database outright, so this is the one finding `check` exists to be able to report: it names the offending filename and keeps scanning the records around it;
 - **unreadable records** — Markdown that cannot be parsed, and anything behind a symbolic link;
 - **audit reconciliation problems** — records with no audit history, audited records whose file has gone, files whose content does not match the audited state, a journal whose chain cannot be replayed, and a stored change set that does not match the approval recorded beside it;
@@ -175,6 +176,7 @@ They answer different questions, and `check` does not repeat `status`'s answer.
 
 - `cr status` is the working tree: *what would `cr save` record next?* Every line it prints is a normal, resolvable direct edit.
 - `cr check` is integrity: *is this database coherent?* When a divergence from the journal is one `cr save` can reconcile, `check` reports it as a **warning** and points you back at `status`. When the same record also fails to parse or fails its schema, `save` will refuse it, so `check` raises it to an **error** — that record is stuck, and `check` is the only command that says why.
+- Some edits `save` refuses wherever they are made: any direct edit to `users`, and creating, deleting, or changing the `$cr_access` of a record in a record-owned collection by hand. `check` reports those as **errors** too, and names the command to use instead — `cr user restore`, `cr create`, `cr delete`, or `cr access`.
 
 Everything else `check` reports — dangling links, malformed relations, schema drift, invalid names, journal damage — is invisible to `status`.
 

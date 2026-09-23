@@ -210,6 +210,7 @@ fn the_route_is_described_by_the_generated_openapi_document() {
         "dangling_link",
         "malformed_relation",
         "schema_violation",
+        "invalid_access_metadata",
         "unusable_schema",
         "invalid_record_name",
         "unreadable_record",
@@ -219,6 +220,9 @@ fn the_route_is_described_by_the_generated_openapi_document() {
         "audit_chain_broken",
         "approval_mismatch",
         "interrupted_sync_run",
+        "audit_anchor_mismatch",
+        "audit_anchor_behind",
+        "audit_anchor_missing",
     ] {
         assert!(kinds.contains(&kind.to_owned()), "{kind} is undocumented");
     }

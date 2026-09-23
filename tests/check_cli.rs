@@ -14,7 +14,7 @@ use std::{
     process::Command,
 };
 
-use common::{TestDatabase, binary, clear_attribution_environment, run_success};
+use common::{TestDatabase, binary, clear_attribution_environment, run_failure, run_success};
 use serde_json::Value;
 
 /// Exit status for "ran successfully, found problems".
@@ -444,6 +444,273 @@ fn assert_record_owned_records_are_checked_like_writes(name: &str, encrypted: bo
             "{finding:#?}"
         );
     }
+}
+
+const OWNER: &str = "Owner <owner@example.com>";
+
+fn as_owner(database: &TestDatabase) -> Command {
+    let mut command = database.command();
+    command.env("CR_ACTOR", OWNER);
+    command
+}
+
+/// An access-controlled database with one record-owned collection, `things`,
+/// holding one owner-created record, `t1`.
+fn record_owned(name: &str) -> TestDatabase {
+    let database = TestDatabase::new(name);
+    run_success(as_owner(&database).args([
+        "access",
+        "init",
+        "--name",
+        "Owner",
+        "--email",
+        "owner@example.com",
+    ]));
+    run_success(as_owner(&database).args([
+        "access",
+        "policy",
+        "set",
+        "collection:things",
+        "--mode",
+        "record-owned",
+        "--default-visibility",
+        "private",
+    ]));
+    run_success(as_owner(&database).args(["create", "things", "t1", "--set", "name=first"]));
+    database
+}
+
+/// Rewrite one record file in place.
+fn edit(path: &Path, from: &str, to: &str) {
+    let stored = fs::read_to_string(path).unwrap();
+    assert!(stored.contains(from), "{from:?} is not in:\n{stored}");
+    fs::write(path, stored.replacen(from, to, 1)).unwrap();
+}
+
+/// Assert that `cr save` really refuses a record `check` calls unsaveable.
+fn assert_save_refuses(database: &TestDatabase, reference: &str, expected: &str) {
+    let refusal = run_failure(as_owner(database).args(["save", reference, "--message", "attempt"]));
+    assert!(refusal.contains(expected), "{refusal}");
+}
+
+#[test]
+fn malformed_record_access_metadata_is_an_error_that_blocks_save() {
+    let database = record_owned("check-access-malformed");
+    let path = record_path(&database, "things", "t1");
+    edit(&path, "visibility: private", "visibility: bogus");
+
+    let run = check_with(as_owner(&database), &["--json"]);
+    assert_eq!(run.status, FOUND_PROBLEMS, "{}", run.stdout);
+    let finding = run.one("invalid_access_metadata");
+    assert_eq!(finding["severity"], "error");
+    assert_eq!(finding["collection"], "things");
+    assert_eq!(finding["id"], "t1");
+    assert_eq!(finding["field"], "$cr_access");
+    assert!(
+        finding["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid '$cr_access' metadata"),
+        "{finding:#?}"
+    );
+    // The divergence beside it no longer promises that `save` records it.
+    let mismatch = run.one("record_content_mismatch");
+    assert_eq!(mismatch["severity"], "error");
+    assert!(
+        mismatch["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be saved until the problems reported above it are fixed"),
+        "{mismatch:#?}"
+    );
+    assert_save_refuses(&database, "things/t1", "invalid '$cr_access' metadata");
+
+    // Removing the metadata altogether is refused the same way.
+    let stored = fs::read_to_string(&path).unwrap();
+    let without: String = stored
+        .lines()
+        .filter(|line| !line.starts_with("$cr_access") && !line.starts_with("  "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert!(!without.contains("owner:"), "{without}");
+    fs::write(&path, without).unwrap();
+    let run = check_with(as_owner(&database), &["--json"]);
+    let finding = run.one("invalid_access_metadata");
+    assert_eq!(finding["field"], "$cr_access");
+    assert!(
+        finding["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing reserved '$cr_access' metadata"),
+        "{finding:#?}"
+    );
+    assert_eq!(run.one("record_content_mismatch")["severity"], "error");
+    assert_save_refuses(
+        &database,
+        "things/t1",
+        "missing reserved '$cr_access' metadata",
+    );
+}
+
+#[test]
+fn a_hand_edited_access_change_is_an_error_that_points_at_cr_access() {
+    let database = record_owned("check-access-changed");
+    let path = record_path(&database, "things", "t1");
+    edit(&path, "visibility: private", "visibility: shared");
+
+    let run = check_with(as_owner(&database), &["--json"]);
+    assert_eq!(run.status, FOUND_PROBLEMS, "{}", run.stdout);
+    // Well formed, so the metadata itself is not a finding.
+    assert!(run.findings("invalid_access_metadata").is_empty());
+    let mismatch = run.one("record_content_mismatch");
+    assert_eq!(mismatch["severity"], "error");
+    assert_eq!(mismatch["field"], "$cr_access");
+    let message = mismatch["message"].as_str().unwrap();
+    assert!(message.contains("'cr save' refuses it"), "{message}");
+    assert!(message.contains("'cr access visibility'"), "{message}");
+    assert!(!message.contains("'cr save' records"), "{message}");
+    assert_save_refuses(&database, "things/t1", "managed through 'cr access'");
+
+    // An ordinary edit beside unchanged metadata is still a plain warning.
+    edit(&path, "visibility: shared", "visibility: private");
+    edit(&path, "name: first", "name: renamed");
+    let run = check_with(as_owner(&database), &["--json"]);
+    assert_eq!(run.status, 0, "{}", run.stdout);
+    let mismatch = run.one("record_content_mismatch");
+    assert_eq!(mismatch["severity"], "warning");
+    assert!(mismatch.get("field").is_none(), "{mismatch:#?}");
+    run_success(as_owner(&database).args(["save", "things/t1", "--message", "rename"]));
+}
+
+#[test]
+fn record_owned_files_created_or_deleted_by_hand_are_errors() {
+    let database = record_owned("check-access-add-delete");
+    let original = record_path(&database, "things", "t1");
+    let copy = record_path(&database, "things", "t2");
+    fs::copy(&original, &copy).unwrap();
+    fs::remove_file(&original).unwrap();
+
+    let run = check_with(as_owner(&database), &["--json"]);
+    assert_eq!(run.status, FOUND_PROBLEMS, "{}", run.stdout);
+    let added = run.one("unaudited_record");
+    assert_eq!(added["id"], "t2");
+    assert_eq!(added["severity"], "error");
+    assert!(
+        added["message"].as_str().unwrap().contains("'cr create'"),
+        "{added:#?}"
+    );
+    let missing = run.one("missing_record");
+    assert_eq!(missing["id"], "t1");
+    assert_eq!(missing["severity"], "error");
+    assert!(
+        missing["message"].as_str().unwrap().contains("'cr delete'"),
+        "{missing:#?}"
+    );
+    assert_save_refuses(&database, "things/t2", "create it through CR");
+    assert_save_refuses(&database, "things/t1", "delete it through CR");
+}
+
+#[test]
+fn direct_edits_to_users_are_errors_that_point_at_cr_user() {
+    let database = record_owned("check-users-direct-edit");
+    run_success(as_owner(&database).args([
+        "user",
+        "add",
+        "bob@example.com",
+        "--name",
+        "Bob",
+        "--email",
+        "bob@example.com",
+    ]));
+    let bob = record_path(&database, "users", "bob@example.com");
+    edit(&bob, "name: Bob", "name: Robert");
+
+    let run = check_with(as_owner(&database), &["--json"]);
+    assert_eq!(run.status, FOUND_PROBLEMS, "{}", run.stdout);
+    // A well-formed user: the only problem is where the edit was made.
+    assert_eq!(run.kinds(), ["record_content_mismatch"], "{}", run.stdout);
+    let mismatch = run.one("record_content_mismatch");
+    assert_eq!(mismatch["severity"], "error");
+    assert_eq!(mismatch["collection"], "users");
+    assert_eq!(mismatch["id"], "bob@example.com");
+    let message = mismatch["message"].as_str().unwrap();
+    assert!(
+        message.contains("'cr user restore bob@example.com'"),
+        "{message}"
+    );
+    assert!(!message.contains("'cr status'"), "{message}");
+    assert_save_refuses(
+        &database,
+        "users/bob@example.com",
+        "managed through 'cr user'",
+    );
+
+    // The remedy the finding names does resolve it.
+    run_success(as_owner(&database).args(["user", "restore", "bob@example.com"]));
+    let run = check_with(as_owner(&database), &["--json"]);
+    assert_eq!(run.status, 0, "{}", run.stdout);
+    assert_eq!(run.json()["findings"], serde_json::json!([]));
+
+    // A registration written by hand is refused too, and named as such.
+    fs::write(
+        record_path(&database, "users", "carol@example.com"),
+        "---\nname: Carol\n---\n",
+    )
+    .unwrap();
+    let run = check_with(as_owner(&database), &["--json"]);
+    let added = run.one("unaudited_record");
+    assert_eq!(added["severity"], "error");
+    assert!(
+        added["message"].as_str().unwrap().contains("'cr user add'"),
+        "{added:#?}"
+    );
+}
+
+#[test]
+fn users_records_are_judged_against_the_built_in_schema() {
+    let database = record_owned("check-users-schema");
+    run_success(as_owner(&database).args([
+        "user",
+        "add",
+        "bob@example.com",
+        "--name",
+        "Bob",
+        "--email",
+        "bob@example.com",
+    ]));
+    let bob = record_path(&database, "users", "bob@example.com");
+
+    // A field the built-in schema does not allow.
+    edit(&bob, "name: Bob", "name: Bob\nnickname: Bobby");
+    let run = check_with(as_owner(&database), &["--json"]);
+    let violation = run.one("schema_violation");
+    assert_eq!(violation["collection"], "users");
+    assert_eq!(violation["id"], "bob@example.com");
+    let message = violation["message"].as_str().unwrap();
+    assert!(message.contains("the built-in users schema"), "{message}");
+    assert!(message.contains("nickname"), "{message}");
+    assert!(
+        run.one("record_content_mismatch")["message"]
+            .as_str()
+            .unwrap()
+            .contains("'cr user restore bob@example.com'")
+    );
+
+    // A shape the schema accepts and a principal cannot have.
+    edit(
+        &bob,
+        "nickname: Bobby",
+        "access:\n- resource: database\n  role: viewer\n- resource: database\n  role: editor",
+    );
+    let run = check_with(as_owner(&database), &["--json"]);
+    let violation = run.one("schema_violation");
+    assert!(
+        violation["message"]
+            .as_str()
+            .unwrap()
+            .contains("more than one access role for resource 'database'"),
+        "{violation:#?}"
+    );
 }
 
 #[test]
@@ -1103,4 +1370,37 @@ printf '%s\n' '{"type":"checkpoint","state":{"cursor":"done"}}'
     let run = check(&database.root, &["--json"]);
     assert_eq!(run.status, 0, "stdout:\n{}", run.stdout);
     assert!(run.stdout.contains("\"findings\": []"), "{}", run.stdout);
+}
+
+#[test]
+fn a_deleted_record_in_a_collection_with_an_unusable_schema_is_an_error() {
+    let database = seeded();
+    // The only record in `companies` is gone, so nothing in the collection is
+    // scanned and its schema is first compiled while reconciling.
+    fs::remove_file(record_path(&database, "companies", "acme")).unwrap();
+    fs::write(
+        database.root.join(".cr/schemas/companies.json"),
+        "{ not json",
+    )
+    .unwrap();
+
+    let run = check(&database.root, &["--json"]);
+    assert_eq!(run.status, FOUND_PROBLEMS, "{}", run.stdout);
+    assert_eq!(run.one("unusable_schema")["collection"], "companies");
+    let missing = run.one("missing_record");
+    assert_eq!(missing["severity"], "error");
+    assert!(
+        missing["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be saved until the problems reported above it are fixed"),
+        "{missing:#?}"
+    );
+    let refusal =
+        run_failure(
+            database
+                .command()
+                .args(["save", "companies/acme", "--message", "attempt"]),
+        );
+    assert!(refusal.contains("unusable JSON Schema"), "{refusal}");
 }
