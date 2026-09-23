@@ -172,6 +172,19 @@ the sources, and each result names the relations holding the reference:
 curl 'http://127.0.0.1:3000/api/v1/collections/companies/records/acme/backlinks?from=deals&sort=value&direction=desc'
 ```
 
+Read, review, install, or remove a collection's schema. `PUT` takes the
+schema itself as the body and answers with a review naming every existing
+record that fails it; `preview=true` only reviews, and a schema some record
+fails is refused with `422` unless `allow_violations=true`. The same rules as
+`cr schema set` apply: owners only, and no change to encryption or record
+ownership.
+
+```sh
+curl -X PUT 'http://127.0.0.1:3000/api/v1/collections/deals/schema?preview=true' \
+  -H 'Content-Type: application/json' \
+  -d '{ "type": "object", "required": ["stage"] }'
+```
+
 Follow relations outward from a record with `traverse`. `depth` (1 to 10) and
 repeated `relation` parameters bound it, and `expand=true` returns a nested
 tree instead of a flat graph of `nodes` and `edges`:
@@ -273,6 +286,9 @@ The complete endpoint list is discoverable from that document. The main resource
 
 ```text
 GET    /api/v1/collections
+GET    /api/v1/collections/{collection}/schema
+PUT    /api/v1/collections/{collection}/schema
+DELETE /api/v1/collections/{collection}/schema
 GET    /api/v1/collections/{collection}/records
 POST   /api/v1/collections/{collection}/records
 GET    /api/v1/collections/{collection}/records/{id}

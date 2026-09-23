@@ -1,20 +1,20 @@
 use std::{
     io::{self, Write},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     str::FromStr,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
     AccessAction, AccessResource, AgentEvidence, Assignment, AttributionOverrides, AuditFilter,
-    CheckReport, CheckScope, CollectionAccessPolicy, Database, DomainError, FilterExpression,
-    Record, RecordPrecondition, RecordVisibility, Role, SearchQuery, SearchTarget, SortDirection,
-    SyncAttribution, UserDeleteOptions, UserEnsureOutcome, UserKind, UserRegistrationOptions,
-    UserStatus, UserUpdate, ViewLayout, parse_threshold, sort_by_record_field,
-    sort_records_by_field,
+    CheckReport, CheckScope, CollectionAccessPolicy, CollectionPresentation, Database, DomainError,
+    FilterExpression, Record, RecordPrecondition, RecordVisibility, Role, SchemaReview,
+    SearchQuery, SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions,
+    UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout,
+    parse_threshold, sort_by_record_field, sort_records_by_field,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -464,7 +464,17 @@ enum Command {
         command: PinCommand,
     },
 
-    /// Declare collection encryption policy and navigation labels in JSON Schema.
+    /// List every collection you can see, with its schema features.
+    ///
+    /// Plain output is one line per collection: its name, its navigation
+    /// title, and which of schema, encrypted, and record-owned apply.
+    Collections {
+        /// Return each collection's name and complete schema as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show, check, install, and remove collection JSON Schemas.
     Schema {
         #[command(subcommand)]
         command: SchemaCommand,
@@ -709,6 +719,46 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum SchemaCommand {
+    /// Print a collection's JSON Schema. `users` prints its built-in schema.
+    Show { collection: String },
+
+    /// Judge a proposed schema against the collection's existing records without installing it.
+    ///
+    /// Exits 0 when every record satisfies it and 2 when some do not.
+    Check {
+        collection: String,
+
+        /// The proposed JSON Schema file, or - to read standard input.
+        file: PathBuf,
+
+        /// Print the review as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Install a JSON Schema for a collection after checking its existing records.
+    ///
+    /// Which values are encrypted and whether records are creator-owned cannot
+    /// change here; use `cr schema encrypt` and `cr access policy set`.
+    Set {
+        collection: String,
+
+        /// The JSON Schema file, or - to read standard input.
+        file: PathBuf,
+
+        /// Install it even though existing records do not satisfy it. `cr check`
+        /// reports them, and each is refused on its next write until fixed.
+        #[arg(long)]
+        allow_violations: bool,
+
+        /// Print the review as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove a collection's JSON Schema, making it schemaless again.
+    Remove { collection: String },
+
     /// Encrypt one complete front matter value at rest. Dotted paths select nested fields.
     Encrypt { collection: String, field: String },
 
@@ -1652,7 +1702,72 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 }
             }
         },
+        Command::Collections { json } => {
+            let models = database.collection_models()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&models)?);
+            } else {
+                for model in models {
+                    let title = CollectionPresentation::from_schema(model.schema.as_ref())
+                        .title(&model.name);
+                    let mut features = Vec::new();
+                    if model.schema.is_some() {
+                        features.push("schema");
+                    }
+                    if model.encrypted() {
+                        features.push("encrypted");
+                    }
+                    if model.record_owned() {
+                        features.push("record-owned");
+                    }
+                    let features = if features.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        features.join(",")
+                    };
+                    println!("{}\t{title}\t{features}", model.name);
+                }
+            }
+        }
         Command::Schema { command } => match command {
+            SchemaCommand::Show { collection } => match database.schema(&collection)? {
+                Some(schema) => println!("{}", serde_json::to_string_pretty(&schema)?),
+                None => {
+                    return Err(DomainError::NotFound(format!(
+                        "collection '{collection}' has no schema"
+                    ))
+                    .into());
+                }
+            },
+            SchemaCommand::Check {
+                collection,
+                file,
+                json,
+            } => {
+                let proposed = read_schema_file(&file)?;
+                let review = database.review_schema(&collection, &proposed)?;
+                print_schema_review(&review, json, true)?;
+                if !review.violations.is_empty() {
+                    return Ok(ExitCode::from(2));
+                }
+            }
+            SchemaCommand::Set {
+                collection,
+                file,
+                allow_violations,
+                json,
+            } => {
+                let proposed = read_schema_file(&file)?;
+                let review = database.set_schema(&collection, &proposed, allow_violations)?;
+                print_schema_review(&review, json, false)?;
+            }
+            SchemaCommand::Remove { collection } => {
+                if database.remove_schema(&collection)? {
+                    println!("Removed the schema for {collection}");
+                } else {
+                    println!("{collection} has no schema");
+                }
+            }
             SchemaCommand::Encrypt { collection, field } => {
                 let changed = database.encrypt_schema_field(&collection, &field)?;
                 println!(
@@ -2640,6 +2755,63 @@ fn print_records(records: Vec<Record>, json: bool) -> Result<()> {
     } else {
         for record in records {
             println!("{}", record.path.display());
+        }
+    }
+    Ok(())
+}
+
+/// Read a proposed JSON Schema from a file, or from standard input for `-`.
+fn read_schema_file(file: &Path) -> Result<serde_json::Value> {
+    let serialized = if file == Path::new("-") {
+        let mut serialized = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut serialized)?;
+        serialized
+    } else {
+        std::fs::read_to_string(file)
+            .with_context(|| format!("could not read {}", file.display()))?
+    };
+    serde_json::from_str(&serialized).map_err(|error| {
+        DomainError::Invalid(format!("the proposed schema is not valid JSON: {error}")).into()
+    })
+}
+
+fn print_schema_review(review: &SchemaReview, json: bool, checking: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(review)?);
+        return Ok(());
+    }
+    for violation in &review.violations {
+        match &violation.field {
+            Some(field) => println!(
+                "{}/{} {field}: {}",
+                review.collection, violation.id, violation.message
+            ),
+            None => println!(
+                "{}/{}: {}",
+                review.collection, violation.id, violation.message
+            ),
+        }
+    }
+    let judged = format!(
+        "{} of {} records satisfy it",
+        review.records
+            - review
+                .violations
+                .iter()
+                .map(|violation| &violation.id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+        review.records
+    );
+    let collection = &review.collection;
+    match (checking, review.applied, review.changed) {
+        (true, _, true) => println!("Checked the proposed schema for {collection}: {judged}."),
+        (true, _, false) => println!(
+            "Checked the proposed schema for {collection}, which is the one installed: {judged}."
+        ),
+        (false, true, _) => println!("Installed the schema for {collection}: {judged}."),
+        (false, false, _) => {
+            println!("The schema for {collection} is already installed: {judged}.")
         }
     }
     Ok(())

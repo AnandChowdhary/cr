@@ -2004,3 +2004,81 @@ async fn rest_traverse_returns_a_graph_or_an_expanded_tree() {
     assert_eq!(operation["operationId"], "traverseRecord");
     assert!(openapi["components"]["schemas"]["Traversal"].is_object());
 }
+
+#[tokio::test]
+async fn rest_schema_routes_show_review_install_and_remove_a_schema() {
+    let (_temporary, database) = test_database("server-schema");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    database
+        .create(
+            "deals",
+            "one",
+            &[Assignment::from_str("stage=open").unwrap()],
+            "",
+        )
+        .unwrap();
+    database.create("deals", "two", &[], "").unwrap();
+    let uri = "/api/v1/collections/deals/schema";
+    let schema = json!({ "type": "object", "required": ["stage"] });
+
+    let absent = request(&app, Method::GET, uri, None, &[]).await;
+    assert_eq!(absent.status, StatusCode::NOT_FOUND);
+
+    let preview = json_request(
+        &app,
+        Method::PUT,
+        &format!("{uri}?preview=true"),
+        schema.clone(),
+        &[],
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.text());
+    assert_eq!(preview.json()["applied"], false);
+    assert_eq!(preview.json()["violations"][0]["id"], "two");
+
+    let refused = json_request(&app, Method::PUT, uri, schema.clone(), &[]).await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        refused.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("1 of 2 records"),
+        "{}",
+        refused.text()
+    );
+
+    let installed = json_request(
+        &app,
+        Method::PUT,
+        &format!("{uri}?allow_violations=true"),
+        schema.clone(),
+        &[],
+    )
+    .await;
+    assert_eq!(installed.json()["applied"], true);
+    let shown = request(&app, Method::GET, uri, None, &[]).await;
+    assert_eq!(shown.json(), schema);
+
+    let removed = request(&app, Method::DELETE, uri, None, &[]).await;
+    assert_eq!(removed.json(), json!({ "removed": true }));
+    let removed = request(&app, Method::DELETE, uri, None, &[]).await;
+    assert_eq!(removed.json(), json!({ "removed": false }));
+
+    let users = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/users/schema",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(users.status, StatusCode::NOT_FOUND, "{}", users.text());
+
+    let openapi = request(&app, Method::GET, "/openapi.json", None, &[])
+        .await
+        .json();
+    let path = &openapi["paths"]["/api/v1/collections/{collection}/schema"];
+    assert_eq!(path["get"]["operationId"], "getCollectionSchema");
+    assert_eq!(path["put"]["operationId"], "setCollectionSchema");
+    assert_eq!(path["delete"]["operationId"], "removeCollectionSchema");
+}

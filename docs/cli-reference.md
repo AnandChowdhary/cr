@@ -37,6 +37,11 @@ cr delete COLLECTION ID --yes [-m MESSAGE] [ATTRIBUTION]
 cr delete COLLECTION ID --preview [--json]
 cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N]
 
+cr collections [--json]
+cr schema show COLLECTION
+cr schema check COLLECTION FILE [--json]
+cr schema set COLLECTION FILE [--allow-violations] [--json]
+cr schema remove COLLECTION
 cr schema encrypt COLLECTION FIELD
 cr schema encrypt-body COLLECTION
 cr schema label COLLECTION (LABEL | --clear)
