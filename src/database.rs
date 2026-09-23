@@ -4,6 +4,7 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -27,7 +28,7 @@ use crate::{
     audit::{
         AuditEncryptionTransition, AuditFilter, AuditHistory, AuditIdempotency,
         AuditIdempotencyResult, AuditLog, AuditMutation, AuditedRecordStates, ChangePreview,
-        ReconciledMutation, RecordActivity, record_hash,
+        JournalCache, ReconciledMutation, RecordActivity, record_hash,
     },
     check::{CheckReport, CheckScope},
     encryption::{
@@ -254,6 +255,9 @@ pub struct Database {
     audit_message: Option<String>,
     attribution: Attribution,
     idempotency_key: Option<String>,
+    /// Shared by every clone, and so by every request a server derives from
+    /// one database; see [`Self::with_journal_cache`].
+    journal: Option<Arc<JournalCache>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -565,6 +569,7 @@ impl Database {
             audit_message: None,
             attribution: Attribution::from_environment()?,
             idempotency_key: None,
+            journal: None,
         };
         let database = database.with_default_actor();
         database.audit().ensure_layout()?;
@@ -636,6 +641,7 @@ impl Database {
             audit_message: None,
             attribution: Attribution::from_environment()?,
             idempotency_key: None,
+            journal: None,
         };
         let database = database.with_default_actor();
         let audit = database.audit();
@@ -1831,7 +1837,7 @@ impl Database {
 
     fn has_database_owner_other_than(&self, excluded: &str) -> Result<bool> {
         let states = self.audit().record_states()?;
-        for ((collection, id), state) in states {
+        for ((collection, id), state) in states.iter() {
             if collection != USERS_COLLECTION || id == excluded {
                 continue;
             }
@@ -1845,11 +1851,11 @@ impl Database {
             if user.status != UserStatus::Active || !user.is_database_owner() {
                 continue;
             }
-            let path = self.record_path(USERS_COLLECTION, &id)?;
+            let path = self.record_path(USERS_COLLECTION, id)?;
             let Some(raw) = paths::read_to_string_optional(
                 &self.root,
                 &path,
-                &record_label(USERS_COLLECTION, &id),
+                &record_label(USERS_COLLECTION, id),
             )?
             else {
                 continue;
@@ -2256,11 +2262,14 @@ impl Database {
         self.list_with_audited_cache(collection, filters, &mut audited_states)
     }
 
-    fn list_with_audited_cache(
+    /// [`Self::list`] with the audit replay a plaintext collection needs held
+    /// in `audited_states`, so listing several collections replays the journal
+    /// once rather than once per collection.
+    pub(crate) fn list_with_audited_cache(
         &self,
         collection: &str,
         filters: &[Assignment],
-        audited_states: &mut Option<AuditedRecordStates>,
+        audited_states: &mut Option<Arc<AuditedRecordStates>>,
     ) -> Result<Vec<Record>> {
         validate_component(collection, "collection")?;
         let directory = self.config.data_dir.join(collection);
@@ -4354,12 +4363,12 @@ impl Database {
         id: &str,
         stored: &Document,
         policy: &EncryptionPolicy,
-        audited_states: &mut Option<AuditedRecordStates>,
+        audited_states: &mut Option<Arc<AuditedRecordStates>>,
     ) -> Result<Document> {
         if needs_audited_encryption_ownership(policy) && audited_states.is_none() {
             *audited_states = Some(self.audit().record_states()?);
         }
-        self.reveal_document_with_policy(collection, id, stored, policy, audited_states.as_ref())
+        self.reveal_document_with_policy(collection, id, stored, policy, audited_states.as_deref())
     }
 
     fn reveal_document_with_policy(
@@ -4403,7 +4412,7 @@ impl Database {
         collection: &str,
         id: &str,
         raw: &str,
-        audited_states: &mut Option<AuditedRecordStates>,
+        audited_states: &mut Option<Arc<AuditedRecordStates>>,
     ) -> Result<Document> {
         let stored = parse_record(collection, id, raw)?;
         let policy = self.encryption_policy(collection)?;
@@ -4652,6 +4661,20 @@ impl Database {
             &self.actor,
             &self.attribution,
         )
+        .with_journal_cache(self.journal.as_deref())
+    }
+
+    /// Keep the verified journal between reads instead of walking it from the
+    /// first event every time.
+    ///
+    /// For a process that outlives many operations on one database, which is
+    /// to say the server. Every clone of the result shares the one cache, so
+    /// each request resumes where the last left off, and a database that
+    /// already has one keeps it. [`JournalCache`] states exactly what is
+    /// trusted in place of re-hashing, and what is not.
+    pub(crate) fn with_journal_cache(mut self) -> Self {
+        self.journal.get_or_insert_with(Arc::default);
+        self
     }
 
     fn with_default_actor(mut self) -> Self {

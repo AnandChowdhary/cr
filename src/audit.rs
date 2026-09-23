@@ -1,10 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     ffi::OsStr,
+    fmt,
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::SystemTime,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -634,6 +640,267 @@ struct ChainState {
     idempotency_identities: HashSet<IdempotencyIdentity>,
 }
 
+/// The checks a walk of the chain applies, as state that can stop at any line
+/// boundary and resume from it.
+///
+/// [`AuditLog::verify_chain`] runs one from the first segment to the last.
+/// [`JournalCache`] keeps one between walks and feeds it only the lines
+/// appended since, so an event verified late is held to exactly the rules an
+/// event verified by a fresh walk is: there is one implementation of them.
+struct ChainWalk {
+    expected_sequence: u64,
+    previous_hash: Option<String>,
+    previous_version: Option<u32>,
+    idempotency_identities: HashSet<IdempotencyIdentity>,
+}
+
+impl ChainWalk {
+    fn new() -> Self {
+        Self {
+            expected_sequence: 1,
+            previous_hash: None,
+            previous_version: None,
+            idempotency_identities: HashSet::new(),
+        }
+    }
+
+    /// Refuse a segment whose name does not start where the chain so far ends.
+    fn begin_segment(&self, path: &Path) -> Result<()> {
+        if segment_start(path)? != self.expected_sequence {
+            bail!("audit segment sequence gap at {}", self.expected_sequence);
+        }
+        Ok(())
+    }
+
+    /// Verify each line of `contents` — a segment from a line boundary to its
+    /// end — hand every entry to `visitor`, and return how many there were.
+    fn lines<F>(&mut self, path: &Path, contents: &[u8], visitor: &mut F) -> Result<usize>
+    where
+        F: FnMut(&AuditEntry, &str) -> Result<()>,
+    {
+        let mut entries = 0;
+        let mut rest = contents;
+        while !rest.is_empty() {
+            let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+                bail!("audit segment {} has a truncated tail", path.display());
+            };
+            self.line(path, &rest[..end], visitor)?;
+            rest = &rest[end + 1..];
+            entries += 1;
+        }
+        Ok(entries)
+    }
+
+    fn line<F>(&mut self, path: &Path, line: &[u8], visitor: &mut F) -> Result<()>
+    where
+        F: FnMut(&AuditEntry, &str) -> Result<()>,
+    {
+        let stored = parse_line(line)
+            .with_context(|| format!("invalid audit event in {}", path.display()))?;
+        if stored.entry.payload.sequence != self.expected_sequence {
+            bail!("audit sequence gap at {}", self.expected_sequence);
+        }
+        if stored.entry.payload.previous_hash != self.previous_hash {
+            bail!(
+                "audit hash chain is broken at sequence {}",
+                self.expected_sequence
+            );
+        }
+        if let Some(previous_version) = self.previous_version {
+            verify_version_progress(
+                previous_version,
+                stored.entry.payload.version,
+                self.expected_sequence,
+            )?;
+        }
+        register_idempotency_identity(&mut self.idempotency_identities, &stored.entry.payload)?;
+        visitor(&stored.entry, &stored.payload)?;
+        self.previous_version = Some(stored.entry.payload.version);
+        self.previous_hash = Some(stored.entry.hash);
+        self.expected_sequence += 1;
+        Ok(())
+    }
+
+    fn finish(self) -> ChainState {
+        ChainState {
+            entries: self.expected_sequence - 1,
+            head_hash: self.previous_hash,
+            idempotency_identities: self.idempotency_identities,
+        }
+    }
+}
+
+/// When each record was created and last changed, by collection and then ID.
+pub(crate) type CollectionsActivity = BTreeMap<String, BTreeMap<String, RecordActivity>>;
+
+/// A verified walk of the journal, kept so that the next reader verifies only
+/// what has been appended since.
+///
+/// Without one, every read that needs audited state — listing a plaintext
+/// collection, a record's created and updated times, switching the RBAC
+/// perspective — replays and re-hashes every event ever recorded, so a
+/// long-lived server does the same work again on every request and each page
+/// costs more the longer the database has existed. `cr serve` keeps one for as
+/// long as it runs; nothing else does, so the CLI still verifies the whole
+/// chain once per command.
+///
+/// What it trusts in place of re-hashing:
+///
+/// * The newest segment is compared byte for byte with what was verified, and
+///   only the lines after that prefix are verified. Appends rewrite that file,
+///   so this is where tampering is most likely to land, and it is detected
+///   exactly as a fresh walk would detect it.
+/// * An older segment is not read again while its identity is what it was
+///   when it was verified: the same path, device and inode, length,
+///   modification time and change time. A write, truncation, or replacement
+///   changes at least one of those, and the change time cannot be set back by
+///   `touch` or any other ordinary interface. A change sends the next reader
+///   back to the first segment.
+///
+/// That is a real trade and a deliberate one. A same-length rewrite of a
+/// sealed segment that also restores its change time goes unnoticed until the
+/// server restarts. Restoring it takes resetting the system clock or writing
+/// the block device directly, and anyone who can do either can also replace
+/// the binary. The one other way is timing: a filesystem that stamps times
+/// from a coarse clock gives a rewrite landing in the same tick as the
+/// segment's last legitimate write the same change time, a window of a few
+/// milliseconds after a segment is sealed.
+///
+/// Verification never uses the cache: `cr audit verify`, `cr check`, and
+/// their API routes walk the whole chain every time. Neither does any write:
+/// `append` verifies the whole chain before it extends it, so a mutation never
+/// builds on a journal only the cache believed.
+#[derive(Default)]
+pub(crate) struct JournalCache {
+    verified: Mutex<Option<VerifiedJournal>>,
+}
+
+impl fmt::Debug for JournalCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JournalCache")
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a walk of the journal established, and where it stopped.
+struct VerifiedJournal {
+    walk: ChainWalk,
+    states: Arc<AuditedRecordStates>,
+    activity: Arc<CollectionsActivity>,
+    /// Every segment before the newest, as it was when it was verified.
+    sealed: Vec<(PathBuf, SegmentStamp)>,
+    /// The newest segment and exactly the bytes of it that were verified.
+    tail: Option<(PathBuf, Vec<u8>)>,
+}
+
+impl VerifiedJournal {
+    fn snapshot(&self) -> JournalSnapshot {
+        JournalSnapshot {
+            states: Arc::clone(&self.states),
+            activity: Arc::clone(&self.activity),
+        }
+    }
+
+    /// Verify the part of each segment not yet verified, in order, and make
+    /// the last of them the tail.
+    fn append(&mut self, segments: Vec<UnverifiedSegment>) -> Result<()> {
+        if segments
+            .iter()
+            .all(|segment| segment.verified == Some(segment.contents.len()))
+        {
+            return Ok(());
+        }
+        // Copies the maps only when a reader still holds the previous
+        // snapshot, which is what lets a snapshot be read without a lock.
+        let states = Arc::make_mut(&mut self.states);
+        let activity = Arc::make_mut(&mut self.activity);
+        let mut visitor = |entry: &AuditEntry, _: &str| {
+            track_activity(activity, entry);
+            replay_entry(states, entry)
+        };
+        let last = segments.len() - 1;
+        self.tail = None;
+        for (index, segment) in segments.into_iter().enumerate() {
+            match segment.verified {
+                Some(verified) => {
+                    self.walk
+                        .lines(&segment.path, &segment.contents[verified..], &mut visitor)?;
+                }
+                None => {
+                    self.walk.begin_segment(&segment.path)?;
+                    if self
+                        .walk
+                        .lines(&segment.path, &segment.contents, &mut visitor)?
+                        == 0
+                    {
+                        bail!("audit segment {} is empty", segment.path.display());
+                    }
+                }
+            }
+            if index == last {
+                self.tail = Some((segment.path, segment.contents));
+            } else {
+                self.sealed.push((segment.path, segment.stamp));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One segment read from disk, with how much of it is already verified.
+struct UnverifiedSegment {
+    path: PathBuf,
+    stamp: SegmentStamp,
+    contents: Vec<u8>,
+    /// The length of the prefix a previous walk verified, or `None` for a
+    /// segment no walk has seen.
+    verified: Option<usize>,
+}
+
+/// The shared result of a cached walk.
+struct JournalSnapshot {
+    states: Arc<AuditedRecordStates>,
+    activity: Arc<CollectionsActivity>,
+}
+
+/// What rewriting a sealed segment cannot leave as it was.
+///
+/// On Unix the change time carries the weight: every write, truncation, or
+/// permission change sets it to the current time, and unlike the modification
+/// time no ordinary interface sets it back. A segment replaced rather than
+/// rewritten has a different inode. Elsewhere only the length and
+/// modification time are available, which is a weaker promise.
+#[derive(Debug, Eq, PartialEq)]
+struct SegmentStamp {
+    length: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl SegmentStamp {
+    fn of(file: &File) -> Result<Self> {
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("could not inspect {SEGMENT_LABEL}"))?;
+        Ok(Self {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct IdempotencyIdentity {
     principal: String,
@@ -650,6 +917,7 @@ pub(crate) struct AuditLog<'a> {
     segment_max_bytes: u64,
     actor: &'a str,
     attribution: &'a Attribution,
+    journal: Option<&'a JournalCache>,
 }
 
 pub(crate) struct AuditMutation<'a> {
@@ -746,7 +1014,15 @@ impl<'a> AuditLog<'a> {
             segment_max_bytes,
             actor,
             attribution,
+            journal: None,
         }
+    }
+
+    /// Answer [`Self::record_states`], [`Self::record_activity`] and
+    /// [`Self::collections_activity`] from `journal` rather than a fresh walk.
+    pub(crate) fn with_journal_cache(mut self, journal: Option<&'a JournalCache>) -> Self {
+        self.journal = journal;
+        self
     }
 
     pub fn ensure_layout(&self) -> Result<()> {
@@ -1589,8 +1865,13 @@ impl<'a> AuditLog<'a> {
         }
     }
 
-    pub fn record_states(&self) -> Result<AuditedRecordStates> {
-        let (states, _) = self.states(false)?;
+    pub fn record_states(&self) -> Result<Arc<AuditedRecordStates>> {
+        let states = match self.journal {
+            Some(journal) => self.cached_journal(journal)?.states,
+            None => Arc::new(self.states(false)?.0),
+        };
+        // Not cached: this reads record files, which change without the
+        // journal changing.
         self.verify_legacy_representation_heads(&states)?;
         Ok(states)
     }
@@ -1617,41 +1898,148 @@ impl<'a> AuditLog<'a> {
     pub(crate) fn collections_activity(
         &self,
         include: impl Fn(&str) -> bool,
-    ) -> Result<BTreeMap<String, BTreeMap<String, RecordActivity>>> {
-        let mut collections: BTreeMap<String, BTreeMap<String, RecordActivity>> = BTreeMap::new();
+    ) -> Result<CollectionsActivity> {
+        if let Some(journal) = self.journal {
+            return Ok(self
+                .cached_journal(journal)?
+                .activity
+                .iter()
+                .filter(|(collection, _)| include(collection))
+                .map(|(collection, activity)| (collection.clone(), activity.clone()))
+                .collect());
+        }
+        let mut collections = CollectionsActivity::new();
         self.verify_chain(|entry, _| {
-            let collection = entry.payload.record.collection.as_str();
-            if !include(collection) {
-                return Ok(());
+            if include(&entry.payload.record.collection) {
+                track_activity(&mut collections, entry);
             }
-            if !collections.contains_key(collection) {
-                collections.insert(collection.to_owned(), BTreeMap::new());
-            }
-            let activity = collections
-                .get_mut(collection)
-                .expect("the collection was just inserted");
-            let id = entry.payload.record.id.as_str();
-            if entry.payload.action == AuditAction::Delete {
-                activity.remove(id);
-                return Ok(());
-            }
-            let at = entry.payload.timestamp.as_str();
-            let sequence = entry.payload.sequence;
-            activity
-                .entry(id.to_owned())
-                .and_modify(|activity| {
-                    activity.updated_at = at.to_owned();
-                    activity.updated_sequence = sequence;
-                })
-                .or_insert_with(|| RecordActivity {
-                    created_at: at.to_owned(),
-                    created_sequence: sequence,
-                    updated_at: at.to_owned(),
-                    updated_sequence: sequence,
-                });
             Ok(())
         })?;
         Ok(collections)
+    }
+
+    /// The verified journal as `journal` holds it, brought up to date first.
+    ///
+    /// Anything the cache cannot vouch for is walked afresh, and a walk that
+    /// fails leaves nothing cached, so the next reader starts from the first
+    /// segment and meets the same failure rather than a stale success.
+    fn cached_journal(&self, journal: &JournalCache) -> Result<JournalSnapshot> {
+        let mut verified = match journal.verified.lock() {
+            Ok(verified) => verified,
+            // A reader panicked part-way through extending it, so what is
+            // there may be half an update. Start again from nothing.
+            Err(poisoned) => {
+                let mut verified = poisoned.into_inner();
+                *verified = None;
+                journal.verified.clear_poison();
+                verified
+            }
+        };
+        let paths = self.segment_paths()?;
+        if let Some(cached) = verified.as_mut() {
+            match self.extend_journal(cached, &paths) {
+                Ok(true) => return Ok(cached.snapshot()),
+                Ok(false) => {}
+                Err(error) => {
+                    *verified = None;
+                    return Err(error);
+                }
+            }
+        }
+        *verified = None;
+        let walked = self.walk_journal(&paths)?;
+        let snapshot = walked.snapshot();
+        *verified = Some(walked);
+        Ok(snapshot)
+    }
+
+    /// Verify every segment from the first, keeping what a later
+    /// [`Self::extend_journal`] needs to resume where this stopped.
+    fn walk_journal(&self, paths: &[PathBuf]) -> Result<VerifiedJournal> {
+        #[cfg(test)]
+        VERIFY_CHAIN_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let mut journal = VerifiedJournal {
+            walk: ChainWalk::new(),
+            states: Arc::default(),
+            activity: Arc::default(),
+            sealed: Vec::new(),
+            tail: None,
+        };
+        let mut segments = Vec::with_capacity(paths.len());
+        for path in paths {
+            let (stamp, contents) = self.read_stamped_segment(path)?;
+            segments.push(UnverifiedSegment {
+                path: path.clone(),
+                stamp,
+                contents,
+                verified: None,
+            });
+        }
+        journal.append(segments)?;
+        Ok(journal)
+    }
+
+    /// Bring `journal` up to date with the segments now on disk, verifying
+    /// only the events it has not seen.
+    ///
+    /// `Ok(false)` means something it had already verified is no longer what
+    /// it verified, which only a walk from the first segment can judge.
+    /// `journal` is untouched in that case; it is changed only once every
+    /// earlier segment has been found as it was left.
+    fn extend_journal(&self, journal: &mut VerifiedJournal, paths: &[PathBuf]) -> Result<bool> {
+        let sealed = journal.sealed.len();
+        let known = sealed + usize::from(journal.tail.is_some());
+        if paths.len() < known {
+            return Ok(false);
+        }
+        for ((path, stamp), current) in journal.sealed.iter().zip(paths) {
+            if path != current || self.segment_stamp(path)? != *stamp {
+                return Ok(false);
+            }
+        }
+        let mut segments = Vec::with_capacity(paths.len() - sealed);
+        if let Some((path, verified)) = &journal.tail {
+            if *path != paths[sealed] {
+                return Ok(false);
+            }
+            let (stamp, contents) = self.read_stamped_segment(path)?;
+            if !contents.starts_with(verified) {
+                return Ok(false);
+            }
+            segments.push(UnverifiedSegment {
+                path: path.clone(),
+                stamp,
+                contents,
+                verified: Some(verified.len()),
+            });
+        }
+        for path in &paths[known..] {
+            let (stamp, contents) = self.read_stamped_segment(path)?;
+            segments.push(UnverifiedSegment {
+                path: path.clone(),
+                stamp,
+                contents,
+                verified: None,
+            });
+        }
+        journal.append(segments)?;
+        Ok(true)
+    }
+
+    /// A segment's contents and the metadata of the very file they were read
+    /// from, so a replacement between the two cannot pair one file's identity
+    /// with another's bytes.
+    fn read_stamped_segment(&self, path: &Path) -> Result<(SegmentStamp, Vec<u8>)> {
+        let mut file = paths::open_file(self.root, path, SEGMENT_LABEL)?;
+        let stamp = SegmentStamp::of(&file)?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .with_context(|| format!("could not read {SEGMENT_LABEL}"))?;
+        Ok((stamp, contents))
+    }
+
+    fn segment_stamp(&self, path: &Path) -> Result<SegmentStamp> {
+        SegmentStamp::of(&paths::open_file(self.root, path, SEGMENT_LABEL)?)
     }
 
     /// Replay the chain once while also enforcing approval bindings.
@@ -1874,63 +2262,15 @@ impl<'a> AuditLog<'a> {
     {
         #[cfg(test)]
         VERIFY_CHAIN_CALLS.with(|calls| calls.set(calls.get() + 1));
-        let paths = self.segment_paths()?;
-        let mut expected_sequence = 1;
-        let mut previous_hash: Option<String> = None;
-        let mut previous_version: Option<u32> = None;
-        let mut idempotency_identities = HashSet::new();
-
-        for path in paths {
-            if segment_start(&path)? != expected_sequence {
-                bail!("audit segment sequence gap at {expected_sequence}");
-            }
-            let file = paths::open_file(self.root, &path, SEGMENT_LABEL)?;
-            let mut reader = BufReader::new(file);
-            let mut segment_entries = 0usize;
-
-            loop {
-                let mut line = Vec::new();
-                let read = reader.read_until(b'\n', &mut line)?;
-                if read == 0 {
-                    break;
-                }
-                if line.last() != Some(&b'\n') {
-                    bail!("audit segment {} has a truncated tail", path.display());
-                }
-                line.pop();
-                let stored = parse_line(&line)
-                    .with_context(|| format!("invalid audit event in {}", path.display()))?;
-                if stored.entry.payload.sequence != expected_sequence {
-                    bail!("audit sequence gap at {expected_sequence}");
-                }
-                if stored.entry.payload.previous_hash != previous_hash {
-                    bail!("audit hash chain is broken at sequence {expected_sequence}");
-                }
-                if let Some(previous_version) = previous_version {
-                    verify_version_progress(
-                        previous_version,
-                        stored.entry.payload.version,
-                        expected_sequence,
-                    )?;
-                }
-                register_idempotency_identity(&mut idempotency_identities, &stored.entry.payload)?;
-                visitor(&stored.entry, &stored.payload)?;
-                previous_version = Some(stored.entry.payload.version);
-                previous_hash = Some(stored.entry.hash);
-                expected_sequence += 1;
-                segment_entries += 1;
-            }
-
-            if segment_entries == 0 {
+        let mut walk = ChainWalk::new();
+        for path in self.segment_paths()? {
+            walk.begin_segment(&path)?;
+            let contents = self.read_segment_bytes(&path)?;
+            if walk.lines(&path, &contents, &mut visitor)? == 0 {
                 bail!("audit segment {} is empty", path.display());
             }
         }
-
-        Ok(ChainState {
-            entries: expected_sequence - 1,
-            head_hash: previous_hash,
-            idempotency_identities,
-        })
+        Ok(walk.finish())
     }
 
     fn record_state(
@@ -2141,6 +2481,37 @@ fn unreadable_anchor(error: serde_json::Error) -> anyhow::Error {
 fn stored_line(hash: &str, payload: &str) -> Result<String> {
     let hash = serde_json::to_string(hash)?;
     Ok(format!("{{\"hash\":{hash},\"payload\":{payload}}}\n"))
+}
+
+/// Fold one event into when each record in its collection was created and
+/// last changed.
+fn track_activity(collections: &mut CollectionsActivity, entry: &AuditEntry) {
+    let collection = entry.payload.record.collection.as_str();
+    if !collections.contains_key(collection) {
+        collections.insert(collection.to_owned(), BTreeMap::new());
+    }
+    let activity = collections
+        .get_mut(collection)
+        .expect("the collection was just inserted");
+    let id = entry.payload.record.id.as_str();
+    if entry.payload.action == AuditAction::Delete {
+        activity.remove(id);
+        return;
+    }
+    let at = entry.payload.timestamp.as_str();
+    let sequence = entry.payload.sequence;
+    activity
+        .entry(id.to_owned())
+        .and_modify(|activity| {
+            activity.updated_at = at.to_owned();
+            activity.updated_sequence = sequence;
+        })
+        .or_insert_with(|| RecordActivity {
+            created_at: at.to_owned(),
+            created_sequence: sequence,
+            updated_at: at.to_owned(),
+            updated_sequence: sequence,
+        });
 }
 
 fn parse_line(line: &[u8]) -> Result<StoredEntry> {
@@ -2821,9 +3192,9 @@ mod tests {
     use super::{
         AuditAction, AuditChange, AuditEntry, AuditFilter, AuditIdempotency,
         AuditIdempotencyResult, AuditLog, AuditMutation, AuditPayload, AuditRecord, AuditSource,
-        CHANGE_SET_HASH_DOMAIN, PENDING_PATH, PendingMutation, PreparedEntry, ReconciledMutation,
-        VERIFY_CHAIN_CALLS, apply_changes, change_set_hash, diff_documents, digest, event_hash,
-        parse_line, record_hash, stored_line,
+        CHANGE_SET_HASH_DOMAIN, CollectionsActivity, PENDING_PATH, PendingMutation, PreparedEntry,
+        ReconciledMutation, VERIFY_CHAIN_CALLS, apply_changes, change_set_hash, diff_documents,
+        digest, event_hash, parse_line, record_hash, stored_line,
     };
     use crate::{
         Assignment, Database,
@@ -3436,6 +3807,144 @@ mod tests {
         );
         assert!(history.encryption_transitions.is_empty());
         assert_eq!(verify_calls, 1);
+    }
+
+    /// A database whose journal starts a new segment every
+    /// `segment_max_events` events, once with a journal cache and once
+    /// without, over the same files.
+    fn cached_and_uncached(
+        root: &std::path::Path,
+        segment_max_events: usize,
+    ) -> (Database, Database) {
+        Database::init(root).unwrap();
+        std::fs::write(
+            root.join(".cr/config.yaml"),
+            format!(
+                "version: 1\ndata_dir: records\naudit:\n  segment_max_events: {segment_max_events}\n"
+            ),
+        )
+        .unwrap();
+        let uncached = Database::discover(Some(root))
+            .unwrap()
+            .with_actor("tester@example.com")
+            .unwrap();
+        (uncached.clone().with_journal_cache(), uncached)
+    }
+
+    type Replayed =
+        std::collections::BTreeMap<(String, String), (Option<String>, Option<serde_json::Value>)>;
+
+    fn replayed(database: &Database) -> Replayed {
+        database
+            .audit()
+            .record_states()
+            .unwrap()
+            .iter()
+            .map(|(key, state)| (key.clone(), (state.hash.clone(), state.document.clone())))
+            .collect()
+    }
+
+    fn activity(database: &Database) -> CollectionsActivity {
+        database.audit().collections_activity(|_| true).unwrap()
+    }
+
+    #[test]
+    fn a_cached_journal_verifies_only_what_was_appended_since() {
+        let root = tempfile::tempdir().unwrap();
+        let (cached, uncached) = cached_and_uncached(root.path(), 2);
+        VERIFY_CHAIN_CALLS.with(|calls| calls.set(0));
+        assert!(replayed(&cached).is_empty());
+        assert_eq!(VERIFY_CHAIN_CALLS.with(Cell::get), 1);
+
+        // Two events to a segment, so the newest segment fills, is sealed, and
+        // is followed by a new one while the cache watches.
+        for index in 0..7 {
+            let id = format!("item-{index}");
+            let assignment: Assignment = format!("value={index}").parse().unwrap();
+            cached.create("items", &id, &[assignment], "").unwrap();
+            if index % 3 == 1 {
+                let assignment: Assignment = "value=changed".parse().unwrap();
+                cached.update("items", &id, &[assignment], None).unwrap();
+            }
+            if index == 5 {
+                cached.delete("items", "item-0").unwrap();
+            }
+
+            VERIFY_CHAIN_CALLS.with(|calls| calls.set(0));
+            let states = replayed(&cached);
+            let collections = activity(&cached);
+            assert_eq!(
+                VERIFY_CHAIN_CALLS.with(Cell::get),
+                0,
+                "reading after item {index} walked the whole chain"
+            );
+            assert_eq!(states, replayed(&uncached), "after item {index}");
+            assert_eq!(collections, activity(&uncached), "after item {index}");
+        }
+        assert!(
+            std::fs::read_dir(root.path().join(".cr/audit/segments"))
+                .unwrap()
+                .count()
+                > 3
+        );
+    }
+
+    #[test]
+    fn a_rewritten_segment_is_verified_again_from_the_first_event() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let (cached, uncached) = cached_and_uncached(root.path(), 2);
+        for index in 0..5 {
+            let assignment: Assignment = format!("value={index}").parse().unwrap();
+            cached
+                .create("items", &format!("item-{index}"), &[assignment], "")
+                .unwrap();
+        }
+        let expected = replayed(&uncached);
+        assert_eq!(replayed(&cached), expected);
+
+        let segments = root.path().join(".cr/audit/segments");
+        for (segment, which) in [
+            ("00000000000000000001.jsonl", "a sealed segment"),
+            ("00000000000000000005.jsonl", "the newest segment"),
+        ] {
+            let path = segments.join(segment);
+            let original = std::fs::read(&path).unwrap();
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let forged = String::from_utf8(original.clone())
+                .unwrap()
+                .replacen("tester", "forger", 1);
+            assert_eq!(forged.len(), original.len());
+            // Coarse filesystem clocks tick every few milliseconds, and a
+            // rewrite in the same tick as the write before it would keep that
+            // write's change time. Nothing tampers that quickly by accident.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // In place, the same length, and the modification time put back:
+            // only the bytes and the change time say anything happened.
+            let rewrite = |contents: &[u8]| {
+                let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.write_all(contents).unwrap();
+                file.set_modified(modified).unwrap();
+            };
+            rewrite(forged.as_bytes());
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                modified
+            );
+
+            let Err(error) = cached.audit().record_states() else {
+                panic!("{which}: the forged event was accepted");
+            };
+            assert!(
+                format!("{error:#}").contains("audit event hash mismatch"),
+                "{which}: {error:#}"
+            );
+            // A failed walk caches nothing, so the restored journal is walked
+            // afresh rather than half-remembered.
+            rewrite(&original);
+            assert_eq!(replayed(&cached), expected, "{which}");
+        }
     }
 
     #[test]

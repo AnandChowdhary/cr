@@ -307,6 +307,8 @@ Priorities:
 
 - [ ] **P2 — Larger scale and performance baselines.**
   Measure list, search, audit pagination, startup, and OpenAPI generation across realistic record counts and body sizes before designing indexes.
+  The server's per-request journal walks are done. `cr serve` keeps one verified walk and extends it with appended events (`JournalCache` in `src/audit.rs`), the view index replays the journal once for every collection rather than once per collection, and `ViewIndex::summarize` pins that count in a unit test. On 5,000 records and 15,000 events across 20 collections the index went from 8.2 s to about 0.1 s warm, and a view page from 0.6 s to about 10 ms.
+  What remains: the `/audit` timeline and `/api/v1/audit/log` still walk the whole chain per request, because history pages need exact per-event encryption transitions that the cache does not keep; under RBAC the index re-reads and re-validates a collection's schema once per record while deciding which audit history the principal may read; and every page still reads and parses each record it lists, which is the part an index would remove.
 
 - [ ] **P2 — Independent OpenAPI validation.**
   Validate the complete generated document, not only local `$ref` resolution, and test schema changes that use `$id`, local references, and supported external references.

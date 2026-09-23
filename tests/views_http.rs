@@ -1588,7 +1588,10 @@ async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     assert!(database.set_collection_icon("deals", Some("💼")).unwrap());
     let app = router(database.clone(), ServerConfig::default()).unwrap();
 
-    let home = request(&app, Method::GET, "/", None, &[]).await;
+    // The document a browser is sent first leaves the numbers for the page to
+    // fetch; `tests/view_index_http.rs` covers that. This is the document with
+    // them in it, which is also what the region is cut from.
+    let home = request(&app, Method::GET, "/?summary=inline", None, &[]).await;
     assert_eq!(home.status, StatusCode::OK);
     let (sidebar, index) = home
         .text()
@@ -1632,7 +1635,7 @@ async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
         "---\n: [\n---\n",
     )
     .unwrap();
-    let degraded = request(&app, Method::GET, "/", None, &[]).await;
+    let degraded = request(&app, Method::GET, "/?summary=inline", None, &[]).await;
     assert_eq!(degraded.status, StatusCode::OK);
     let degraded_index = degraded
         .text()

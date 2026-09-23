@@ -65,6 +65,12 @@ Out of scope:
   audit chain records them rather than preventing them.
 - Serving a database over an untrusted network without a TLS-terminating proxy.
   `cr serve` speaks plain HTTP by design.
+- A same-length rewrite of a sealed audit segment that also restores the
+  file's change time, made while `cr serve` is running, goes unnoticed by that
+  server until it restarts. That is the documented trade of its verified-journal
+  cache; see [the server's verified journal](docs/architecture.md#the-servers-verified-journal).
+  `cr audit verify` and `cr check` still detect it, and a way to make the server
+  miss a rewrite that does *not* restore the change time is in scope.
 - Findings against a dependency that already has a published advisory. The
   `cargo audit` workflow covers those; open a normal issue instead.
 - The known, already-tracked hardening gaps listed as **P0** and **P1** in

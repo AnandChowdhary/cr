@@ -383,7 +383,9 @@ async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
     let (_temporary, database) = seeded_database("perspective-ui");
     let app = router(database.clone(), ServerConfig::default()).unwrap();
 
-    let home = request(&app, Method::GET, "/", None, None, &[]).await;
+    // The counts are part of what the policy decides, so ask for the index
+    // with them rendered in rather than left for the page to fetch.
+    let home = request(&app, Method::GET, "/?summary=inline", None, None, &[]).await;
     assert_eq!(home.status, StatusCode::OK);
     assert!(home.text().contains("aria-label=\"View as user\""));
     assert!(home.text().contains("Owner — owner"));
@@ -426,7 +428,7 @@ async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
     let reader_home = request(
         &app,
         Method::GET,
-        "/",
+        "/?summary=inline",
         None,
         None,
         &[("cookie", &reader_cookie)],
