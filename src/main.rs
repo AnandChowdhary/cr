@@ -357,6 +357,32 @@ enum Command {
         json: bool,
     },
 
+    /// Follow relations outward from a record.
+    ///
+    /// Each record is visited once, so a cycle stops where it closes. A
+    /// reference to a record that is missing or that you may not read is shown
+    /// and not followed.
+    Traverse {
+        collection: String,
+        id: String,
+
+        /// Follow only this relation. Repeat to follow several. By default every relation is followed.
+        #[arg(short = 'r', long = "relation", value_name = "RELATION")]
+        relations: Vec<String>,
+
+        /// How many relations to follow outward from the record, from 1 to 10.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        depth: usize,
+
+        /// Return JSON: every record reached, and every reference followed.
+        #[arg(long)]
+        json: bool,
+
+        /// With --json, nest each record's linked records under it instead.
+        #[arg(long, requires = "json")]
+        expand: bool,
+    },
+
     /// Search record paths, front matter, and Markdown bodies.
     Search {
         /// Literal text to find, or a regular expression with --regex.
@@ -1454,6 +1480,26 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         backlink.relations.join(",")
                     );
                 }
+            }
+        }
+        Command::Traverse {
+            collection,
+            id,
+            relations,
+            depth,
+            json,
+            expand,
+        } => {
+            let traversal = database.traverse(&collection, &id, &relations, depth)?;
+            if json {
+                let rendered = if expand {
+                    traversal.tree_json()?
+                } else {
+                    traversal.graph_json()?
+                };
+                println!("{}", serde_json::to_string_pretty(&rendered)?);
+            } else {
+                print!("{}", traversal.render_text());
             }
         }
         Command::Search {

@@ -40,10 +40,10 @@ use crate::{
     AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
     AuditIntentPart, AuditSource, Backlink, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary,
     CollectionModel, CollectionPresentation, Database, DomainError, FilterExpression,
-    FilterOperator, Finding, RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition,
-    SchemaViolation, SearchQuery, SearchTarget, SortDirection, USERS_COLLECTION, User, UserKind,
-    UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
-    audit::AuditChange, sort_by_record_field, sort_records_by_field,
+    FilterOperator, Finding, MAX_TRAVERSAL_DEPTH, RECORD_ACCESS_FIELD, Record, RecordActivity,
+    RecordPrecondition, SchemaViolation, SearchQuery, SearchTarget, SortDirection,
+    USERS_COLLECTION, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout,
+    ViewPredicateMatch, audit::AuditChange, sort_by_record_field, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -583,6 +583,16 @@ struct BacklinkQuery {
     direction: SortDirectionParameter,
     limit: Option<usize>,
     offset: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TraverseQuery {
+    #[serde(default)]
+    relation: Vec<String>,
+    depth: Option<usize>,
+    #[serde(default)]
+    expand: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1447,6 +1457,10 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
                 .route(
                     "/collections/{collection}/records/{id}/backlinks",
                     get(list_backlinks),
+                )
+                .route(
+                    "/collections/{collection}/records/{id}/traverse",
+                    get(traverse_record),
                 )
                 .route("/search", get(search_records))
                 .route("/status", get(status))
@@ -3508,6 +3522,27 @@ async fn list_backlinks(
     Ok(Json(page))
 }
 
+/// Follow relations outward from one record.
+async fn traverse_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((collection, id)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<JsonValue>> {
+    let query: TraverseQuery = parse_query(raw)?;
+    let rendered = run_database(&state, &headers, move |database| {
+        let traversal =
+            database.traverse(&collection, &id, &query.relation, query.depth.unwrap_or(1))?;
+        if query.expand {
+            traversal.tree_json()
+        } else {
+            traversal.graph_json()
+        }
+    })
+    .await?;
+    Ok(Json(rendered))
+}
+
 /// Remove one relation reference. Every part of the reference is a path
 /// component, so it needs no request body, which a `DELETE` should not carry.
 async fn unlink_record(
@@ -3807,6 +3842,36 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "has_more": { "type": "boolean" },
                 "next_offset": { "type": ["integer", "null"], "minimum": 0 },
                 "previous_offset": { "type": ["integer", "null"], "minimum": 0 }
+            }
+        },
+        "TraversalNode": {
+            "type": "object",
+            "required": ["collection", "id", "status"],
+            "properties": {
+                "collection": { "type": "string" },
+                "id": { "type": "string" },
+                "status": { "enum": ["found", "missing", "forbidden", "unreadable"] },
+                "depth": { "type": "integer", "minimum": 0 },
+                "path": { "type": "string" },
+                "version": { "type": "string" },
+                "front_matter": { "$ref": "#/components/schemas/FrontMatter" },
+                "seen": { "type": "boolean", "description": "In an expanded tree, a reference to a record already expanded elsewhere." },
+                "links": { "type": "object", "additionalProperties": { "type": "array", "items": { "$ref": "#/components/schemas/TraversalNode" } } }
+            }
+        },
+        "Traversal": {
+            "description": "A flat graph of nodes and edges, or with expand=true one nested TraversalNode for the start with depth and truncated beside it.",
+            "type": "object",
+            "properties": {
+                "root": { "type": "string" },
+                "depth": { "type": "integer" },
+                "truncated": { "type": "boolean" },
+                "nodes": { "type": "array", "items": { "$ref": "#/components/schemas/TraversalNode" } },
+                "edges": { "type": "array", "items": {
+                    "type": "object",
+                    "required": ["from", "relation", "to"],
+                    "properties": { "from": { "type": "string" }, "relation": { "type": "string" }, "to": { "type": "string" } }
+                } }
             }
         },
         "Backlink": {
@@ -4374,6 +4439,15 @@ fn openapi_paths() -> JsonValue {
                 { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
                 { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } }
             ], "responses": ok("#/components/schemas/BacklinkPage") }
+        },
+        "/api/v1/collections/{collection}/records/{id}/traverse": {
+            "get": { "operationId": "traverseRecord", "description": "Follow relations outward from a record, breadth first. Each record is visited once, a missing or unreadable target is reported and not followed, and at most 1000 records are visited.", "parameters": [
+                collection.clone(),
+                id.clone(),
+                { "name": "relation", "in": "query", "description": "Follow only these relations. By default every relation is followed.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
+                { "name": "depth", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": MAX_TRAVERSAL_DEPTH, "default": 1 } },
+                { "name": "expand", "in": "query", "description": "Nest each record's linked records under it instead of returning a flat graph.", "schema": { "type": "boolean", "default": false } }
+            ], "responses": ok("#/components/schemas/Traversal") }
         },
         "/api/v1/collections/{collection}/records/{id}/links/{relation}/{target_collection}/{target_id}": {
             "delete": { "operationId": "unlinkRecord", "description": "Remove every reference to target_collection/target_id from the named relation. Removing a reference that is not there changes nothing, and the target does not have to exist.", "parameters": conditional_mutation_parameters(vec![
