@@ -1741,3 +1741,99 @@ async fn an_unusable_record_filename_is_a_classified_conflict_over_http() {
     .await;
     assert_eq!(single.status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn rest_unlink_removes_a_relation_with_preview_retries_and_preconditions() {
+    let (_temporary, database) = test_database("server-unlink");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    for (collection, id) in [("companies", "acme"), ("deals", "renewal")] {
+        let created = json_request(
+            &app,
+            Method::POST,
+            &format!("/api/v1/collections/{collection}/records"),
+            json!({ "id": id, "front_matter": { "name": id } }),
+            &[],
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED);
+    }
+    let link_key = [("idempotency-key", IDEMPOTENCY_KEY)];
+    let linked = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/collections/deals/records/renewal/links",
+        json!({ "relation": "company", "target_collection": "companies", "target_id": "acme" }),
+        &link_key,
+    )
+    .await;
+    assert_eq!(linked.status, StatusCode::OK);
+    let unlink = "/api/v1/collections/deals/records/renewal/links/company/companies/acme";
+
+    // Reusing the link's retry key for the unlink is a different request.
+    let reused = request(&app, Method::DELETE, unlink, None, &link_key).await;
+    assert_eq!(reused.status, StatusCode::CONFLICT);
+    assert_eq!(reused.json()["error"]["code"], "idempotency_conflict");
+
+    let sequence = database.audit_head().unwrap().sequence;
+    let preview = request(
+        &app,
+        Method::DELETE,
+        &format!("{unlink}?preview=true"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK);
+    assert_eq!(preview.json()["changes"][0]["operation"], "remove");
+    assert_eq!(database.audit_head().unwrap().sequence, sequence);
+
+    let stale = [(
+        "if-match",
+        "\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"",
+    )];
+    let refused = request(&app, Method::DELETE, unlink, None, &stale).await;
+    assert_eq!(refused.status, StatusCode::PRECONDITION_FAILED);
+
+    let key = [("idempotency-key", "6ba7b810-9dad-11d1-80b4-00c04fd430c8")];
+    let removed = request(&app, Method::DELETE, unlink, None, &key).await;
+    assert_eq!(removed.status, StatusCode::OK, "{}", removed.text());
+    assert!(removed.json()["front_matter"].get("relations").is_none());
+    assert!(removed.headers.contains_key(header::ETAG));
+    let replay = request(&app, Method::DELETE, unlink, None, &key).await;
+    assert_eq!(replay.body, removed.body);
+    assert_eq!(database.audit_head().unwrap().sequence, sequence + 1);
+
+    // The target does not have to exist.
+    let dangling = request(
+        &app,
+        Method::DELETE,
+        "/api/v1/collections/deals/records/renewal/links/company/companies/gone",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(dangling.status, StatusCode::OK);
+
+    let openapi = request(&app, Method::GET, "/openapi.json", None, &[])
+        .await
+        .json();
+    let operation = &openapi["paths"]["/api/v1/collections/{collection}/records/{id}/links/{relation}/{target_collection}/{target_id}"]
+        ["delete"];
+    assert_eq!(operation["operationId"], "unlinkRecord");
+    let names: Vec<_> = operation["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|parameter| parameter["name"].as_str().unwrap())
+        .collect();
+    for name in [
+        "relation",
+        "target_collection",
+        "target_id",
+        "If-Match",
+        "Idempotency-Key",
+        "preview",
+    ] {
+        assert!(names.contains(&name), "{name} missing from {names:?}");
+    }
+}

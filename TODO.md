@@ -169,8 +169,8 @@ Priorities:
 
 ## Relationships
 
-- [ ] **P1 — Add `unlink` and its REST equivalent.**
-  Removal must be idempotent, schema-validated, atomic, and represented clearly in the audit diff.
+- [x] **P1 — Add `unlink` and its REST equivalent.**
+  `cr unlink` and `DELETE /api/v1/collections/{collection}/records/{id}/links/{relation}/{target_collection}/{target_id}` remove every reference to one record from a named relation, matched by `collection` and `id` so an annotated or duplicated reference goes too, and prune the relation and then `relations` once empty, so link-then-unlink restores the record byte for byte. Removing an absent reference succeeds and changes nothing, as a repeated link does. The target is never read, so a dangling reference can be removed and only link permission on the source is needed. The write takes the ordinary single-record path, so it is schema-validated, atomic, previewable, approvable, conditional on `If-Match` or `--expected-record-hash`, and retryable with an idempotency key. It is recorded as a `link` event whose change set shows the removal, rather than as a new `unlink` action that every earlier `cr` would refuse; its retry key is scoped to `link` with the request marked as an unlink, for the same reason. `tests/relations_cli.rs` and `tests/server_api.rs` cover it. The web UI does not render relations yet, so it has no unlink control.
 
 - [ ] **P1 — Backlink queries.**
   Find every record that references a given `collection/id`, with filtering and pagination.
@@ -210,8 +210,8 @@ Priorities:
 
 ## Data modeling and file workflows
 
-- [ ] **P1 — Add CLI field removal for parity with HTTP PATCH.**
-  Provide `cr update --unset dotted.field` using the same atomic mutation path and audit semantics as REST `remove`.
+- [x] **P1 — Add CLI field removal for parity with HTTP PATCH.**
+  `cr update --unset dotted.field`, repeatable and combinable with `--set` and `--body`, removes fields in the same single audited update event, after the assignments, with REST `remove` semantics: a missing field is refused. Setting and unsetting overlapping paths in one update is refused rather than resolved by order. `$cr_access` stays managed through `cr access`, and in `users` only `profile.*` can be unset. The idempotency request carries `unset` only when it is used, so a retry of an update recorded before it existed still matches.
 
 - [ ] **P1 — First-class collection and schema commands.**
   List models, inspect schemas, validate proposed schema changes, and create/update schemas without manually editing `.cr/schemas`.

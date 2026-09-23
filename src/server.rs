@@ -23,7 +23,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use percent_encoding::{
@@ -1396,6 +1396,10 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
                 .route(
                     "/collections/{collection}/records/{id}/links",
                     post(link_record),
+                )
+                .route(
+                    "/collections/{collection}/records/{id}/links/{relation}/{target_collection}/{target_id}",
+                    delete(unlink_record),
                 )
                 .route("/search", get(search_records))
                 .route("/status", get(status))
@@ -3416,6 +3420,50 @@ async fn link_record(
     api_record_response(StatusCode::OK, record)
 }
 
+/// Remove one relation reference. Every part of the reference is a path
+/// component, so it needs no request body, which a `DELETE` should not carry.
+async fn unlink_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((collection, id, relation, target_collection, target_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Response> {
+    let query: PreviewQuery = parse_query(raw)?;
+    let precondition = if_match(&headers, false)?;
+    if query.preview {
+        let preview = run_idempotent_database(&state, &headers, move |database| {
+            database.preview_unlink_conditionally(
+                &collection,
+                &id,
+                &relation,
+                &target_collection,
+                &target_id,
+                precondition.as_ref(),
+            )
+        })
+        .await?;
+        return Ok(Json(preview).into_response());
+    }
+    let record = run_idempotent_database(&state, &headers, move |database| {
+        database.unlink_conditionally(
+            &collection,
+            &id,
+            &relation,
+            &target_collection,
+            &target_id,
+            precondition.as_ref(),
+        )
+    })
+    .await?;
+    api_record_response(StatusCode::OK, record)
+}
+
 async fn search_records(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4202,7 +4250,16 @@ fn openapi_paths() -> JsonValue {
             "get": { "operationId": "getRecordField", "parameters": [collection.clone(), id.clone(), json!({ "name": "field", "in": "path", "required": true, "schema": { "type": "string" } })], "responses": ok("#/components/schemas/FieldResponse") }
         },
         "/api/v1/collections/{collection}/records/{id}/links": {
-            "post": { "operationId": "linkRecord", "parameters": conditional_mutation_parameters(vec![collection, id]), "requestBody": json_body("#/components/schemas/LinkRequest"), "responses": record_ok_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview") }
+            "post": { "operationId": "linkRecord", "parameters": conditional_mutation_parameters(vec![collection.clone(), id.clone()]), "requestBody": json_body("#/components/schemas/LinkRequest"), "responses": record_ok_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview") }
+        },
+        "/api/v1/collections/{collection}/records/{id}/links/{relation}/{target_collection}/{target_id}": {
+            "delete": { "operationId": "unlinkRecord", "description": "Remove every reference to target_collection/target_id from the named relation. Removing a reference that is not there changes nothing, and the target does not have to exist.", "parameters": conditional_mutation_parameters(vec![
+                collection,
+                id,
+                json!({ "name": "relation", "in": "path", "required": true, "schema": { "type": "string" } }),
+                json!({ "name": "target_collection", "in": "path", "required": true, "schema": { "type": "string" } }),
+                json!({ "name": "target_id", "in": "path", "required": true, "schema": { "type": "string" } })
+            ]), "responses": record_ok_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview") }
         },
         "/api/v1/search": {
             "get": { "operationId": "searchRecords", "parameters": [

@@ -62,6 +62,14 @@ cr update companies acme --set 'industry=Industrial automation'
 cr update companies acme --set 'active=false' --body 'Account is currently paused.'
 ```
 
+Remove a field with `--unset`, using the same dotted path as `--set`. A field
+that does not exist is refused, and so is setting and unsetting the same field
+in one update:
+
+```sh
+cr update companies acme --unset industry --unset address.suite
+```
+
 Add a named relation from one record to another:
 
 ```sh
@@ -73,6 +81,21 @@ The arguments are:
 ```text
 cr link SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
 ```
+
+Remove it again with `cr unlink`, which takes the same arguments:
+
+```sh
+cr unlink contacts jane-doe company companies acme
+```
+
+`unlink` removes every reference to that record from the relation, including
+one annotated with extra keys. When the relation is left empty it is removed,
+and so is `relations` once nothing is left in it, so a link followed by an
+unlink leaves the file exactly as it was. Unlinking a reference that is not
+there changes nothing. The target does not have to exist, which is how you
+remove a relation `cr check` reports as a `dangling_link`. Both directions are
+recorded as `link` events, and the change set shows whether a reference was
+added or removed.
 
 Delete a record. Deletion requires confirmation and retains an audited tombstone:
 

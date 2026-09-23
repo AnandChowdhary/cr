@@ -2764,6 +2764,43 @@ impl Database {
         Ok(false)
     }
 
+    /// Parse `unset` paths and refuse an update no mutation should attempt:
+    /// one that touches reserved access metadata, or sets and unsets
+    /// overlapping fields, whose outcome would depend on the order applied.
+    fn validate_update(
+        &self,
+        collection: &str,
+        assignments: &[Assignment],
+        unset: &[String],
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        let unset = unset
+            .iter()
+            .map(|raw| Ok((raw.clone(), parse_path(raw)?)))
+            .collect::<Result<Vec<_>>>()?;
+        if self.record_access_policy(collection)?.is_some() {
+            reject_record_access_assignments(assignments)?;
+            if unset
+                .iter()
+                .any(|(_, path)| path.first().is_some_and(|part| part == RECORD_ACCESS_FIELD))
+            {
+                return Err(invalid(format!(
+                    "front matter field '{RECORD_ACCESS_FIELD}' is managed through 'cr access'"
+                )));
+            }
+        }
+        for (raw, path) in &unset {
+            if assignments.iter().any(|assignment| {
+                let set = assignment.path();
+                set.starts_with(path) || path.starts_with(set)
+            }) {
+                return Err(invalid(format!(
+                    "field '{raw}' cannot be both set and unset in one update"
+                )));
+            }
+        }
+        Ok(unset)
+    }
+
     pub fn update(
         &self,
         collection: &str,
@@ -2771,36 +2808,45 @@ impl Database {
         assignments: &[Assignment],
         body: Option<&str>,
     ) -> Result<Record> {
-        self.update_conditionally(collection, id, assignments, body, None)
+        self.update_conditionally(collection, id, assignments, &[], body, None)
     }
 
     /// Update a record, optionally requiring its exact current version.
+    ///
+    /// `unset` removes dotted fields after the assignments are applied, with
+    /// the semantics of a REST patch's `remove`: a field that does not exist
+    /// is refused rather than ignored.
     pub fn update_conditionally(
         &self,
         collection: &str,
         id: &str,
         assignments: &[Assignment],
+        unset: &[String],
         body: Option<&str>,
         precondition: Option<&RecordPrecondition>,
     ) -> Result<Record> {
-        if self.record_access_policy(collection)?.is_some() {
-            reject_record_access_assignments(assignments)?;
-        }
-        let user_fields = validate_users_field_update(collection, assignments, body)?;
+        let unset = self.validate_update(collection, assignments, unset)?;
+        let user_fields = validate_users_field_update(collection, assignments, &unset, body)?;
         let idempotency = self.idempotency_request("update", collection, id, || {
-            Ok(json!({
+            let mut input = json!({
                 "assignments": assignments
                     .iter()
                     .map(Assignment::idempotency_value)
                     .collect::<Result<Vec<_>>>()?,
                 "body": body,
                 "precondition": precondition.map(RecordPrecondition::idempotency_value),
-            }))
+            });
+            // Only present when used, so a retry of an update recorded before
+            // `unset` existed still hashes to the request it was.
+            if !unset.is_empty() {
+                input["unset"] = json!(unset.iter().map(|(raw, _)| raw).collect::<Vec<_>>());
+            }
+            Ok(input)
         })?;
         self.run_update(
             collection,
             id,
-            update_with(assignments, body),
+            update_with(assignments, &unset, body),
             MutationMode::Apply,
             if let Some(includes_name) = user_fields {
                 AccessRequest::user_fields(id, includes_name)
@@ -2821,7 +2867,7 @@ impl Database {
         assignments: &[Assignment],
         body: Option<&str>,
     ) -> Result<ChangePreview> {
-        self.preview_update_conditionally(collection, id, assignments, body, None)
+        self.preview_update_conditionally(collection, id, assignments, &[], body, None)
     }
 
     /// Preview an update against an optional exact current version.
@@ -2830,17 +2876,16 @@ impl Database {
         collection: &str,
         id: &str,
         assignments: &[Assignment],
+        unset: &[String],
         body: Option<&str>,
         precondition: Option<&RecordPrecondition>,
     ) -> Result<ChangePreview> {
-        if self.record_access_policy(collection)?.is_some() {
-            reject_record_access_assignments(assignments)?;
-        }
-        let user_fields = validate_users_field_update(collection, assignments, body)?;
+        let unset = self.validate_update(collection, assignments, unset)?;
+        let user_fields = validate_users_field_update(collection, assignments, &unset, body)?;
         self.run_update(
             collection,
             id,
-            update_with(assignments, body),
+            update_with(assignments, &unset, body),
             MutationMode::Preview,
             if let Some(includes_name) = user_fields {
                 AccessRequest::user_fields(id, includes_name)
@@ -3198,7 +3243,8 @@ impl Database {
                 "precondition": precondition.map(RecordPrecondition::idempotency_value),
             }))
         })?;
-        self.run_link(
+        self.run_relation_change(
+            RelationChange::Add,
             collection,
             id,
             relation,
@@ -3241,7 +3287,8 @@ impl Database {
         precondition: Option<&RecordPrecondition>,
     ) -> Result<ChangePreview> {
         reject_users_mutation(collection)?;
-        self.run_link(
+        self.run_relation_change(
+            RelationChange::Add,
             collection,
             id,
             relation,
@@ -3254,9 +3301,15 @@ impl Database {
         .preview()
     }
 
+    /// Add or remove one relation reference as a single audited `link` event.
+    ///
+    /// Both directions record the `link` action, so removing a reference
+    /// needs no audit format change that would make an older `cr` refuse the
+    /// journal; the change set says which direction it went.
     #[allow(clippy::too_many_arguments)]
-    fn run_link(
+    fn run_relation_change(
         &self,
+        change: RelationChange,
         collection: &str,
         id: &str,
         relation: &str,
@@ -3267,6 +3320,8 @@ impl Database {
         idempotency: Option<IdempotencyRequest>,
     ) -> Result<MutationOutcome> {
         validate_component(relation, "relation")?;
+        validate_component(target_collection, "collection")?;
+        validate_component(target_id, "id")?;
         let audit = self.audit();
         let _lock = audit.lock()?;
         if mode == MutationMode::Apply {
@@ -3277,27 +3332,34 @@ impl Database {
         }
         let decision =
             self.authorize(AccessAction::Link, &AccessResource::record(collection, id))?;
-        self.authorize(
-            AccessAction::Read,
-            &AccessResource::record(target_collection, target_id),
-        )?;
+        // Adding a reference discloses that its target exists, so it needs
+        // the target to be readable and real. Removing one reads nothing about
+        // the target, which is what lets a dangling reference be removed.
+        if change == RelationChange::Add {
+            self.authorize(
+                AccessAction::Read,
+                &AccessResource::record(target_collection, target_id),
+            )?;
+        }
         if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
             return Ok(MutationOutcome::Applied(record));
         }
-        let target_path = self.record_path(target_collection, target_id)?;
-        let target_raw = self
-            .read_record(target_collection, target_id, &target_path)
-            .map_err(|error| {
-                if is_missing(&error) {
-                    error.context(DomainError::NotFound(format!(
-                        "relation target {target_collection}/{target_id} does not exist"
-                    )))
-                } else {
-                    error
-                }
-            })?;
-        self.parse_logical_record(target_collection, target_id, &target_raw)?;
-        audit.assert_current(target_collection, target_id, target_raw.as_bytes())?;
+        if change == RelationChange::Add {
+            let target_path = self.record_path(target_collection, target_id)?;
+            let target_raw = self
+                .read_record(target_collection, target_id, &target_path)
+                .map_err(|error| {
+                    if is_missing(&error) {
+                        error.context(DomainError::NotFound(format!(
+                            "relation target {target_collection}/{target_id} does not exist"
+                        )))
+                    } else {
+                        error
+                    }
+                })?;
+            self.parse_logical_record(target_collection, target_id, &target_raw)?;
+            audit.assert_current(target_collection, target_id, target_raw.as_bytes())?;
+        }
 
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
@@ -3308,12 +3370,21 @@ impl Database {
         let before_stored = parse_record(collection, id, &before_raw)?;
         let before = self.reveal_document(collection, id, &before_stored)?;
         let mut document = before.clone();
-        let relations = mapping_field(&mut document.attributes, "relations")?;
-        let targets = sequence_field(relations, relation)?;
-        let reference = relation_value(target_collection, target_id);
-
-        if !targets.contains(&reference) {
-            targets.push(reference);
+        match change {
+            RelationChange::Add => {
+                let relations = mapping_field(&mut document.attributes, "relations")?;
+                let targets = sequence_field(relations, relation)?;
+                let reference = relation_value(target_collection, target_id);
+                if !targets.contains(&reference) {
+                    targets.push(reference);
+                }
+            }
+            RelationChange::Remove => remove_relation(
+                &mut document.attributes,
+                relation,
+                target_collection,
+                target_id,
+            )?,
         }
 
         self.validate(collection, &document.attributes)?;
@@ -3350,6 +3421,104 @@ impl Database {
             paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
         })?;
         Ok(MutationOutcome::Applied(record))
+    }
+
+    pub fn unlink(
+        &self,
+        collection: &str,
+        id: &str,
+        relation: &str,
+        target_collection: &str,
+        target_id: &str,
+    ) -> Result<Record> {
+        self.unlink_conditionally(collection, id, relation, target_collection, target_id, None)
+    }
+
+    /// Remove a relation, optionally requiring the source record's exact
+    /// version.
+    ///
+    /// Removing a reference that is not there succeeds and changes nothing,
+    /// exactly as linking one that already is, so a retried or repeated unlink
+    /// is harmless. The target does not have to exist: removing a dangling
+    /// reference is how a `dangling_link` finding is resolved.
+    pub fn unlink_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        relation: &str,
+        target_collection: &str,
+        target_id: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
+        reject_users_mutation(collection)?;
+        // Scoped as a `link` so the event's recorded operation is one every
+        // `cr` that can read a `link` event already verifies; `unlink` in the
+        // request keeps a retry key from replaying across the two.
+        let idempotency = self.idempotency_request("link", collection, id, || {
+            Ok(json!({
+                "relation": relation,
+                "target_collection": target_collection,
+                "target_id": target_id,
+                "precondition": precondition.map(RecordPrecondition::idempotency_value),
+                "unlink": true,
+            }))
+        })?;
+        self.run_relation_change(
+            RelationChange::Remove,
+            collection,
+            id,
+            relation,
+            target_collection,
+            target_id,
+            MutationMode::Apply,
+            precondition,
+            idempotency,
+        )?
+        .record()
+    }
+
+    /// Compute what `unlink` would record, without writing anything.
+    pub fn preview_unlink(
+        &self,
+        collection: &str,
+        id: &str,
+        relation: &str,
+        target_collection: &str,
+        target_id: &str,
+    ) -> Result<ChangePreview> {
+        self.preview_unlink_conditionally(
+            collection,
+            id,
+            relation,
+            target_collection,
+            target_id,
+            None,
+        )
+    }
+
+    /// Preview removing a relation against an optional source-record version.
+    pub fn preview_unlink_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        relation: &str,
+        target_collection: &str,
+        target_id: &str,
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
+        reject_users_mutation(collection)?;
+        self.run_relation_change(
+            RelationChange::Remove,
+            collection,
+            id,
+            relation,
+            target_collection,
+            target_id,
+            MutationMode::Preview,
+            precondition,
+            None,
+        )?
+        .preview()
     }
 
     pub fn delete(&self, collection: &str, id: &str) -> Result<Record> {
@@ -4750,10 +4919,16 @@ fn parse_reference(reference: &str) -> Result<(String, String)> {
 /// optional whole-body replacement.
 fn update_with<'a>(
     assignments: &'a [Assignment],
+    unset: &'a [(String, Vec<String>)],
     body: Option<&'a str>,
 ) -> impl FnOnce(&mut Document) -> Result<()> + 'a {
     move |document| {
         apply_all(&mut document.attributes, assignments)?;
+        for (raw, path) in unset {
+            if !remove_path(&mut document.attributes, path) {
+                return Err(invalid(format!("field '{raw}' does not exist")));
+            }
+        }
         if let Some(body) = body {
             document.body = body.to_owned();
         }
@@ -4801,6 +4976,68 @@ fn sequence_field<'a>(mapping: &'a mut Mapping, field: &str) -> Result<&'a mut V
         Some(Value::Sequence(sequence)) => Ok(sequence),
         _ => Err(invalid(format!("relation '{field}' must be a list"))),
     }
+}
+
+/// Which way a relation change goes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelationChange {
+    Add,
+    Remove,
+}
+
+/// Remove every reference to `collection/id` from one named relation.
+///
+/// A reference is matched by its `collection` and `id` alone, so a
+/// hand-annotated reference with extra keys is removed too, as is a duplicate.
+/// The relation, and then `relations` itself, is dropped once it is empty, so
+/// a link followed by an unlink leaves the record byte for byte as it was.
+/// Nothing is pruned when nothing was removed.
+fn remove_relation(
+    attributes: &mut Mapping,
+    relation: &str,
+    target_collection: &str,
+    target_id: &str,
+) -> Result<()> {
+    let relations_key = Value::String("relations".to_owned());
+    let relations = match attributes.get_mut(&relations_key) {
+        None => return Ok(()),
+        Some(Value::Mapping(relations)) => relations,
+        Some(_) => {
+            return Err(invalid(
+                "field 'relations' must be an object to store relations",
+            ));
+        }
+    };
+    let relation_key = Value::String(relation.to_owned());
+    let targets = match relations.get_mut(&relation_key) {
+        None => return Ok(()),
+        Some(Value::Sequence(targets)) => targets,
+        Some(_) => return Err(invalid(format!("relation '{relation}' must be a list"))),
+    };
+    let before = targets.len();
+    targets.retain(|target| !is_reference_to(target, target_collection, target_id));
+    if targets.len() == before {
+        return Ok(());
+    }
+    if targets.is_empty() {
+        relations.remove(&relation_key);
+    }
+    if relations.is_empty() {
+        attributes.remove(&relations_key);
+    }
+    Ok(())
+}
+
+/// Whether one relation element refers to `collection/id`.
+fn is_reference_to(value: &Value, collection: &str, id: &str) -> bool {
+    let Value::Mapping(reference) = value else {
+        return false;
+    };
+    let field = |key: &str| match reference.get(Value::String(key.to_owned())) {
+        Some(Value::String(value)) => Some(value.as_str()),
+        _ => None,
+    };
+    field("collection") == Some(collection) && field("id") == Some(id)
 }
 
 fn relation_value(collection: &str, id: &str) -> Value {
@@ -4905,6 +5142,7 @@ fn reject_users_mutation(collection: &str) -> Result<()> {
 fn validate_users_field_update(
     collection: &str,
     assignments: &[Assignment],
+    unset: &[(String, Vec<String>)],
     body: Option<&str>,
 ) -> Result<Option<bool>> {
     if collection != USERS_COLLECTION {
@@ -4914,10 +5152,13 @@ fn validate_users_field_update(
         .iter()
         .any(|assignment| assignment.targets_field("name"));
     if body.is_some()
-        || assignments.is_empty()
+        || (assignments.is_empty() && unset.is_empty())
         || assignments.iter().any(|assignment| {
             !assignment.targets_nested("profile") && !assignment.targets_field("name")
         })
+        || unset
+            .iter()
+            .any(|(_, path)| path.len() < 2 || path[0] != "profile")
     {
         return Err(invalid(
             "ordinary users updates may change only profile.* and the target's name; email, kind, status, access, and Markdown stay on managed commands",

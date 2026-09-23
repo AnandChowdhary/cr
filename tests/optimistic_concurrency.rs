@@ -27,6 +27,7 @@ fn record_versions_are_exact_and_stale_conditions_do_not_mutate_or_audit() {
             "items",
             "one",
             &[Assignment::from_str("stage=won").unwrap()],
+            &[],
             None,
             Some(&expected),
         )
@@ -38,6 +39,7 @@ fn record_versions_are_exact_and_stale_conditions_do_not_mutate_or_audit() {
             "items",
             "one",
             &[Assignment::from_str("stage=lost").unwrap()],
+            &[],
             None,
             Some(&expected),
         )

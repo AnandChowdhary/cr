@@ -428,6 +428,10 @@ enum Command {
         #[arg(long = "set-env", value_name = "KEY=ENV")]
         environment_assignments: Vec<EnvironmentAssignment>,
 
+        /// Remove a front matter field by its dotted path. Refused if the field does not exist.
+        #[arg(long = "unset", value_name = "KEY")]
+        unset: Vec<String>,
+
         /// Replace the Markdown body. If omitted, the existing body is preserved.
         #[arg(long)]
         body: Option<String>,
@@ -469,6 +473,41 @@ enum Command {
         expected_record_hash: Option<String>,
 
         /// Explain why this relation is being added.
+        #[arg(short = 'm', long, value_name = "MESSAGE")]
+        message: Option<String>,
+
+        /// High-entropy retry key (16-128 visible ASCII bytes). Successful retries return the original result.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
+
+        /// Compute the change set without writing, and print the digest that approves it.
+        #[arg(long, conflicts_with = "approved_changes")]
+        preview: bool,
+
+        /// Print the applied record or preview as JSON.
+        #[arg(long)]
+        json: bool,
+
+        #[command(flatten)]
+        attribution: AttributionArgs,
+    },
+
+    /// Remove a named relation from one record to another.
+    ///
+    /// Removing a relation that is not there changes nothing. The target does
+    /// not have to exist, so a dangling relation can be removed.
+    Unlink {
+        collection: String,
+        id: String,
+        relation: String,
+        target_collection: String,
+        target_id: String,
+
+        /// Refuse unless the source record still has this sha256 version from `cr get --json`.
+        #[arg(long, value_name = "SHA256")]
+        expected_record_hash: Option<String>,
+
+        /// Explain why this relation is being removed.
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
 
@@ -1850,6 +1889,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             id,
             mut assignments,
             environment_assignments,
+            unset,
             body,
             expected_record_hash,
             message,
@@ -1859,8 +1899,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             attribution,
         } => {
             append_environment_assignments(&mut assignments, &environment_assignments)?;
-            if assignments.is_empty() && body.is_none() {
-                bail!("provide at least one --set, --set-env, or --body value");
+            if assignments.is_empty() && unset.is_empty() && body.is_none() {
+                bail!("provide at least one --set, --set-env, --unset, or --body value");
             }
             let database = retryable(
                 attributed(database, &attribution, message.as_deref())?,
@@ -1874,6 +1914,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     &collection,
                     &id,
                     &assignments,
+                    &unset,
                     body.as_deref(),
                     precondition.as_ref(),
                 )?;
@@ -1883,6 +1924,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     &collection,
                     &id,
                     &assignments,
+                    &unset,
                     body.as_deref(),
                     precondition.as_ref(),
                 )?;
@@ -1921,6 +1963,48 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 print_preview(&preview, json)?;
             } else {
                 let record = database.link_conditionally(
+                    &collection,
+                    &id,
+                    &relation,
+                    &target_collection,
+                    &target_id,
+                    precondition.as_ref(),
+                )?;
+                print_mutation_result(&record, json)?;
+            }
+        }
+        Command::Unlink {
+            collection,
+            id,
+            relation,
+            target_collection,
+            target_id,
+            expected_record_hash,
+            message,
+            idempotency_key,
+            preview,
+            json,
+            attribution,
+        } => {
+            let database = retryable(
+                attributed(database, &attribution, message.as_deref())?,
+                idempotency_key,
+            )?;
+            let precondition = expected_record_hash
+                .map(RecordPrecondition::version)
+                .transpose()?;
+            if preview {
+                let preview = database.preview_unlink_conditionally(
+                    &collection,
+                    &id,
+                    &relation,
+                    &target_collection,
+                    &target_id,
+                    precondition.as_ref(),
+                )?;
+                print_preview(&preview, json)?;
+            } else {
+                let record = database.unlink_conditionally(
                     &collection,
                     &id,
                     &relation,
