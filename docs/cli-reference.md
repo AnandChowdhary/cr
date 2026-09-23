@@ -15,11 +15,11 @@ cr identity [--json] [ATTRIBUTION]
 cr create COLLECTION ID [--set KEY=YAML]... [--set-env KEY=ENV]...
                         [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
                         [--preview [--json]]
-cr get COLLECTION ID [--json | --field KEY [--raw]]
+cr get COLLECTION ID [--json | --field KEY [--raw] | --select FIELDS [--json]]
 cr list COLLECTION [--where KEY=YAML]... [--where-expr EXPRESSION]...
-                   [--filter FILTER] [--sort FIELD [--desc]] [--json]
+                   [--filter FILTER] [--select FIELDS]... [--sort FIELD [--desc]] [--json]
 cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]...
-                  [--where-expr EXPRESSION]... [--filter FILTER]
+                  [--where-expr EXPRESSION]... [--filter FILTER] [--select FIELDS]...
                   [--sort FIELD [--desc]] [--json]
                   [--front-matter | --field KEY | --body | --path]
                   [--ignore-case] [--regex]
@@ -32,8 +32,10 @@ cr unlink SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
               [-m MESSAGE] [ATTRIBUTION] [--preview [--json]]
 cr backlinks COLLECTION ID [--from COLLECTION] [--relation NAME]
                            [--where KEY=YAML]... [--where-expr EXPRESSION]...
-                           [--filter FILTER] [--sort FIELD [--desc]] [--json]
-cr traverse COLLECTION ID [--relation NAME]... [--depth N] [--json [--expand]]
+                           [--filter FILTER] [--select FIELDS]...
+                           [--sort FIELD [--desc]] [--json]
+cr traverse COLLECTION ID [--relation NAME]... [--depth N]
+                          [--json [--expand] [--select FIELDS]...]
 cr delete COLLECTION ID --yes [-m MESSAGE] [ATTRIBUTION]
 cr delete COLLECTION ID --preview [--json]
 cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N]

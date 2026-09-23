@@ -8,6 +8,7 @@ mod error;
 mod frontmatter;
 mod paths;
 mod pins;
+mod projection;
 mod query;
 mod search;
 pub mod server;
@@ -42,6 +43,7 @@ pub use database::{
 };
 pub use error::DomainError;
 pub use pins::Pin;
+pub use projection::Projection;
 pub use query::Filter;
 pub use search::{SearchQuery, SearchTarget};
 pub use sync::{SyncAttribution, SyncDefinition, SyncRunLedger, SyncRunSummary};

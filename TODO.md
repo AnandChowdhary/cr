@@ -152,8 +152,8 @@ Priorities:
 - [ ] **P1 — Sorting.**
   Single-field sorting now works across CLI, REST, and HTML for dotted fields, path, collection, or ID with stable missing-value and mixed-type rules before pagination. Add ordered multi-field keys and define a URL/CLI syntax that preserves deterministic ties.
 
-- [ ] **P1 — Field projections.**
-  Add `--select` and an HTTP equivalent so callers can request only selected front matter fields, identity/path fields, or optionally Markdown. Apply it to `backlinks` and `traverse` output as well as `list`, `search`, and `get`.
+- [x] **P1 — Field projections.**
+  `--select` on `get`, `list`, `search`, `backlinks`, and `traverse`, and `select` on the equivalent HTTP routes, take comma-separated or repeated selectors: dotted front matter paths and `$id`, `$collection`, `$path`, `$version`, and `$body`. A projected record is a flat object keyed by the selectors as written, leaving out fields the record does not have, or in plain CLI output one tab-separated row with escaped tabs, newlines, carriage returns, and backslashes. `traverse` puts the projection under `fields` in place of path, version, and front matter, and a projected single record keeps its `ETag`. `src/projection.rs` is the one implementation. Projected results are still computed from fully read records; the index entry above is what would avoid reading unselected fields. `tests/select_cli.rs` and `tests/server_api.rs` cover it.
 
 - [ ] **P1 — Counts and aggregation.**
   Add count, distinct values, grouping, and basic numeric aggregation without requiring record bodies in the response.

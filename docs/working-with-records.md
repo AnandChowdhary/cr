@@ -243,6 +243,34 @@ it. A filter that does not parse is refused with the column of the problem:
 error: expected a value after '=' at the end of the filter (column 8)
 ```
 
+### Choose the fields to return
+
+`--select` returns only the fields you name, on `get`, `list`, `search`, and
+`backlinks`. Name dotted front matter paths, or `$id`, `$collection`,
+`$path`, `$version`, and `$body`, separated by commas or in repeated flags.
+Plain output becomes one tab-separated row per record, ready for `cut`, `sort`,
+or a spreadsheet:
+
+```sh
+cr list deals --select '$id,value,owner.name' --filter 'stage = open'
+# acme-renewal-2027	25000	Jane Doe
+```
+
+With `--json`, each record is a flat object keyed by the selectors as you
+wrote them:
+
+```sh
+cr list deals --select '$id,value' --json
+# [ { "$id": "acme-renewal-2027", "value": 25000 } ]
+```
+
+A field a record does not have is left out of its object and is an empty cell
+in its row, so missing stays distinct from `null`. Strings are written as they
+are and other values as compact JSON; tabs, newlines, carriage returns, and
+backslashes inside a value are escaped as `\t`, `\n`, `\r`, and `\\` so every
+record stays on one line. On `traverse --json`, `--select` puts each record's
+chosen fields under `fields` in place of its path, version, and front matter.
+
 ## Search
 
 Search literal text across every Markdown record:

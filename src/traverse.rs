@@ -16,6 +16,7 @@ use serde_json::{Map, Value as JsonValue, json};
 use crate::{
     database::{Database, Record, relation_references, validate_component},
     error::{DomainError, invalid},
+    projection::Projection,
 };
 
 /// The deepest traversal a caller may ask for.
@@ -105,12 +106,15 @@ impl Traversal {
     }
 
     /// A flat rendering: every node once, and every edge by reference.
-    pub fn graph_json(&self) -> Result<JsonValue> {
+    ///
+    /// With a projection, each record carries only the selected fields, under
+    /// `fields`, instead of its path, version, and front matter.
+    pub fn graph_json(&self, projection: Option<&Projection>) -> Result<JsonValue> {
         let nodes = self
             .nodes
             .iter()
             .map(|node| {
-                let mut object = node_json(node)?;
+                let mut object = node_json(node, projection)?;
                 object.insert("depth".to_owned(), json!(node.depth));
                 Ok(JsonValue::Object(object))
             })
@@ -137,20 +141,25 @@ impl Traversal {
 
     /// A nested rendering: each record expanded with its front matter where it
     /// was first reached, under `links` keyed by relation, and every later
-    /// reference to it a stub marked `seen`.
-    pub fn tree_json(&self) -> Result<JsonValue> {
-        let mut tree = self.subtree_json(0)?;
+    /// reference to it a stub marked `seen`. A projection applies as it does
+    /// to [`Self::graph_json`].
+    pub fn tree_json(&self, projection: Option<&Projection>) -> Result<JsonValue> {
+        let mut tree = self.subtree_json(0, projection)?;
         tree.insert("depth".to_owned(), json!(self.depth));
         tree.insert("truncated".to_owned(), json!(self.truncated));
         Ok(JsonValue::Object(tree))
     }
 
-    fn subtree_json(&self, index: usize) -> Result<Map<String, JsonValue>> {
-        let mut object = node_json(&self.nodes[index])?;
+    fn subtree_json(
+        &self,
+        index: usize,
+        projection: Option<&Projection>,
+    ) -> Result<Map<String, JsonValue>> {
+        let mut object = node_json(&self.nodes[index], projection)?;
         let mut links: Map<String, JsonValue> = Map::new();
         for (edge, expands) in self.edges_from(index) {
             let child = if expands {
-                self.subtree_json(edge.to)?
+                self.subtree_json(edge.to, projection)?
             } else {
                 let mut stub = reference_json(&self.nodes[edge.to]);
                 stub.insert("seen".to_owned(), JsonValue::Bool(true));
@@ -213,9 +222,17 @@ fn reference_json(node: &TraversalNode) -> Map<String, JsonValue> {
     object
 }
 
-fn node_json(node: &TraversalNode) -> Result<Map<String, JsonValue>> {
+fn node_json(
+    node: &TraversalNode,
+    projection: Option<&Projection>,
+) -> Result<Map<String, JsonValue>> {
     let mut object = reference_json(node);
-    if let Some(record) = &node.record {
+    if let (Some(record), Some(projection)) = (&node.record, projection) {
+        object.insert(
+            "fields".to_owned(),
+            JsonValue::Object(projection.object(record)?),
+        );
+    } else if let Some(record) = &node.record {
         object.insert(
             "path".to_owned(),
             json!(record.path.to_string_lossy().into_owned()),

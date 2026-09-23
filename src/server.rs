@@ -40,10 +40,11 @@ use crate::{
     AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
     AuditIntentPart, AuditSource, Backlink, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary,
     CollectionModel, CollectionPresentation, Database, DomainError, Filter, FilterExpression,
-    FilterOperator, Finding, MAX_TRAVERSAL_DEPTH, RECORD_ACCESS_FIELD, Record, RecordActivity,
-    RecordPrecondition, SchemaReview, SchemaViolation, SearchQuery, SearchTarget, SortDirection,
-    USERS_COLLECTION, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout,
-    ViewPredicateMatch, audit::AuditChange, sort_by_record_field, sort_records_by_field,
+    FilterOperator, Finding, MAX_TRAVERSAL_DEPTH, Projection, RECORD_ACCESS_FIELD, Record,
+    RecordActivity, RecordPrecondition, SchemaReview, SchemaViolation, SearchQuery, SearchTarget,
+    SortDirection, USERS_COLLECTION, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup,
+    ViewLayout, ViewPredicateMatch, audit::AuditChange, sort_by_record_field,
+    sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -588,6 +589,8 @@ struct BacklinkQuery {
     #[serde(default)]
     where_expr: Vec<String>,
     filter: Option<String>,
+    #[serde(default)]
+    select: Vec<String>,
     sort: Option<String>,
     #[serde(default)]
     direction: SortDirectionParameter,
@@ -603,6 +606,15 @@ struct TraverseQuery {
     depth: Option<usize>,
     #[serde(default)]
     expand: bool,
+    #[serde(default)]
+    select: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetRecordQuery {
+    #[serde(default)]
+    select: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -613,6 +625,8 @@ struct ListQuery {
     #[serde(default)]
     where_expr: Vec<String>,
     filter: Option<String>,
+    #[serde(default)]
+    select: Vec<String>,
     sort: Option<String>,
     #[serde(default)]
     direction: SortDirectionParameter,
@@ -1072,6 +1086,8 @@ struct SearchParameters {
     #[serde(default)]
     where_expr: Vec<String>,
     filter: Option<String>,
+    #[serde(default)]
+    select: Vec<String>,
     sort: Option<String>,
     #[serde(default)]
     direction: SortDirectionParameter,
@@ -3286,12 +3302,13 @@ async fn list_records(
     headers: HeaderMap,
     Path(collection): Path<String>,
     RawQuery(raw): RawQuery,
-) -> ApiResult<Json<Page<ApiRecordSummary>>> {
+) -> ApiResult<Response> {
     let query: ListQuery = parse_query(raw)?;
     let bounds = page_bounds(query.limit, query.offset, state.max_page_size)?;
     let filters = parse_filters(query.filters)?;
     let expressions = parse_filter_expressions(query.where_expr)?;
     let filter = parse_filter(query.filter)?;
+    let projection = parse_projection(&query.select)?;
     let sort = query.sort;
     let direction = query.direction.into();
     let records = run_database(&state, &headers, move |database| {
@@ -3308,20 +3325,31 @@ async fn list_records(
         Ok(records)
     })
     .await?;
-    let page = paginate(records, bounds).try_map(ApiRecordSummary::try_from)?;
-    Ok(Json(page))
+    record_page_response(paginate(records, bounds), projection.as_ref())
 }
 
 async fn get_record(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((collection, id)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
 ) -> ApiResult<Response> {
+    let query: GetRecordQuery = parse_query(raw)?;
+    let projection = parse_projection(&query.select)?;
     let record = run_database(&state, &headers, move |database| {
         database.get(&collection, &id)
     })
     .await?;
-    api_record_response(StatusCode::OK, record)
+    match projection {
+        Some(projection) => {
+            let etag = entity_tag(&record.version)?;
+            let object = projection.object(&record).map_err(ApiError::from_domain)?;
+            let mut response = Json(object).into_response();
+            response.headers_mut().insert(header::ETAG, etag);
+            Ok(response)
+        }
+        None => api_record_response(StatusCode::OK, record),
+    }
 }
 
 async fn get_document(
@@ -3552,12 +3580,13 @@ async fn list_backlinks(
     headers: HeaderMap,
     Path((collection, id)): Path<(String, String)>,
     RawQuery(raw): RawQuery,
-) -> ApiResult<Json<Page<ApiBacklink>>> {
+) -> ApiResult<Response> {
     let query: BacklinkQuery = parse_query(raw)?;
     let bounds = page_bounds(query.limit, query.offset, state.max_page_size)?;
     let filters = parse_filters(query.filters)?;
     let expressions = parse_filter_expressions(query.where_expr)?;
     let filter = parse_filter(query.filter)?;
+    let projection = parse_projection(&query.select)?;
     let (from, relation, sort) = (query.from, query.relation, query.sort);
     let direction = query.direction.into();
     let backlinks = run_database(&state, &headers, move |database| {
@@ -3587,8 +3616,16 @@ async fn list_backlinks(
         Ok(backlinks)
     })
     .await?;
-    let page = paginate(backlinks, bounds).try_map(ApiBacklink::try_from)?;
-    Ok(Json(page))
+    let page = paginate(backlinks, bounds);
+    Ok(match projection {
+        Some(projection) => Json(page.try_map(|backlink| {
+            projection
+                .object(&backlink.record)
+                .map_err(ApiError::from_domain)
+        })?)
+        .into_response(),
+        None => Json(page.try_map(ApiBacklink::try_from)?).into_response(),
+    })
 }
 
 /// Follow relations outward from one record.
@@ -3599,13 +3636,14 @@ async fn traverse_record(
     RawQuery(raw): RawQuery,
 ) -> ApiResult<Json<JsonValue>> {
     let query: TraverseQuery = parse_query(raw)?;
+    let projection = parse_projection(&query.select)?;
     let rendered = run_database(&state, &headers, move |database| {
         let traversal =
             database.traverse(&collection, &id, &query.relation, query.depth.unwrap_or(1))?;
         if query.expand {
-            traversal.tree_json()
+            traversal.tree_json(projection.as_ref())
         } else {
-            traversal.graph_json()
+            traversal.graph_json(projection.as_ref())
         }
     })
     .await?;
@@ -3660,12 +3698,13 @@ async fn search_records(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-) -> ApiResult<Json<Page<ApiRecordSummary>>> {
+) -> ApiResult<Response> {
     let parameters: SearchParameters = parse_query(raw)?;
     let bounds = page_bounds(parameters.limit, parameters.offset, state.max_page_size)?;
     let filters = parse_filters(parameters.filters)?;
     let expressions = parse_filter_expressions(parameters.where_expr)?;
     let filter = parse_filter(parameters.filter)?;
+    let projection = parse_projection(&parameters.select)?;
     let sort = parameters.sort;
     let direction = parameters.direction.into();
     let target = search_target(parameters.target, parameters.field)?;
@@ -3691,8 +3730,7 @@ async fn search_records(
         Ok(records)
     })
     .await?;
-    let page = paginate(records, bounds).try_map(ApiRecordSummary::try_from)?;
-    Ok(Json(page))
+    record_page_response(paginate(records, bounds), projection.as_ref())
 }
 
 async fn status(
@@ -3926,6 +3964,7 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "path": { "type": "string" },
                 "version": { "type": "string" },
                 "front_matter": { "$ref": "#/components/schemas/FrontMatter" },
+                "fields": { "$ref": "#/components/schemas/ProjectedRecord" },
                 "seen": { "type": "boolean", "description": "In an expanded tree, a reference to a record already expanded elsewhere." },
                 "links": { "type": "object", "additionalProperties": { "type": "array", "items": { "$ref": "#/components/schemas/TraversalNode" } } }
             }
@@ -3962,7 +4001,7 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
             "type": "object",
             "required": ["data", "pagination"],
             "properties": {
-                "data": { "type": "array", "items": { "$ref": "#/components/schemas/Backlink" } },
+                "data": { "type": "array", "items": { "anyOf": [{ "$ref": "#/components/schemas/Backlink" }, { "$ref": "#/components/schemas/ProjectedRecord" }] } },
                 "pagination": { "$ref": "#/components/schemas/Pagination" }
             }
         },
@@ -3970,7 +4009,7 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
             "type": "object",
             "required": ["data", "pagination"],
             "properties": {
-                "data": { "type": "array", "items": { "$ref": "#/components/schemas/RecordSummary" } },
+                "data": { "type": "array", "items": { "anyOf": [{ "$ref": "#/components/schemas/RecordSummary" }, { "$ref": "#/components/schemas/ProjectedRecord" }] } },
                 "pagination": { "$ref": "#/components/schemas/Pagination" }
             }
         },
@@ -4068,6 +4107,14 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "request": { "$ref": "#/components/schemas/AuditIntentPart" },
                 "rationale": { "$ref": "#/components/schemas/AuditIntentPart" }
             }
+        },
+        "ProjectedRecord": {
+            "description": "The fields a select parameter asked for, keyed by selector as written. A field the record does not have is left out.",
+            "type": "object",
+            "additionalProperties": true
+        },
+        "RecordOrProjection": {
+            "anyOf": [{ "$ref": "#/components/schemas/Record" }, { "$ref": "#/components/schemas/ProjectedRecord" }]
         },
         "JsonSchema": {
             "description": "A Draft 2020-12 JSON Schema, which may carry cr's x-cr-* annotations.",
@@ -4498,6 +4545,7 @@ fn openapi_paths() -> JsonValue {
                     json!({ "name": "where", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }),
                     json!({ "name": "where_expr", "in": "query", "description": "Typed expressions such as value>=10000, name contains Acme, or owner is-empty. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }),
                     json!({ "name": "filter", "in": "query", "description": "A filter with AND, OR, NOT, parentheses, comparisons, contains, starts-with, ends-with, in [...], exists, is null, and is-empty, such as stage in [open, won] AND (value >= 10000 OR owner is null). Combined with the other filters by AND.", "schema": { "type": "string" } }),
+                    json!({ "name": "select", "in": "query", "description": "Return only these fields: dotted front matter paths, or $id, $collection, $path, $version, and $body. Comma-separated or repeated. Each result is then a flat object keyed by the selectors, without the fields a record does not have.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }),
                     json!({ "name": "sort", "in": "query", "description": "Dotted front matter field or $id, $collection, or $path. Missing fields remain last.", "schema": { "type": "string" } }),
                     json!({ "name": "direction", "in": "query", "description": "Sort direction. Record ID remains the ascending deterministic tie-breaker.", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } }),
                     json!({ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } }),
@@ -4511,7 +4559,7 @@ fn openapi_paths() -> JsonValue {
             }
         },
         "/api/v1/collections/{collection}/records/{id}": {
-            "get": { "operationId": "getRecord", "parameters": [collection.clone(), id.clone()], "responses": record_ok("#/components/schemas/Record") },
+            "get": { "operationId": "getRecord", "parameters": [collection.clone(), id.clone(), { "name": "select", "in": "query", "description": "Return only these fields: dotted front matter paths, or $id, $collection, $path, $version, and $body. Comma-separated or repeated. Each result is then a flat object keyed by the selectors, without the fields a record does not have.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }], "responses": record_ok("#/components/schemas/RecordOrProjection") },
             "put": {
                 "operationId": "replaceRecord",
                 "description": "Replace the complete front matter and Markdown document. If-Match is required so a stale whole-document editor cannot overwrite a newer change.",
@@ -4544,6 +4592,7 @@ fn openapi_paths() -> JsonValue {
                 { "name": "where", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "where_expr", "in": "query", "description": "Typed expressions on the source record. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "filter", "in": "query", "description": "A filter with AND, OR, NOT, parentheses, comparisons, contains, starts-with, ends-with, in [...], exists, is null, and is-empty, such as stage in [open, won] AND (value >= 10000 OR owner is null). Combined with the other filters by AND.", "schema": { "type": "string" } },
+                { "name": "select", "in": "query", "description": "Return only these fields: dotted front matter paths, or $id, $collection, $path, $version, and $body. Comma-separated or repeated. Each result is then a flat object keyed by the selectors, without the fields a record does not have.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "sort", "in": "query", "description": "Dotted front matter field or $id, $collection, or $path. Missing fields remain last.", "schema": { "type": "string" } },
                 { "name": "direction", "in": "query", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } },
                 { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
@@ -4556,7 +4605,8 @@ fn openapi_paths() -> JsonValue {
                 id.clone(),
                 { "name": "relation", "in": "query", "description": "Follow only these relations. By default every relation is followed.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "depth", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": MAX_TRAVERSAL_DEPTH, "default": 1 } },
-                { "name": "expand", "in": "query", "description": "Nest each record's linked records under it instead of returning a flat graph.", "schema": { "type": "boolean", "default": false } }
+                { "name": "expand", "in": "query", "description": "Nest each record's linked records under it instead of returning a flat graph.", "schema": { "type": "boolean", "default": false } },
+                { "name": "select", "in": "query", "description": "Give each record only these fields, under fields, instead of its path, version, and front matter.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }
             ], "responses": ok("#/components/schemas/Traversal") }
         },
         "/api/v1/collections/{collection}/records/{id}/links/{relation}/{target_collection}/{target_id}": {
@@ -4575,6 +4625,7 @@ fn openapi_paths() -> JsonValue {
                 { "name": "where", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "where_expr", "in": "query", "description": "Typed expressions such as value>=10000, name contains Acme, or owner is-empty. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "filter", "in": "query", "description": "A filter with AND, OR, NOT, parentheses, comparisons, contains, starts-with, ends-with, in [...], exists, is null, and is-empty, such as stage in [open, won] AND (value >= 10000 OR owner is null). Combined with the other filters by AND.", "schema": { "type": "string" } },
+                { "name": "select", "in": "query", "description": "Return only these fields: dotted front matter paths, or $id, $collection, $path, $version, and $body. Comma-separated or repeated. Each result is then a flat object keyed by the selectors, without the fields a record does not have.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "sort", "in": "query", "description": "Dotted front matter field or $id, $collection, or $path. Missing fields remain last.", "schema": { "type": "string" } },
                 { "name": "direction", "in": "query", "description": "Sort direction. Record ID remains the ascending deterministic tie-breaker.", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } },
                 { "name": "target", "in": "query", "schema": { "enum": ["document", "front_matter", "field", "body", "path"] } },
@@ -10396,6 +10447,25 @@ fn parse_filters(filters: Vec<String>) -> ApiResult<Vec<Assignment>> {
         .into_iter()
         .map(|filter| filter.parse().map_err(ApiError::from_domain))
         .collect()
+}
+
+fn parse_projection(select: &[String]) -> ApiResult<Option<Projection>> {
+    Projection::from_lists(select).map_err(ApiError::from_domain)
+}
+
+/// A page of records, as summaries or, with a projection, as the flat objects
+/// it selects.
+fn record_page_response(
+    page: Page<Record>,
+    projection: Option<&Projection>,
+) -> ApiResult<Response> {
+    Ok(match projection {
+        Some(projection) => {
+            Json(page.try_map(|record| projection.object(&record).map_err(ApiError::from_domain))?)
+                .into_response()
+        }
+        None => Json(page.try_map(ApiRecordSummary::try_from)?).into_response(),
+    })
 }
 
 fn parse_filter(filter: Option<String>) -> ApiResult<Option<Filter>> {
