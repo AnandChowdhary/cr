@@ -26,9 +26,13 @@
 //! that silently omitted them would be lying. But it reports them at
 //! [`Severity::Warning`] and points at `status`, *provided `cr save` could
 //! actually reconcile them*. When the same record also fails to parse, fails
-//! its schema, or cannot be named, `save` will refuse it, the divergence is
-//! permanent until a human intervenes, and the finding is escalated to
-//! [`Severity::Error`]. That is the line: `status` enumerates the working set,
+//! its schema, carries unreadable access metadata, or cannot be named, `save`
+//! will refuse it, the divergence is permanent until a human intervenes, and
+//! the finding is escalated to [`Severity::Error`]. Some divergences `save`
+//! refuses wherever they occur rather than for what the file holds — any
+//! direct edit to `users`, and a creation, deletion, or access change in a
+//! record-owned collection — and those are errors that name the command that
+//! does resolve them. That is the line: `status` enumerates the working set,
 //! `check` says whether the working set is reconcilable and whether the journal
 //! underneath it is sound.
 //!
@@ -58,8 +62,11 @@ use serde::Serialize;
 use yaml_serde::{Mapping, Value};
 
 use crate::{
-    access::CollectionAccessPolicy,
-    audit::{AnchorStatus, record_hash},
+    access::{
+        CollectionAccessPolicy, RECORD_ACCESS_FIELD, RecordAccess, USERS_COLLECTION, User,
+        users_schema,
+    },
+    audit::{AnchorStatus, AuditedRecordState, AuditedRecordStates, record_hash},
     database::{
         CollectionEntry, Database, collection_directory_name, collection_entry, schema_attributes,
         validate_component,
@@ -109,6 +116,9 @@ pub enum FindingKind {
     MalformedRelation,
     /// A record whose front matter no longer satisfies its collection schema.
     SchemaViolation,
+    /// A record in a record-owned collection whose reserved `$cr_access`
+    /// metadata is missing or malformed.
+    InvalidAccessMetadata,
     /// A collection schema that is not usable, so its records cannot be checked.
     UnusableSchema,
     /// A file or directory name that cannot be a record ID or a collection.
@@ -142,6 +152,7 @@ impl FindingKind {
             Self::DanglingLink => "dangling_link",
             Self::MalformedRelation => "malformed_relation",
             Self::SchemaViolation => "schema_violation",
+            Self::InvalidAccessMetadata => "invalid_access_metadata",
             Self::UnusableSchema => "unusable_schema",
             Self::InvalidRecordName => "invalid_record_name",
             Self::UnreadableRecord => "unreadable_record",
@@ -167,6 +178,7 @@ impl FindingKind {
             self,
             Self::MalformedRelation
                 | Self::SchemaViolation
+                | Self::InvalidAccessMetadata
                 | Self::UnusableSchema
                 | Self::InvalidRecordName
                 | Self::UnreadableRecord
@@ -407,9 +419,17 @@ pub(crate) fn run(database: &Database, scope: &CheckScope) -> Result<CheckReport
     mark_blocked(&mut scanned, &findings);
 
     // Phase three: reconcile against the already replayed journal.
-    let audited_records = audited_states.as_ref().map_or(0, |states| {
-        reconcile(states, &scanned, selected.as_deref(), &mut findings)
-    });
+    let audited_records = match &audited_states {
+        Some(states) => reconcile(
+            database,
+            &mut validators,
+            states,
+            &scanned,
+            selected.as_deref(),
+            &mut findings,
+        )?,
+        None => 0,
+    };
 
     // Database-wide, and therefore reported under `--collection` too: a
     // half-applied import is not a property of one collection.
@@ -564,7 +584,7 @@ fn scan_record(
     collection: &str,
     id: &str,
     special: bool,
-    audited_states: Option<&crate::audit::AuditedRecordStates>,
+    audited_states: Option<&AuditedRecordStates>,
     findings: &mut Vec<Finding>,
 ) -> Result<ScannedRecord> {
     let mut record = ScannedRecord {
@@ -662,7 +682,28 @@ fn scan_record(
         SchemaState::Absent => {}
         SchemaState::Unusable => unreachable!("returned above"),
         SchemaState::Ready(compiled) => {
+            // The schema never sees the reserved access metadata, but every
+            // write reads it first and refuses a record whose value is missing
+            // or malformed, so `check` has to read it too.
+            if compiled.record_owned
+                && let Err(error) = RecordAccess::from_attributes(&document.attributes)
+            {
+                findings.push(
+                    Finding::record(
+                        FindingKind::InvalidAccessMetadata,
+                        Severity::Error,
+                        collection,
+                        id,
+                        format!(
+                            "record {collection}/{id} cannot be saved or updated: {}",
+                            safe(&error)
+                        ),
+                    )
+                    .at_field(RECORD_ACCESS_FIELD),
+                );
+            }
             let validator = &compiled.validator;
+            let schema = schema_name(collection);
             let instance = serde_json::to_value(schema_attributes(
                 &document.attributes,
                 compiled.record_owned,
@@ -678,24 +719,39 @@ fn scan_record(
                             collection,
                             id,
                             format!(
-                                "record {collection}/{id} does not match the schema for collection '{collection}' (protected values redacted)"
+                                "record {collection}/{id} does not match {schema} (protected values redacted)"
                             ),
                         ));
                         record.attributes = Some(document.attributes);
                         return Ok(record);
                     }
+                    let mut violated = false;
                     for error in validator.iter_errors(&instance) {
+                        violated = true;
                         let mut finding = Finding::record(
                             FindingKind::SchemaViolation,
                             Severity::Error,
                             collection,
                             id,
-                            format!(
-                                "record {collection}/{id} does not match the schema for collection '{collection}': {error}"
-                            ),
+                            format!("record {collection}/{id} does not match {schema}: {error}"),
                         );
                         finding.field = dotted_path(&error.instance_path().to_string());
                         findings.push(finding);
+                    }
+                    // Writes to `users` follow the built-in schema with the
+                    // stricter reading of a principal, and only once the schema
+                    // passes, so a field both reject is reported once.
+                    if !violated
+                        && collection == USERS_COLLECTION
+                        && let Err(error) = User::from_attributes(&document.attributes)
+                    {
+                        findings.push(Finding::record(
+                            FindingKind::SchemaViolation,
+                            Severity::Error,
+                            collection,
+                            id,
+                            format!("record {collection}/{id} does not match {schema}: {}", safe(&error)),
+                        ));
                     }
                 }
                 Err(_) => findings.push(Finding::record(
@@ -843,11 +899,13 @@ fn reference_of(value: &Value) -> std::result::Result<(String, String), String> 
 ///
 /// Returns how many distinct in-scope records the journal carries history for.
 fn reconcile(
-    states: &crate::audit::AuditedRecordStates,
+    database: &Database,
+    validators: &mut SchemaCache,
+    states: &AuditedRecordStates,
     scanned: &BTreeMap<(String, String), ScannedRecord>,
     selected: Option<&str>,
     findings: &mut Vec<Finding>,
-) -> usize {
+) -> Result<usize> {
     let audited: BTreeMap<_, _> = states
         .iter()
         .filter(|((collection, _), _)| selected.is_none_or(|name| name == collection))
@@ -863,63 +921,185 @@ fn reconcile(
         if record.is_some_and(|record| record.hash.is_none()) {
             continue;
         }
-        let severity = if record.is_some_and(|record| record.blocked) {
-            Severity::Error
-        } else {
-            Severity::Warning
-        };
         let current = record.and_then(|record| record.hash.clone());
-        let audited_hash = audited.get(&key);
-
-        let finding = match (audited_hash, current) {
-            (None, Some(_)) => Some(Finding::record(
-                FindingKind::UnauditedRecord,
-                severity,
-                &collection,
-                &id,
-                format!(
-                    "record {collection}/{id} exists but has no audit history; 'cr status' reports it as added and 'cr save' records it"
-                ),
-            )),
-            (Some(Some(_)), None) => Some(Finding::record(
-                FindingKind::MissingRecord,
-                severity,
-                &collection,
-                &id,
-                format!(
-                    "record {collection}/{id} is audited but its file is missing; 'cr status' reports it as deleted and 'cr save' records the deletion"
-                ),
-            )),
-            (Some(Some(expected)), Some(actual)) if expected != &actual => Some(Finding::record(
-                FindingKind::RecordContentMismatch,
-                severity,
-                &collection,
-                &id,
-                format!(
-                    "record {collection}/{id} does not match its latest audited state; 'cr status' reports it as modified and 'cr save' records the change"
-                ),
-            )),
-            (Some(None), Some(_)) => Some(Finding::record(
-                FindingKind::RecordContentMismatch,
-                severity,
-                &collection,
-                &id,
-                format!(
-                    "record {collection}/{id} exists but its audit history ends with a deletion; 'cr status' reports it as added and 'cr save' records it"
-                ),
-            )),
-            _ => None,
+        let divergence = match (audited.get(&key), current) {
+            (None, Some(_)) => Divergence::Unaudited,
+            (Some(Some(_)), None) => Divergence::Missing,
+            (Some(Some(expected)), Some(actual)) if expected != &actual => Divergence::Modified,
+            (Some(None), Some(_)) => Divergence::Recreated,
+            _ => continue,
         };
-        if let Some(mut finding) = finding {
-            if finding.severity == Severity::Error {
-                finding.message.push_str(
-                    ", but this record cannot be saved until the problems reported above it are fixed",
+
+        // A deleted record was never scanned, so its collection's schema may
+        // not have been compiled yet; an unusable one stops `save` here too.
+        let (record_owned, unusable) = match validators.get(database, &collection, findings)? {
+            SchemaState::Ready(compiled) => (compiled.record_owned, false),
+            SchemaState::Unusable => (false, true),
+            SchemaState::Absent => (false, false),
+        };
+        let opening = divergence.describe(&collection, &id);
+        let finding = match save_refusal(
+            &collection,
+            &id,
+            divergence,
+            record_owned,
+            states.get(&key),
+            record,
+        ) {
+            Some(refusal) => {
+                let finding = Finding::record(
+                    divergence.kind(),
+                    Severity::Error,
+                    &collection,
+                    &id,
+                    format!(
+                        "{opening}, and 'cr save' refuses it because {}",
+                        refusal.reason
+                    ),
                 );
+                match refusal.field {
+                    Some(field) => finding.at_field(field),
+                    None => finding,
+                }
             }
-            findings.push(finding);
+            None if unusable || record.is_some_and(|record| record.blocked) => Finding::record(
+                divergence.kind(),
+                Severity::Error,
+                &collection,
+                &id,
+                format!(
+                    "{opening}; {}, but this record cannot be saved until the problems reported above it are fixed",
+                    divergence.reconciliation()
+                ),
+            ),
+            None => Finding::record(
+                divergence.kind(),
+                Severity::Warning,
+                &collection,
+                &id,
+                format!("{opening}; {}", divergence.reconciliation()),
+            ),
+        };
+        findings.push(finding);
+    }
+    Ok(audited.len())
+}
+
+/// How a record on disk differs from its latest audited state.
+#[derive(Clone, Copy)]
+enum Divergence {
+    /// A file with no audit history.
+    Unaudited,
+    /// An audited record whose file is gone.
+    Missing,
+    /// A file whose bytes differ from its audited state.
+    Modified,
+    /// A file whose audit history ends with a deletion.
+    Recreated,
+}
+
+impl Divergence {
+    fn kind(self) -> FindingKind {
+        match self {
+            Self::Unaudited => FindingKind::UnauditedRecord,
+            Self::Missing => FindingKind::MissingRecord,
+            Self::Modified | Self::Recreated => FindingKind::RecordContentMismatch,
         }
     }
-    audited.len()
+
+    /// The opening clause of the finding: what is on disk.
+    fn describe(self, collection: &str, id: &str) -> String {
+        match self {
+            Self::Unaudited => format!("record {collection}/{id} exists but has no audit history"),
+            Self::Missing => format!("record {collection}/{id} is audited but its file is missing"),
+            Self::Modified => {
+                format!("record {collection}/{id} does not match its latest audited state")
+            }
+            Self::Recreated => format!(
+                "record {collection}/{id} exists but its audit history ends with a deletion"
+            ),
+        }
+    }
+
+    /// How `status` lists the divergence and what `save` would record for it.
+    fn reconciliation(self) -> &'static str {
+        match self {
+            Self::Unaudited | Self::Recreated => {
+                "'cr status' reports it as added and 'cr save' records it"
+            }
+            Self::Missing => "'cr status' reports it as deleted and 'cr save' records the deletion",
+            Self::Modified => "'cr status' reports it as modified and 'cr save' records the change",
+        }
+    }
+}
+
+/// Why `cr save` refuses a divergence however well formed the file is.
+struct SaveRefusal {
+    /// A clause completing "'cr save' refuses it because …", with the remedy.
+    reason: String,
+    /// The front matter field the refusal is about, where there is one.
+    field: Option<&'static str>,
+}
+
+/// The divergences `cr save` refuses for where they are rather than for what
+/// the file contains: every direct edit to the reserved `users` collection,
+/// and a creation, a deletion, or an access change in a record-owned
+/// collection. A finding about one of them must not say that `save` records
+/// it, and must be an error, because nothing but a person resolves it.
+fn save_refusal(
+    collection: &str,
+    id: &str,
+    divergence: Divergence,
+    record_owned: bool,
+    audited: Option<&AuditedRecordState>,
+    record: Option<&ScannedRecord>,
+) -> Option<SaveRefusal> {
+    if collection == USERS_COLLECTION {
+        let remedy = match divergence {
+            Divergence::Modified | Divergence::Missing => {
+                format!("run 'cr user restore {id}' to put back its audited state")
+            }
+            Divergence::Unaudited | Divergence::Recreated => {
+                "remove the file and register the principal with 'cr user add'".to_owned()
+            }
+        };
+        return Some(SaveRefusal {
+            reason: format!(
+                "the users collection is managed through 'cr user' and 'cr access'; {remedy}"
+            ),
+            field: None,
+        });
+    }
+    if !record_owned {
+        return None;
+    }
+    match divergence {
+        Divergence::Unaudited | Divergence::Recreated => Some(SaveRefusal {
+            reason: "a record-owned collection records its owner when a record is created; remove the file and create the record with 'cr create'".to_owned(),
+            field: None,
+        }),
+        Divergence::Missing => Some(SaveRefusal {
+            reason: "deleting from a record-owned collection is authorized against the record's current owner; restore the file and delete the record with 'cr delete'".to_owned(),
+            field: None,
+        }),
+        Divergence::Modified => {
+            // Metadata that cannot be read at all is already its own finding,
+            // and that finding blocks `save` by itself.
+            let current = record
+                .and_then(|record| record.attributes.as_ref())
+                .and_then(|attributes| RecordAccess::from_attributes(attributes).ok())?;
+            let before = audited
+                .and_then(|state| state.document.as_ref())
+                .and_then(|document| Document::from_audit_value(document).ok())
+                .and_then(|document| RecordAccess::from_attributes(&document.attributes).ok());
+            (before.as_ref() != Some(&current)).then(|| SaveRefusal {
+                reason: format!(
+                    "its '{RECORD_ACCESS_FIELD}' metadata changed, and that field is managed through 'cr access'; put back the audited value and use 'cr access visibility' or 'cr access owner'"
+                ),
+                field: Some(RECORD_ACCESS_FIELD),
+            })
+        }
+    }
 }
 
 /// Raise reconciliation severity for records that `cr save` would refuse.
@@ -995,6 +1175,15 @@ impl SchemaCache {
     }
 }
 
+/// What a finding calls the schema a collection's records are judged against.
+fn schema_name(collection: &str) -> String {
+    if collection == USERS_COLLECTION {
+        "the built-in users schema".to_owned()
+    } else {
+        format!("the schema for collection '{collection}'")
+    }
+}
+
 fn schema_path(collection: &str) -> std::path::PathBuf {
     Path::new(crate::database::SCHEMA_DIRECTORY).join(format!("{collection}.json"))
 }
@@ -1014,6 +1203,16 @@ fn compile_schema(
     collection: &str,
     findings: &mut Vec<Finding>,
 ) -> Result<Option<CompiledSchema>> {
+    // The reserved collection is judged by the schema built into `cr`, as every
+    // write to it is, and never by a file beside the others.
+    if collection == USERS_COLLECTION {
+        let validator = jsonschema::validator_for(&users_schema())
+            .map_err(|error| anyhow::anyhow!("the built-in users schema is unusable: {error}"))?;
+        return Ok(Some(CompiledSchema {
+            validator,
+            record_owned: false,
+        }));
+    }
     let label = format!("the JSON Schema for collection '{collection}'");
     let Some(serialized) =
         paths::read_to_string_optional(database.root(), &schema_path(collection), &label)?

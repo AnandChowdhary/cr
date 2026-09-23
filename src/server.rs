@@ -3856,7 +3856,8 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
             "properties": {
                 "severity": { "enum": ["error", "warning"], "description": "warning marks a divergence cr save can still reconcile, which cr status also reports." },
                 "kind": { "enum": [
-                    "dangling_link", "malformed_relation", "schema_violation", "unusable_schema",
+                    "dangling_link", "malformed_relation", "schema_violation",
+                    "invalid_access_metadata", "unusable_schema",
                     "invalid_record_name", "unreadable_record", "unaudited_record", "missing_record",
                     "record_content_mismatch", "audit_chain_broken", "approval_mismatch",
                     "interrupted_sync_run", "audit_anchor_mismatch", "audit_anchor_behind",
