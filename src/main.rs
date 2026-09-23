@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
     AccessAction, AccessResource, AgentEvidence, Assignment, AttributionOverrides, AuditFilter,
     CheckReport, CheckScope, CollectionAccessPolicy, CollectionPresentation, Database, DomainError,
-    FilterExpression, Record, RecordPrecondition, RecordVisibility, Role, SchemaReview,
+    Filter, FilterExpression, Record, RecordPrecondition, RecordVisibility, Role, SchemaReview,
     SearchQuery, SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions,
     UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout,
     parse_threshold, sort_by_record_field, sort_records_by_field,
@@ -306,6 +306,11 @@ enum Command {
         #[arg(long = "where-expr", value_name = "EXPRESSION")]
         expressions: Vec<FilterExpression>,
 
+        /// Match a filter with AND, OR, NOT, parentheses, in, exists, and is null,
+        /// such as "stage in [open, won] AND (value >= 10000 OR owner is null)".
+        #[arg(long, value_name = "FILTER")]
+        filter: Option<Filter>,
+
         /// Sort by a dotted field, $id, $collection, or $path. Missing fields stay last.
         #[arg(long, value_name = "FIELD")]
         sort: Option<String>,
@@ -343,6 +348,10 @@ enum Command {
         /// Match a typed expression on the source record, such as value>=10000.
         #[arg(long = "where-expr", value_name = "EXPRESSION")]
         expressions: Vec<FilterExpression>,
+
+        /// Match a filter on the source record, with AND, OR, NOT, parentheses, in, exists, and is null.
+        #[arg(long, value_name = "FILTER")]
+        filter: Option<Filter>,
 
         /// Sort by a dotted field, $id, $collection, or $path. Missing fields stay last.
         #[arg(long, value_name = "FIELD")]
@@ -399,6 +408,10 @@ enum Command {
         /// First match a typed expression such as value>=10000. Multiple expressions use AND.
         #[arg(long = "where-expr", value_name = "EXPRESSION")]
         expressions: Vec<FilterExpression>,
+
+        /// First match a filter with AND, OR, NOT, parentheses, in, exists, and is null.
+        #[arg(long, value_name = "FILTER")]
+        filter: Option<Filter>,
 
         /// Sort by a dotted field, $id, $collection, or $path. Missing fields stay last.
         #[arg(long, value_name = "FIELD")]
@@ -1452,6 +1465,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             collection,
             filters,
             expressions,
+            filter,
             sort,
             desc,
             json,
@@ -1461,6 +1475,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 expressions
                     .iter()
                     .all(|expression| expression.matches(&record.attributes))
+                    && filter.as_ref().is_none_or(|filter| filter.matches(record))
             });
             if let Some(field) = sort {
                 sort_records_by_field(
@@ -1482,6 +1497,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             relation,
             filters,
             expressions,
+            filter,
             sort,
             desc,
             json,
@@ -1497,6 +1513,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 expressions
                     .iter()
                     .all(|expression| expression.matches(&backlink.record.attributes))
+                    && filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.matches(&backlink.record))
             });
             if let Some(field) = sort {
                 sort_by_record_field(
@@ -1557,6 +1576,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             collection,
             filters,
             expressions,
+            filter,
             sort,
             desc,
             front_matter,
@@ -1584,6 +1604,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 expressions
                     .iter()
                     .all(|expression| expression.matches(&record.attributes))
+                    && filter.as_ref().is_none_or(|filter| filter.matches(record))
             });
             if let Some(field) = sort {
                 sort_records_by_field(
