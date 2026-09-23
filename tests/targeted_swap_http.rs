@@ -557,6 +557,26 @@ async fn a_failed_swap_leaves_the_table_alone_instead_of_pasting_an_error_page_i
         "cr.js no longer distinguishes a whole-page boost from a targeted swap"
     );
 
+    // Nor is a failed `GET` left doing nothing, which is what htmx does with one:
+    // it becomes the page load it stands in for, so the reader gets the error
+    // page where a click without JavaScript would have put it. The same clause
+    // is what keeps these controls working behind an authenticating proxy —
+    // Cloudflare Access, say — whose expired session redirects every request to
+    // a sign-in page on another origin: a page load follows that redirect and
+    // comes back signed in, and an htmx request fails without a response
+    // (`htmx:sendError`). See `loadInstead` in `cr.js`.
+    assert!(
+        UI_SCRIPT.contains(
+            "!event.detail.shouldSwap && xhr.status >= 400 && requestConfig.verb === 'get'"
+        ),
+        "cr.js leaves a refused GET doing nothing"
+    );
+    assert!(
+        UI_SCRIPT.contains("document.addEventListener('htmx:sendError'")
+            && UI_SCRIPT.contains("detail.pathInfo?.finalRequestPath"),
+        "cr.js leaves a GET that got no response doing nothing"
+    );
+
     // The error page itself is outside the seam, so a targeted request that fails
     // is answered with a document that htmx will refuse to swap rather than with
     // something that would look at home in a table cell.
