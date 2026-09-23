@@ -53,7 +53,7 @@
 You need a current Rust toolchain. Install the latest release from GitHub:
 
 ```sh
-cargo install --git https://github.com/AnandChowdhary/cr --tag v0.1.0
+cargo install --git https://github.com/AnandChowdhary/cr --tag v0.2.0
 ```
 
 When developing a checkout, install that exact source tree instead:
