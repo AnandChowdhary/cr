@@ -50,7 +50,41 @@
 
 ## Quick start
 
-You need a current Rust toolchain. Install the latest release from GitHub:
+Download a prebuilt binary from the
+[latest release](https://github.com/AnandChowdhary/cr/releases/latest). Each
+release attaches `cr-<tag>-<target>.tar.gz` for these targets, together with
+a `SHA256SUMS` file and a signed build-provenance attestation:
+
+| Target | Runs on |
+| --- | --- |
+| `x86_64-unknown-linux-gnu` | 64-bit Intel and AMD Linux with glibc 2.35 or newer: Ubuntu 22.04 and 24.04, Debian 12 |
+| `aarch64-unknown-linux-gnu` | 64-bit Arm Linux with glibc 2.35 or newer |
+| `x86_64-unknown-linux-musl` | Any 64-bit Intel and AMD Linux; statically linked |
+| `aarch64-apple-darwin` | Apple silicon Macs |
+| `x86_64-apple-darwin` | Intel Macs |
+
+The URL follows from the tag and target alone, so a deploy script can pin a
+release:
+
+```sh
+tag=v0.2.0
+target=x86_64-unknown-linux-gnu
+base="https://github.com/AnandChowdhary/cr/releases/download/$tag"
+curl -fsSLO "$base/cr-$tag-$target.tar.gz"
+curl -fsSLO "$base/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS  # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
+gh attestation verify "cr-$tag-$target.tar.gz" --repo AnandChowdhary/cr \
+  --signer-workflow AnandChowdhary/cr/.github/workflows/release.yml
+tar -xzf "cr-$tag-$target.tar.gz"
+sudo install -m 0755 "cr-$tag-$target/cr" /usr/local/bin/cr
+```
+
+The checksum proves the download is intact. The attestation proves this
+repository's release workflow built the archive, so a matching file uploaded
+from anywhere else fails verification. Each archive holds the `cr` binary, this
+README, and the license in a directory with the archive's name.
+
+To build from source instead, you need a current Rust toolchain:
 
 ```sh
 cargo install --git https://github.com/AnandChowdhary/cr --tag v0.2.0
