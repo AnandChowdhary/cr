@@ -35,8 +35,9 @@ pub use check::{
     CheckReport, CheckScope, CheckSummary, Finding, FindingKind, Severity, parse_threshold,
 };
 pub use database::{
-    Backlink, CollectionModel, Database, Record, RecordPrecondition, SchemaViolation,
-    SortDirection, WorkingChange, WorkingChangeKind, sort_by_record_field, sort_records_by_field,
+    Backlink, CollectionModel, Database, Record, RecordPrecondition, RecordSchemaViolation,
+    SchemaReview, SchemaViolation, SortDirection, WorkingChange, WorkingChangeKind,
+    sort_by_record_field, sort_records_by_field,
 };
 pub use error::DomainError;
 pub use pins::Pin;

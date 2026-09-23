@@ -41,7 +41,7 @@ use crate::{
     AuditIntentPart, AuditSource, Backlink, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary,
     CollectionModel, CollectionPresentation, Database, DomainError, FilterExpression,
     FilterOperator, Finding, MAX_TRAVERSAL_DEPTH, RECORD_ACCESS_FIELD, Record, RecordActivity,
-    RecordPrecondition, SchemaViolation, SearchQuery, SearchTarget, SortDirection,
+    RecordPrecondition, SchemaReview, SchemaViolation, SearchQuery, SearchTarget, SortDirection,
     USERS_COLLECTION, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout,
     ViewPredicateMatch, audit::AuditChange, sort_by_record_field, sort_records_by_field,
 };
@@ -543,6 +543,15 @@ struct Pagination {
 struct PreviewQuery {
     #[serde(default)]
     preview: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaChangeQuery {
+    #[serde(default)]
+    preview: bool,
+    #[serde(default)]
+    allow_violations: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1427,6 +1436,10 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
             Router::new()
                 .route("/identity", get(identity))
                 .route("/collections", get(collections))
+                .route(
+                    "/collections/{collection}/schema",
+                    get(get_schema).put(put_schema).delete(delete_schema),
+                )
                 .route(
                     "/collections/{collection}/records",
                     get(list_records).post(create_record),
@@ -3218,6 +3231,53 @@ async fn collections(
     Ok(Json(paginate(models, bounds)))
 }
 
+async fn get_schema(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(collection): Path<String>,
+) -> ApiResult<Json<JsonValue>> {
+    let schema = run_database(&state, &headers, move |database| {
+        database.schema(&collection)?.ok_or_else(|| {
+            DomainError::NotFound(format!("collection '{collection}' has no schema")).into()
+        })
+    })
+    .await?;
+    Ok(Json(schema))
+}
+
+/// Install a collection schema, or with `preview=true` only review it.
+async fn put_schema(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(collection): Path<String>,
+    RawQuery(raw): RawQuery,
+    payload: std::result::Result<Json<JsonValue>, JsonRejection>,
+) -> ApiResult<Json<SchemaReview>> {
+    let query: SchemaChangeQuery = parse_query(raw)?;
+    let Json(proposed) = json_payload(payload)?;
+    let review = run_database(&state, &headers, move |database| {
+        if query.preview {
+            database.review_schema(&collection, &proposed)
+        } else {
+            database.set_schema(&collection, &proposed, query.allow_violations)
+        }
+    })
+    .await?;
+    Ok(Json(review))
+}
+
+async fn delete_schema(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(collection): Path<String>,
+) -> ApiResult<Json<JsonValue>> {
+    let removed = run_database(&state, &headers, move |database| {
+        database.remove_schema(&collection)
+    })
+    .await?;
+    Ok(Json(json!({ "removed": removed })))
+}
+
 async fn list_records(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3998,6 +4058,34 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "rationale": { "$ref": "#/components/schemas/AuditIntentPart" }
             }
         },
+        "JsonSchema": {
+            "description": "A Draft 2020-12 JSON Schema, which may carry cr's x-cr-* annotations.",
+            "type": ["object", "boolean"]
+        },
+        "SchemaReview": {
+            "type": "object",
+            "required": ["collection", "changed", "applied", "records", "violations"],
+            "properties": {
+                "collection": { "type": "string" },
+                "changed": { "type": "boolean", "description": "Whether the proposed schema differs from the installed one." },
+                "applied": { "type": "boolean", "description": "Whether it was written." },
+                "records": { "type": "integer", "description": "Existing records judged against it." },
+                "violations": { "type": "array", "items": {
+                    "type": "object",
+                    "required": ["id", "message"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "field": { "type": "string" },
+                        "message": { "type": "string" }
+                    }
+                } }
+            }
+        },
+        "SchemaRemoval": {
+            "type": "object",
+            "required": ["removed"],
+            "properties": { "removed": { "type": "boolean" } }
+        },
         "CollectionModel": {
             "type": "object", "required": ["name"],
             "properties": {
@@ -4382,6 +4470,15 @@ fn openapi_paths() -> JsonValue {
         },
         "/api/v1/collections": {
             "get": { "operationId": "listCollections", "parameters": page_parameters.clone(), "responses": ok("#/components/schemas/CollectionPage") }
+        },
+        "/api/v1/collections/{collection}/schema": {
+            "get": { "operationId": "getCollectionSchema", "description": "The JSON Schema the collection's records are judged against. users answers with its built-in schema.", "parameters": [collection.clone()], "responses": ok("#/components/schemas/JsonSchema") },
+            "put": { "operationId": "setCollectionSchema", "description": "Install a JSON Schema after judging every existing record against it. Refused when a record does not satisfy it unless allow_violations=true, and when it would change which values are encrypted or whether records are creator-owned. With preview=true, only review it.", "parameters": [
+                collection.clone(),
+                { "name": "preview", "in": "query", "schema": { "type": "boolean", "default": false } },
+                { "name": "allow_violations", "in": "query", "schema": { "type": "boolean", "default": false } }
+            ], "requestBody": json_body("#/components/schemas/JsonSchema"), "responses": ok("#/components/schemas/SchemaReview") },
+            "delete": { "operationId": "removeCollectionSchema", "description": "Remove the schema, making the collection schemaless. Refused while it declares encrypted storage or creator-owned records.", "parameters": [collection.clone()], "responses": ok("#/components/schemas/SchemaRemoval") }
         },
         "/api/v1/collections/{collection}/records": {
             "get": {

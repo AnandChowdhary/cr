@@ -267,6 +267,45 @@ pub struct CollectionModel {
     pub schema: Option<serde_json::Value>,
 }
 
+impl CollectionModel {
+    /// Whether the collection's schema declares encrypted storage.
+    pub fn encrypted(&self) -> bool {
+        EncryptionPolicy::from_schema(self.schema.as_ref()).is_ok_and(|policy| !policy.is_empty())
+    }
+
+    /// Whether the collection stores creator-owned records.
+    pub fn record_owned(&self) -> bool {
+        CollectionAccessPolicy::from_schema(self.schema.as_ref())
+            .is_ok_and(|policy| policy.is_some())
+    }
+}
+
+/// What installing a proposed collection schema does, or would do.
+#[derive(Clone, Debug, Serialize)]
+pub struct SchemaReview {
+    pub collection: String,
+    /// Whether the proposed schema differs from the installed one.
+    pub changed: bool,
+    /// Whether the proposed schema was written.
+    pub applied: bool,
+    /// How many existing records were judged against it.
+    pub records: usize,
+    /// Every reason an existing record does not satisfy it.
+    pub violations: Vec<RecordSchemaViolation>,
+}
+
+/// One reason one existing record does not satisfy a proposed schema.
+#[derive(Clone, Debug, Serialize)]
+pub struct RecordSchemaViolation {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    pub message: String,
+}
+
+/// The most violations a refused schema change lists in its message.
+const LISTED_SCHEMA_VIOLATIONS: usize = 10;
+
 /// One reason a record's front matter does not satisfy its collection's schema.
 ///
 /// Produced by [`Database::schema_violations`] for a caller that can place each
@@ -2736,6 +2775,217 @@ impl Database {
         })?;
         self.write_collection_schema(collection, &schema, existing.is_some())?;
         Ok(true)
+    }
+
+    /// The schema a collection's records are judged against, or `None` for a
+    /// schemaless collection. `users` answers with its built-in schema.
+    ///
+    /// Visible to exactly the principals [`Self::collection_models`] lists the
+    /// collection for.
+    pub fn schema(&self, collection: &str) -> Result<Option<JsonValue>> {
+        validate_component(collection, "collection")?;
+        self.collection_models()?
+            .into_iter()
+            .find(|model| model.name == collection)
+            .map(|model| model.schema)
+            .ok_or_else(|| {
+                DomainError::NotFound(format!("collection '{collection}' does not exist")).into()
+            })
+    }
+
+    /// Judge `proposed` as `collection`'s schema without installing it: whether
+    /// it is usable, whether it changes anything, and which existing records
+    /// would not satisfy it.
+    pub fn review_schema(&self, collection: &str, proposed: &JsonValue) -> Result<SchemaReview> {
+        self.change_schema(collection, proposed, None)
+    }
+
+    /// Install `proposed` as `collection`'s schema.
+    ///
+    /// Refused when an existing record does not satisfy it, unless
+    /// `allow_violations`: then those records are what `cr check` reports next,
+    /// and each is refused on its next write until it is fixed. Which values are
+    /// encrypted and whether records are creator-owned cannot change here; those
+    /// have their own commands because they change what is stored, not only
+    /// what is accepted.
+    pub fn set_schema(
+        &self,
+        collection: &str,
+        proposed: &JsonValue,
+        allow_violations: bool,
+    ) -> Result<SchemaReview> {
+        self.change_schema(collection, proposed, Some(allow_violations))
+    }
+
+    /// Remove `collection`'s schema, returning it to schemaless.
+    ///
+    /// Refused while the schema declares encrypted storage or record-owned
+    /// access, since each is what makes the stored records readable or
+    /// authorizable.
+    pub fn remove_schema(&self, collection: &str) -> Result<bool> {
+        validate_component(collection, "collection")?;
+        if collection == USERS_COLLECTION {
+            return Err(invalid(
+                "the users collection has a built-in schema and cannot be removed",
+            ));
+        }
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        if self.access_enabled()? {
+            self.assert_current_principal_policy(&audit)?;
+        }
+        self.authorize_owner(&AccessResource::collection(collection))?;
+
+        let Some(existing) = self.collection_schema(collection)? else {
+            return Ok(false);
+        };
+        if !EncryptionPolicy::from_schema(Some(&existing))?.is_empty() {
+            return Err(conflict(format!(
+                "collection '{collection}' stores encrypted values its schema declares, so removing the schema would leave them unreadable"
+            )));
+        }
+        if CollectionAccessPolicy::from_schema(Some(&existing))?.is_some() {
+            return Err(conflict(format!(
+                "collection '{collection}' has creator-owned records its schema declares, so removing the schema would change who may read them"
+            )));
+        }
+        let path = Path::new(SCHEMA_DIRECTORY).join(format!("{collection}.json"));
+        paths::remove_file(&self.root, &path, &schema_label(collection))?;
+        Ok(true)
+    }
+
+    /// Review a proposed schema and, when `apply` is given, install it.
+    fn change_schema(
+        &self,
+        collection: &str,
+        proposed: &JsonValue,
+        apply: Option<bool>,
+    ) -> Result<SchemaReview> {
+        validate_component(collection, "collection")?;
+        if collection == USERS_COLLECTION {
+            return Err(invalid(
+                "the users collection has a built-in schema and cannot be replaced",
+            ));
+        }
+        // The lock spans judging and writing, so no record can be written
+        // between the records being judged and the schema taking effect.
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        if apply.is_some() {
+            audit.recover_pending()?;
+        }
+        if self.access_enabled()? {
+            self.assert_current_principal_policy(&audit)?;
+        }
+        self.authorize_owner(&AccessResource::collection(collection))?;
+
+        jsonschema::meta::validate(proposed).map_err(|error| {
+            invalid(format!(
+                "the proposed schema for collection '{collection}' is not a valid JSON Schema: {error}"
+            ))
+        })?;
+        let encryption = EncryptionPolicy::from_schema(Some(proposed)).with_context(|| {
+            DomainError::Invalid(format!(
+                "invalid encryption annotations for collection '{collection}'"
+            ))
+        })?;
+        let access = CollectionAccessPolicy::from_schema(Some(proposed)).with_context(|| {
+            DomainError::Invalid(format!(
+                "invalid access annotations for collection '{collection}'"
+            ))
+        })?;
+        validate_presentation_hints(collection, proposed)?;
+
+        let existing = self.collection_schema(collection)?;
+        if EncryptionPolicy::from_schema(existing.as_ref())? != encryption {
+            return Err(invalid(format!(
+                "the proposed schema changes which values collection '{collection}' encrypts; use 'cr schema encrypt' or 'cr schema encrypt-body'"
+            )));
+        }
+        if CollectionAccessPolicy::from_schema(existing.as_ref())? != access {
+            return Err(invalid(format!(
+                "the proposed schema changes collection '{collection}''s record access policy; use 'cr access policy set'"
+            )));
+        }
+
+        let validator = jsonschema::validator_for(proposed).map_err(|error| {
+            invalid(format!(
+                "the proposed schema for collection '{collection}' could not be compiled: {error}"
+            ))
+        })?;
+        let records = self.list(collection, &[])?;
+        let mut violations = Vec::new();
+        for record in &records {
+            let instance = serde_json::to_value(schema_attributes(
+                &record.attributes,
+                access.is_some(),
+            ))
+            .map_err(|_| {
+                invalid(format!(
+                    "record {collection}/{} has front matter that cannot be represented as JSON for schema validation",
+                    record.id
+                ))
+            })?;
+            if !encryption.is_empty() {
+                // Descriptions quote the failing value, which here is the
+                // protected value itself, so a protected record gets one
+                // sentence that names nothing.
+                if !validator.is_valid(&instance) {
+                    violations.push(RecordSchemaViolation {
+                        id: record.id.clone(),
+                        field: None,
+                        message: redacted_mismatch(collection),
+                    });
+                }
+                continue;
+            }
+            violations.extend(validator.iter_errors(&instance).map(|error| {
+                RecordSchemaViolation {
+                    id: record.id.clone(),
+                    field: violation_field(&error),
+                    message: error.to_string(),
+                }
+            }));
+        }
+
+        let changed = existing.as_ref() != Some(proposed);
+        let mut review = SchemaReview {
+            collection: collection.to_owned(),
+            changed,
+            applied: false,
+            records: records.len(),
+            violations,
+        };
+        let Some(allow_violations) = apply else {
+            return Ok(review);
+        };
+        if !review.violations.is_empty() && !allow_violations {
+            let failing: BTreeSet<_> = review.violations.iter().map(|v| &v.id).collect();
+            let mut message = format!(
+                "{} of {} records in collection '{collection}' do not satisfy the proposed schema:",
+                failing.len(),
+                review.records
+            );
+            for violation in review.violations.iter().take(LISTED_SCHEMA_VIOLATIONS) {
+                message.push_str(&format!(
+                    "\n- {collection}/{}: {}",
+                    violation.id, violation.message
+                ));
+            }
+            if review.violations.len() > LISTED_SCHEMA_VIOLATIONS {
+                message.push_str(&format!(
+                    "\n- and {} more",
+                    review.violations.len() - LISTED_SCHEMA_VIOLATIONS
+                ));
+            }
+            return Err(invalid(message));
+        }
+        if changed {
+            self.write_collection_schema(collection, proposed, existing.is_some())?;
+            review.applied = true;
+        }
+        Ok(review)
     }
 
     fn write_collection_schema(
@@ -5356,6 +5606,36 @@ fn user_id_tombstoned(id: &str) -> anyhow::Error {
     conflict(format!(
         "user ID '{id}' was previously deleted; pass --reuse-deleted-id to reuse its audit identity"
     ))
+}
+
+/// Refuse `x-cr-ui` hints `cr schema label` and `cr schema icon` would refuse,
+/// rather than install a label navigation then silently ignores.
+fn validate_presentation_hints(collection: &str, schema: &JsonValue) -> Result<()> {
+    let Some(hints) = schema.get(UI_EXTENSION) else {
+        return Ok(());
+    };
+    let hints = hints.as_object().ok_or_else(|| {
+        invalid(format!(
+            "the proposed schema for collection '{collection}' has an {UI_EXTENSION} that is not an object"
+        ))
+    })?;
+    for (key, normalize) in [
+        (
+            "label",
+            normalize_collection_label as fn(&str) -> Result<String>,
+        ),
+        ("icon", normalize_collection_icon),
+    ] {
+        if let Some(value) = hints.get(key) {
+            let value = value.as_str().ok_or_else(|| {
+                invalid(format!(
+                    "the proposed schema for collection '{collection}' has a {key} that is not a string"
+                ))
+            })?;
+            normalize(value)?;
+        }
+    }
+    Ok(())
 }
 
 /// The schema `cr schema label` and `cr schema icon` start from.
