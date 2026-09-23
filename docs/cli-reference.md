@@ -32,6 +32,7 @@ cr unlink SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
 cr backlinks COLLECTION ID [--from COLLECTION] [--relation NAME]
                            [--where KEY=YAML]... [--where-expr EXPRESSION]...
                            [--sort FIELD [--desc]] [--json]
+cr traverse COLLECTION ID [--relation NAME]... [--depth N] [--json [--expand]]
 cr delete COLLECTION ID --yes [-m MESSAGE] [ATTRIBUTION]
 cr delete COLLECTION ID --preview [--json]
 cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N]

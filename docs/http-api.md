@@ -172,6 +172,14 @@ the sources, and each result names the relations holding the reference:
 curl 'http://127.0.0.1:3000/api/v1/collections/companies/records/acme/backlinks?from=deals&sort=value&direction=desc'
 ```
 
+Follow relations outward from a record with `traverse`. `depth` (1 to 10) and
+repeated `relation` parameters bound it, and `expand=true` returns a nested
+tree instead of a flat graph of `nodes` and `edges`:
+
+```sh
+curl 'http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal/traverse?depth=2&expand=true'
+```
+
 ## Filtering, search, and pagination
 
 Repeated `where` parameters are combined with AND and retain YAML types. URL-encode the `=` when writing URLs manually:
@@ -273,6 +281,7 @@ DELETE /api/v1/collections/{collection}/records/{id}
 POST   /api/v1/collections/{collection}/records/{id}/links
 DELETE /api/v1/collections/{collection}/records/{id}/links/{relation}/{target_collection}/{target_id}
 GET    /api/v1/collections/{collection}/records/{id}/backlinks
+GET    /api/v1/collections/{collection}/records/{id}/traverse
 GET    /api/v1/search
 ```
 

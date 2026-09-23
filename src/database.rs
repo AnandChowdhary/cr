@@ -2143,6 +2143,29 @@ impl Database {
         self.get_with_optional_audited_states(collection, id, Some(audited_states))
     }
 
+    /// [`Self::get`] with the audit replay some collections need held in
+    /// `audited_states`, so reading many records replays the journal at most
+    /// once.
+    pub(crate) fn get_with_audited_cache(
+        &self,
+        collection: &str,
+        id: &str,
+        audited_states: &mut Option<Arc<AuditedRecordStates>>,
+    ) -> Result<Record> {
+        self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
+        let path = self.record_path(collection, id)?;
+        let raw = self.read_record(collection, id, &path)?;
+        let document =
+            self.parse_logical_record_with_audited_cache(collection, id, &raw, audited_states)?;
+        Ok(record_from_document(
+            collection,
+            id,
+            path,
+            document,
+            record_hash(raw.as_bytes()),
+        ))
+    }
+
     fn get_with_optional_audited_states(
         &self,
         collection: &str,
@@ -5120,6 +5143,43 @@ fn referring_relations(
             .then(|| name.clone())
         })
         .collect()
+}
+
+/// Every well-formed reference in `attributes`, as `(relation, collection,
+/// id)` in the order the record stores them.
+///
+/// Well-formed means what `cr check` accepts: a string relation name that is
+/// a usable name, holding a list of objects whose `collection` and `id` are
+/// usable names. Anything else is skipped here and reported by `check`.
+pub(crate) fn relation_references(attributes: &Mapping) -> Vec<(String, String, String)> {
+    let Some(Value::Mapping(relations)) = attributes.get(Value::String("relations".to_owned()))
+    else {
+        return Vec::new();
+    };
+    let mut references = Vec::new();
+    for (name, targets) in relations {
+        let (Value::String(name), Value::Sequence(targets)) = (name, targets) else {
+            continue;
+        };
+        if validate_component(name, "relation").is_err() {
+            continue;
+        }
+        for target in targets {
+            let Value::Mapping(reference) = target else {
+                continue;
+            };
+            let field = |key: &str| match reference.get(Value::String(key.to_owned())) {
+                Some(Value::String(value)) if validate_component(value, key).is_ok() => {
+                    Some(value.clone())
+                }
+                _ => None,
+            };
+            if let (Some(collection), Some(id)) = (field("collection"), field("id")) {
+                references.push((name.clone(), collection, id));
+            }
+        }
+    }
+    references
 }
 
 /// Whether one relation element refers to `collection/id`.

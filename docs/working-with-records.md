@@ -120,6 +120,33 @@ cr backlinks companies acme --from deals --where-expr 'value>=10000' --sort valu
 The target does not have to exist, so this also finds the records still
 pointing at something that was deleted. Only records you may read are listed.
 
+## Follow relations
+
+`cr traverse` follows relations outward from a record, breadth first, for up
+to `--depth` steps (1 by default, at most 10):
+
+```sh
+cr traverse deals acme-renewal-2027 --depth 2
+# deals/acme-renewal-2027
+#   company: companies/acme
+#     parent: companies/acme-holdings
+#   primary_contact: contacts/jane-doe
+#     company: companies/acme (shown above)
+```
+
+Each record is visited once, so a cycle stops where it closes and a record
+reached twice is marked `(shown above)`. A reference to a record that no longer
+exists is marked `(missing)`, and one you may not read `(not readable)`;
+neither is followed further, and neither stops the traversal. `--relation`
+(repeatable) follows only the named relations, at every step.
+
+`--json` returns a flat graph: every record reached, once, with its depth,
+status, and front matter, and every reference followed as a `from`,
+`relation`, `to` edge. Add `--expand` for a nested tree instead, with each
+record's linked records under `links`, keyed by relation, where it was first
+reached, and a `seen: true` stub everywhere else. A traversal visits at most
+1,000 records and sets `truncated` when it stops early.
+
 Delete a record. Deletion requires confirmation and retains an audited tombstone:
 
 ```sh

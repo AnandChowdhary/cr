@@ -1922,3 +1922,85 @@ async fn rest_backlinks_list_filter_and_paginate_referring_records() {
     );
     assert!(openapi["components"]["schemas"]["BacklinkPage"].is_object());
 }
+
+#[tokio::test]
+async fn rest_traverse_returns_a_graph_or_an_expanded_tree() {
+    let (_temporary, database) = test_database("server-traverse");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    for (collection, id) in [
+        ("companies", "acme"),
+        ("companies", "holding"),
+        ("deals", "renewal"),
+    ] {
+        database
+            .create(
+                collection,
+                id,
+                &[Assignment::from_str(&format!("name={id}")).unwrap()],
+                "",
+            )
+            .unwrap();
+    }
+    database
+        .link("deals", "renewal", "company", "companies", "acme")
+        .unwrap();
+    database
+        .link("companies", "acme", "parent", "companies", "holding")
+        .unwrap();
+    database
+        .link("companies", "holding", "subsidiary", "companies", "acme")
+        .unwrap();
+
+    let graph = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/records/renewal/traverse?depth=3",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(graph.status, StatusCode::OK, "{}", graph.text());
+    let graph = graph.json();
+    assert_eq!(graph["root"], "deals/renewal");
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 3);
+    assert_eq!(graph["edges"].as_array().unwrap().len(), 3);
+
+    let tree = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/deals/records/renewal/traverse?depth=3&expand=true&relation=company&relation=parent",
+        None,
+        &[],
+    )
+    .await
+    .json();
+    let holding = &tree["links"]["company"][0]["links"]["parent"][0];
+    assert_eq!(holding["id"], "holding");
+    assert!(holding.get("links").is_none(), "{tree:#}");
+
+    for (uri, status) in [
+        (
+            "/api/v1/collections/deals/records/renewal/traverse?depth=11",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "/api/v1/collections/deals/records/renewal/traverse?nope=1",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/api/v1/collections/deals/records/missing/traverse",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let response = request(&app, Method::GET, uri, None, &[]).await;
+        assert_eq!(response.status, status, "{uri}: {}", response.text());
+    }
+
+    let openapi = request(&app, Method::GET, "/openapi.json", None, &[])
+        .await
+        .json();
+    let operation =
+        &openapi["paths"]["/api/v1/collections/{collection}/records/{id}/traverse"]["get"];
+    assert_eq!(operation["operationId"], "traverseRecord");
+    assert!(openapi["components"]["schemas"]["Traversal"].is_object());
+}

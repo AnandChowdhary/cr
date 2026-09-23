@@ -11,6 +11,7 @@ mod pins;
 mod search;
 pub mod server;
 mod sync;
+mod traverse;
 mod value;
 mod views;
 
@@ -41,6 +42,10 @@ pub use error::DomainError;
 pub use pins::Pin;
 pub use search::{SearchQuery, SearchTarget};
 pub use sync::{SyncAttribution, SyncDefinition, SyncRunLedger, SyncRunSummary};
+pub use traverse::{
+    MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_RECORDS, Traversal, TraversalEdge, TraversalNode,
+    TraversalStatus,
+};
 pub use value::{Assignment, FilterExpression, FilterOperator, compare_yaml_values};
 pub use views::{
     CollectionPresentation, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,

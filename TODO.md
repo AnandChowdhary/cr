@@ -153,7 +153,7 @@ Priorities:
   Single-field sorting now works across CLI, REST, and HTML for dotted fields, path, collection, or ID with stable missing-value and mixed-type rules before pagination. Add ordered multi-field keys and define a URL/CLI syntax that preserves deterministic ties.
 
 - [ ] **P1 — Field projections.**
-  Add `--select` and an HTTP equivalent so callers can request only selected front matter fields, identity/path fields, or optionally Markdown.
+  Add `--select` and an HTTP equivalent so callers can request only selected front matter fields, identity/path fields, or optionally Markdown. Apply it to `backlinks` and `traverse` output as well as `list`, `search`, and `get`.
 
 - [ ] **P1 — Counts and aggregation.**
   Add count, distinct values, grouping, and basic numeric aggregation without requiring record bodies in the response.
@@ -178,8 +178,8 @@ Priorities:
 - [ ] **P2 — Show relations and backlinks on the record page.**
   The server-rendered record page shows a relation only as raw front matter and shows nothing that links to the record. Render outgoing relations as links, a "Linked from" section built on `Database::backlinks`, and an unlink control, without making every record page scan the whole database unbounded.
 
-- [ ] **P1 — Relationship traversal and expansion.**
-  Traverse named relations with explicit depth limits, cycle detection, missing-target reporting, projections, and compact versus expanded output.
+- [x] **P1 — Relationship traversal and expansion.**
+  `cr traverse COLLECTION ID` and `GET /api/v1/collections/{collection}/records/{id}/traverse` follow relations outward breadth first, limited to repeatable `--relation`/`relation` names at every step, for an explicit `--depth` from 1 (the default) to 10, and at most 1,000 records, beyond which the result says `truncated`. Each record is visited once, so a cycle ends where it closes. Every record after the start is read with `get`'s authorization, and a reference that cannot be followed becomes a node with status `missing`, `forbidden`, or `unreadable` rather than an error; only the start must exist. Output is a plain indented tree, a flat JSON graph of nodes and edges, or with `--expand`/`expand=true` a nested tree that expands each record where it was first reached and stubs every later reference as `seen`. Reads share one lazily loaded audit replay. Field projections are the separate entry below, and will apply here too. `tests/traverse_cli.rs` and `tests/server_api.rs` cover it.
 
 - [x] **P1 — Whole-database integrity checks.**
   `cr check` and `GET /api/v1/check` report twelve finding kinds without stopping at the first one: dangling links, malformed relation values, schema violations, unusable collection schemas, invalid record and collection names, records that cannot be read or parsed, the three audit reconciliation states (no history, audited file missing, content divergence), a journal that cannot be replayed, a stored change set that does not match its approval, and a sync run that stopped partway. Findings name records by `collection/id` and never by path, and `src/check.rs` holds the logic so `database.rs`, `main.rs`, and `server.rs` only gained seams. Exit status is 0 for clean, 2 for "ran and found problems", and 1 for "could not run"; `--fail-on error|warning|never` moves the threshold and `--collection` bounds the expensive phase. `check` is strictly read-only, proven by a byte-level before/after snapshot over the whole database in `tests/check_cli.rs` and `tests/check_http.rs`.
