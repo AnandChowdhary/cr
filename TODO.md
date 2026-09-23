@@ -325,6 +325,9 @@ Priorities:
 - [ ] **P2 — Cross-platform filesystem coverage.**
   Run Windows and Linux CI in addition to macOS-oriented development, including locks, atomic replacement, permissions, Unicode, and symlink/junction behavior.
 
+- [ ] **P2 — Find why concurrent first writes on macOS can fail to open the audit lock.**
+  `tests/idempotency.rs::concurrent_cli_retries_commit_one_event_and_all_return_success` starts eight `cr create` processes against a database no write has touched yet. Once on `macos-latest` (PR #60, passing on rerun) one of them failed with `could not open the audit lock at …/.cr/audit/lock: No such file or directory`. `paths::open_lock_file` opens the lock with `openat(O_RDWR | O_CREAT)` relative to a descriptor for `.cr/audit` that `create_directory_all` has just opened or created, and nothing in `cr` removes or renames that directory, so `ENOENT` should be impossible there; it has not reproduced on Linux. Reproduce it on macOS in a loop before changing anything. A bounded retry of the open on `ENOENT` would hide the symptom, but only a confirmed cause justifies it, because the same error from a genuinely removed directory must still fail.
+
 - [ ] **P2 — HTTP security regression tests.**
   Cover header smuggling boundaries, oversized/slow bodies, path encoding, token handling, accidental secret logging, and denial-of-service limits.
 
