@@ -361,7 +361,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     );
     let browser_pipeline_page = request(&app, Method::GET, "/browser-pipeline", None, &[]).await;
     assert_eq!(browser_pipeline_page.status, StatusCode::OK);
-    assert!(browser_pipeline_page.text().contains("Kanban grouped by"));
+    assert!(browser_pipeline_page.text().contains("Grouped by"));
     assert!(
         browser_pipeline_page
             .text()
@@ -812,7 +812,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
 
     let board = request(&app, Method::GET, "/pipeline", None, &[]).await;
     assert_eq!(board.status, StatusCode::OK);
-    assert!(board.text().contains("Kanban grouped by"));
+    assert!(board.text().contains("Grouped by"));
     assert!(board.text().contains("data-kanban-board=\"true\""));
     assert!(board.text().contains("draggable=\"true\""));
     // The drag-and-drop enhancement moved to the embedded asset the page
@@ -831,11 +831,12 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
             .contains("&lt;script&gt;alert('x')&lt;/script&gt;")
     );
     assert!(!board.text().contains("<script>alert('x')</script>"));
-    let qualification = board.text().find(">qualification<").unwrap();
-    let interview = board.text().find(">interview<").unwrap();
-    let offer = board.text().find(">offer<").unwrap();
-    let won = board.text().find(">won<").unwrap();
-    let lost = board.text().find(">lost<").unwrap();
+    // Lanes are named as the form names the options: readably.
+    let qualification = board.text().find(">Qualification<").unwrap();
+    let interview = board.text().find(">Interview<").unwrap();
+    let offer = board.text().find(">Offer<").unwrap();
+    let won = board.text().find(">Won<").unwrap();
+    let lost = board.text().find(">Lost<").unwrap();
     assert!(qualification < interview && interview < offer && offer < won && won < lost);
     assert!(
         board.text().find("/pipeline/records/gamma").unwrap()
@@ -870,9 +871,9 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     .await;
     assert_eq!(projected_board.status, StatusCode::OK);
     assert!(projected_board.text().contains("1 shown"));
-    assert!(projected_board.text().contains(">name</dt>"));
-    assert!(!projected_board.text().contains(">owner</dt>"));
-    assert!(!projected_board.text().contains(">score</dt>"));
+    assert!(projected_board.text().contains(">Name</dt>"));
+    assert!(!projected_board.text().contains(">Owner</dt>"));
+    assert!(!projected_board.text().contains(">Score</dt>"));
 
     let typed_filter = request(
         &app,

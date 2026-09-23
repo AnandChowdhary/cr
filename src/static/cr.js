@@ -207,6 +207,44 @@ const enhanceNotice = () => {
   announce(notice.textContent.trim());
 };
 
+// Timestamps. The server writes each tooltip in UTC because it cannot know the
+// reader's time zone; the browser can, so the tooltip is rewritten in local
+// time. The visible text — "3 hours ago" — reads the same in every zone.
+const enhanceTimes = () => {
+  document.querySelectorAll('time.cr-time[datetime]').forEach((time) => {
+    if (!claim(time)) return;
+    const instant = new Date(time.dateTime);
+    if (Number.isNaN(instant.getTime())) return;
+    time.title = instant.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  });
+};
+
+// Unsaved edits. A navigation swaps the page body rather than loading a new
+// document, so a click on the sidebar in the middle of an edit used to throw
+// the edit away without a word. A record form becomes unsaved at its first
+// change and saved again when it is submitted. While a form on the page is
+// unsaved, a request htmx is about to make asks first (see `htmx:confirm`
+// below), and leaving the page any other way — a reload, a native form post,
+// closing the tab — gets the browser's own `beforeunload` prompt.
+//
+// A form the server sent back refusing a submission is unsaved from the
+// start: it holds exactly what was typed, and none of it was written. A Set
+// rather than the WeakSet `claim` uses, because the guard asks which forms are
+// unsaved, which a WeakSet cannot answer; a form that has left the document no
+// longer counts, which is what `isConnected` checks.
+const unsavedForms = new Set();
+const hasUnsavedChanges = () => [...unsavedForms].some((form) => form.isConnected);
+
+const enhanceRecordForm = () => {
+  const form = document.getElementById('cr-record-form');
+  if (!claim(form)) return;
+  if (form.querySelector(':scope > [role="alert"]')) unsavedForms.add(form);
+  const markUnsaved = () => unsavedForms.add(form);
+  form.addEventListener('input', markUnsaved);
+  form.addEventListener('change', markUnsaved);
+  form.addEventListener('submit', () => unsavedForms.delete(form));
+};
+
 // Save-as-view: a Kanban view needs a grouping field and a table view has no
 // use for one, so the control follows the chosen layout.
 const enhanceViewLayout = () => {
@@ -363,12 +401,43 @@ document.addEventListener('htmx:beforeSwap', (event) => {
   }
 });
 
+// The unsaved-edits guard's two prompts. `htmx:confirm` fires before every
+// request htmx makes — a boosted link or form, a targeted swap, the navigation
+// that follows a save — and cancels it when prevented. The form's own
+// submission is let through, because it is how the changes get saved; so is
+// anything once the reader has chosen to discard them.
+document.addEventListener('htmx:confirm', (event) => {
+  if (!hasUnsavedChanges()) return;
+  const form = event.detail.elt?.closest?.('form');
+  if (form && unsavedForms.has(form)) return;
+  if (window.confirm('You have unsaved changes. Leave without saving them?')) {
+    unsavedForms.clear();
+  } else {
+    event.preventDefault();
+  }
+});
+
+window.addEventListener('beforeunload', (event) => {
+  if (!hasUnsavedChanges()) return;
+  event.preventDefault();
+  event.returnValue = '';
+});
+
+// A submission that never reached the server wrote nothing, so the form is
+// unsaved again.
+document.addEventListener('htmx:sendError', (event) => {
+  const form = event.detail.elt?.closest?.('form');
+  if (form && form.id === 'cr-record-form') unsavedForms.add(form);
+});
+
 // Run the enhancements now — this script is deferred, so the document is
 // parsed — and again whenever htmx inserts markup. The first call is what keeps
 // every enhancement above working when htmx is absent, blocked, or still in
 // flight; it is not htmx that owns them.
 const enhanceAll = () => {
   enhanceNotice();
+  enhanceTimes();
+  enhanceRecordForm();
   enhanceFilterBuilder();
   enhanceViewLayout();
   enhanceKanbanBoard();

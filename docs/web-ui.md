@@ -270,6 +270,25 @@ Use the optional `x-cr-ui.order` schema extension to control field order without
 
 Fields omitted from the order remain visible after configured fields, with required fields first.
 
+Tables and Kanban cards use the same words as the form. A column heading is the field's schema `title`, or its key made readable (`expected_close` becomes **Expected Close**), and an enum's value reads as the form's option does (`negotiation` becomes **Negotiation**). Give a number an `x-cr-unit` to show it as an amount, with its digits grouped and its unit after it. The unit is either a fixed string or the name of another field that holds it:
+
+```json
+"value": { "type": "integer", "x-cr-unit": { "field": "currency" } },
+"probability": { "type": "integer", "minimum": 0, "maximum": 100, "x-cr-unit": "%" }
+```
+
+With those, a deal shows `125,000 USD` and `80%` instead of `125000` and `80`. A number with no unit is shown exactly as stored, because it may be a year or a postcode. Like `x-cr-ui`, `x-cr-unit` changes only presentation, never what validates.
+
+A record page is headed by the record's `name` or `title` field, with its ID beneath; a record with neither is called by its ID. Times in tables, the index, and activity feeds read as how long ago they were, such as "3 hours ago", with the exact time in the tooltip.
+
+If you start editing a record and then click a link, the page asks before discarding your changes. Reloading or closing the tab asks too, through the browser's own prompt.
+
+### Link related records
+
+A record page lists the record's relations beside its form. **Links to** shows each relation the record holds, named and linked to the other record's page. **Linked from** shows every record that links to this one, the same records `cr backlinks` finds. A related record that no longer exists, or that the current perspective cannot read, is shown only as its `collection/id`.
+
+To add a relation, open **+ Link a record**, enter a relation name such as `company`, and pick the record as `collection/id`. Both fields suggest what the database already contains. **Remove** takes a relation away. Each change is its own audited `link` event, exactly as if it had been made with `cr link` or `cr unlink`. A change made from a page that has since gone stale is refused rather than applied, and so is saving the record form after a relation changed underneath it. The record form carries the stored relations through unchanged, so saving it never undoes a link.
+
 ## Name collections and give them icons
 
 A collection's navigation name and emoji live beside `order`, in the same

@@ -485,7 +485,12 @@ async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
     )
     .await;
     assert_eq!(reader_record.status, StatusCode::OK);
-    assert!(reader_record.text().contains("View public"));
+    // A record with no name is called by its ID.
+    assert!(
+        reader_record
+            .text()
+            .contains(r#"<h1 class="cr-title">public</h1>"#)
+    );
     assert!(reader_record.text().contains("Read-only perspective"));
     assert!(!reader_record.text().contains("Save changes"));
     assert!(!reader_record.text().contains("Delete this record"));
@@ -555,7 +560,11 @@ async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
         &[("cookie", &editor_cookie)],
     )
     .await;
-    assert!(editor_record.text().contains("Edit public"));
+    assert!(
+        editor_record
+            .text()
+            .contains(r#"<h1 class="cr-title">public</h1>"#)
+    );
     assert!(editor_record.text().contains("Save changes"));
     assert!(!editor_record.text().contains("Delete this record"));
 

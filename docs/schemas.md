@@ -67,7 +67,8 @@ The same file drives more than validation:
 
 - [encryption at rest](encryption.md) for the fields and bodies it marks;
 - the typed [record forms](web-ui.md#use-schema-driven-record-forms) and their
-  field order in the web UI;
+  field order in the web UI, and the headings, option labels, and units
+  (`x-cr-unit`) that tables and Kanban cards show;
 - a collection's [name and icon](web-ui.md#name-collections-and-give-them-icons);
 - the lanes of a [Kanban pipeline](web-ui.md#create-a-kanban-pipeline), which
   follow an `enum`'s declared order;
