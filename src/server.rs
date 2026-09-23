@@ -38,12 +38,12 @@ use yaml_serde::{Mapping, Value as YamlValue};
 use crate::{
     AccessAction, AccessIdentity, AccessResource, AgentEvidence, Assignment, Attribution,
     AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
-    AuditIntentPart, AuditSource, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary,
+    AuditIntentPart, AuditSource, Backlink, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary,
     CollectionModel, CollectionPresentation, Database, DomainError, FilterExpression,
     FilterOperator, Finding, RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition,
     SchemaViolation, SearchQuery, SearchTarget, SortDirection, USERS_COLLECTION, User, UserKind,
     UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
-    audit::AuditChange, sort_records_by_field,
+    audit::AuditChange, sort_by_record_field, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -476,6 +476,33 @@ impl TryFrom<Record> for ApiRecord {
     }
 }
 
+/// One record that links to another, with the relations holding the reference.
+#[derive(Debug, Serialize)]
+struct ApiBacklink {
+    collection: String,
+    id: String,
+    path: String,
+    version: String,
+    relations: Vec<String>,
+    front_matter: JsonValue,
+}
+
+impl TryFrom<Backlink> for ApiBacklink {
+    type Error = ApiError;
+
+    fn try_from(backlink: Backlink) -> ApiResult<Self> {
+        let record = backlink.record;
+        Ok(Self {
+            collection: record.collection,
+            id: record.id,
+            path: display_path(&record.path),
+            version: record.version,
+            relations: backlink.relations,
+            front_matter: json_front_matter(record.attributes)?,
+        })
+    }
+}
+
 impl TryFrom<Record> for ApiRecordSummary {
     type Error = ApiError;
 
@@ -538,6 +565,22 @@ struct BrowseQuery {
 #[serde(deny_unknown_fields)]
 struct CheckQuery {
     collection: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BacklinkQuery {
+    from: Option<String>,
+    relation: Option<String>,
+    #[serde(default, rename = "where")]
+    filters: Vec<String>,
+    #[serde(default)]
+    where_expr: Vec<String>,
+    sort: Option<String>,
+    #[serde(default)]
+    direction: SortDirectionParameter,
     limit: Option<usize>,
     offset: Option<usize>,
 }
@@ -1400,6 +1443,10 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
                 .route(
                     "/collections/{collection}/records/{id}/links/{relation}/{target_collection}/{target_id}",
                     delete(unlink_record),
+                )
+                .route(
+                    "/collections/{collection}/records/{id}/backlinks",
+                    get(list_backlinks),
                 )
                 .route("/search", get(search_records))
                 .route("/status", get(status))
@@ -3420,6 +3467,47 @@ async fn link_record(
     api_record_response(StatusCode::OK, record)
 }
 
+/// List the records that link to one record, which need not exist.
+async fn list_backlinks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((collection, id)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<Page<ApiBacklink>>> {
+    let query: BacklinkQuery = parse_query(raw)?;
+    let bounds = page_bounds(query.limit, query.offset, state.max_page_size)?;
+    let filters = parse_filters(query.filters)?;
+    let expressions = parse_filter_expressions(query.where_expr)?;
+    let (from, relation, sort) = (query.from, query.relation, query.sort);
+    let direction = query.direction.into();
+    let backlinks = run_database(&state, &headers, move |database| {
+        let mut backlinks = database.backlinks(
+            &collection,
+            &id,
+            from.as_deref(),
+            relation.as_deref(),
+            &filters,
+        )?;
+        backlinks.retain(|backlink| {
+            expressions
+                .iter()
+                .all(|expression| expression.matches(&backlink.record.attributes))
+        });
+        if let Some(field) = sort {
+            sort_by_record_field(
+                &mut backlinks,
+                |backlink| &backlink.record,
+                &field,
+                direction,
+            )?;
+        }
+        Ok(backlinks)
+    })
+    .await?;
+    let page = paginate(backlinks, bounds).try_map(ApiBacklink::try_from)?;
+    Ok(Json(page))
+}
+
 /// Remove one relation reference. Every part of the reference is a path
 /// component, so it needs no request body, which a `DELETE` should not carry.
 async fn unlink_record(
@@ -3719,6 +3807,27 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "has_more": { "type": "boolean" },
                 "next_offset": { "type": ["integer", "null"], "minimum": 0 },
                 "previous_offset": { "type": ["integer", "null"], "minimum": 0 }
+            }
+        },
+        "Backlink": {
+            "type": "object",
+            "required": ["collection", "id", "path", "version", "relations", "front_matter"],
+            "description": "A record that links to the requested record, with the relations holding the reference.",
+            "properties": {
+                "collection": { "type": "string" },
+                "id": { "type": "string" },
+                "path": { "type": "string" },
+                "version": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                "relations": { "type": "array", "items": { "type": "string" } },
+                "front_matter": { "$ref": "#/components/schemas/FrontMatter" }
+            }
+        },
+        "BacklinkPage": {
+            "type": "object",
+            "required": ["data", "pagination"],
+            "properties": {
+                "data": { "type": "array", "items": { "$ref": "#/components/schemas/Backlink" } },
+                "pagination": { "$ref": "#/components/schemas/Pagination" }
             }
         },
         "RecordPage": {
@@ -4251,6 +4360,20 @@ fn openapi_paths() -> JsonValue {
         },
         "/api/v1/collections/{collection}/records/{id}/links": {
             "post": { "operationId": "linkRecord", "parameters": conditional_mutation_parameters(vec![collection.clone(), id.clone()]), "requestBody": json_body("#/components/schemas/LinkRequest"), "responses": record_ok_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview") }
+        },
+        "/api/v1/collections/{collection}/records/{id}/backlinks": {
+            "get": { "operationId": "listBacklinks", "description": "List readable records whose relations refer to this record. The record does not have to exist.", "parameters": [
+                collection.clone(),
+                id.clone(),
+                { "name": "from", "in": "query", "description": "Only records in this collection.", "schema": { "type": "string" } },
+                { "name": "relation", "in": "query", "description": "Only references held in this relation.", "schema": { "type": "string" } },
+                { "name": "where", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
+                { "name": "where_expr", "in": "query", "description": "Typed expressions on the source record. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
+                { "name": "sort", "in": "query", "description": "Dotted front matter field or $id, $collection, or $path. Missing fields remain last.", "schema": { "type": "string" } },
+                { "name": "direction", "in": "query", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } },
+                { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } }
+            ], "responses": ok("#/components/schemas/BacklinkPage") }
         },
         "/api/v1/collections/{collection}/records/{id}/links/{relation}/{target_collection}/{target_id}": {
             "delete": { "operationId": "unlinkRecord", "description": "Remove every reference to target_collection/target_id from the named relation. Removing a reference that is not there changes nothing, and the target does not have to exist.", "parameters": conditional_mutation_parameters(vec![

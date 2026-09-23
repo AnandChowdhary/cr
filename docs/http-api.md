@@ -164,6 +164,14 @@ Removing a relation accepts the same `If-Match`, `Idempotency-Key`, and
 `preview=true` as adding one. Removing a reference that is not there changes
 nothing, and the target does not have to exist.
 
+List the records that link to one, paginated like any list. `from`,
+`relation`, `where`, `where_expr`, `sort`, and `direction` narrow and order
+the sources, and each result names the relations holding the reference:
+
+```sh
+curl 'http://127.0.0.1:3000/api/v1/collections/companies/records/acme/backlinks?from=deals&sort=value&direction=desc'
+```
+
 ## Filtering, search, and pagination
 
 Repeated `where` parameters are combined with AND and retain YAML types. URL-encode the `=` when writing URLs manually:
@@ -264,6 +272,7 @@ PATCH  /api/v1/collections/{collection}/records/{id}
 DELETE /api/v1/collections/{collection}/records/{id}
 POST   /api/v1/collections/{collection}/records/{id}/links
 DELETE /api/v1/collections/{collection}/records/{id}/links/{relation}/{target_collection}/{target_id}
+GET    /api/v1/collections/{collection}/records/{id}/backlinks
 GET    /api/v1/search
 ```
 
