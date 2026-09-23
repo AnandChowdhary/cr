@@ -1809,6 +1809,8 @@ launching owner under `access.impersonated_by`.
 
 The HTTP layer calls the same Rust database methods as the CLI. It does not spawn a `cr` subprocess. Schema validation, atomic writes, audit locking, direct-edit reconciliation, and tamper checks therefore behave the same way in both interfaces. HTTP mutations are recorded with `source: api`.
 
+One thing differs, and it is what keeps pages fast on a database with a long history. A CLI command verifies the audit chain from the first event every time it needs it. The server verifies it once, starting as soon as it is listening, and after that verifies only the events appended since, so a page costs about the same on the ten-thousandth event as on the tenth. The newest segment is still compared byte for byte on every read. An older segment is trusted while its file identity, size, and modification and change times are unchanged. A rewrite that also restores the change time, which takes resetting the clock or writing the disk directly, is only noticed after the server restarts. `cr audit verify`, `cr check`, their API routes, and every write still verify the whole chain. [`docs/architecture.md`](docs/architecture.md#the-servers-verified-journal) has the details.
+
 ### Browse automatic views
 
 Open [http://127.0.0.1:3000/](http://127.0.0.1:3000/) to see every collection. Each collection gets a useful table without configuration, so a `deals` collection is immediately available at:
@@ -1825,6 +1827,12 @@ collection, and every count is what the current perspective may read—a viewer
 granted one record sees `1`, however many the collection holds. A collection
 that cannot be read, or a journal that does not verify, leaves a dash in place
 of its numbers rather than an error page; opening the view reports why.
+
+Counting reads every record, so the numbers arrive just after the rows: the
+index names every view at once, then fills in the counts, the last changes,
+and the total in the heading with one more request. With JavaScript off, a
+**Count records** link opens the same index with the numbers already in it, at
+`/?summary=inline`.
 
 A collection is called by its directory name in sentence case, so
 `inbound-ratings` reads **Inbound ratings**, and is marked 🗃️ in the sidebar

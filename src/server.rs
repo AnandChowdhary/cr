@@ -818,6 +818,28 @@ fn saved_filter_group_matches(
     }
 }
 
+/// What the view index is asked for.
+///
+/// Unknown parameters are ignored rather than refused, unlike on the other
+/// pages: this is the page a server's address opens, and a stray parameter on a
+/// bookmark must not turn it into an error.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ViewsHomeQuery {
+    #[serde(default)]
+    summary: ViewIndexSummary,
+}
+
+/// Whether the view index document counts the records itself.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ViewIndexSummary {
+    /// The rows at once, and their numbers when the page asks for the region.
+    #[default]
+    Deferred,
+    /// The numbers in the document, for a reader whose browser will not ask.
+    Inline,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuditViewQuery {
@@ -1280,6 +1302,10 @@ fn log_error(status: StatusCode, code: &str, request_id: &str, detail: &str) {
 }
 
 pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
+    // Every request is derived from this one database, so they all resume the
+    // same verified journal rather than each re-hashing it from the first
+    // event. The startup check below is the walk that fills it.
+    let database = database.with_journal_cache();
     // A malformed or linked records directory is stored-state corruption, not
     // a reason to make the HTTP application impossible to construct. Defer a
     // classified conflict to the request that touches it, as the rest of the
@@ -1401,6 +1427,10 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
 
 pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
     let bind = config.bind;
+    // Given here rather than left to `router`, so the warm-up below fills the
+    // cache every request will read.
+    let database = database.with_journal_cache();
+    let journal = database.clone();
     let application = router(database, config)?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -1415,6 +1445,14 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
     std::io::stdout()
         .flush()
         .context("could not flush server address")?;
+    // Verify the journal now, while nobody is waiting for it, so the first
+    // page finds it verified instead of walking it. A request that arrives
+    // sooner waits on this walk rather than starting its own. A failure is
+    // left to the request that needs the journal, which walks it again and
+    // reports why, exactly as it would have without this.
+    tokio::task::spawn_blocking(move || {
+        let _ = journal.audit().record_states();
+    });
     axum::serve(listener, application)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -1699,17 +1737,34 @@ async fn switch_perspective(State(state): State<AppState>, RawForm(raw): RawForm
     result.unwrap_or_else(html_error)
 }
 
-async fn views_home(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn views_home(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let result: ApiResult<Markup> = async {
-        let (views, index) = run_database(&state, &headers, |database| {
+        let query: ViewsHomeQuery = parse_query(raw)?;
+        let representation = Representation::requested(&headers);
+        // Counting reads every record of every collection, which is not a
+        // reason to keep the names of the views from a reader who came to pick
+        // one. So the document is sent without the numbers unless it was asked
+        // for them, and the region is only ever requested to fill them in, so
+        // asking for it is asking for them.
+        let summarize =
+            query.summary == ViewIndexSummary::Inline || representation.wants(VIEW_INDEX_REGION);
+        let (views, index) = run_database(&state, &headers, move |database| {
             let views = database.views()?;
-            let index = ViewIndex::summarize(database, &views)?;
+            let index = if summarize {
+                ViewIndex::summarize(database, &views)?
+            } else {
+                ViewIndex::titles(database)?
+            };
             Ok((views, index))
         })
         .await?;
         let ui = ui_context(&state, &headers).await?;
         Ok(render_views_home(
-            &Representation::requested(&headers),
+            &representation,
             &views,
             &index,
             ui.as_ref(),
@@ -1756,24 +1811,27 @@ impl ViewSummary {
 /// Everything the view index shows beyond the view definitions themselves.
 #[derive(Debug)]
 struct ViewIndex {
+    /// What each collection is called, for the saved views that narrow it.
+    collection_titles: BTreeMap<String, String>,
+    /// `None` in the document a browser is sent first, which leaves the
+    /// numbers to a request for `VIEW_INDEX_REGION`.
+    summary: Option<IndexSummary>,
+}
+
+/// The numbers in the view index, which are the part that reads every record.
+#[derive(Debug)]
+struct IndexSummary {
     /// One per view, by position.
     views: Vec<ViewSummary>,
     users: ViewSummary,
     /// Records across the collections the views read, each collection counted
     /// once however many views narrow it; `None` when one could not be read.
     records: Option<usize>,
-    /// What each collection is called, for the saved views that narrow it.
-    collection_titles: BTreeMap<String, String>,
 }
 
 impl ViewIndex {
-    /// Each collection is read once however many views share it, and the
-    /// journal is walked once for all of them. Neither failure is the index's to
-    /// report: a collection that cannot be read or a journal that does not
-    /// verify leaves a dash where its numbers would be, and opening the view
-    /// says why. The index is how a reader gets to that explanation, so it must
-    /// not be what breaks.
-    fn summarize(database: &Database, views: &[ViewDefinition]) -> Result<Self> {
+    /// The index without its numbers, which costs what the sidebar costs.
+    fn titles(database: &Database) -> Result<Self> {
         let collection_titles = database
             .collection_models()?
             .into_iter()
@@ -1783,14 +1841,34 @@ impl ViewIndex {
                 (model.name, title)
             })
             .collect();
+        Ok(Self {
+            collection_titles,
+            summary: None,
+        })
+    }
+
+    /// Each collection is read once however many views share it, and the
+    /// journal is walked at most once for all of them. Neither failure is the
+    /// index's to report: a collection that cannot be read or a journal that
+    /// does not verify leaves a dash where its numbers would be, and opening
+    /// the view says why. The index is how a reader gets to that explanation,
+    /// so it must not be what breaks.
+    fn summarize(database: &Database, views: &[ViewDefinition]) -> Result<Self> {
+        let mut index = Self::titles(database)?;
         let activity = database.collections_activity().unwrap_or_default();
         let mut listings: BTreeMap<&str, Option<Vec<Record>>> = BTreeMap::new();
+        // Shared across collections, as `search` shares it: a plaintext listing
+        // replays the whole journal, and one replay per collection made this
+        // page cost collections times history.
+        let mut audited_states = None;
         let summaries = views
             .iter()
             .map(|view| {
-                let records = listings
-                    .entry(view.collection.as_str())
-                    .or_insert_with(|| database.list(&view.collection, &[]).ok());
+                let records = listings.entry(view.collection.as_str()).or_insert_with(|| {
+                    database
+                        .list_with_audited_cache(&view.collection, &[], &mut audited_states)
+                        .ok()
+                });
                 let (Some(records), Ok(predicates)) =
                     (records.as_ref(), ViewPredicates::parse(view))
                 else {
@@ -1814,15 +1892,15 @@ impl ViewIndex {
                 )
             })
             .unwrap_or_default();
-        Ok(Self {
+        index.summary = Some(IndexSummary {
             views: summaries,
             users,
             records: listings
                 .values()
                 .map(|records| records.as_ref().map(Vec::len))
                 .sum(),
-            collection_titles,
-        })
+        });
+        Ok(index)
     }
 }
 
@@ -4262,6 +4340,21 @@ fn render_views_home(
     ui: Option<&UiContext>,
     csrf_token: &str,
 ) -> Markup {
+    let internal = ui.is_some_and(|ui| ui.can_read_users);
+    let deferred = index.summary.is_none() && (!views.is_empty() || internal);
+    let region = view_index_region(views, index, ui, deferred);
+    // The answer smaller than the page: the rows with their numbers, and the
+    // heading's total beside them as an out-of-band patch, rendered by the
+    // function the heading itself calls so the two cannot disagree.
+    if representation.wants(VIEW_INDEX_REGION) {
+        return fragment(
+            "Database views",
+            html! {
+                (region)
+                (view_index_total(views, index, OutOfBand::Yes))
+            },
+        );
+    }
     page_or_content(
         representation,
         "Database views",
@@ -4278,8 +4371,13 @@ fn render_views_home(
                 }
                 div class="flex flex-wrap gap-1.5" {
                     span class="cr-pill" { (views.len()) " views" }
-                    @if let Some(total) = index.records.filter(|_| !views.is_empty()) {
-                        span class="cr-pill" { (count_noun(total, "record", "records")) }
+                    (view_index_total(views, index, OutOfBand::No))
+                    @if deferred {
+                        // Nothing will ask for the region without a script, so
+                        // offer the document that has the numbers in it.
+                        noscript {
+                            a href=(VIEW_INDEX_SUMMARY_URL) class="cr-pill" { "Count records" }
+                        }
                     }
                 }
             }
@@ -4292,10 +4390,41 @@ fn render_views_home(
                         "."
                     }
                 }
-            } @else {
+            }
+            (region)
+        },
+        ui,
+        csrf_token,
+    )
+}
+
+/// Every row of the view index, and so every number in it.
+///
+/// `deferred` renders the rows with placeholders where the numbers go, and asks
+/// for this same region with them filled in as soon as htmx has processed it.
+/// The answer replaces the region whole, and carries no trigger of its own.
+fn view_index_region(
+    views: &[ViewDefinition],
+    index: &ViewIndex,
+    ui: Option<&UiContext>,
+    deferred: bool,
+) -> Markup {
+    let summaries = match &index.summary {
+        Some(summary) => summary.views.iter().map(Some).collect::<Vec<_>>(),
+        None => vec![None; views.len()],
+    };
+    let users = index.summary.as_ref().map(|summary| &summary.users);
+    html! {
+        div id=(VIEW_INDEX_REGION)
+            aria-busy=[deferred.then_some("true")]
+            hx-get=[deferred.then_some(VIEW_INDEX_SUMMARY_URL)]
+            hx-trigger=[deferred.then_some("load")]
+            hx-swap=[deferred.then_some("outerHTML")]
+        {
+            @if !views.is_empty() {
                 section class="cr-view-index" aria-label="Available database views" {
                     (view_index_header("View"))
-                    @for (view, summary) in navigation_order_with(views, &index.views) {
+                    @for (view, summary) in navigation_order_with(views, &summaries) {
                         a href=(format!("/{}", encode_segment(&view.name))) class="cr-view-row group" {
                             div class="cr-view-name" {
                                 span class="cr-view-icon" aria-hidden="true" { (view_icon(view)) }
@@ -4306,7 +4435,7 @@ fn render_views_home(
                                     }
                                 }
                             }
-                            (view_index_numbers(summary))
+                            (view_index_numbers(*summary))
                             div class="cr-view-kind" {
                                 span class="cr-pill" {
                                     @if view.saved { "saved" } @else { "automatic" }
@@ -4344,7 +4473,7 @@ fn render_views_home(
                             span class="cr-view-icon" aria-hidden="true" { (USERS_ICON) }
                             h2 class="truncate" { "Users" }
                         }
-                        (view_index_numbers(&index.users))
+                        (view_index_numbers(users))
                         div class="cr-view-kind" {
                             span class="cr-pill" { "access control" }
                             span class="cr-pill cr-pill-warn" { "read-only" }
@@ -4370,10 +4499,30 @@ fn render_views_home(
                     }
                 }
             }
-        },
-        ui,
-        csrf_token,
-    )
+        }
+    }
+}
+
+/// The heading's total-records pill.
+///
+/// Rendered even when there is no total to show, empty and hidden, because it
+/// is also where the index region's out-of-band copy lands, and htmx drops a
+/// patch whose target is not on the page.
+fn view_index_total(views: &[ViewDefinition], index: &ViewIndex, out_of_band: OutOfBand) -> Markup {
+    let total = index
+        .summary
+        .as_ref()
+        .and_then(|summary| summary.records)
+        .filter(|_| !views.is_empty());
+    html! {
+        @match total {
+            Some(total) => span id=(VIEW_INDEX_TOTAL_ID) class="cr-pill" hx-swap-oob=[out_of_band.attribute()] {
+                (count_noun(total, "record", "records"))
+            },
+            // No `cr-pill`: its `display` would override `hidden`.
+            None => span id=(VIEW_INDEX_TOTAL_ID) hidden hx-swap-oob=[out_of_band.attribute()] {},
+        }
+    }
 }
 
 fn view_index_header(first: &str) -> Markup {
@@ -4388,12 +4537,22 @@ fn view_index_header(first: &str) -> Markup {
     }
 }
 
-/// The record count and last change of one index row.
+/// The record count and last change of one index row, or placeholders for them
+/// while the region is still being counted.
 ///
 /// The column headings are hidden from assistive technology — each row is one
 /// link, read as one phrase — so the units a heading would have supplied are in
-/// the row itself, visible only where the headings are not.
-fn view_index_numbers(summary: &ViewSummary) -> Markup {
+/// the row itself, visible only where the headings are not. A placeholder is
+/// hidden too: the region's `aria-busy` is what says the numbers are coming.
+fn view_index_numbers(summary: Option<&ViewSummary>) -> Markup {
+    let Some(summary) = summary else {
+        return html! {
+            span class="cr-view-count" {
+                span class="text-slate-400" aria-hidden="true" { "…" }
+            }
+            span class="cr-view-updated" {}
+        };
+    };
     html! {
         span class="cr-view-count" {
             @match summary.records {
@@ -8009,6 +8168,27 @@ const VIEW_FILTER_SUMMARY_ID: &str = "cr-view-filter-summary";
 /// the form can ever be asked for it.
 const RECORD_FORM_REGION: &str = "cr-record-form";
 
+/// The DOM id of the view index's rows, the part of the index with numbers in
+/// it.
+///
+/// Counting what each view shows reads every record of every collection, and
+/// the index is the page a server's address opens, so a browser navigating to
+/// it is sent the rows with placeholders and this region asks for itself again
+/// once htmx has loaded, answered by `?summary=inline` with the numbers filled
+/// in. The heading's total travels beside it as an out-of-band patch.
+/// `?summary=inline` without an htmx target is the whole document with the
+/// numbers in it: what the `<noscript>` link beside the total offers a browser
+/// that will never ask for the region.
+const VIEW_INDEX_REGION: &str = "cr-view-index";
+
+/// The DOM id of the view index heading's total-records pill; see
+/// `view_index_total`.
+const VIEW_INDEX_TOTAL_ID: &str = "cr-view-index-total";
+
+/// The view index with its numbers rendered in, as a document or, asked for
+/// `VIEW_INDEX_REGION`, as that region.
+const VIEW_INDEX_SUMMARY_URL: &str = "/?summary=inline";
+
 /// Which representation of a page a request is asking for: the whole document,
 /// or one region of it.
 ///
@@ -10008,10 +10188,49 @@ fn collection_component_name(collection: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, INTERNAL_MESSAGE};
-    use crate::DomainError;
+    use super::{ApiError, INTERNAL_MESSAGE, ViewIndex};
+    use crate::{
+        Database, DomainError,
+        audit::{reset_verify_chain_calls, verify_chain_calls},
+    };
     use anyhow::anyhow;
     use axum::http::StatusCode;
+
+    /// Every plaintext listing needs the journal replayed, and the index lists
+    /// every collection. Replaying it once per collection made the index cost
+    /// collections times history — a minute, on a database with a long one —
+    /// so the number of walks is pinned here, and it does not grow with the
+    /// number of collections.
+    #[test]
+    fn the_view_index_walks_the_journal_a_fixed_number_of_times() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::init(root.path().join("database")).unwrap();
+        for collection in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"] {
+            for id in ["one", "two"] {
+                database.create(collection, id, &[], "").unwrap();
+            }
+        }
+        let views = database.views().unwrap();
+
+        // One walk for the activity, and one replay every listing shares.
+        reset_verify_chain_calls();
+        let index = ViewIndex::summarize(&database, &views).unwrap();
+        assert_eq!(verify_chain_calls(), 2);
+        assert_eq!(index.summary.unwrap().records, Some(12));
+
+        // The server's database keeps the verified journal, so its first index
+        // walks it once and the next does not walk it at all, even after an
+        // append: only the new event is verified.
+        let served = database.with_journal_cache();
+        reset_verify_chain_calls();
+        ViewIndex::summarize(&served, &views).unwrap();
+        assert_eq!(verify_chain_calls(), 1);
+        served.create("alpha", "three", &[], "").unwrap();
+        reset_verify_chain_calls();
+        let index = ViewIndex::summarize(&served, &views).unwrap();
+        assert_eq!(verify_chain_calls(), 0);
+        assert_eq!(index.summary.unwrap().records, Some(13));
+    }
 
     /// A leaky diagnostic chain of the shape the domain layer actually
     /// produces, used to prove that none of it reaches a caller.
