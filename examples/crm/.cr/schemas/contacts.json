@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "x-cr-ui": {
+    "icon": "👤",
     "order": ["name", "email", "title", "status", "last_contacted", "relations"]
   },
   "required": ["name", "email", "title", "status"],

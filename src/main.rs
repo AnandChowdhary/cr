@@ -388,7 +388,7 @@ enum Command {
         command: PinCommand,
     },
 
-    /// Declare collection encryption policy in JSON Schema.
+    /// Declare collection encryption policy and navigation labels in JSON Schema.
     Schema {
         #[command(subcommand)]
         command: SchemaCommand,
@@ -599,6 +599,26 @@ enum SchemaCommand {
 
     /// Encrypt every record's Markdown body at rest.
     EncryptBody { collection: String },
+
+    /// Name a collection in navigation, for example "Inbound ratings".
+    Label {
+        collection: String,
+        #[arg(required_unless_present = "clear")]
+        label: Option<String>,
+        /// Return to the name derived from the collection directory.
+        #[arg(long, conflicts_with = "label")]
+        clear: bool,
+    },
+
+    /// Mark a collection in navigation with an emoji instead of the default 🗃️.
+    Icon {
+        collection: String,
+        #[arg(required_unless_present = "clear")]
+        icon: Option<String>,
+        /// Return to the default icon.
+        #[arg(long, conflicts_with = "icon")]
+        clear: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1462,6 +1482,34 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         "Already enabled"
                     }
                 );
+            }
+            SchemaCommand::Label {
+                collection, label, ..
+            } => {
+                let changed = database.set_collection_label(&collection, label.as_deref())?;
+                match (label, changed) {
+                    (Some(label), true) => println!("Labeled {collection} as {}", label.trim()),
+                    (Some(label), false) => {
+                        println!("{collection} is already labeled {}", label.trim())
+                    }
+                    (None, true) => println!("Cleared the label for {collection}"),
+                    (None, false) => println!("{collection} has no label"),
+                }
+            }
+            SchemaCommand::Icon {
+                collection, icon, ..
+            } => {
+                let changed = database.set_collection_icon(&collection, icon.as_deref())?;
+                match (icon, changed) {
+                    (Some(icon), true) => {
+                        println!("Set the icon for {collection} to {}", icon.trim())
+                    }
+                    (Some(icon), false) => {
+                        println!("{collection} already uses the icon {}", icon.trim())
+                    }
+                    (None, true) => println!("Cleared the icon for {collection}"),
+                    (None, false) => println!("{collection} has no icon"),
+                }
             }
         },
         Command::Sync { command } => match command {

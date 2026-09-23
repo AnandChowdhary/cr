@@ -42,4 +42,6 @@ pub use pins::Pin;
 pub use search::{SearchQuery, SearchTarget};
 pub use sync::{SyncAttribution, SyncDefinition, SyncRunLedger, SyncRunSummary};
 pub use value::{Assignment, FilterExpression, FilterOperator, compare_yaml_values};
-pub use views::{ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch};
+pub use views::{
+    CollectionPresentation, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
+};

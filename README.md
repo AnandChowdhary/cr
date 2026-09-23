@@ -1699,10 +1699,26 @@ Open [http://127.0.0.1:3000/](http://127.0.0.1:3000/) to see every collection. E
 http://127.0.0.1:3000/deals
 ```
 
+The index lists saved views, then collections, one line each: the name, how
+many records the view shows, when the most recently changed of them last
+changed, and whether it is automatic, saved, or Kanban along with any saved
+filters. A saved view's count is the records it matches, not the size of its
+collection, and every count is what the current perspective may read—a viewer
+granted one record sees `1`, however many the collection holds. A collection
+that cannot be read, or a journal that does not verify, leaves a dash in place
+of its numbers rather than an error page; opening the view reports why.
+
+A collection is called by its directory name in sentence case, so
+`inbound-ratings` reads **Inbound ratings**, and is marked 🗃️ in the sidebar
+and index. Give it a better name or its own emoji with
+[`cr schema label` and `cr schema icon`](#name-collections-and-give-them-icons).
+
 The default UI uses a compact workspace shell rather than a documentation-style
 page frame. On desktop, saved views, then collections, then internal records
 stay visible in a persistent sidebar with audit, OpenAPI, and the RBAC
-perspective control anchored below;
+perspective control anchored below. Every entry is marked by an emoji—a
+collection's own when its schema names one—and each section is ordered by the
+name a reader sees;
 the active route remains highlighted on list, board, and record pages. Narrow
 screens collapse the same hierarchy into a sticky top bar and horizontally
 scrollable view strip. The main workspace uses short breadcrumbs, one-line
@@ -1777,7 +1793,16 @@ http://127.0.0.1:3000/browse
 
 It is a read-only fallback for inspecting files that are not CR records. The
 first page is the canonical database root and lists every visible entry,
-including dotfiles, with directories first. Open a directory to continue
+including dotfiles, with directories first. Like a view table, each entry shows
+when it was **Created** and **Updated**—here the filesystem's birth and
+modification times rather than the audit journal's, and `—` where a filesystem
+does not record a birth time. Listings open newest-created first. Click
+**Name**, **Created**, **Updated**, or **Size** to sort by it, and again to
+reverse; directories stay above files, then links and the rest, whichever column
+orders them, and a value the filesystem cannot give sorts last in both
+directions. The order is in the URL as `sort_field` and `sort_direction` and
+follows you into subdirectories; the default order adds nothing, so a pinned
+location is still recognized. Open a directory to continue
 browsing, open a regular file for an escaped text preview (or a hexadecimal
 binary preview), and use the `..` row to move above the database until reaching
 the filesystem root. Text previews wrap long lines, breaking even a URL or a
@@ -1874,6 +1899,40 @@ Use the optional `x-cr-ui.order` schema extension to control field order without
 ```
 
 Fields omitted from the order remain visible after configured fields, with required fields first.
+
+### Name collections and give them icons
+
+A collection's navigation name and emoji live beside `order`, in the same
+`x-cr-ui` extension. Set them from the CLI:
+
+```sh
+cr schema label inbound-ratings "Inbound ratings"
+cr schema icon inbound-ratings ⭐
+cr schema label inbound-ratings --clear   # back to the directory name
+cr schema icon inbound-ratings --clear    # back to 🗃️
+```
+
+or by hand:
+
+```json
+{
+  "x-cr-ui": { "label": "Inbound ratings", "icon": "⭐" }
+}
+```
+
+The label replaces the collection's name in the sidebar, the view index, page
+headings, and `cr view show`; the icon marks the collection and every saved
+view of it. A label is one line of at most 80 characters, and an icon is a
+single emoji of at most 8 characters, so the joiners and selectors that build
+one fit but a word does not. Neither changes what a record may contain.
+
+The commands refuse a value that does not fit, need collection ownership when
+RBAC is enabled, and create `.cr/schemas/<collection>.json` when the collection
+has none—without `properties`, so the record form stays the complete raw-YAML
+editor. Like `cr schema encrypt`, they rewrite an existing schema file in
+canonical JSON formatting. A hand-written value that does not fit is ignored,
+the same as a malformed `order`, so a typo in a hint never takes a page down.
+The built-in `users` collection keeps its fixed name.
 
 ### Browse audit history
 
@@ -2367,6 +2426,8 @@ cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N]
 
 cr schema encrypt COLLECTION FIELD
 cr schema encrypt-body COLLECTION
+cr schema label COLLECTION (LABEL | --clear)
+cr schema icon COLLECTION (EMOJI | --clear)
 
 cr access init [--name NAME] [--email EMAIL] [--kind human|service | --service]
 cr access check ACTION RESOURCE [--json]

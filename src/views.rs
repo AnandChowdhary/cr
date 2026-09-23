@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -43,11 +43,26 @@ const RESERVED_VIEW_NAMES: &[&str] = &[
     "users",
 ];
 
+/// The schema extension that holds a collection's presentation hints.
+///
+/// The record form already reads `order` from it. Nothing under it changes what
+/// a record may contain, which is why it is a vendor keyword beside the
+/// validation rather than a second file beside the schema.
+pub(crate) const UI_EXTENSION: &str = "x-cr-ui";
+const MAX_COLLECTION_LABEL_CHARS: usize = 80;
+/// Enough for the longest emoji sequences — a family, a skin-toned
+/// profession, a flag — without admitting a word.
+const MAX_COLLECTION_ICON_CHARS: usize = 8;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ViewDefinition {
     pub name: String,
     pub version: u32,
     pub title: String,
+    /// The collection's icon, shared by every view of it, when its schema
+    /// declares one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     pub collection: String,
     pub filters: Vec<String>,
     pub where_expr: Vec<String>,
@@ -83,6 +98,86 @@ pub struct ViewFilterGroup {
     #[serde(default, rename = "match")]
     pub match_mode: ViewPredicateMatch,
     pub expressions: Vec<String>,
+}
+
+/// How navigation names and marks a collection.
+///
+/// Both come from `x-cr-ui` in the collection's schema. They are hints, read
+/// the way the form reads `order`: a value that is not a usable label or icon
+/// is ignored rather than refused, because a typo in presentation must not take
+/// every page of the database down with it. `cr schema label` and
+/// `cr schema icon` refuse the same values before they are written.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CollectionPresentation {
+    pub label: Option<String>,
+    pub icon: Option<String>,
+}
+
+impl CollectionPresentation {
+    /// What navigation calls the collection: its label, or its directory name
+    /// in sentence case, so `inbound-ratings` reads `Inbound ratings`.
+    pub fn title(&self, collection: &str) -> String {
+        self.label.clone().unwrap_or_else(|| {
+            let words = collection.replace(['-', '_'], " ");
+            let mut characters = words.chars();
+            match characters.next() {
+                Some(first) => first.to_uppercase().chain(characters).collect(),
+                None => words,
+            }
+        })
+    }
+
+    pub fn from_schema(schema: Option<&serde_json::Value>) -> Self {
+        let hint = |key: &str| {
+            schema
+                .and_then(|schema| schema.get(UI_EXTENSION))
+                .and_then(|ui| ui.get(key))
+                .and_then(serde_json::Value::as_str)
+        };
+        Self {
+            label: hint("label").and_then(|label| normalize_collection_label(label).ok()),
+            icon: hint("icon").and_then(|icon| normalize_collection_icon(icon).ok()),
+        }
+    }
+}
+
+/// A collection label as it is stored: trimmed, one line, and short enough for
+/// a sidebar.
+pub(crate) fn normalize_collection_label(label: &str) -> Result<String> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Err(invalid("collection label cannot be empty"));
+    }
+    if label.chars().any(char::is_control) {
+        return Err(invalid("collection label must be a single line"));
+    }
+    if label.chars().count() > MAX_COLLECTION_LABEL_CHARS {
+        return Err(invalid(format!(
+            "collection label cannot be longer than {MAX_COLLECTION_LABEL_CHARS} characters"
+        )));
+    }
+    Ok(label.to_owned())
+}
+
+/// A collection icon as it is stored: one emoji, give or take the joiners and
+/// selectors that build one.
+pub(crate) fn normalize_collection_icon(icon: &str) -> Result<String> {
+    let icon = icon.trim();
+    if icon.is_empty() {
+        return Err(invalid("collection icon cannot be empty"));
+    }
+    if icon
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(invalid("collection icon cannot contain spaces"));
+    }
+    if icon.chars().count() > MAX_COLLECTION_ICON_CHARS {
+        return Err(invalid(format!(
+            "collection icon must be a single emoji, at most {MAX_COLLECTION_ICON_CHARS} characters"
+        )));
+    }
+    Ok(icon.to_owned())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -220,41 +315,44 @@ impl Database {
         if RESERVED_VIEW_NAMES.contains(&name) {
             return Err(DomainError::view_not_found(name).into());
         }
-        if let Some(view) = self.read_view_optional(name)? {
-            if !self.access_enabled()?
-                || self
-                    .collection_models()?
-                    .into_iter()
-                    .any(|model| model.name == view.collection)
-            {
+        let models = self.collection_models()?;
+        let presentation = |collection: &str| {
+            CollectionPresentation::from_schema(
+                models
+                    .iter()
+                    .find(|model| model.name == collection)
+                    .and_then(|model| model.schema.as_ref()),
+            )
+        };
+        if let Some(mut view) = self.read_view_optional(name)? {
+            if !self.access_enabled()? || models.iter().any(|model| model.name == view.collection) {
+                view.icon = presentation(&view.collection).icon;
                 return Ok(view);
             }
             return Err(DomainError::view_not_found(name).into());
         }
 
-        if self
-            .collection_models()?
-            .into_iter()
-            .any(|model| model.name == name)
-        {
-            return Ok(automatic_view(name));
+        if models.iter().any(|model| model.name == name) {
+            return Ok(automatic_view(name, presentation(name)));
         }
         Err(DomainError::view_not_found(name).into())
     }
 
     pub fn views(&self) -> Result<Vec<ViewDefinition>> {
         let models = self.collection_models()?;
-        let visible_collections = models
+        let presentations = models
             .iter()
-            .map(|model| model.name.clone())
-            .collect::<BTreeSet<_>>();
-        let mut views: BTreeMap<String, ViewDefinition> = models
-            .into_iter()
-            .filter(|model| !RESERVED_VIEW_NAMES.contains(&model.name.as_str()))
             .map(|model| {
-                let name = model.name;
-                (name.clone(), automatic_view(&name))
+                (
+                    model.name.clone(),
+                    CollectionPresentation::from_schema(model.schema.as_ref()),
+                )
             })
+            .collect::<BTreeMap<_, _>>();
+        let mut views: BTreeMap<String, ViewDefinition> = presentations
+            .iter()
+            .filter(|(name, _)| !RESERVED_VIEW_NAMES.contains(&name.as_str()))
+            .map(|(name, presentation)| (name.clone(), automatic_view(name, presentation.clone())))
             .collect();
 
         let Some(entries) =
@@ -281,8 +379,10 @@ impl Database {
         }
         names.sort();
         for name in names {
-            let view = self.read_view(&name)?;
-            if !self.access_enabled()? || visible_collections.contains(&view.collection) {
+            let mut view = self.read_view(&name)?;
+            let presentation = presentations.get(&view.collection);
+            if !self.access_enabled()? || presentation.is_some() {
+                view.icon = presentation.and_then(|presentation| presentation.icon.clone());
                 views.insert(name, view);
             }
         }
@@ -433,11 +533,12 @@ fn validate_stored(name: &str, view: &StoredViewDefinition) -> Result<()> {
     Ok(())
 }
 
-fn automatic_view(collection: &str) -> ViewDefinition {
+fn automatic_view(collection: &str, presentation: CollectionPresentation) -> ViewDefinition {
     ViewDefinition {
         name: collection.to_owned(),
         version: VIEW_FORMAT_VERSION,
-        title: collection.replace(['-', '_'], " "),
+        title: presentation.title(collection),
+        icon: presentation.icon,
         collection: collection.to_owned(),
         filters: Vec::new(),
         where_expr: Vec::new(),
@@ -457,6 +558,7 @@ fn to_public(name: &str, stored: StoredViewDefinition, saved: bool) -> ViewDefin
         name: name.to_owned(),
         version: stored.version,
         title: stored.title,
+        icon: None,
         collection: stored.collection,
         filters: stored.filters,
         where_expr: stored.where_expr,

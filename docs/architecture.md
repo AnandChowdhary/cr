@@ -104,7 +104,7 @@ database-root/
 - Front matter contains arbitrary model attributes.
 - The Markdown body is opaque user content and is preserved by metadata-only updates.
 - Relations live under `relations.<name>` as lists of `{ collection, id }` references. `cr link` verifies the target exists and is idempotent.
-- A collection schema is optional and validates only its front matter.
+- A collection schema is optional and validates only its front matter. Its `x-cr-ui` extension carries presentation hints—form field order, a navigation label, an icon—that never change what validates, and a hint that does not fit is ignored rather than refused.
 - A saved view is an optional versioned query/display definition. Collections also receive automatic views without a file.
 - A saved sync is an optional versioned command definition. Its mutable JSON checkpoint and advisory lock are stored separately from configuration, as is the ledger of a run that has started applying records and not yet finished.
 

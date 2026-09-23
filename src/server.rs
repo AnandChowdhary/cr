@@ -9,6 +9,7 @@ use std::{
         Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::SystemTime,
 };
 
 #[cfg(unix)]
@@ -31,16 +32,18 @@ use percent_encoding::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value as JsonValue, json};
 use sha2::{Digest, Sha256};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
     AccessAction, AccessIdentity, AccessResource, AgentEvidence, Assignment, Attribution,
     AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
     AuditIntentPart, AuditSource, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary,
-    CollectionModel, Database, DomainError, FilterExpression, FilterOperator, Finding,
-    RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SchemaViolation, SearchQuery,
-    SearchTarget, SortDirection, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup,
-    ViewLayout, ViewPredicateMatch, audit::AuditChange, sort_records_by_field,
+    CollectionModel, CollectionPresentation, Database, DomainError, FilterExpression,
+    FilterOperator, Finding, RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition,
+    SchemaViolation, SearchQuery, SearchTarget, SortDirection, USERS_COLLECTION, User, UserKind,
+    UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
+    audit::AuditChange, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -200,6 +203,15 @@ impl BrowserEntryKind {
         }
     }
 
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Directory => DIRECTORY_ICON,
+            Self::File => FILE_ICON,
+            Self::Symlink => SYMLINK_ICON,
+            Self::Other => OTHER_FILE_ICON,
+        }
+    }
+
     fn sort_rank(self) -> u8 {
         match self {
             Self::Directory => 0,
@@ -216,6 +228,155 @@ struct BrowserEntry {
     href: Option<String>,
     kind: BrowserEntryKind,
     size: Option<u64>,
+    /// Birth time, which not every filesystem records.
+    created: Option<SystemTime>,
+    modified: Option<SystemTime>,
+}
+
+/// A directory-listing column the reader can order by.
+///
+/// Type is not one of them: directories are always listed first, then files,
+/// then everything else, so ordering by type could only ever reproduce the
+/// grouping every listing already has.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum BrowseSortField {
+    Name,
+    Size,
+    Created,
+    Updated,
+}
+
+impl BrowseSortField {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Size => "size",
+            Self::Created => "created",
+            Self::Updated => "updated",
+        }
+    }
+}
+
+/// How a directory listing is ordered within its kind groups.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrowseSort {
+    field: BrowseSortField,
+    direction: ViewSortDirection,
+}
+
+impl BrowseSort {
+    /// Newest first, the order a view table opens in, and for the same reason:
+    /// a directory is read to answer "what changed?" at least as often as
+    /// "what is here?".
+    const DEFAULT: Self = Self {
+        field: BrowseSortField::Created,
+        direction: ViewSortDirection::Desc,
+    };
+
+    fn requested(query: &BrowseQuery) -> Self {
+        match (query.sort_field, query.sort_direction) {
+            (None, None) => Self::DEFAULT,
+            (field, direction) => Self {
+                field: field.unwrap_or(Self::DEFAULT.field),
+                direction: direction.unwrap_or_default(),
+            },
+        }
+    }
+
+    /// `href`, a browse link, carrying this order along.
+    ///
+    /// The default order adds nothing, so a link to a directory in the default
+    /// order is its canonical address — the one a pin stores and the sidebar
+    /// compares against.
+    fn carry(self, href: &str) -> String {
+        if self == Self::DEFAULT {
+            return href.to_owned();
+        }
+        let separator = if href.contains('?') { '&' } else { '?' };
+        let direction = match self.direction {
+            ViewSortDirection::Asc => "asc",
+            ViewSortDirection::Desc => "desc",
+        };
+        format!(
+            "{href}{separator}sort_field={}&sort_direction={direction}",
+            self.field.as_str()
+        )
+    }
+
+    /// The order a column heading switches to: that column ascending, or
+    /// descending when it already is ascending — the rule view tables use.
+    fn toggled(self, field: BrowseSortField) -> Self {
+        let direction = if self.field == field && self.direction == ViewSortDirection::Asc {
+            ViewSortDirection::Desc
+        } else {
+            ViewSortDirection::Asc
+        };
+        Self { field, direction }
+    }
+
+    fn indicator(self, field: BrowseSortField) -> &'static str {
+        match (self.field == field, self.direction) {
+            (false, _) => "↕",
+            (true, ViewSortDirection::Asc) => "↑",
+            (true, ViewSortDirection::Desc) => "↓",
+        }
+    }
+
+    fn aria_state(self, field: BrowseSortField) -> &'static str {
+        match (self.field == field, self.direction) {
+            (false, _) => "none",
+            (true, ViewSortDirection::Asc) => "ascending",
+            (true, ViewSortDirection::Desc) => "descending",
+        }
+    }
+
+    /// Directories, then files, then links and the rest; within each group
+    /// this order, with values a filesystem does not record last in either
+    /// direction and the name as the deterministic tie-breaker.
+    fn apply(self, entries: &mut [BrowserEntry]) {
+        fn present_first<T: Ord>(
+            left: Option<T>,
+            right: Option<T>,
+            direction: ViewSortDirection,
+        ) -> std::cmp::Ordering {
+            match (left, right) {
+                (Some(left), Some(right)) => match direction {
+                    ViewSortDirection::Asc => left.cmp(&right),
+                    ViewSortDirection::Desc => right.cmp(&left),
+                },
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        }
+        let by_name = |left: &BrowserEntry, right: &BrowserEntry| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.name.cmp(&right.name))
+        };
+        entries.sort_by(|left, right| {
+            let chosen = match self.field {
+                BrowseSortField::Name => match self.direction {
+                    ViewSortDirection::Asc => by_name(left, right),
+                    ViewSortDirection::Desc => by_name(right, left),
+                },
+                BrowseSortField::Size => present_first(left.size, right.size, self.direction),
+                BrowseSortField::Created => {
+                    present_first(left.created, right.created, self.direction)
+                }
+                BrowseSortField::Updated => {
+                    present_first(left.modified, right.modified, self.direction)
+                }
+            };
+            left.kind
+                .sort_rank()
+                .cmp(&right.kind.sort_rank())
+                .then(chosen)
+                .then_with(|| by_name(left, right))
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -368,6 +529,8 @@ struct PageQuery {
 #[serde(deny_unknown_fields)]
 struct BrowseQuery {
     path: Option<String>,
+    sort_field: Option<BrowseSortField>,
+    sort_direction: Option<ViewSortDirection>,
 }
 
 /// Scope and window for an integrity report.
@@ -586,6 +749,57 @@ impl ViewFilterMatch {
                 Self::All => filters.iter().all(|filter| filter.matches(attributes)),
                 Self::Any => filters.iter().any(|filter| filter.matches(attributes)),
             }
+    }
+}
+
+/// A view definition's own predicates, parsed once.
+///
+/// This is the part of "which records does this view show" that the definition
+/// decides, before a search or an ad hoc filter narrows it further, and the view
+/// page and the view index both ask it so that the count beside a view on the
+/// index is the count on the view.
+#[derive(Debug)]
+struct ViewPredicates {
+    /// Equalities, which the database can apply while it lists.
+    assignments: Vec<Assignment>,
+    expressions: Vec<FilterExpression>,
+    groups: Vec<(ViewPredicateMatch, Vec<FilterExpression>)>,
+}
+
+impl ViewPredicates {
+    fn parse(view: &ViewDefinition) -> Result<Self> {
+        let expressions = |expressions: &[String]| {
+            expressions
+                .iter()
+                .map(|expression| FilterExpression::from_str(expression))
+                .collect::<Result<Vec<_>>>()
+        };
+        Ok(Self {
+            assignments: view
+                .filters
+                .iter()
+                .map(|filter| Assignment::from_str(filter))
+                .collect::<Result<Vec<_>>>()?,
+            expressions: expressions(&view.where_expr)?,
+            groups: view
+                .filter_groups
+                .iter()
+                .map(|group| Ok((group.match_mode, expressions(&group.expressions)?)))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
+    fn matches(&self, attributes: &Mapping) -> bool {
+        self.assignments
+            .iter()
+            .all(|assignment| assignment.matches(attributes))
+            && self
+                .expressions
+                .iter()
+                .all(|expression| expression.matches(attributes))
+            && self.groups.iter().all(|(match_mode, expressions)| {
+                saved_filter_group_matches(*match_mode, expressions, attributes)
+            })
     }
 }
 
@@ -1487,17 +1701,129 @@ async fn switch_perspective(State(state): State<AppState>, RawForm(raw): RawForm
 
 async fn views_home(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let result: ApiResult<Markup> = async {
-        let views = run_database(&state, &headers, Database::views).await?;
+        let (views, index) = run_database(&state, &headers, |database| {
+            let views = database.views()?;
+            let index = ViewIndex::summarize(database, &views)?;
+            Ok((views, index))
+        })
+        .await?;
         let ui = ui_context(&state, &headers).await?;
         Ok(render_views_home(
             &Representation::requested(&headers),
             &views,
+            &index,
             ui.as_ref(),
             &state.csrf_token,
         ))
     }
     .await;
     html_result(result)
+}
+
+/// What the view index says about one view: how many records it shows this
+/// perspective, and when the most recently changed of them last changed.
+#[derive(Debug, Default)]
+struct ViewSummary {
+    /// `None` when the collection could not be read.
+    records: Option<usize>,
+    /// `None` when no matching record has audit history this perspective may
+    /// read, or when the journal could not be read.
+    updated_at: Option<String>,
+}
+
+impl ViewSummary {
+    fn of<'a>(
+        records: impl IntoIterator<Item = &'a str>,
+        activity: Option<&BTreeMap<String, RecordActivity>>,
+    ) -> Self {
+        let mut count = 0;
+        let mut newest: Option<&RecordActivity> = None;
+        for id in records {
+            count += 1;
+            if let Some(record) = activity.and_then(|activity| activity.get(id))
+                && newest.is_none_or(|newest| record.updated_sequence > newest.updated_sequence)
+            {
+                newest = Some(record);
+            }
+        }
+        Self {
+            records: Some(count),
+            updated_at: newest.map(|record| record.updated_at.clone()),
+        }
+    }
+}
+
+/// Everything the view index shows beyond the view definitions themselves.
+#[derive(Debug)]
+struct ViewIndex {
+    /// One per view, by position.
+    views: Vec<ViewSummary>,
+    users: ViewSummary,
+    /// Records across the collections the views read, each collection counted
+    /// once however many views narrow it; `None` when one could not be read.
+    records: Option<usize>,
+    /// What each collection is called, for the saved views that narrow it.
+    collection_titles: BTreeMap<String, String>,
+}
+
+impl ViewIndex {
+    /// Each collection is read once however many views share it, and the
+    /// journal is walked once for all of them. Neither failure is the index's to
+    /// report: a collection that cannot be read or a journal that does not
+    /// verify leaves a dash where its numbers would be, and opening the view
+    /// says why. The index is how a reader gets to that explanation, so it must
+    /// not be what breaks.
+    fn summarize(database: &Database, views: &[ViewDefinition]) -> Result<Self> {
+        let collection_titles = database
+            .collection_models()?
+            .into_iter()
+            .map(|model| {
+                let title =
+                    CollectionPresentation::from_schema(model.schema.as_ref()).title(&model.name);
+                (model.name, title)
+            })
+            .collect();
+        let activity = database.collections_activity().unwrap_or_default();
+        let mut listings: BTreeMap<&str, Option<Vec<Record>>> = BTreeMap::new();
+        let summaries = views
+            .iter()
+            .map(|view| {
+                let records = listings
+                    .entry(view.collection.as_str())
+                    .or_insert_with(|| database.list(&view.collection, &[]).ok());
+                let (Some(records), Ok(predicates)) =
+                    (records.as_ref(), ViewPredicates::parse(view))
+                else {
+                    return ViewSummary::default();
+                };
+                ViewSummary::of(
+                    records
+                        .iter()
+                        .filter(|record| predicates.matches(&record.attributes))
+                        .map(|record| record.id.as_str()),
+                    activity.get(&view.collection),
+                )
+            })
+            .collect();
+        let users = database
+            .users()
+            .map(|users| {
+                ViewSummary::of(
+                    users.iter().map(|(id, _)| id.as_str()),
+                    activity.get(USERS_COLLECTION),
+                )
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            views: summaries,
+            users,
+            records: listings
+                .values()
+                .map(|records| records.as_ref().map(Vec::len))
+                .sum(),
+            collection_titles,
+        })
+    }
 }
 
 async fn audit_view(
@@ -1625,13 +1951,15 @@ async fn browse_view(
             Ok((start, navigation))
         })
         .await?;
+        let sort = BrowseSort::requested(&query);
         let requested = query.path;
-        let page =
-            tokio::task::spawn_blocking(move || browse_filesystem(&start, requested.as_deref()))
-                .await
-                .map_err(|error| {
-                    ApiError::internal(anyhow!(error).context("filesystem browser task failed"))
-                })??;
+        let page = tokio::task::spawn_blocking(move || {
+            browse_filesystem(&start, requested.as_deref(), sort)
+        })
+        .await
+        .map_err(|error| {
+            ApiError::internal(anyhow!(error).context("filesystem browser task failed"))
+        })??;
         let mut documents = Vec::new();
         if let BrowserItem::Directory(entries) = &page.item {
             for (anchor, entry) in directory_documents(entries) {
@@ -1657,6 +1985,7 @@ async fn browse_view(
         Ok(render_browse_view(
             &Representation::requested(&headers),
             &page,
+            sort,
             &documents,
             &navigation,
             ui.as_ref(),
@@ -1727,7 +2056,11 @@ async fn change_pin(
     result.unwrap_or_else(html_error)
 }
 
-fn browse_filesystem(start: &FilePath, requested: Option<&str>) -> ApiResult<BrowserPage> {
+fn browse_filesystem(
+    start: &FilePath,
+    requested: Option<&str>,
+    sort: BrowseSort,
+) -> ApiResult<BrowserPage> {
     let candidate = match requested.filter(|value| !value.is_empty()) {
         Some(path) => {
             let path = PathBuf::from(path);
@@ -1753,7 +2086,9 @@ fn browse_filesystem(start: &FilePath, requested: Option<&str>) -> ApiResult<Bro
         .map(FilePath::to_path_buf);
     let crumbs = browse_crumbs(&location);
     let item = if metadata.is_dir() {
-        BrowserItem::Directory(browse_directory(&location)?)
+        let mut entries = browse_directory(&location)?;
+        sort.apply(&mut entries);
+        BrowserItem::Directory(entries)
     } else if metadata.is_file() {
         BrowserItem::File(browse_file(&location)?)
     } else {
@@ -1790,24 +2125,27 @@ fn browse_directory(path: &FilePath) -> ApiResult<Vec<BrowserEntry>> {
         } else {
             BrowserEntryKind::Other
         };
-        let size = (kind == BrowserEntryKind::File)
-            .then(|| entry.metadata().ok().map(|metadata| metadata.len()))
-            .flatten();
+        // The entry's own metadata, not its target's: a link's times are the
+        // link's, as its kind is.
+        let metadata = entry.metadata().ok();
+        let size = metadata
+            .as_ref()
+            .filter(|_| kind == BrowserEntryKind::File)
+            .map(std::fs::Metadata::len);
         let entry_path = entry.path();
         entries.push(BrowserEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             href: entry_path.to_str().map(browse_url),
             kind,
             size,
+            created: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.created().ok()),
+            modified: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok()),
         });
     }
-    entries.sort_by(|left, right| {
-        left.kind
-            .sort_rank()
-            .cmp(&right.kind.sort_rank())
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-            .then_with(|| left.name.cmp(&right.name))
-    });
     Ok(entries)
 }
 
@@ -2013,42 +2351,16 @@ async fn view_records(
             updatable,
         ) = run_database(&state, &headers, move |database| {
             let view = database.view(&requested_view)?;
-            let view_filters = view
-                .filters
-                .iter()
-                .map(|filter| Assignment::from_str(filter))
-                .collect::<Result<Vec<_>>>()?;
-            let view_expressions = view
-                .where_expr
-                .iter()
-                .map(|expression| FilterExpression::from_str(expression))
-                .collect::<Result<Vec<_>>>()?;
-            let view_filter_groups = view
-                .filter_groups
-                .iter()
-                .map(|group| {
-                    let expressions = group
-                        .expressions
-                        .iter()
-                        .map(|expression| FilterExpression::from_str(expression))
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok((group.match_mode, expressions))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let predicates = ViewPredicates::parse(&view)?;
             let mut records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
                 Some(pattern) => {
                     let search = SearchQuery::new(pattern, SearchTarget::Document, false, true)?;
-                    database.search(Some(&view.collection), &view_filters, &search)?
+                    database.search(Some(&view.collection), &predicates.assignments, &search)?
                 }
-                None => database.list(&view.collection, &view_filters)?,
+                None => database.list(&view.collection, &predicates.assignments)?,
             };
             records.retain(|record| {
-                view_expressions
-                    .iter()
-                    .all(|expression| expression.matches(&record.attributes))
-                    && view_filter_groups.iter().all(|(match_mode, expressions)| {
-                        saved_filter_group_matches(*match_mode, expressions, &record.attributes)
-                    })
+                predicates.matches(&record.attributes)
                     && query_for_database
                         .filter_match
                         .matches(&ad_hoc_filters, &record.attributes)
@@ -3946,6 +4258,7 @@ fn json_body(schema: &str) -> JsonValue {
 fn render_views_home(
     representation: &Representation,
     views: &[ViewDefinition],
+    index: &ViewIndex,
     ui: Option<&UiContext>,
     csrf_token: &str,
 ) -> Markup {
@@ -3955,15 +4268,20 @@ fn render_views_home(
         "/",
         views,
         html! {
-            div class="cr-page-heading mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
+            div class="cr-page-heading mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between" {
                 div {
                     p class="cr-eyebrow" { "Workspace" }
                     h1 class="cr-title mt-1" { "Database views" }
                     p class="cr-lede mt-1 max-w-2xl" {
-                        "Browse every collection or open a saved, filtered view. All changes use the same validated and audited database operations as the CLI and REST API."
+                        "Every collection and saved view. Changes use the same validated, audited operations as the CLI and REST API."
                     }
                 }
-                span class="cr-pill" { (views.len()) " views" }
+                div class="flex flex-wrap gap-1.5" {
+                    span class="cr-pill" { (views.len()) " views" }
+                    @if let Some(total) = index.records.filter(|_| !views.is_empty()) {
+                        span class="cr-pill" { (count_noun(total, "record", "records")) }
+                    }
+                }
             }
             @if views.is_empty() {
                 div class="cr-empty-state" {
@@ -3976,18 +4294,20 @@ fn render_views_home(
                 }
             } @else {
                 section class="cr-view-index" aria-label="Available database views" {
-                    div class="cr-view-index-header" aria-hidden="true" {
-                        span { "View" }
-                        span { "Type" }
-                        span { "Open" }
-                    }
-                    @for view in views {
+                    (view_index_header("View"))
+                    @for (view, summary) in navigation_order_with(views, &index.views) {
                         a href=(format!("/{}", encode_segment(&view.name))) class="cr-view-row group" {
-                            div class="min-w-0" {
-                                h2 class="truncate text-[0.95rem] font-semibold text-slate-950" { (&view.title) }
-                                p class="cr-path mt-1 truncate" { "records/" (&view.collection) }
+                            div class="cr-view-name" {
+                                span class="cr-view-icon" aria-hidden="true" { (view_icon(view)) }
+                                h2 class="truncate" { (&view.title) }
+                                @if view.saved {
+                                    span class="cr-view-source" {
+                                        (index.collection_titles.get(&view.collection).map_or(view.collection.as_str(), String::as_str))
+                                    }
+                                }
                             }
-                            div class="flex min-w-0 flex-wrap items-center gap-2" {
+                            (view_index_numbers(summary))
+                            div class="cr-view-kind" {
                                 span class="cr-pill" {
                                     @if view.saved { "saved" } @else { "automatic" }
                                 }
@@ -4017,18 +4337,15 @@ fn render_views_home(
                 }
             }
             @if ui.is_some_and(|ui| ui.can_read_users) {
-                section class="cr-view-index mt-6" aria-label="Internal records" {
-                    div class="cr-view-index-header" aria-hidden="true" {
-                        span { "Internal" }
-                        span { "Type" }
-                        span { "Open" }
-                    }
+                section class="cr-view-index mt-5" aria-label="Internal records" {
+                    (view_index_header("Internal"))
                     a href="/users" class="cr-view-row group" {
-                        div class="min-w-0" {
-                            h2 class="truncate text-[0.95rem] font-semibold text-slate-950" { "Users" }
-                            p class="cr-path mt-1 truncate" { "records/users" }
+                        div class="cr-view-name" {
+                            span class="cr-view-icon" aria-hidden="true" { (USERS_ICON) }
+                            h2 class="truncate" { "Users" }
                         }
-                        div class="flex min-w-0 flex-wrap items-center gap-2" {
+                        (view_index_numbers(&index.users))
+                        div class="cr-view-kind" {
                             span class="cr-pill" { "access control" }
                             span class="cr-pill cr-pill-warn" { "read-only" }
                             span class="text-xs text-slate-500" { "Registered principals and their grants" }
@@ -4037,11 +4354,13 @@ fn render_views_home(
                     }
                     @if ui.is_some_and(|ui| ui.can_browse_files) {
                         a href="/browse" class="cr-view-row group" {
-                            div class="min-w-0" {
-                                h2 class="truncate text-[0.95rem] font-semibold text-slate-950" { "Browse" }
-                                p class="cr-path mt-1 truncate" { "filesystem" }
+                            div class="cr-view-name" {
+                                span class="cr-view-icon" aria-hidden="true" { (ALL_FILES_ICON) }
+                                h2 class="truncate" { "Browse" }
                             }
-                            div class="flex min-w-0 flex-wrap items-center gap-2" {
+                            span {}
+                            span {}
+                            div class="cr-view-kind" {
                                 span class="cr-pill" { "owner only" }
                                 span class="cr-pill cr-pill-warn" { "read-only" }
                                 span class="text-xs text-slate-500" { "Files visible to the server process" }
@@ -4055,6 +4374,91 @@ fn render_views_home(
         ui,
         csrf_token,
     )
+}
+
+fn view_index_header(first: &str) -> Markup {
+    html! {
+        div class="cr-view-index-header" aria-hidden="true" {
+            span { (first) }
+            span class="text-right" { "Records" }
+            span { "Updated" }
+            span { "Type" }
+            span {}
+        }
+    }
+}
+
+/// The record count and last change of one index row.
+///
+/// The column headings are hidden from assistive technology — each row is one
+/// link, read as one phrase — so the units a heading would have supplied are in
+/// the row itself, visible only where the headings are not.
+fn view_index_numbers(summary: &ViewSummary) -> Markup {
+    html! {
+        span class="cr-view-count" {
+            @match summary.records {
+                Some(records) => {
+                    (records)
+                    span class="cr-view-unit" { " " (if records == 1 { "record" } else { "records" }) }
+                }
+                None => span class="text-slate-400" { "—" },
+            }
+        }
+        span class="cr-view-updated" {
+            @if summary.updated_at.is_some() {
+                span class="cr-view-unit" { "updated " }
+            }
+            (render_timestamp(summary.updated_at.as_deref()))
+        }
+    }
+}
+
+fn count_noun(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+/// The icon a collection shows until its schema names another.
+const DEFAULT_COLLECTION_ICON: &str = "🗃️";
+const HOME_ICON: &str = "🏠";
+const USERS_ICON: &str = "👥";
+const ALL_FILES_ICON: &str = "🗂️";
+const DIRECTORY_ICON: &str = "📁";
+const FILE_ICON: &str = "📄";
+const SYMLINK_ICON: &str = "🔗";
+const OTHER_FILE_ICON: &str = "⚙️";
+/// A pinned location that does not exist cannot say whether it would be a
+/// directory or a file.
+const MISSING_PIN_ICON: &str = "📍";
+const AUDIT_ICON: &str = "📜";
+const OPENAPI_ICON: &str = "🔌";
+
+/// The order every list of views is shown in: saved views, then collections,
+/// each by the name a reader sees rather than the one in the URL, since a label
+/// need not sort where its directory does.
+fn navigation_order(views: &[ViewDefinition]) -> impl Iterator<Item = &ViewDefinition> {
+    navigation_order_with(views, views).map(|(view, _)| view)
+}
+
+/// [`navigation_order`] for views paired, by position, with what was computed
+/// for each.
+fn navigation_order_with<'a, T>(
+    views: &'a [ViewDefinition],
+    paired: &'a [T],
+) -> impl Iterator<Item = (&'a ViewDefinition, &'a T)> {
+    let mut ordered = views.iter().zip(paired).collect::<Vec<_>>();
+    ordered.sort_by_cached_key(|(view, _)| {
+        (
+            !view.saved,
+            view.title.to_lowercase(),
+            view.title.clone(),
+            view.name.clone(),
+        )
+    });
+    ordered.into_iter()
+}
+
+fn view_icon(view: &ViewDefinition) -> &str {
+    view.icon.as_deref().unwrap_or(DEFAULT_COLLECTION_ICON)
 }
 
 fn render_users_view(
@@ -4183,6 +4587,7 @@ fn render_users_view(
 fn render_browse_view(
     representation: &Representation,
     page: &BrowserPage,
+    sort: BrowseSort,
     documents: &[BrowserDocument],
     views: &[ViewDefinition],
     ui: Option<&UiContext>,
@@ -4209,10 +4614,10 @@ fn render_browse_view(
             nav aria-label="Breadcrumb" class="mb-3 flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-500" {
                 a href="/" class="font-medium hover:text-blue-700" { "Views" }
                 span aria-hidden="true" { "/" }
-                a href="/browse" class="font-medium hover:text-blue-700" { "Browse" }
+                a href=(sort.carry("/browse")) class="font-medium hover:text-blue-700" { "Browse" }
                 @for crumb in &page.crumbs {
                     span aria-hidden="true" { "/" }
-                    a href=(&crumb.href) class="max-w-48 truncate font-mono hover:text-blue-700" { (&crumb.label) }
+                    a href=(sort.carry(&crumb.href)) class="max-w-48 truncate font-mono hover:text-blue-700" { (&crumb.label) }
                 }
             }
             div class="cr-page-heading mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between" {
@@ -4231,9 +4636,9 @@ fn render_browse_view(
                     @if let Some(here) = page.location.to_str() {
                         (render_pin_control(here, pinned, csrf_token))
                     }
-                    a href="/browse" class="cr-button" { "Database root" }
+                    a href=(sort.carry("/browse")) class="cr-button" { "Database root" }
                     @if let Some(parent) = &page.parent {
-                        a href=(browse_url(parent.to_string_lossy().as_ref())) class="cr-button" { "Up" }
+                        a href=(sort.carry(&browse_url(parent.to_string_lossy().as_ref()))) class="cr-button" { "Up" }
                     }
                 }
             }
@@ -4244,21 +4649,26 @@ fn render_browse_view(
                             table class="min-w-full divide-y divide-slate-200 text-left text-sm" {
                                 thead {
                                     tr {
-                                        th scope="col" class="px-4 py-3 font-semibold text-slate-700" { "Name" }
+                                        (browse_sort_heading(page, sort, BrowseSortField::Name, "Name", ""))
+                                        (browse_sort_heading(page, sort, BrowseSortField::Created, "Created", ""))
+                                        (browse_sort_heading(page, sort, BrowseSortField::Updated, "Updated", ""))
                                         th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Type" }
-                                        th scope="col" class="whitespace-nowrap px-4 py-3 text-right font-semibold text-slate-700" { "Size" }
+                                        (browse_sort_heading(page, sort, BrowseSortField::Size, "Size", "text-right"))
                                         th scope="col" class="w-14 px-4 py-3" { span class="sr-only" { "Open" } }
                                     }
                                 }
                                 tbody class="divide-y divide-slate-100" {
                                     @if let Some(parent) = &page.parent {
-                                        @let href = browse_url(parent.to_string_lossy().as_ref());
+                                        @let href = sort.carry(&browse_url(parent.to_string_lossy().as_ref()));
                                         tr {
                                             td class="px-4 py-3" {
                                                 a href=(&href) class="font-mono font-semibold text-slate-900 hover:text-blue-700" {
+                                                    span class="cr-file-icon" aria-hidden="true" { (DIRECTORY_ICON) }
                                                     ".."
                                                 }
                                             }
+                                            td {}
+                                            td {}
                                             td class="px-4 py-3" { span class="cr-pill" { "parent" } }
                                             td class="px-4 py-3 text-right text-slate-400" { "—" }
                                             td class="px-4 py-3 text-right" { a href=(&href) aria-label="Open parent directory" class="font-semibold text-blue-700 hover:text-blue-900" { "→" } }
@@ -4266,31 +4676,37 @@ fn render_browse_view(
                                     }
                                     @if entries.is_empty() && page.parent.is_none() {
                                         tr {
-                                            td colspan="4" class="px-4 py-12 text-center text-slate-500" { "This directory is empty." }
+                                            td colspan="6" class="px-4 py-12 text-center text-slate-500" { "This directory is empty." }
                                         }
                                     } @else {
                                         @for entry in entries {
+                                            @let href = entry.href.as_deref().map(|href| sort.carry(href));
                                             tr {
                                                 td class="px-4 py-3" {
-                                                    @if let Some(href) = &entry.href {
+                                                    @if let Some(href) = &href {
                                                         a href=(href) class="font-mono font-semibold text-slate-900 hover:text-blue-700" {
-                                                            @if entry.kind == BrowserEntryKind::Directory {
-                                                                span aria-hidden="true" { "▸ " }
-                                                            } @else {
-                                                                span aria-hidden="true" { "· " }
-                                                            }
+                                                            span class="cr-file-icon" aria-hidden="true" { (entry.kind.icon()) }
                                                             (&entry.name)
                                                         }
                                                     } @else {
-                                                        span class="font-mono text-slate-500" title="This name is not valid UTF-8 and cannot be put in a browser URL" { (&entry.name) }
+                                                        span class="font-mono text-slate-500" title="This name is not valid UTF-8 and cannot be put in a browser URL" {
+                                                            span class="cr-file-icon" aria-hidden="true" { (entry.kind.icon()) }
+                                                            (&entry.name)
+                                                        }
                                                     }
+                                                }
+                                                td class="whitespace-nowrap px-4 py-3" {
+                                                    (render_timestamp(entry.created.and_then(format_system_time).as_deref()))
+                                                }
+                                                td class="whitespace-nowrap px-4 py-3" {
+                                                    (render_timestamp(entry.modified.and_then(format_system_time).as_deref()))
                                                 }
                                                 td class="px-4 py-3" { span class="cr-pill" { (entry.kind.label()) } }
                                                 td class="whitespace-nowrap px-4 py-3 text-right cr-data" {
                                                     @if let Some(size) = entry.size { (format_file_size(size)) } @else { "—" }
                                                 }
                                                 td class="px-4 py-3 text-right" {
-                                                    @if let Some(href) = &entry.href {
+                                                    @if let Some(href) = &href {
                                                         a href=(href) aria-label=(format!("Open {}", entry.name)) class="font-semibold text-blue-700 hover:text-blue-900" { "→" }
                                                     }
                                                 }
@@ -4414,6 +4830,50 @@ fn render_file_preview(file: &BrowserFile, document: Option<(&str, Option<&str>)
             }
         }
     }
+}
+
+/// A sortable directory-listing heading, in the same shape as a view table's.
+///
+/// A directory whose path is not UTF-8 cannot be put in a URL, so it gets its
+/// headings as plain text in the order it was listed in.
+fn browse_sort_heading(
+    page: &BrowserPage,
+    sort: BrowseSort,
+    field: BrowseSortField,
+    heading: &str,
+    align: &str,
+) -> Markup {
+    let next = sort.toggled(field);
+    let spoken_direction = match next.direction {
+        ViewSortDirection::Asc => "ascending",
+        ViewSortDirection::Desc => "descending",
+    };
+    html! {
+        th scope="col" aria-sort=(sort.aria_state(field)) class=(format!("whitespace-nowrap px-4 py-3 font-semibold text-slate-700 {align}")) {
+            @if let Some(location) = page.location.to_str() {
+                a href=(next.carry(&browse_url(location))) aria-label=(format!("Sort by {} {spoken_direction}", heading.to_lowercase())) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
+                    (heading) span aria-hidden="true" class="text-slate-400" { (sort.indicator(field)) }
+                }
+            } @else {
+                (heading)
+            }
+        }
+    }
+}
+
+/// A filesystem time in the audit journal's format, so one renderer shows both.
+///
+/// `None` for a time RFC 3339 cannot write — a timestamp any process may set
+/// can be set to the year 30000, and a listing must not fail over it.
+fn format_system_time(time: SystemTime) -> Option<String> {
+    let nanoseconds = match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(after) => i128::try_from(after.as_nanos()).ok()?,
+        Err(before) => -i128::try_from(before.duration().as_nanos()).ok()?,
+    };
+    OffsetDateTime::from_unix_timestamp_nanos(nanoseconds)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
 }
 
 fn format_file_size(bytes: u64) -> String {
@@ -4929,7 +5389,8 @@ fn render_view_records(
             div class="cr-page-heading mb-4 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between" {
                 div {
                     div class="flex flex-wrap items-center gap-2" {
-                        h1 class="cr-title capitalize" { (&view.title) }
+                        span class="cr-title-icon" aria-hidden="true" { (view_icon(view)) }
+                        h1 class="cr-title" { (&view.title) }
                         span class="cr-pill" {
                             @if view.saved { "saved view" } @else { "automatic view" }
                         }
@@ -6603,6 +7064,7 @@ const GLOBAL_STYLES: &str = r#"
   --cr-accent-soft: #f0f1fb;
   --cr-danger: #b91c1c;
   --cr-radius: 8px;
+  --cr-emoji: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
   --cr-sidebar-width: 232px;
   --cr-shadow-popover: 0 18px 44px rgb(36 36 36 / 0.14), 0 2px 8px rgb(36 36 36 / 0.07);
 }
@@ -6813,40 +7275,29 @@ html {
 .cr-sidebar-link:hover { background: var(--cr-sidebar-hover); color: var(--cr-ink); }
 .cr-sidebar-link.is-active { background: #e8e8e4; color: var(--cr-ink); font-weight: 620; }
 
+/* Every navigation entry is marked by an emoji: a collection's own when its
+   schema names one, a fixed one otherwise. The box is a fixed square so that
+   labels line up whatever a platform's emoji font measures, and clips rather
+   than wraps the rare icon that is really a short word. */
 .cr-nav-glyph {
   display: inline-flex;
-  width: 16px;
-  flex: 0 0 16px;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
   align-items: center;
   justify-content: center;
-  color: #8b8a87;
-  font-size: 0.72rem;
-}
-
-.cr-nav-glyph-collection,
-.cr-nav-glyph-view,
-.cr-nav-glyph-kanban {
-  width: 13px;
-  height: 13px;
-  flex-basis: 13px;
-  border: 1px solid #aaa9a5;
-  border-radius: 3px;
-}
-
-.cr-nav-glyph-internal {
-  width: 13px;
-  height: 13px;
-  flex-basis: 13px;
-  border: 1px dashed #aaa9a5;
-  border-radius: 999px;
+  overflow: hidden;
+  font-family: var(--cr-emoji);
+  font-size: 0.86rem;
+  line-height: 1;
 }
 
 .cr-nav-note { margin-left: auto; color: #aaa9a5; font-size: 0.62rem; font-weight: 550; }
 .cr-sidebar-notice { margin: 4px 8px; color: #92400e; font-size: 0.68rem; line-height: 1.35; overflow-wrap: anywhere; }
 
-.cr-nav-glyph-collection::after { content: ""; width: 5px; border-top: 1px solid #aaa9a5; border-bottom: 1px solid #aaa9a5; height: 4px; }
-.cr-nav-glyph-view::after { content: ""; width: 7px; border-top: 1px solid #aaa9a5; }
-.cr-nav-glyph-kanban::after { content: ""; width: 7px; height: 7px; border-left: 2px solid #aaa9a5; border-right: 2px solid #aaa9a5; }
+.cr-mobile-icon { margin-right: 4px; font-family: var(--cr-emoji); }
+.cr-title-icon { font-family: var(--cr-emoji); font-size: 1.35rem; line-height: 1; }
+.cr-file-icon { display: inline-block; width: 1.4em; font-family: var(--cr-emoji); }
 
 .cr-external { margin-left: auto; color: #aaa9a5; font-size: 0.7rem; }
 
@@ -6970,32 +7421,52 @@ html {
 .cr-view-index-header,
 .cr-view-row {
   display: grid;
-  grid-template-columns: minmax(220px, 0.9fr) minmax(0, 1.7fr) 32px;
+  grid-template-columns: minmax(200px, 1fr) 72px 118px minmax(0, 1.4fr) 20px;
   align-items: center;
-  column-gap: 24px;
+  column-gap: 20px;
 }
 
 .cr-view-index-header {
   border-bottom: 1px solid var(--cr-line);
   background: var(--cr-surface-subtle);
   color: #71717a;
-  padding: 9px 16px;
-  font-size: 0.68rem;
+  padding: 7px 14px;
+  font-size: 0.66rem;
   font-weight: 650;
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
 
 .cr-view-row {
-  min-height: 54px;
+  min-height: 38px;
   border-bottom: 1px solid var(--cr-line);
-  padding: 9px 14px;
+  padding: 5px 14px;
   transition: background-color 120ms ease-out;
 }
 
 .cr-view-row:last-child { border-bottom: 0; }
 .cr-view-row:hover { background: #fafafa; }
 .cr-view-row:hover h2 { color: var(--cr-accent); }
+
+.cr-view-name { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.cr-view-name h2 { min-width: 0; color: var(--cr-ink); font-size: 0.85rem; font-weight: 600; }
+.cr-view-icon { flex: 0 0 auto; width: 18px; overflow: hidden; font-family: var(--cr-emoji); font-size: 0.95rem; line-height: 1; text-align: center; }
+.cr-view-source { flex: 0 1 auto; min-width: 0; overflow: hidden; color: var(--cr-muted); font-size: 0.72rem; text-overflow: ellipsis; white-space: nowrap; }
+.cr-view-source::before { content: "in "; }
+.cr-view-count { color: var(--cr-ink); font-size: 0.8rem; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.cr-view-updated { white-space: nowrap; }
+.cr-view-kind { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px; }
+
+/* A unit the column heading states where there is one: read aloud always,
+   shown only once the headings are hidden. */
+.cr-view-unit {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
 
 .cr-view-arrow {
   color: #a1a1aa;
@@ -7195,9 +7666,13 @@ html {
 
 @media (max-width: 640px) {
   .cr-view-index-header { display: none; }
-  .cr-view-row { grid-template-columns: minmax(0, 1fr) 24px; gap: 10px; }
-  .cr-view-row > :nth-child(2) { grid-column: 1; }
-  .cr-view-arrow { grid-column: 2; grid-row: 1 / span 2; }
+  .cr-view-row { grid-template-columns: minmax(0, 1fr) auto 20px; column-gap: 10px; row-gap: 4px; padding: 8px 12px; }
+  .cr-view-name { grid-column: 1; grid-row: 1; }
+  .cr-view-count { grid-column: 2; grid-row: 1; color: var(--cr-muted); font-size: 0.72rem; }
+  .cr-view-updated { display: none; }
+  .cr-view-kind { grid-column: 1 / span 2; grid-row: 2; }
+  .cr-view-arrow { grid-column: 3; grid-row: 1 / span 2; }
+  .cr-view-unit { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
   .cr-title { font-size: 1.45rem; }
   .cr-mobile-header .cr-perspective select { max-width: 155px; }
 }
@@ -7250,25 +7725,25 @@ fn sidebar_navigation(
             }
             nav aria-label="Primary" class="cr-sidebar-nav" {
                 a href="/" class=(if current_path == "/" { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == "/").then_some("page")] {
-                    span class="cr-nav-glyph" aria-hidden="true" { "⌂" }
+                    span class="cr-nav-glyph" aria-hidden="true" { (HOME_ICON) }
                     span { "All views" }
                 }
                 @if views.iter().any(|view| view.saved) {
                     p class="cr-sidebar-label" { "Saved views" }
-                    @for view in views.iter().filter(|view| view.saved) {
+                    @for view in navigation_order(views).filter(|view| view.saved) {
                         @let path = format!("/{}", encode_segment(&view.name));
                         a href=(&path) class=(if current_path == path { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == path).then_some("page")] title=(&view.title) {
-                            span class=(if view.layout == ViewLayout::Kanban { "cr-nav-glyph cr-nav-glyph-kanban" } else { "cr-nav-glyph cr-nav-glyph-view" }) aria-hidden="true" { "" }
+                            span class="cr-nav-glyph" aria-hidden="true" { (view_icon(view)) }
                             span class="truncate" { (&view.title) }
                         }
                     }
                 }
                 @if views.iter().any(|view| !view.saved) {
                     p class="cr-sidebar-label" { "Collections" }
-                    @for view in views.iter().filter(|view| !view.saved) {
+                    @for view in navigation_order(views).filter(|view| !view.saved) {
                         @let path = format!("/{}", encode_segment(&view.name));
                         a href=(&path) class=(if current_path == path { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == path).then_some("page")] title=(&view.title) {
-                            span class="cr-nav-glyph cr-nav-glyph-collection" aria-hidden="true" { "" }
+                            span class="cr-nav-glyph" aria-hidden="true" { (view_icon(view)) }
                             span class="truncate" { (&view.title) }
                         }
                     }
@@ -7279,7 +7754,7 @@ fn sidebar_navigation(
                 @if ui.is_some_and(|ui| ui.can_read_users) {
                     p class="cr-sidebar-label" { "Internal" }
                     a href="/users" class=(if current_path == "/users" { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == "/users").then_some("page")] title="Users · read-only" {
-                        span class="cr-nav-glyph cr-nav-glyph-internal" aria-hidden="true" { "" }
+                        span class="cr-nav-glyph" aria-hidden="true" { (USERS_ICON) }
                         span class="truncate" { "Users" }
                         span class="cr-nav-note" { "read-only" }
                     }
@@ -7289,12 +7764,12 @@ fn sidebar_navigation(
                 nav aria-label="Utilities" {
                     @if ui.is_none_or(|ui| ui.can_view_global_audit) {
                         a href="/audit" class=(if current_path == "/audit" { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == "/audit").then_some("page")] {
-                            span class="cr-nav-glyph" aria-hidden="true" { "↺" }
+                            span class="cr-nav-glyph" aria-hidden="true" { (AUDIT_ICON) }
                             span { "Audit log" }
                         }
                     }
                     a href="/openapi.json" hx-boost=(UNBOOSTED) class="cr-sidebar-link" {
-                        span class="cr-nav-glyph" aria-hidden="true" { "{}" }
+                        span class="cr-nav-glyph" aria-hidden="true" { (OPENAPI_ICON) }
                         span { "OpenAPI" }
                         span class="cr-external" aria-hidden="true" { "↗" }
                     }
@@ -7323,19 +7798,14 @@ fn browse_navigation(current_path: &str, ui: &UiContext) -> Markup {
     html! {
         p class="cr-sidebar-label" { "Browse" }
         a href="/browse" class=(if all_files { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[all_files.then_some("page")] title="Every file visible to the server · owner only · read-only" {
-            span class="cr-nav-glyph cr-nav-glyph-internal" aria-hidden="true" { "" }
+            span class="cr-nav-glyph" aria-hidden="true" { (ALL_FILES_ICON) }
             span class="truncate" { "All files" }
             span class="cr-nav-note" { "read-only" }
         }
         @for pin in &ui.pins {
             @let active = pin.href == current_path;
             a href=(&pin.href) class=(if active { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[active.then_some("page")] title=(&pin.location) {
-                span class="cr-nav-glyph" aria-hidden="true" {
-                    @match pin.kind {
-                        UiPinKind::Directory => { "▸" }
-                        UiPinKind::File | UiPinKind::Missing => { "·" }
-                    }
-                }
+                span class="cr-nav-glyph" aria-hidden="true" { (pin_icon(pin.kind)) }
                 span class="truncate" { (&pin.label) }
                 @if pin.kind == UiPinKind::Missing {
                     span class="cr-nav-note" { "missing" }
@@ -7346,6 +7816,18 @@ fn browse_navigation(current_path: &str, ui: &UiContext) -> Markup {
             p class="cr-sidebar-notice" role="note" title=(error) { "Pins unavailable: " (error) }
         }
     }
+}
+
+fn pin_icon(kind: UiPinKind) -> &'static str {
+    match kind {
+        UiPinKind::Directory => DIRECTORY_ICON,
+        UiPinKind::File => FILE_ICON,
+        UiPinKind::Missing => MISSING_PIN_ICON,
+    }
+}
+
+fn mobile_icon(icon: &str) -> Markup {
+    html! { span class="cr-mobile-icon" aria-hidden="true" { (icon) } }
 }
 
 fn mobile_navigation(
@@ -7371,26 +7853,26 @@ fn mobile_navigation(
                 }
             }
             nav aria-label="Views" class="cr-mobile-view-strip" {
-                a href="/" class=(if current_path == "/" { "is-active" } else { "" }) { "All views" }
+                a href="/" class=(if current_path == "/" { "is-active" } else { "" }) { (mobile_icon(HOME_ICON)) "All views" }
                 // Same order as the desktop sidebar: saved views, then
                 // collections, then the internal registry.
-                @for view in views.iter().filter(|view| view.saved).chain(views.iter().filter(|view| !view.saved)) {
+                @for view in navigation_order(views) {
                     @let path = format!("/{}", encode_segment(&view.name));
-                    a href=(&path) class=(if current_path == path { "is-active" } else { "" }) { (&view.title) }
+                    a href=(&path) class=(if current_path == path { "is-active" } else { "" }) { (mobile_icon(view_icon(view))) (&view.title) }
                 }
                 @if ui.is_some_and(|ui| ui.can_read_users) {
-                    a href="/users" class=(if current_path == "/users" { "is-active" } else { "" }) { "Users" }
+                    a href="/users" class=(if current_path == "/users" { "is-active" } else { "" }) { (mobile_icon(USERS_ICON)) "Users" }
                 }
                 @if let Some(ui) = ui.filter(|ui| ui.can_browse_files) {
                     @let on_pin = ui.pins.iter().any(|pin| pin.href == current_path);
                     @let all_files = (current_path == "/browse" || current_path.starts_with("/browse?")) && !on_pin;
-                    a href="/browse" class=(if all_files { "is-active" } else { "" }) { "All files" }
+                    a href="/browse" class=(if all_files { "is-active" } else { "" }) { (mobile_icon(ALL_FILES_ICON)) "All files" }
                     @for pin in &ui.pins {
-                        a href=(&pin.href) class=(if pin.href == current_path { "is-active" } else { "" }) title=(&pin.location) { (&pin.label) }
+                        a href=(&pin.href) class=(if pin.href == current_path { "is-active" } else { "" }) title=(&pin.location) { (mobile_icon(pin_icon(pin.kind))) (&pin.label) }
                     }
                 }
                 @if ui.is_none_or(|ui| ui.can_view_global_audit) {
-                    a href="/audit" class=(if current_path == "/audit" { "is-active" } else { "" }) { "Audit" }
+                    a href="/audit" class=(if current_path == "/audit" { "is-active" } else { "" }) { (mobile_icon(AUDIT_ICON)) "Audit" }
                 }
                 @if ui.is_some() {
                     a href="/openapi.json" hx-boost=(UNBOOSTED) { "API" }

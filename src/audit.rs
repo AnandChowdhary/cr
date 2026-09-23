@@ -1605,11 +1605,31 @@ impl<'a> AuditLog<'a> {
         &self,
         collection: &str,
     ) -> Result<BTreeMap<String, RecordActivity>> {
-        let mut activity: BTreeMap<String, RecordActivity> = BTreeMap::new();
+        Ok(self
+            .collections_activity(|name| name == collection)?
+            .remove(collection)
+            .unwrap_or_default())
+    }
+
+    /// [`Self::record_activity`] for every collection `include` accepts, keyed
+    /// by collection, from one walk of the chain rather than one per
+    /// collection.
+    pub(crate) fn collections_activity(
+        &self,
+        include: impl Fn(&str) -> bool,
+    ) -> Result<BTreeMap<String, BTreeMap<String, RecordActivity>>> {
+        let mut collections: BTreeMap<String, BTreeMap<String, RecordActivity>> = BTreeMap::new();
         self.verify_chain(|entry, _| {
-            if entry.payload.record.collection != collection {
+            let collection = entry.payload.record.collection.as_str();
+            if !include(collection) {
                 return Ok(());
             }
+            if !collections.contains_key(collection) {
+                collections.insert(collection.to_owned(), BTreeMap::new());
+            }
+            let activity = collections
+                .get_mut(collection)
+                .expect("the collection was just inserted");
             let id = entry.payload.record.id.as_str();
             if entry.payload.action == AuditAction::Delete {
                 activity.remove(id);
@@ -1631,7 +1651,7 @@ impl<'a> AuditLog<'a> {
                 });
             Ok(())
         })?;
-        Ok(activity)
+        Ok(collections)
     }
 
     /// Replay the chain once while also enforcing approval bindings.
