@@ -13,9 +13,9 @@
       "description": "Current pipeline stage; changing it also moves the Kanban card."
     },
     "status": { "enum": ["open", "closed"], "description": "High-level lifecycle state." },
-    "value": { "type": "integer", "minimum": 0, "description": "Expected contract value in the selected currency." },
+    "value": { "type": "integer", "minimum": 0, "description": "Expected contract value in the selected currency.", "x-cr-unit": { "field": "currency" } },
     "currency": { "enum": ["USD", "EUR", "GBP"] },
-    "probability": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "probability": { "type": "integer", "minimum": 0, "maximum": 100, "x-cr-unit": "%" },
     "expected_close": { "type": "string", "format": "date" },
     "owner": { "type": "string", "minLength": 1 },
     "strategic": { "type": "boolean", "description": "Mark high-priority opportunities for leadership attention." },

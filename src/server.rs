@@ -44,7 +44,7 @@ use crate::{
     RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SchemaReview, SchemaViolation,
     SearchQuery, SearchTarget, SortDirection, USERS_COLLECTION, User, UserKind, UserStatus,
     ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch, audit::AuditChange,
-    sort_by_record_field, sort_records_by_field,
+    database::relation_references, sort_by_record_field, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -1047,6 +1047,19 @@ struct HtmlKanbanMoveForm {
     target: String,
 }
 
+/// A link or unlink from the record page's relations panel.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HtmlRelationForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    #[serde(rename = "_expected_record_hash")]
+    expected_record_hash: String,
+    relation: String,
+    /// The other record, as `collection/id`.
+    target: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HtmlSaveViewForm {
@@ -1461,6 +1474,11 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
             get(edit_record_form).post(update_record_form),
         )
         .route("/{view}/records/{id}/move", post(move_kanban_card))
+        .route("/{view}/records/{id}/relations", post(link_record_form))
+        .route(
+            "/{view}/records/{id}/relations/remove",
+            post(unlink_record_form),
+        )
         // One path, both methods: `GET` renders the confirmation and `POST`
         // performs the deletion, which keeps the destructive request's contract
         // exactly as it was while making the question that precedes it something
@@ -2795,21 +2813,33 @@ async fn new_record_form(
                 update: true,
                 delete: false,
             },
+            None,
+            None,
         ))
     }
     .await;
     html_result(result)
 }
 
+/// What a record page's URL may say besides which record it is.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordPageQuery {
+    /// The outcome of the relation change that redirected here.
+    notice: Option<String>,
+}
+
 async fn edit_record_form(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((view_name, id)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
 ) -> Response {
     let result: ApiResult<Markup> = async {
+        let query: RecordPageQuery = parse_query(raw)?;
         let requested_view = view_name.clone();
         let requested_id = id.clone();
-        let (view, record, audit_entries, schema, navigation, permissions) =
+        let (view, record, audit_entries, schema, navigation, permissions, relations) =
             run_database(&state, &headers, move |database| {
                 let view = database.view(&requested_view)?;
                 let record = database.get(&view.collection, &requested_id)?;
@@ -2824,7 +2854,16 @@ async fn edit_record_form(
                     update: database.access_allowed(AccessAction::Update, &resource)?,
                     delete: database.access_allowed(AccessAction::Delete, &resource)?,
                 };
-                Ok((view, record, audit_entries, schema, navigation, permissions))
+                let relations = record_relations(database, &record, &navigation);
+                Ok((
+                    view,
+                    record,
+                    audit_entries,
+                    schema,
+                    navigation,
+                    permissions,
+                    relations,
+                ))
             })
             .await?;
         let ui = ui_context(&state, &headers).await?;
@@ -2839,6 +2878,8 @@ async fn edit_record_form(
             &navigation,
             ui.as_ref(),
             permissions,
+            Some(&relations),
+            query.notice.as_deref(),
         ))
     }
     .await;
@@ -2987,6 +3028,7 @@ struct RecordFormContext {
     navigation: Vec<ViewDefinition>,
     permissions: RecordPermissions,
     violations: Vec<SchemaViolation>,
+    relations: Option<RecordRelations>,
     ui: Option<UiContext>,
 }
 
@@ -3068,6 +3110,9 @@ async fn reject_record_form(
                         .ok()
                 })
                 .unwrap_or_default();
+            let relations = record
+                .as_ref()
+                .map(|record| record_relations(database, record, &navigation));
             Ok((
                 view,
                 record,
@@ -3076,10 +3121,12 @@ async fn reject_record_form(
                 navigation,
                 permissions,
                 violations,
+                relations,
             ))
         })
         .await?;
-        let (view, record, audit_entries, schema, navigation, permissions, violations) = context;
+        let (view, record, audit_entries, schema, navigation, permissions, violations, relations) =
+            context;
         Ok(RecordFormContext {
             view,
             record,
@@ -3088,6 +3135,7 @@ async fn reject_record_form(
             navigation,
             permissions,
             violations,
+            relations,
             ui: ui_context(state, headers).await?,
         })
     }
@@ -3128,8 +3176,127 @@ async fn reject_record_form(
         &context.navigation,
         context.ui.as_ref(),
         context.permissions,
+        context.relations.as_ref(),
+        None,
     );
     rejected_form_response(status, markup)
+}
+
+async fn link_record_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((view_name, id)): Path<(String, String)>,
+    RawForm(raw): RawForm,
+) -> Response {
+    change_relation_form(
+        &state,
+        &headers,
+        view_name,
+        id,
+        &raw,
+        RelationChangeKind::Link,
+    )
+    .await
+}
+
+async fn unlink_record_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((view_name, id)): Path<(String, String)>,
+    RawForm(raw): RawForm,
+) -> Response {
+    change_relation_form(
+        &state,
+        &headers,
+        view_name,
+        id,
+        &raw,
+        RelationChangeKind::Unlink,
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelationChangeKind {
+    Link,
+    Unlink,
+}
+
+/// Apply a link or unlink from the relations panel, then return to the record.
+///
+/// The same `link` and `unlink` the CLI and the API run, with the version the
+/// page was rendered from as their precondition, so a change made against a
+/// page that has gone stale is refused with `412` rather than applied to a
+/// record the reader has not seen. A refusal is the ordinary error page; a
+/// success redirects to the record page with a notice naming the other record.
+async fn change_relation_form(
+    state: &AppState,
+    headers: &HeaderMap,
+    view_name: String,
+    id: String,
+    raw: &[u8],
+    kind: RelationChangeKind,
+) -> Response {
+    let result: ApiResult<Response> = async {
+        let form: HtmlRelationForm = parse_html_form(raw)?;
+        verify_csrf(state, &form.csrf)?;
+        let relation = form.relation.trim().to_owned();
+        let (target_collection, target_id) = form
+            .target
+            .trim()
+            .split_once('/')
+            .map(|(collection, id)| (collection.trim().to_owned(), id.trim().to_owned()))
+            .filter(|(collection, id)| !collection.is_empty() && !id.is_empty())
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "invalid_form",
+                    "the linked record must be written as collection/id, for example companies/acme",
+                )
+            })?;
+        let precondition = RecordPrecondition::version(form.expected_record_hash)
+            .map_err(ApiError::from_domain)?;
+        let requested_view = view_name.clone();
+        let record_id = id.clone();
+        let notice = run_database(state, headers, move |database| {
+            let view = database.view(&requested_view)?;
+            match kind {
+                RelationChangeKind::Link => database.link_conditionally(
+                    &view.collection,
+                    &record_id,
+                    &relation,
+                    &target_collection,
+                    &target_id,
+                    Some(&precondition),
+                )?,
+                RelationChangeKind::Unlink => database.unlink_conditionally(
+                    &view.collection,
+                    &record_id,
+                    &relation,
+                    &target_collection,
+                    &target_id,
+                    Some(&precondition),
+                )?,
+            };
+            // Named only when this perspective may read it, like the panel.
+            let target = database
+                .get(&target_collection, &target_id)
+                .map(|target| {
+                    record_name(&target.attributes)
+                        .unwrap_or(&target.id)
+                        .to_owned()
+                })
+                .unwrap_or_else(|_| format!("{target_collection}/{target_id}"));
+            let relation = humanize_field_name(&relation).to_lowercase();
+            Ok(match kind {
+                RelationChangeKind::Link => format!("Linked {target} as {relation}"),
+                RelationChangeKind::Unlink => format!("Removed the {relation} link to {target}"),
+            })
+        })
+        .await?;
+        see_other(&record_notice_url(&view_name, &id, &notice))
+    }
+    .await;
+    result.unwrap_or_else(html_error)
 }
 
 async fn move_kanban_card(
@@ -5709,7 +5876,7 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
                                     @if let Some(agent) = &entry.payload.agent {
                                         " · via " a href=(audit_agent_url(&agent.id)) class="font-medium text-gray-700 hover:text-blue-700" { (&agent.id) }
                                     }
-                                    " · " time datetime=(&entry.payload.timestamp) { (&entry.payload.timestamp) }
+                                    " · " (render_timestamp(Some(&entry.payload.timestamp)))
                                 }
                                 @if let Some(agent) = &entry.payload.agent {
                                     (render_audit_agent(agent))
@@ -6196,7 +6363,7 @@ fn render_view_records(
                                             @for column in available_columns {
                                                 label class="flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-700 hover:border-indigo-300 hover:bg-indigo-50/40" {
                                                     input type="checkbox" name="column" value=(column) checked[columns.contains(column)] class="size-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500";
-                                                    span class="truncate" title=(column) { (humanize_field_name(column)) }
+                                                    span class="truncate" title=(column) { (field_label(schema, column)) }
                                                 }
                                             }
                                         }
@@ -6282,18 +6449,20 @@ fn render_view_records(
 /// and read out as "created", and a view's own column is headed by its raw front
 /// matter key — which is what a reader correlating the table with a record file
 /// needs to see — while being read out humanized.
-fn sortable_headings(columns: &[String]) -> Vec<(&str, String, String)> {
+fn sortable_headings<'a>(
+    columns: &'a [String],
+    schema: Option<&JsonValue>,
+) -> Vec<(&'a str, String, String)> {
     std::iter::once(("$id", "ID".to_owned(), "record ID".to_owned()))
         .chain(
             ACTIVITY_COLUMNS
                 .iter()
                 .map(|(field, label)| (*field, humanize_field_name(label), (*label).to_owned())),
         )
-        .chain(
-            columns
-                .iter()
-                .map(|column| (column.as_str(), column.clone(), humanize_field_name(column))),
-        )
+        .chain(columns.iter().map(|column| {
+            let label = field_label(schema, column);
+            (column.as_str(), label.clone(), label)
+        }))
         .collect()
 }
 
@@ -6518,7 +6687,7 @@ fn view_results(
                                 // one of them now needs its position for
                                 // `sort_link_id` and a position is only
                                 // meaningful across the whole row.
-                                @for (index, (field, heading, spoken)) in sortable_headings(columns).iter().enumerate() {
+                                @for (index, (field, heading, spoken)) in sortable_headings(columns, schema).iter().enumerate() {
                                     th scope="col" aria-sort=(sort_aria_state(query, field)) class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" {
                                         a id=(sort_link_id(index)) href=(view_sort_url(view, query, field, page.limit)) aria-label=(sort_link_label(query, spoken, field)) class="inline-flex items-center gap-1.5 hover:text-indigo-700"
                                             hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_FROM_INSIDE) hx-push-url="true" {
@@ -6547,7 +6716,7 @@ fn view_results(
                                         }
                                         @for column in columns {
                                             td class="max-w-sm px-4 py-3 text-gray-700" {
-                                                a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="line-clamp-2 hover:text-indigo-700 hover:underline" { (record_value(record, column)) }
+                                                a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="line-clamp-2 hover:text-indigo-700 hover:underline" { (display_field(record, column, schema)) }
                                             }
                                         }
                                         td class="whitespace-nowrap px-4 py-3 text-right" {
@@ -6665,7 +6834,7 @@ fn render_kanban_board(
     html! {
         div class="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-gray-600" {
             p {
-                "Kanban grouped by " code class="rounded bg-gray-200 px-1.5 py-0.5 font-mono text-xs font-semibold text-gray-900" { (group_by) }
+                "Grouped by " span class="font-semibold text-gray-900" { (field_label(schema, group_by)) }
             }
             @if updatable.is_empty() {
                 p { "This perspective can view cards but cannot move them." }
@@ -6706,8 +6875,8 @@ fn render_kanban_board(
                                         dl class="mt-2 space-y-1" {
                                             @for column in &card_columns {
                                                 div {
-                                                    dt class="text-[0.65rem] font-bold uppercase tracking-wide text-gray-400" { (column) }
-                                                    dd class="mt-0.5 line-clamp-2 text-sm text-gray-700" { (record_value(record, column)) }
+                                                    dt class="text-[0.65rem] font-bold uppercase tracking-wide text-gray-400" { (field_label(schema, column)) }
+                                                    dd class="mt-0.5 line-clamp-2 text-sm text-gray-700" { (display_field(record, column, schema)) }
                                                 }
                                             }
                                         }
@@ -6756,10 +6925,11 @@ fn kanban_lanes<'a>(
 ) -> Vec<KanbanLane<'a>> {
     let mut lane_values = Vec::new();
     let mut known = BTreeSet::new();
+    let definition = property_definition(schema, group_by);
     for value in kanban_schema_values(schema, group_by) {
         let serialized = serialize_yaml_value(&value);
         if known.insert(serialized.clone()) {
-            lane_values.push((serialized, yaml_value(&value)));
+            lane_values.push((serialized, display_value(&value, definition, None)));
         }
     }
 
@@ -6770,7 +6940,7 @@ fn kanban_lanes<'a>(
             Some(value) => {
                 let serialized = serialize_yaml_value(value);
                 if !known.contains(&serialized) {
-                    observed.insert((serialized, yaml_value(value)));
+                    observed.insert((serialized, display_value(value, definition, None)));
                 }
             }
             None => has_unassigned = true,
@@ -6905,11 +7075,7 @@ fn schema_form_fields(schema: &JsonValue, attributes: &Mapping) -> Option<Vec<Sc
         .iter()
         .map(|(key, definition)| SchemaFormField {
             key: key.clone(),
-            label: definition
-                .get("title")
-                .and_then(JsonValue::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| humanize_field_name(key)),
+            label: field_label(Some(schema), key),
             description: definition
                 .get("description")
                 .and_then(JsonValue::as_str)
@@ -7017,6 +7183,152 @@ fn schema_value_label(value: &YamlValue) -> String {
         YamlValue::String(value) => humanize_field_name(value),
         _ => yaml_value(value),
     }
+}
+
+/// A top-level field's schema definition, when the schema declares one.
+fn property_definition<'a>(schema: Option<&'a JsonValue>, key: &str) -> Option<&'a JsonValue> {
+    schema?.get("properties")?.get(key)
+}
+
+/// What a field is called on screen: its schema `title`, or else its key made
+/// readable. It is the rule the record form has always used for its labels,
+/// so a column heading and the control that edits the column say the same
+/// thing.
+fn field_label(schema: Option<&JsonValue>, key: &str) -> String {
+    property_definition(schema, key)
+        .and_then(|definition| definition.get("title"))
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| humanize_field_name(key))
+}
+
+/// A record's field as a table cell or Kanban card shows it.
+fn display_field(record: &Record, column: &str, schema: Option<&JsonValue>) -> String {
+    match record.field(column).ok().flatten() {
+        Some(value) => display_value(
+            value,
+            property_definition(schema, column),
+            Some(&record.attributes),
+        ),
+        None => "—".to_owned(),
+    }
+}
+
+/// A value as a reader sees it, following what the record form shows.
+///
+/// A table used to print the stored YAML beside a form that printed the same
+/// value readably, so the two disagreed about what `negotiation` was called.
+/// Now an enum's value reads as the form's option does, a list of scalars is a
+/// comma-separated list, and a boolean is capitalised as in the form. A number
+/// the schema gives an `x-cr-unit` is an amount: its digits are grouped and the
+/// unit follows it. A number without one is printed as stored, because a bare
+/// integer is as likely to be a year, a postcode or an identifier as a
+/// quantity, and grouping any of those would misprint it. `unit_source` is the
+/// record a `{"field": …}` unit is read from.
+fn display_value(
+    value: &YamlValue,
+    definition: Option<&JsonValue>,
+    unit_source: Option<&Mapping>,
+) -> String {
+    match value {
+        YamlValue::String(text)
+            if definition.is_some_and(|definition| definition.get("enum").is_some()) =>
+        {
+            humanize_field_name(text)
+        }
+        YamlValue::Number(number) => {
+            match definition.and_then(|definition| definition.get("x-cr-unit")) {
+                Some(unit) => {
+                    let amount = group_digits(&number.to_string());
+                    match amount_unit(unit, unit_source) {
+                        Some(unit) if unit == "%" => format!("{amount}%"),
+                        // A no-break space, so a narrow column cannot put the
+                        // unit on a line of its own.
+                        Some(unit) => format!("{amount}\u{a0}{unit}"),
+                        None => amount,
+                    }
+                }
+                None => number.to_string(),
+            }
+        }
+        YamlValue::Bool(true) => "True".to_owned(),
+        YamlValue::Bool(false) => "False".to_owned(),
+        YamlValue::Sequence(items)
+            if !items.is_empty()
+                && items.iter().all(|item| {
+                    matches!(
+                        item,
+                        YamlValue::String(_) | YamlValue::Number(_) | YamlValue::Bool(_)
+                    )
+                }) =>
+        {
+            let item_definition = definition.and_then(|definition| definition.get("items"));
+            items
+                .iter()
+                .map(|item| display_value(item, item_definition, unit_source))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        _ => yaml_value(value),
+    }
+}
+
+/// The unit an `x-cr-unit` names: the string itself, or the value of the
+/// sibling field `{"field": "currency"}` points at, which is how an amount
+/// whose currency varies per record is written.
+fn amount_unit(unit: &JsonValue, record: Option<&Mapping>) -> Option<String> {
+    match unit {
+        JsonValue::String(unit) if !unit.is_empty() => Some(unit.clone()),
+        JsonValue::Object(reference) => {
+            let field = reference.get("field")?.as_str()?;
+            match record?.get(YamlValue::String(field.to_owned()))? {
+                YamlValue::String(unit) if !unit.is_empty() => Some(unit.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `1234567.5` becomes `1,234,567.5`. Anything that is not plain decimal
+/// notation — an exponent, `.inf` — is returned as it was.
+fn group_digits(number: &str) -> String {
+    let (sign, unsigned) = match number.strip_prefix('-') {
+        Some(unsigned) => ("-", unsigned),
+        None => ("", number),
+    };
+    let (whole, fraction) = match unsigned.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (unsigned, None),
+    };
+    if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+        return number.to_owned();
+    }
+    let mut grouped = String::with_capacity(number.len() + whole.len() / 3);
+    grouped.push_str(sign);
+    for (index, digit) in whole.chars().enumerate() {
+        if index > 0 && (whole.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    if let Some(fraction) = fraction {
+        grouped.push('.');
+        grouped.push_str(fraction);
+    }
+    grouped
+}
+
+/// What a record is called on screen: a non-empty `name` or `title` field,
+/// which is what nearly every collection names its records by. `None` sends
+/// the caller back to the record ID, which is always there.
+fn record_name(attributes: &Mapping) -> Option<&str> {
+    ["name", "title"].into_iter().find_map(|key| {
+        match attributes.get(YamlValue::String(key.to_owned())) {
+            Some(YamlValue::String(name)) if !name.trim().is_empty() => Some(name.as_str()),
+            _ => None,
+        }
+    })
 }
 
 fn schema_field_type_label(kind: &SchemaFieldKind) -> &'static str {
@@ -7350,6 +7662,274 @@ fn record_form_diagnostics(
     diagnostics
 }
 
+/// The field `cr link` writes relations into.
+const RELATIONS_FIELD: &str = "relations";
+
+/// The most records the link form suggests. The suggestions are a `<datalist>`
+/// the browser filters as the reader types, so a few hundred cost nothing; past
+/// that the list is cut, and any record can still be linked by typing its
+/// `collection/id`.
+const RELATION_SUGGESTION_LIMIT: usize = 500;
+
+/// One end of a relation, as the record page lists it.
+struct RelatedRecord {
+    relation: String,
+    collection: String,
+    id: String,
+    /// What the other record is called, when this perspective may read it.
+    /// `None` for a record that is missing or hidden, which is then shown only
+    /// by the `collection/id` the relation states — no more than the record
+    /// being viewed already says about it.
+    name: Option<String>,
+    /// Its page, when it has one; the `users` collection, for one, has none.
+    url: Option<String>,
+    /// The other record's collection as the sidebar names it.
+    collection_title: String,
+}
+
+/// What the record page's relations panel shows.
+struct RecordRelations {
+    /// The relations this record holds, in the order it stores them.
+    outgoing: Vec<RelatedRecord>,
+    /// The relations readable records hold to this one, in collection, then
+    /// ID order.
+    incoming: Vec<RelatedRecord>,
+    /// Relation names already in use, suggested by the link form.
+    relation_names: Vec<String>,
+    /// Readable records the link form suggests, as `collection/id` and a
+    /// description of the record.
+    targets: Vec<(String, String)>,
+}
+
+/// Read what `record` links to and what links to it.
+///
+/// One pass over every record this perspective can read answers all of it:
+/// the names of the records it links to, the records that link to it, and the
+/// suggestions for a new link. It is the scan `cr backlinks` makes — there is
+/// no relation index — so a record page reads the database once, the cost
+/// `TODO.md` already records for listing pages. A collection that cannot be
+/// listed or decrypted contributes nothing rather than failing the page: the
+/// panel shows what can be read.
+fn record_relations(
+    database: &Database,
+    record: &Record,
+    views: &[ViewDefinition],
+) -> RecordRelations {
+    let mut readable = Vec::new();
+    let mut titles = BTreeMap::new();
+    let mut audited_states = None;
+    for model in database.collection_models().unwrap_or_default() {
+        titles.insert(
+            model.name.clone(),
+            CollectionPresentation::from_schema(model.schema.as_ref()).title(&model.name),
+        );
+        if let Ok(records) = database.list_with_audited_cache(&model.name, &[], &mut audited_states)
+        {
+            readable.extend(records);
+        }
+    }
+    let index: BTreeMap<(&str, &str), &Record> = readable
+        .iter()
+        .map(|other| ((other.collection.as_str(), other.id.as_str()), other))
+        .collect();
+    let title = |collection: &str| {
+        titles
+            .get(collection)
+            .cloned()
+            .unwrap_or_else(|| humanize_field_name(collection))
+    };
+    let describe = |relation: &str, collection: &str, id: &str| {
+        let found = index.get(&(collection, id));
+        RelatedRecord {
+            relation: relation.to_owned(),
+            collection: collection.to_owned(),
+            id: id.to_owned(),
+            name: found.map(|other| {
+                record_name(&other.attributes)
+                    .unwrap_or(&other.id)
+                    .to_owned()
+            }),
+            url: found.and_then(|_| record_page_url(views, collection, id)),
+            collection_title: title(collection),
+        }
+    };
+
+    let own = relation_references(&record.attributes);
+    let outgoing = own
+        .iter()
+        .map(|(relation, collection, id)| describe(relation, collection, id))
+        .collect();
+    let mut relation_names: BTreeSet<String> =
+        own.into_iter().map(|(relation, _, _)| relation).collect();
+    let mut incoming = Vec::new();
+    for source in &readable {
+        for (relation, collection, id) in relation_references(&source.attributes) {
+            if collection == record.collection && id == record.id {
+                incoming.push(describe(&relation, &source.collection, &source.id));
+            }
+            relation_names.insert(relation);
+        }
+    }
+    let targets = readable
+        .iter()
+        .filter(|other| !(other.collection == record.collection && other.id == record.id))
+        .take(RELATION_SUGGESTION_LIMIT)
+        .map(|other| {
+            (
+                format!("{}/{}", other.collection, other.id),
+                format!(
+                    "{} · {}",
+                    record_name(&other.attributes).unwrap_or(&other.id),
+                    title(&other.collection)
+                ),
+            )
+        })
+        .collect();
+    RecordRelations {
+        outgoing,
+        incoming,
+        relation_names: relation_names.into_iter().collect(),
+        targets,
+    }
+}
+
+/// The page a record of `collection` is shown on.
+///
+/// Its collection's own view when there is one — the automatic view, or a
+/// saved view that has taken the collection's name — and otherwise any view of
+/// the collection. `None` for a collection no view shows, `users` among them.
+fn record_page_url(views: &[ViewDefinition], collection: &str, id: &str) -> Option<String> {
+    let view = views
+        .iter()
+        .find(|view| view.name == collection && view.collection == collection)
+        .or_else(|| views.iter().find(|view| view.collection == collection))?;
+    Some(format!(
+        "/{}/records/{}",
+        encode_segment(&view.name),
+        encode_segment(id)
+    ))
+}
+
+/// The record page's relations panel: what this record links to, what links
+/// to it, and a form to add a link.
+///
+/// Linking and unlinking are their own small forms rather than part of the
+/// record form, because they are their own audited operations — the same
+/// `link` and `unlink` the CLI and the API perform, each recorded as such —
+/// and because a reference can carry more than the form could show, which
+/// `unlink` preserves and a rewritten `relations` field would not. Each carries
+/// the record's version, so a link made against a stale page is refused rather
+/// than applied to a record the reader has not seen. They post natively for the
+/// reason `UNBOOSTED` gives the Kanban move form: a refusal is a rendered error
+/// page, which htmx would not swap in.
+fn render_record_relations(
+    view: &ViewDefinition,
+    record: &Record,
+    relations: &RecordRelations,
+    permissions: RecordPermissions,
+    csrf_token: &str,
+) -> Markup {
+    let base = format!(
+        "/{}/records/{}",
+        encode_segment(&view.name),
+        encode_segment(&record.id)
+    );
+    let link_url = format!("{base}/relations");
+    let unlink_url = format!("{base}/relations/remove");
+    let other_end = |related: &RelatedRecord| {
+        html! {
+            @match (&related.name, &related.url) {
+                (Some(name), Some(url)) => a href=(url) class="cr-relation-target" { (name) },
+                (Some(name), None) => span class="cr-relation-target" { (name) },
+                (None, _) => span class="cr-relation-missing" title="Missing, or not visible to this perspective" { (&related.collection) "/" (&related.id) },
+            }
+        }
+    };
+    html! {
+        section id="relations" class="cr-relations" aria-labelledby="relations-heading" {
+            h2 id="relations-heading" class="text-base font-bold text-gray-900" { "Relations" }
+            @if relations.outgoing.is_empty() && relations.incoming.is_empty() {
+                p class="mt-1 text-xs text-gray-500" { "No linked records yet." }
+            }
+            @if !relations.outgoing.is_empty() {
+                h3 class="cr-relations-label" { "Links to" }
+                ul class="cr-relations-list" {
+                    @for related in &relations.outgoing {
+                        li class="cr-relation" {
+                            div class="min-w-0" {
+                                span class="cr-relation-kind" { (humanize_field_name(&related.relation)) }
+                                (other_end(related))
+                                span class="cr-relation-meta" { (&related.collection_title) }
+                            }
+                            @if permissions.update {
+                                form method="post" action=(&unlink_url) hx-boost=(UNBOOSTED) {
+                                    input type="hidden" name="_csrf" value=(csrf_token);
+                                    input type="hidden" name="_expected_record_hash" value=(&record.version);
+                                    input type="hidden" name="relation" value=(&related.relation);
+                                    input type="hidden" name="target" value=(format!("{}/{}", related.collection, related.id));
+                                    button type="submit" class="cr-relation-remove"
+                                        aria-label=(format!("Remove the {} link to {}", humanize_field_name(&related.relation), related.name.as_deref().unwrap_or(&related.id))) {
+                                        "Remove"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            @if !relations.incoming.is_empty() {
+                h3 class="cr-relations-label" { "Linked from" }
+                ul class="cr-relations-list" {
+                    @for related in &relations.incoming {
+                        li class="cr-relation" {
+                            div class="min-w-0" {
+                                (other_end(related))
+                                span class="cr-relation-meta" {
+                                    (&related.collection_title) " · " (humanize_field_name(&related.relation))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            @if permissions.update {
+                details class="cr-relation-add" {
+                summary { "+ Link a record" }
+                form method="post" action=(&link_url) hx-boost=(UNBOOSTED) class="cr-relation-form" {
+                    input type="hidden" name="_csrf" value=(csrf_token);
+                    input type="hidden" name="_expected_record_hash" value=(&record.version);
+                    label class="block" {
+                        span class="cr-relations-label" { "Relation" }
+                        input name="relation" list="cr-relation-names" required autocomplete="off" placeholder="company"
+                            class="w-full rounded-lg border border-gray-300 px-2.5 py-1.5 text-sm";
+                    }
+                    label class="block" {
+                        span class="cr-relations-label" { "Record" }
+                        input name="target" list="cr-relation-targets" required autocomplete="off" placeholder="companies/acme"
+                            // `/` escaped inside the classes, as on the record
+                            // ID field: browsers compile `pattern` in
+                            // Unicode-sets mode, where a bare one is an error.
+                            pattern="[^\\/]+/[^\\/]+" title="collection/id, for example companies/acme"
+                            class="w-full rounded-lg border border-gray-300 px-2.5 py-1.5 font-mono text-sm";
+                    }
+                    button type="submit" class="cr-button" { "Link record" }
+                    datalist id="cr-relation-names" {
+                        @for name in &relations.relation_names {
+                            option value=(name) {}
+                        }
+                    }
+                    datalist id="cr-relation-targets" {
+                        @for (target, description) in &relations.targets {
+                            option value=(target) { (description) }
+                        }
+                    }
+                }
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_record_form(
     representation: &Representation,
@@ -7362,18 +7942,22 @@ fn render_record_form(
     navigation: &[ViewDefinition],
     ui: Option<&UiContext>,
     permissions: RecordPermissions,
+    relations: Option<&RecordRelations>,
+    notice: Option<&str>,
 ) -> Markup {
     let editing = record.is_some();
     let submitted = rejection.map(|rejection| &rejection.submitted);
-    let title = record
-        .map(|record| {
-            if permissions.update {
-                format!("Edit {}", record.id)
-            } else {
-                format!("View {}", record.id)
-            }
-        })
+    // A record is called by its name, with the ID beside it as the stable
+    // identifier it is, rather than by the ID alone: "Acme annual renewal", not
+    // "Edit acme-renewal". Whether the page can edit is said by the lede and by
+    // the form itself, so the title no longer carries a verb for it.
+    let name = record.map(|record| record_name(&record.attributes).unwrap_or(&record.id));
+    let title = name
+        .map(str::to_owned)
         .unwrap_or_else(|| format!("New {} record", view.collection));
+    let shown_id = record
+        .filter(|record| name != Some(record.id.as_str()))
+        .map(|record| record.id.as_str());
     let action = record
         .map(|record| {
             format!(
@@ -7509,7 +8093,26 @@ fn render_record_form(
                 @if structured {
                     div class="grid gap-3 sm:grid-cols-2" {
                         @for field in &schema_fields {
-                            (render_schema_field(field, form_diagnostics(rejection, &field.key)))
+                            // Relations are edited in the relations panel beside
+                            // the form, one audited link at a time, so the form
+                            // carries the stored value through unchanged rather
+                            // than offering it as YAML to retype. The record's
+                            // version is what keeps that safe: a link made after
+                            // this page was rendered changes it, and the save is
+                            // refused instead of writing the old relations back.
+                            // A value the panel could not have produced — not a
+                            // mapping — or one the save was refused over stays an
+                            // editable field.
+                            @if relations.is_some()
+                                && field.key == RELATIONS_FIELD
+                                && matches!(field.kind, SchemaFieldKind::Yaml)
+                                && matches!(field.value, None | Some(YamlValue::Mapping(_)))
+                                && form_diagnostics(rejection, &field.key).is_empty()
+                            {
+                                input type="hidden" name=(format!("attribute.{}", field.key)) value=(field_yaml_text(field));
+                            } @else {
+                                (render_schema_field(field, form_diagnostics(rejection, &field.key)))
+                            }
                         }
                     }
                     @if allows_additional {
@@ -7576,9 +8179,19 @@ fn render_record_form(
                 span aria-hidden="true" { "/" }
                 span class="text-gray-900" { (&title) }
             }
+            // The outcome of a link or unlink, which redirects back here. See
+            // the same banner on view pages for how it reaches a screen reader.
+            @if let Some(notice) = notice {
+                div data-notice="true" class="mx-auto mb-5 max-w-7xl rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800" { (notice) }
+            }
             div class="mx-auto max-w-7xl" {
                 div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
-                    h1 class="cr-title" { (&title) }
+                    div class="min-w-0" {
+                        h1 class="cr-title" { (&title) }
+                        @if let Some(id) = shown_id {
+                            p class="cr-path mt-1" { (id) }
+                        }
+                    }
                     @if editing {
                         a href="#audit-history" class="cr-button cr-activity-jump" {
                             (audit_entries.len()) " audit " @if audit_entries.len() == 1 { "event" } @else { "events" } " ↓"
@@ -7600,6 +8213,9 @@ fn render_record_form(
                 }
                 @if let Some(record) = record {
                     aside id="audit-history" class="cr-record-activity scroll-mt-20" {
+                        @if let Some(relations) = relations {
+                            (render_record_relations(view, record, relations, permissions, csrf_token))
+                        }
                         div class="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between" {
                             div {
                                 h2 class="text-base font-bold text-gray-900" { "Activity" }
@@ -7692,9 +8308,10 @@ fn render_delete_confirmation(
         encode_segment(&view.name),
         encode_segment(&record.id)
     );
+    let name = record_name(&record.attributes).unwrap_or(&record.id);
     page_or_content(
         representation,
-        &format!("Delete {}", record.id),
+        &format!("Delete {name}"),
         &back,
         navigation,
         html! {
@@ -7703,7 +8320,7 @@ fn render_delete_confirmation(
                 span aria-hidden="true" { "/" }
                 a href=(&back) class="font-medium hover:text-blue-700" { (&view.title) }
                 span aria-hidden="true" { "/" }
-                a href=(&record_url) class="font-medium hover:text-blue-700" { (&record.id) }
+                a href=(&record_url) class="font-medium hover:text-blue-700" { (name) }
                 span aria-hidden="true" { "/" }
                 span class="text-gray-900" { "Delete" }
             }
@@ -7712,7 +8329,13 @@ fn render_delete_confirmation(
                     h1 class="cr-title text-red-900" { "Delete this record?" }
                     p class="mt-2 text-sm text-red-800" {
                         "You are about to delete "
-                        code class="cr-filter-tag" { (&record.id) }
+                        @if name != record.id {
+                            strong { (name) } " ("
+                            code class="cr-filter-tag" { (&record.id) }
+                            ")"
+                        } @else {
+                            code class="cr-filter-tag" { (&record.id) }
+                        }
                         " from collection "
                         code class="cr-filter-tag" { (&view.collection) }
                         "."
@@ -8284,6 +8907,8 @@ html {
 
 .cr-view-row:hover .cr-view-arrow { color: var(--cr-accent); transform: translateX(2px); }
 
+.cr-time { color: var(--cr-gray-500); white-space: nowrap; font-variant-numeric: tabular-nums; }
+
 .cr-path,
 .cr-data {
   color: var(--cr-gray-500);
@@ -8430,6 +9055,25 @@ html {
 .cr-record-activity .cr-audit-entry { padding: 11px; }
 .cr-record-activity .cr-audit-entry > div { gap: 8px; }
 .cr-record-danger { margin-top: 12px; }
+
+/* The record page's relations panel, above its activity. */
+.cr-relations { margin-bottom: 22px; }
+.cr-relations-label { display: block; margin: 12px 0 5px; color: var(--cr-gray-500); font-size: 0.66rem; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
+.cr-relations-list { overflow: hidden; border: 1px solid var(--cr-gray-200); border-radius: var(--cr-radius); background: var(--cr-gray-0); }
+.cr-relation { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--cr-gray-200); padding: 8px 10px; }
+.cr-relation:last-child { border-bottom: 0; }
+.cr-relation-kind { display: block; color: var(--cr-gray-500); font-size: 0.66rem; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
+.cr-relation-target { display: block; overflow: hidden; color: var(--cr-gray-900); font-size: 0.82rem; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+a.cr-relation-target:hover { color: var(--cr-accent); text-decoration: underline; }
+.cr-relation-missing { display: block; overflow: hidden; color: var(--cr-gray-500); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.75rem; text-overflow: ellipsis; white-space: nowrap; }
+.cr-relation-meta { display: block; color: var(--cr-gray-500); font-size: 0.7rem; }
+.cr-relation-remove { flex: 0 0 auto; border-radius: 5px; color: var(--cr-gray-500); padding: 3px 6px; font-size: 0.7rem; font-weight: 600; }
+.cr-relation-remove:hover { background: var(--cr-gray-100); color: var(--cr-danger); }
+.cr-relation-add { margin-top: 10px; }
+.cr-relation-add summary { cursor: pointer; color: var(--cr-gray-600); font-size: 0.75rem; font-weight: 600; }
+.cr-relation-add summary:hover { color: var(--cr-gray-900); }
+.cr-relation-form { display: grid; gap: 8px; margin-top: 8px; border: 1px dashed var(--cr-gray-300); border-radius: var(--cr-radius); padding: 10px; }
+.cr-relation-form .cr-relations-label { margin-top: 0; }
 .cr-record-danger p { font-size: 0.75rem !important; line-height: 1.4; }
 
 @media (min-width: 1200px) {
@@ -9168,15 +9812,6 @@ fn query_columns_custom(query: &ViewQuery) -> bool {
     query.columns == ViewColumnsMode::Custom || !query.column.is_empty()
 }
 
-fn record_value(record: &Record, column: &str) -> String {
-    record
-        .field(column)
-        .ok()
-        .flatten()
-        .map(yaml_value)
-        .unwrap_or_else(|| "—".to_owned())
-}
-
 fn yaml_value(value: &YamlValue) -> String {
     match value {
         YamlValue::String(value) => value.clone(),
@@ -9448,19 +10083,74 @@ fn view_sort_field(query: &ViewQuery) -> Option<&str> {
 const ACTIVITY_COLUMNS: [(&str, &str); 2] =
     [("$created_at", "created"), ("$updated_at", "updated")];
 
-/// Render one audit timestamp compactly while keeping the exact value.
+/// Render one timestamp as how long ago it was, keeping the exact instant.
 ///
-/// The table shows minutes; the `datetime` attribute and tooltip keep the
-/// stored RFC 3339 instant, which is what a reader correlating a row with
-/// `cr audit log` actually needs.
+/// "3 hours ago" is what a reader scanning a table or an activity feed wants;
+/// the exact time is one hover away in the tooltip, and the `datetime`
+/// attribute keeps the stored RFC 3339 instant, which is what a reader
+/// correlating a row with `cr audit log` needs. The tooltip is in UTC because
+/// the server cannot know the reader's time zone; `cr.js` rewrites it into
+/// local time where it runs. A value that does not parse is shown as stored.
 fn render_timestamp(value: Option<&str>) -> Markup {
     match value {
-        Some(value) => html! {
-            time datetime=(value) title=(value) class="cr-data" { (compact_timestamp(value)) }
+        Some(value) => match OffsetDateTime::parse(value, &Rfc3339) {
+            Ok(instant) => html! {
+                time datetime=(value) title=(exact_utc(instant)) class="cr-time" {
+                    (relative_time(instant, OffsetDateTime::now_utc()))
+                }
+            },
+            Err(_) => html! {
+                time datetime=(value) title=(value) class="cr-data" { (compact_timestamp(value)) }
+            },
         },
         // No audit history: a file created outside `cr` and not yet saved.
         None => html! { span class="text-gray-400" { "—" } },
     }
+}
+
+/// `instant` relative to `now`, as "just now", "5 minutes ago", "in 2 days".
+///
+/// The thresholds round to the nearest unit and move to the next one early —
+/// 45 minutes is "1 hour ago", 26 days "1 month ago" — so the number shown is
+/// never a large count of a small unit.
+fn relative_time(instant: OffsetDateTime, now: OffsetDateTime) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    const MONTH: i64 = 2_629_746;
+    const YEAR: i64 = 31_556_952;
+    let elapsed = (now - instant).whole_seconds();
+    let magnitude = elapsed.abs();
+    if magnitude < 45 {
+        return "just now".to_owned();
+    }
+    let (size, unit) = match magnitude {
+        seconds if seconds < 45 * MINUTE => (MINUTE, "minute"),
+        seconds if seconds < 22 * HOUR => (HOUR, "hour"),
+        seconds if seconds < 26 * DAY => (DAY, "day"),
+        seconds if seconds < 320 * DAY => (MONTH, "month"),
+        _ => (YEAR, "year"),
+    };
+    let count = ((magnitude + size / 2) / size).max(1);
+    let plural = if count == 1 { "" } else { "s" };
+    if elapsed >= 0 {
+        format!("{count} {unit}{plural} ago")
+    } else {
+        format!("in {count} {unit}{plural}")
+    }
+}
+
+/// `2026-09-22 09:16 UTC`, the tooltip under a relative time.
+fn exact_utc(instant: OffsetDateTime) -> String {
+    let instant = instant.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+        instant.year(),
+        u8::from(instant.month()),
+        instant.day(),
+        instant.hour(),
+        instant.minute()
+    )
 }
 
 /// `2026-09-22T09:16:14.123456789Z` becomes `2026-09-22 09:16`.
@@ -9969,6 +10659,18 @@ fn parse_form_yaml_value(key: &str, raw: &str) -> ApiResult<YamlValue> {
             format!("attribute '{key}' is not valid typed YAML: {error}"),
         )
     })
+}
+
+/// A record's page with a notice at the top, as `notice_url` is for a view.
+fn record_notice_url(view: &str, id: &str, notice: &str) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("notice", notice);
+    format!(
+        "/{}/records/{}?{}",
+        encode_segment(view),
+        encode_segment(id),
+        serializer.finish()
+    )
 }
 
 fn notice_url(view: &str, notice: &str) -> String {
@@ -10992,5 +11694,79 @@ mod tests {
         assert!(!published.request_id.is_empty());
         assert!(!published.message.contains("/private/db"));
         assert!(!published.message.contains("os error"));
+    }
+
+    #[test]
+    fn amounts_are_grouped_and_anything_else_is_left_as_written() {
+        use super::group_digits;
+        assert_eq!(group_digits("125000"), "125,000");
+        assert_eq!(group_digits("-1234567.891"), "-1,234,567.891");
+        assert_eq!(group_digits("999"), "999");
+        assert_eq!(group_digits("1000"), "1,000");
+        assert_eq!(group_digits("1e+21"), "1e+21");
+        assert_eq!(group_digits(".inf"), ".inf");
+    }
+
+    #[test]
+    fn values_read_as_the_form_shows_them() {
+        use super::display_value;
+        use serde_json::json;
+        use yaml_serde::{Mapping, Value};
+        let record: Mapping = yaml_serde::from_str("currency: EUR").unwrap();
+        let amount = json!({ "type": "integer", "x-cr-unit": { "field": "currency" } });
+        let percent = json!({ "type": "integer", "x-cr-unit": "%" });
+        let stage = json!({ "enum": ["closed_won"] });
+        let tags = json!({ "type": "array", "items": { "enum": ["key_account", "renewal"] } });
+        let number = |text: &str| yaml_serde::from_str::<Value>(text).unwrap();
+        assert_eq!(
+            display_value(&number("84000"), Some(&amount), Some(&record)),
+            "84,000\u{a0}EUR"
+        );
+        // An amount whose unit field is missing is still an amount.
+        assert_eq!(
+            display_value(&number("84000"), Some(&amount), None),
+            "84,000"
+        );
+        assert_eq!(display_value(&number("60"), Some(&percent), None), "60%");
+        // A number with no unit may be a year or a postcode: left alone.
+        assert_eq!(display_value(&number("2019"), None, None), "2019");
+        assert_eq!(display_value(&number("94103"), None, None), "94103");
+        assert_eq!(
+            display_value(&Value::String("closed_won".into()), Some(&stage), None),
+            "Closed Won"
+        );
+        // Only an enum's values are made readable; free text is as typed.
+        assert_eq!(
+            display_value(&Value::String("closed_won".into()), None, None),
+            "closed_won"
+        );
+        assert_eq!(
+            display_value(&number("[key_account, renewal]"), Some(&tags), None),
+            "Key Account, Renewal"
+        );
+        assert_eq!(display_value(&Value::Bool(true), None, None), "True");
+    }
+
+    #[test]
+    fn times_read_as_how_long_ago_they_were() {
+        use super::{exact_utc, relative_time};
+        use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+        let now = OffsetDateTime::parse("2026-09-23T12:00:00Z", &Rfc3339).unwrap();
+        let ago = |duration: Duration| relative_time(now - duration, now);
+        assert_eq!(ago(Duration::seconds(10)), "just now");
+        assert_eq!(ago(Duration::seconds(-10)), "just now");
+        assert_eq!(ago(Duration::seconds(50)), "1 minute ago");
+        assert_eq!(ago(Duration::minutes(5)), "5 minutes ago");
+        assert_eq!(ago(Duration::minutes(50)), "1 hour ago");
+        assert_eq!(ago(Duration::hours(3)), "3 hours ago");
+        assert_eq!(ago(Duration::hours(30)), "1 day ago");
+        assert_eq!(ago(Duration::days(10)), "10 days ago");
+        assert_eq!(ago(Duration::days(50)), "2 months ago");
+        assert_eq!(ago(Duration::days(400)), "1 year ago");
+        assert_eq!(ago(Duration::days(-3)), "in 3 days");
+        assert_eq!(
+            exact_utc(now - Duration::minutes(5)),
+            "2026-09-23 11:55 UTC"
+        );
     }
 }

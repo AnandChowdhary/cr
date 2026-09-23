@@ -189,7 +189,8 @@ async fn the_confirmation_page_asks_with_no_javascript_at_all() {
     let page = get(&app, DELETE_PATH, &[]).await;
     assert_eq!(page.status, StatusCode::OK);
     assert!(page.body.starts_with("<!DOCTYPE html>"));
-    assert!(page.body.contains("<title>Delete acme · cr</title>"));
+    // Named by its `name`, with the ID beside it below.
+    assert!(page.body.contains("<title>Delete Acme · cr</title>"));
     assert!(page.body.contains("Delete this record?"));
 
     // More than `window.confirm` could say: which record, out of which
