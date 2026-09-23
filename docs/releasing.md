@@ -3,7 +3,7 @@
 Every push to `main` that changes `src/`, `Cargo.toml`, or `Cargo.lock` is
 released by [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 Documentation and CI changes are not. A release builds every target in the
-[install table](../README.md#quick-start) and attaches
+[install table](installation.md#download-a-release) and attaches
 `cr-<tag>-<target>.tar.gz` archives, `SHA256SUMS`, and one build-provenance
 attestation covering every archive. Its notes are generated from the pull
 requests merged since the previous release.

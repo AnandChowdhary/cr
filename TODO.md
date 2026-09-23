@@ -7,7 +7,7 @@ This is the canonical backlog for `cr`. It records both desired capabilities and
 - Update this file in the same commit that completes, changes, or supersedes an item.
 - Add newly discovered shortcuts here instead of leaving them only in code comments or conversation history.
 - Check an item only when its acceptance notes are satisfied and covered by appropriate tests.
-- Keep `README.md` focused on current behavior and `docs/architecture.md` focused on design. Future work belongs here.
+- Keep `README.md` a short overview, the guides in `docs/` focused on current behavior, and `docs/architecture.md` focused on design. Future work belongs here.
 
 Priorities:
 
