@@ -317,6 +317,15 @@ pub struct Record {
     pub body: String,
 }
 
+/// A record that refers to another, and the relations it does so through.
+#[derive(Clone, Debug, Serialize)]
+pub struct Backlink {
+    pub record: Record,
+    /// The names of the source's relations that hold a reference to the
+    /// target, in the order the record stores them.
+    pub relations: Vec<String>,
+}
+
 /// A condition that an existing record must satisfy before it is mutated.
 ///
 /// The comparison is performed only after the mutation has acquired the
@@ -471,6 +480,17 @@ pub fn sort_records_by_field(
     field: &str,
     direction: SortDirection,
 ) -> Result<()> {
+    sort_by_record_field(records, |record| record, field, direction)
+}
+
+/// Sort anything that carries a record by one of that record's fields, with
+/// exactly the rules [`sort_records_by_field`] applies to plain records.
+pub fn sort_by_record_field<T>(
+    items: &mut [T],
+    record: impl Fn(&T) -> &Record,
+    field: &str,
+    direction: SortDirection,
+) -> Result<()> {
     let field = field.trim();
     if field.is_empty() {
         return Err(invalid("sort field cannot be empty"));
@@ -488,7 +508,8 @@ pub fn sort_records_by_field(
         parse_path(field)?;
     }
 
-    records.sort_by(|left, right| {
+    items.sort_by(|left, right| {
+        let (left, right) = (record(left), record(right));
         let ordering = match field {
             "$id" => direction_ordering(left.id.cmp(&right.id), direction),
             "$collection" => direction_ordering(left.collection.cmp(&right.collection), direction),
@@ -2362,6 +2383,49 @@ impl Database {
             }
         }
         Ok(matches)
+    }
+
+    /// Every readable record that refers to `collection/id`, with the
+    /// relations it refers to it through.
+    ///
+    /// The target does not have to exist, so references a deletion left
+    /// behind are found too, and nothing about the target is read: a backlink
+    /// discloses only what a source record the caller may read already says.
+    /// `from` limits the scan to one source collection, `relation` to one
+    /// relation name, and `filters` apply to the source records. Results are in
+    /// collection, then ID order.
+    pub fn backlinks(
+        &self,
+        collection: &str,
+        id: &str,
+        from: Option<&str>,
+        relation: Option<&str>,
+        filters: &[Assignment],
+    ) -> Result<Vec<Backlink>> {
+        validate_component(collection, "collection")?;
+        validate_component(id, "id")?;
+        if let Some(relation) = relation {
+            validate_component(relation, "relation")?;
+        }
+        let sources = match from {
+            Some(from) => {
+                validate_component(from, "collection")?;
+                vec![from.to_owned()]
+            }
+            None => self.collection_names()?,
+        };
+
+        let mut backlinks = Vec::new();
+        let mut audited_states = None;
+        for source in sources {
+            for record in self.list_with_audited_cache(&source, filters, &mut audited_states)? {
+                let relations = referring_relations(&record.attributes, collection, id, relation);
+                if !relations.is_empty() {
+                    backlinks.push(Backlink { record, relations });
+                }
+            }
+        }
+        Ok(backlinks)
     }
 
     pub fn collection_models(&self) -> Result<Vec<CollectionModel>> {
@@ -5026,6 +5090,36 @@ fn remove_relation(
         attributes.remove(&relations_key);
     }
     Ok(())
+}
+
+/// The names of the relations in `attributes` holding a reference to
+/// `collection/id`, limited to `only` when it is given.
+///
+/// A `relations` value of the wrong shape refers to nothing here; `cr check`
+/// is what reports it.
+fn referring_relations(
+    attributes: &Mapping,
+    collection: &str,
+    id: &str,
+    only: Option<&str>,
+) -> Vec<String> {
+    let Some(Value::Mapping(relations)) = attributes.get(Value::String("relations".to_owned()))
+    else {
+        return Vec::new();
+    };
+    relations
+        .iter()
+        .filter_map(|(name, targets)| {
+            let (Value::String(name), Value::Sequence(targets)) = (name, targets) else {
+                return None;
+            };
+            (only.is_none_or(|only| only == name)
+                && targets
+                    .iter()
+                    .any(|target| is_reference_to(target, collection, id)))
+            .then(|| name.clone())
+        })
+        .collect()
 }
 
 /// Whether one relation element refers to `collection/id`.

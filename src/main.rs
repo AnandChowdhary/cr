@@ -13,7 +13,8 @@ use cr::{
     CheckReport, CheckScope, CollectionAccessPolicy, Database, DomainError, FilterExpression,
     Record, RecordPrecondition, RecordVisibility, Role, SearchQuery, SearchTarget, SortDirection,
     SyncAttribution, UserDeleteOptions, UserEnsureOutcome, UserKind, UserRegistrationOptions,
-    UserStatus, UserUpdate, ViewLayout, parse_threshold, sort_records_by_field,
+    UserStatus, UserUpdate, ViewLayout, parse_threshold, sort_by_record_field,
+    sort_records_by_field,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -21,6 +22,17 @@ use yaml_serde::Mapping;
 #[derive(Debug, Serialize)]
 struct ListedRecord {
     path: PathBuf,
+    front_matter: Mapping,
+}
+
+/// One `backlinks` result: the source record and the relations that hold the
+/// reference.
+#[derive(Serialize)]
+struct ListedBacklink {
+    collection: String,
+    id: String,
+    path: PathBuf,
+    relations: Vec<String>,
     front_matter: Mapping,
 }
 
@@ -303,6 +315,44 @@ enum Command {
         desc: bool,
 
         /// Return each file path and front matter as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List the records that link to a record.
+    ///
+    /// The target does not have to exist, so references a deletion left
+    /// behind are listed too. Plain output is one line per source record: its
+    /// path, a tab, and the relations that refer to the target.
+    Backlinks {
+        collection: String,
+        id: String,
+
+        /// Only records in this collection.
+        #[arg(long, value_name = "COLLECTION")]
+        from: Option<String>,
+
+        /// Only references held in this relation.
+        #[arg(long, value_name = "RELATION")]
+        relation: Option<String>,
+
+        /// Match a source record field using KEY=YAML. Multiple filters are combined with AND.
+        #[arg(short = 'w', long = "where", value_name = "KEY=YAML")]
+        filters: Vec<Assignment>,
+
+        /// Match a typed expression on the source record, such as value>=10000.
+        #[arg(long = "where-expr", value_name = "EXPRESSION")]
+        expressions: Vec<FilterExpression>,
+
+        /// Sort by a dotted field, $id, $collection, or $path. Missing fields stay last.
+        #[arg(long, value_name = "FIELD")]
+        sort: Option<String>,
+
+        /// Sort descending. Record ID remains the ascending deterministic tie-breaker.
+        #[arg(long, requires = "sort")]
+        desc: bool,
+
+        /// Return each source record's reference, path, relations, and front matter as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -1348,6 +1398,63 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 )?;
             }
             print_records(records, json)?;
+        }
+        Command::Backlinks {
+            collection,
+            id,
+            from,
+            relation,
+            filters,
+            expressions,
+            sort,
+            desc,
+            json,
+        } => {
+            let mut backlinks = database.backlinks(
+                &collection,
+                &id,
+                from.as_deref(),
+                relation.as_deref(),
+                &filters,
+            )?;
+            backlinks.retain(|backlink| {
+                expressions
+                    .iter()
+                    .all(|expression| expression.matches(&backlink.record.attributes))
+            });
+            if let Some(field) = sort {
+                sort_by_record_field(
+                    &mut backlinks,
+                    |backlink| &backlink.record,
+                    &field,
+                    if desc {
+                        SortDirection::Desc
+                    } else {
+                        SortDirection::Asc
+                    },
+                )?;
+            }
+            if json {
+                let listed: Vec<_> = backlinks
+                    .into_iter()
+                    .map(|backlink| ListedBacklink {
+                        collection: backlink.record.collection,
+                        id: backlink.record.id,
+                        path: backlink.record.path,
+                        relations: backlink.relations,
+                        front_matter: backlink.record.attributes,
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&listed)?);
+            } else {
+                for backlink in backlinks {
+                    println!(
+                        "{}\t{}",
+                        backlink.record.path.display(),
+                        backlink.relations.join(",")
+                    );
+                }
+            }
         }
         Command::Search {
             pattern,

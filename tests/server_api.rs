@@ -5,8 +5,10 @@ use axum::{
     body::Body,
     http::{HeaderMap, Method, Request, StatusCode, header},
 };
+use std::str::FromStr;
+
 use cr::{
-    Database,
+    Assignment, Database,
     server::{ServerConfig, router},
 };
 use http_body_util::BodyExt;
@@ -1836,4 +1838,87 @@ async fn rest_unlink_removes_a_relation_with_preview_retries_and_preconditions()
     ] {
         assert!(names.contains(&name), "{name} missing from {names:?}");
     }
+}
+
+#[tokio::test]
+async fn rest_backlinks_list_filter_and_paginate_referring_records() {
+    let (_temporary, database) = test_database("server-backlinks");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    database
+        .create(
+            "companies",
+            "acme",
+            &[Assignment::from_str("name=Acme").unwrap()],
+            "",
+        )
+        .unwrap();
+    for (id, value) in [("alpha", 3000), ("beta", 1000), ("gamma", 2000)] {
+        database
+            .create(
+                "deals",
+                id,
+                &[Assignment::from_str(&format!("value={value}")).unwrap()],
+                "",
+            )
+            .unwrap();
+        database
+            .link("deals", id, "company", "companies", "acme")
+            .unwrap();
+    }
+    database.create("contacts", "jane", &[], "").unwrap();
+    database
+        .link("contacts", "jane", "employer", "companies", "acme")
+        .unwrap();
+
+    let all = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/companies/records/acme/backlinks",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(all.status, StatusCode::OK, "{}", all.text());
+    let all = all.json();
+    assert_eq!(all["pagination"]["total"], 4);
+    assert_eq!(all["data"][0]["collection"], "contacts");
+    assert_eq!(all["data"][0]["relations"], json!(["employer"]));
+    assert!(
+        all["data"][0]["version"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+
+    let page = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/companies/records/acme/backlinks?from=deals&relation=company&where_expr=value%3E%3D1500&sort=value&direction=desc&limit=1&offset=1",
+        None,
+        &[],
+    )
+    .await
+    .json();
+    assert_eq!(page["pagination"]["total"], 2);
+    assert_eq!(page["data"].as_array().unwrap().len(), 1);
+    assert_eq!(page["data"][0]["id"], "gamma");
+
+    let unknown = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/companies/records/acme/backlinks?nope=1",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
+
+    let openapi = request(&app, Method::GET, "/openapi.json", None, &[])
+        .await
+        .json();
+    assert_eq!(
+        openapi["paths"]["/api/v1/collections/{collection}/records/{id}/backlinks"]["get"]["operationId"],
+        "listBacklinks"
+    );
+    assert!(openapi["components"]["schemas"]["BacklinkPage"].is_object());
 }

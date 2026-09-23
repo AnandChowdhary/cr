@@ -97,6 +97,29 @@ remove a relation `cr check` reports as a `dangling_link`. Both directions are
 recorded as `link` events, and the change set shows whether a reference was
 added or removed.
 
+## Find what links to a record
+
+`cr backlinks` lists every record whose relations refer to a record, and the
+relations that do:
+
+```sh
+cr backlinks companies acme
+# records/contacts/jane-doe.md	company
+# records/deals/acme-renewal-2027.md	company
+```
+
+Plain output is the source record's path, a tab, and the relation names. Limit
+the sources with `--from COLLECTION` and `--relation NAME`, filter them with
+`--where` and `--where-expr` as you would a `list`, and order them with
+`--sort`. `--json` adds each source's collection, ID, and front matter:
+
+```sh
+cr backlinks companies acme --from deals --where-expr 'value>=10000' --sort value --desc --json
+```
+
+The target does not have to exist, so this also finds the records still
+pointing at something that was deleted. Only records you may read are listed.
+
 Delete a record. Deletion requires confirmation and retains an audited tombstone:
 
 ```sh
