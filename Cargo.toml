@@ -26,15 +26,17 @@ categories = [
 # Keep the published tarball to source and prose. The screenshots are ~300 KiB of
 # already-compressed JPEG (roughly 80% of the crate) and crates.io rewrites the
 # README's relative image links to `repository`, so they still render there.
-# CI configuration is meaningless to a downstream consumer.
+# CI configuration, and `scripts/tailwind.sh`, which regenerates a stylesheet
+# that is already committed, are meaningless to a downstream consumer.
 #
 # `src/static/` is the deliberate exception to that instinct: the vendored htmx
-# release is ~50 KiB of minified JavaScript, which looks like exactly the kind
-# of weight the line above trims, but `src/server.rs` pulls it in with
-# `include_str!`, so excluding it would publish a crate that does not compile.
+# release is ~50 KiB of minified JavaScript and the compiled Tailwind sheet
+# another ~30 KiB, which looks like exactly the kind of weight the line above
+# trims, but `src/server.rs` pulls both in with `include_str!`, so excluding
+# them would publish a crate that does not compile.
 # Shipping it is also the point — it is what lets `cargo install cr` produce a
 # binary whose UI needs no network.
-exclude = ["/docs/screenshots/", "/.github/"]
+exclude = ["/docs/screenshots/", "/.github/", "/scripts/"]
 
 [dependencies]
 anyhow = "1.0.104"

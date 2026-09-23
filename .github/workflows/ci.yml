@@ -40,6 +40,28 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+  # `src/static/tailwind.css` is generated from the class names in the markup
+  # and committed, because the binary embeds it and must build without Node or
+  # a network. Regenerating it here and diffing is what keeps a class added to
+  # the markup from shipping without its rule. The script downloads a pinned
+  # Tailwind CSS release and checks its SHA-256 before running it.
+  stylesheet:
+    name: tailwind.css
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Regenerate the utility stylesheet
+        run: scripts/tailwind.sh
+
+      - name: Check it matches the committed file
+        run: |
+          if ! git diff --exit-code -- src/static/tailwind.css; then
+            echo "::error file=src/static/tailwind.css::out of date; run scripts/tailwind.sh and commit the result"
+            exit 1
+          fi
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest

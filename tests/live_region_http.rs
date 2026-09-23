@@ -182,9 +182,9 @@ async fn every_page_carries_one_empty_live_region_above_its_content() {
 
     // Hidden from the layout by the server's own stylesheet rather than by
     // Tailwind's `sr-only`. This is the one element whose styling is load
-    // bearing for correctness: with the CDN blocked every other element
-    // degrades to unstyled but readable, and this one would degrade to a
-    // duplicate sentence in the middle of the page.
+    // bearing for correctness: with the utility stylesheet unavailable every
+    // other element degrades to unstyled but readable, and this one would
+    // degrade to a duplicate sentence in the middle of the page.
     let (_, home) = get(&app, "/", &[]).await;
     assert!(
         home.contains(STYLES_MARKER),

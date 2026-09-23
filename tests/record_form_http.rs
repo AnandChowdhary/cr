@@ -237,7 +237,7 @@ fn assert_nothing_was_lost(html: &str) {
     // The box that holds the YAML is open, because a collapsed disclosure would
     // hide both the text and anything said about it.
     assert!(
-        html.contains(r#"bg-slate-50" open>"#),
+        html.contains(r#"bg-gray-50" open>"#),
         "the additional-attributes box came back collapsed:\n{html}"
     );
 }

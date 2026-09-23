@@ -131,7 +131,7 @@ async fn a_journal_forged_while_the_server_runs_is_refused_on_the_next_request()
         let (status, index) = get(&app, "/?summary=inline").await;
         assert_eq!(status, StatusCode::OK, "{which}");
         assert!(
-            index.contains("cr-view-count\"><span class=\"text-slate-400\">—<"),
+            index.contains("cr-view-count\"><span class=\"text-gray-400\">—<"),
             "{which}: the index counted a forged journal"
         );
 

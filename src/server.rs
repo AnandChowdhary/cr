@@ -1731,6 +1731,32 @@ static HTMX_SCRIPT_NAME: LazyLock<String> = LazyLock::new(|| {
 static HTMX_SCRIPT_PATH: LazyLock<String> =
     LazyLock::new(|| format!("/static/{}", HTMX_SCRIPT_NAME.as_str()));
 
+/// The Tailwind utilities the markup uses, compiled ahead of time and committed.
+///
+/// These pages used to load Tailwind's Play CDN, a script that fetched itself
+/// from jsDelivr on every page, compiled CSS in the browser and injected it,
+/// which Tailwind documents as development-only: the UI needed the network,
+/// rendered unstyled until the script had run, and could not be given a
+/// content security policy that did not trust a third-party origin. This file
+/// is the same utilities compiled by the Tailwind CLI from
+/// `src/static/tailwind.input.css`, which says how to regenerate it; CI fails
+/// if the committed bytes are not what that produces. Tailwind is MIT
+/// licensed, and its text is committed beside the file as
+/// `src/static/tailwindcss-4.3.3.LICENSE.txt`.
+const TAILWIND_STYLESHEET: &str = include_str!("static/tailwind.css");
+
+/// `tailwind-<digest>.css`, content addressed like `cr-<digest>.js`.
+static TAILWIND_STYLESHEET_NAME: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "tailwind-{}.css",
+        hexadecimal(&Sha256::digest(TAILWIND_STYLESHEET)[..8])
+    )
+});
+
+/// The absolute path rendered pages link, as `/static/tailwind-<digest>.css`.
+static TAILWIND_STYLESHEET_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("/static/{}", TAILWIND_STYLESHEET_NAME.as_str()));
+
 /// `hx-boost="false"`: the value that hands one element back to the browser's
 /// own navigation, spelled as a constant so the reasons for using it are
 /// written down once rather than repeated at every call site.
@@ -1795,22 +1821,22 @@ const UNBOOSTED: &str = "false";
 /// static route that joined a request-supplied name onto a directory would
 /// reintroduce exactly the class of bug that walk exists to prevent.
 ///
-/// Both assets are JavaScript, so the headers below are shared rather than
-/// per-asset. The day a stylesheet joins them, the content type moves into the
-/// match; the cache lifetime never has to, because every name here is derived
-/// from the bytes it names.
+/// The content type is per asset, because one of them is a stylesheet. The
+/// cache lifetime is shared and never has to move into the match, because
+/// every name here is derived from the bytes it names.
 async fn static_asset(Path(file): Path<String>) -> Response {
-    let content = match file.as_str() {
-        name if name == UI_SCRIPT_NAME.as_str() => UI_SCRIPT,
-        name if name == HTMX_SCRIPT_NAME.as_str() => HTMX_SCRIPT,
+    const JAVASCRIPT: &str = "text/javascript; charset=utf-8";
+    let (content, content_type) = match file.as_str() {
+        name if name == UI_SCRIPT_NAME.as_str() => (UI_SCRIPT, JAVASCRIPT),
+        name if name == HTMX_SCRIPT_NAME.as_str() => (HTMX_SCRIPT, JAVASCRIPT),
+        name if name == TAILWIND_STYLESHEET_NAME.as_str() => {
+            (TAILWIND_STYLESHEET, "text/css; charset=utf-8")
+        }
         _ => return not_found().await.into_response(),
     };
     (
         [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/javascript; charset=utf-8"),
-            ),
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
             (
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=31536000, immutable"),
@@ -4895,10 +4921,10 @@ fn render_views_home(
             }
             @if views.is_empty() {
                 div class="cr-empty-state" {
-                    h2 class="text-lg font-semibold text-slate-900" { "No collections yet" }
-                    p class="mt-2 text-sm text-slate-600" {
+                    h2 class="text-lg font-semibold text-gray-900" { "No collections yet" }
+                    p class="mt-2 text-sm text-gray-600" {
                         "Create a record with the CLI, or add a saved view with "
-                        code class="rounded bg-slate-100 px-1.5 py-1 text-xs" { "cr view create" }
+                        code class="rounded bg-gray-100 px-1.5 py-1 text-xs" { "cr view create" }
                         "."
                     }
                 }
@@ -4956,7 +4982,7 @@ fn view_index_region(
                                     span class="cr-pill cr-pill-accent" { "kanban" }
                                 }
                                 @if view.filters.is_empty() && view.where_expr.is_empty() && view.filter_groups.is_empty() {
-                                    span class="text-xs text-slate-500" { "All records" }
+                                    span class="text-xs text-gray-500" { "All records" }
                                 } @else {
                                     @for filter in &view.filters {
                                         code class="cr-filter-tag" { (filter) }
@@ -4989,7 +5015,7 @@ fn view_index_region(
                         div class="cr-view-kind" {
                             span class="cr-pill" { "access control" }
                             span class="cr-pill cr-pill-warn" { "read-only" }
-                            span class="text-xs text-slate-500" { "Registered principals and their grants" }
+                            span class="text-xs text-gray-500" { "Registered principals and their grants" }
                         }
                         span class="cr-view-arrow" aria-hidden="true" { "→" }
                     }
@@ -5004,7 +5030,7 @@ fn view_index_region(
                             div class="cr-view-kind" {
                                 span class="cr-pill" { "owner only" }
                                 span class="cr-pill cr-pill-warn" { "read-only" }
-                                span class="text-xs text-slate-500" { "Files visible to the server process" }
+                                span class="text-xs text-gray-500" { "Files visible to the server process" }
                             }
                             span class="cr-view-arrow" aria-hidden="true" { "→" }
                         }
@@ -5060,7 +5086,7 @@ fn view_index_numbers(summary: Option<&ViewSummary>) -> Markup {
     let Some(summary) = summary else {
         return html! {
             span class="cr-view-count" {
-                span class="text-slate-400" aria-hidden="true" { "…" }
+                span class="text-gray-400" aria-hidden="true" { "…" }
             }
             span class="cr-view-updated" {}
         };
@@ -5072,7 +5098,7 @@ fn view_index_numbers(summary: Option<&ViewSummary>) -> Markup {
                     (records)
                     span class="cr-view-unit" { " " (if records == 1 { "record" } else { "records" }) }
                 }
-                None => span class="text-slate-400" { "—" },
+                None => span class="text-gray-400" { "—" },
             }
         }
         span class="cr-view-updated" {
@@ -5149,10 +5175,10 @@ fn render_users_view(
         "/users",
         views,
         html! {
-            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-slate-500" {
+            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-gray-500" {
                 a href="/" class="font-medium hover:text-blue-700" { "Views" }
                 span aria-hidden="true" { "/" }
-                span class="text-slate-900" { "Users" }
+                span class="text-gray-900" { "Users" }
             }
             div class="cr-page-heading mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
                 div {
@@ -5160,9 +5186,9 @@ fn render_users_view(
                     h1 class="cr-title mt-1" { "Users" }
                     p class="cr-lede mt-1 max-w-2xl" {
                         "Every principal registered in the reserved "
-                        code class="rounded bg-slate-100 px-1.5 py-0.5 text-xs" { "users" }
+                        code class="rounded bg-gray-100 px-1.5 py-0.5 text-xs" { "users" }
                         " collection. CR owns this collection's schema and history, so the web UI keeps it read-only: register a principal, change a role, or disable an identity with "
-                        code class="rounded bg-slate-100 px-1.5 py-0.5 text-xs" { "cr access" }
+                        code class="rounded bg-gray-100 px-1.5 py-0.5 text-xs" { "cr access" }
                         " or the REST API."
                     }
                 }
@@ -5174,36 +5200,36 @@ fn render_users_view(
             }
             div class="cr-table-shell" {
                 div class="overflow-x-auto" {
-                    table class="min-w-full divide-y divide-slate-200 text-left text-sm" {
+                    table class="min-w-full divide-y divide-gray-200 text-left text-sm" {
                         thead {
                             tr {
-                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Principal" }
-                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Name" }
-                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Email" }
-                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Kind" }
-                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Status" }
-                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Access" }
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Principal" }
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Name" }
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Email" }
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Kind" }
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Status" }
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Access" }
                                 @if show_profile {
-                                    th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Profile" }
+                                    th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Profile" }
                                 }
                             }
                         }
-                        tbody class="divide-y divide-slate-100" {
+                        tbody class="divide-y divide-gray-100" {
                             @if users.is_empty() {
                                 tr {
-                                    td colspan=(columns) class="px-4 py-12 text-center text-slate-500" {
+                                    td colspan=(columns) class="px-4 py-12 text-center text-gray-500" {
                                         "This database has no registered principals. Run "
-                                        code class="rounded bg-slate-100 px-1.5 py-0.5 text-xs" { "cr access init" }
+                                        code class="rounded bg-gray-100 px-1.5 py-0.5 text-xs" { "cr access init" }
                                         " to bootstrap access control."
                                     }
                                 }
                             } @else {
                                 @for (id, user) in users {
                                     tr {
-                                        td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold text-slate-900" { (id) }
-                                        td class="px-4 py-3 text-slate-700" { (&user.name) }
-                                        td class="px-4 py-3 text-slate-700" { (user.email.as_deref().unwrap_or("—")) }
-                                        td class="whitespace-nowrap px-4 py-3 text-slate-700" { (user_kind_label(user.kind)) }
+                                        td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold text-gray-900" { (id) }
+                                        td class="px-4 py-3 text-gray-700" { (&user.name) }
+                                        td class="px-4 py-3 text-gray-700" { (user.email.as_deref().unwrap_or("—")) }
+                                        td class="whitespace-nowrap px-4 py-3 text-gray-700" { (user_kind_label(user.kind)) }
                                         td class="whitespace-nowrap px-4 py-3" {
                                             @if user.status == UserStatus::Disabled {
                                                 span class="cr-pill cr-pill-warn" { "disabled" }
@@ -5213,7 +5239,7 @@ fn render_users_view(
                                         }
                                         td class="px-4 py-3" {
                                             @if user.access.is_empty() {
-                                                span class="text-slate-500" { "no access" }
+                                                span class="text-gray-500" { "no access" }
                                             } @else {
                                                 div class="flex flex-wrap gap-1.5" {
                                                     @for grant in &user.access {
@@ -5225,7 +5251,7 @@ fn render_users_view(
                                             }
                                         }
                                         @if show_profile {
-                                            td class="px-4 py-3 text-slate-700" {
+                                            td class="px-4 py-3 text-gray-700" {
                                                 @if user.profile.is_empty() {
                                                     "—"
                                                 } @else {
@@ -5243,7 +5269,7 @@ fn render_users_view(
                         }
                     }
                 }
-                div class="border-t border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600" {
+                div class="border-t border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-600" {
                     "Records live in "
                     code { "records/users/" }
                     " and every change to them is audited like any other record."
@@ -5282,7 +5308,7 @@ fn render_browse_view(
         &current_path,
         views,
         html! {
-            nav aria-label="Breadcrumb" class="mb-3 flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-500" {
+            nav aria-label="Breadcrumb" class="mb-3 flex min-w-0 flex-wrap items-center gap-2 text-xs text-gray-500" {
                 a href="/" class="font-medium hover:text-blue-700" { "Views" }
                 span aria-hidden="true" { "/" }
                 a href=(sort.carry("/browse")) class="font-medium hover:text-blue-700" { "Browse" }
@@ -5297,7 +5323,7 @@ fn render_browse_view(
                     h1 class="cr-title mt-1" { "Filesystem browser" }
                     p class="cr-lede mt-1 max-w-3xl" {
                         "Read-only access to files visible to the CR server process. Browsing starts at the database root; use "
-                        code class="rounded bg-slate-100 px-1.5 py-0.5 text-xs" { ".." }
+                        code class="rounded bg-gray-100 px-1.5 py-0.5 text-xs" { ".." }
                         " to move toward the filesystem root."
                     }
                     p class="cr-path mt-3 break-all" { (&location) }
@@ -5317,23 +5343,23 @@ fn render_browse_view(
                 BrowserItem::Directory(entries) => {
                     div class="cr-table-shell" {
                         div class="overflow-x-auto" {
-                            table class="min-w-full divide-y divide-slate-200 text-left text-sm" {
+                            table class="min-w-full divide-y divide-gray-200 text-left text-sm" {
                                 thead {
                                     tr {
                                         (browse_sort_heading(page, sort, BrowseSortField::Name, "Name", ""))
                                         (browse_sort_heading(page, sort, BrowseSortField::Created, "Created", ""))
                                         (browse_sort_heading(page, sort, BrowseSortField::Updated, "Updated", ""))
-                                        th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" { "Type" }
+                                        th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Type" }
                                         (browse_sort_heading(page, sort, BrowseSortField::Size, "Size", "text-right"))
                                         th scope="col" class="w-14 px-4 py-3" { span class="sr-only" { "Open" } }
                                     }
                                 }
-                                tbody class="divide-y divide-slate-100" {
+                                tbody class="divide-y divide-gray-100" {
                                     @if let Some(parent) = &page.parent {
                                         @let href = sort.carry(&browse_url(parent.to_string_lossy().as_ref()));
                                         tr {
                                             td class="px-4 py-3" {
-                                                a href=(&href) class="font-mono font-semibold text-slate-900 hover:text-blue-700" {
+                                                a href=(&href) class="font-mono font-semibold text-gray-900 hover:text-blue-700" {
                                                     span class="cr-file-icon" aria-hidden="true" { (DIRECTORY_ICON) }
                                                     ".."
                                                 }
@@ -5341,13 +5367,13 @@ fn render_browse_view(
                                             td {}
                                             td {}
                                             td class="px-4 py-3" { span class="cr-pill" { "parent" } }
-                                            td class="px-4 py-3 text-right text-slate-400" { "—" }
+                                            td class="px-4 py-3 text-right text-gray-400" { "—" }
                                             td class="px-4 py-3 text-right" { a href=(&href) aria-label="Open parent directory" class="font-semibold text-blue-700 hover:text-blue-900" { "→" } }
                                         }
                                     }
                                     @if entries.is_empty() && page.parent.is_none() {
                                         tr {
-                                            td colspan="6" class="px-4 py-12 text-center text-slate-500" { "This directory is empty." }
+                                            td colspan="6" class="px-4 py-12 text-center text-gray-500" { "This directory is empty." }
                                         }
                                     } @else {
                                         @for entry in entries {
@@ -5355,12 +5381,12 @@ fn render_browse_view(
                                             tr {
                                                 td class="px-4 py-3" {
                                                     @if let Some(href) = &href {
-                                                        a href=(href) class="font-mono font-semibold text-slate-900 hover:text-blue-700" {
+                                                        a href=(href) class="font-mono font-semibold text-gray-900 hover:text-blue-700" {
                                                             span class="cr-file-icon" aria-hidden="true" { (entry.kind.icon()) }
                                                             (&entry.name)
                                                         }
                                                     } @else {
-                                                        span class="font-mono text-slate-500" title="This name is not valid UTF-8 and cannot be put in a browser URL" {
+                                                        span class="font-mono text-gray-500" title="This name is not valid UTF-8 and cannot be put in a browser URL" {
                                                             span class="cr-file-icon" aria-hidden="true" { (entry.kind.icon()) }
                                                             (&entry.name)
                                                         }
@@ -5387,7 +5413,7 @@ fn render_browse_view(
                                 }
                             }
                         }
-                        div class="border-t border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600" {
+                        div class="border-t border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-600" {
                             (entries.len()) " entries · directories first · hidden files included"
                         }
                     }
@@ -5398,8 +5424,8 @@ fn render_browse_view(
                                     (render_file_preview(file, Some((&document.name, document.href.as_deref()))))
                                 }
                                 Err(message) => {
-                                    div class="cr-table-shell px-4 py-3 text-sm text-slate-600" {
-                                        span class="font-mono font-semibold text-slate-900" { (&document.name) }
+                                    div class="cr-table-shell px-4 py-3 text-sm text-gray-600" {
+                                        span class="font-mono font-semibold text-gray-900" { (&document.name) }
                                         " could not be previewed: " (message)
                                     }
                                 }
@@ -5412,8 +5438,8 @@ fn render_browse_view(
                 }
                 BrowserItem::Other => {
                     div class="cr-empty-state" {
-                        h2 class="text-lg font-semibold text-slate-900" { "Preview unavailable" }
-                        p class="mt-2 text-sm text-slate-600" {
+                        h2 class="text-lg font-semibold text-gray-900" { "Preview unavailable" }
+                        p class="mt-2 text-sm text-gray-600" {
                             "This location is not a regular file or directory. Devices, sockets, and named pipes are never opened by the browser."
                         }
                     }
@@ -5476,13 +5502,13 @@ fn render_file_preview(file: &BrowserFile, document: Option<(&str, Option<&str>)
     };
     html! {
         div class="cr-table-shell overflow-hidden" {
-            div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600" {
+            div class="flex flex-wrap items-center justify-between gap-2 border-b border-gray-200 bg-gray-50 px-4 py-3 text-xs text-gray-600" {
                 div class="flex flex-wrap items-center gap-2" {
                     @if let Some((name, href)) = document {
                         @if let Some(href) = href {
-                            a href=(href) class="font-mono text-sm font-semibold text-slate-900 hover:text-blue-700" { (name) }
+                            a href=(href) class="font-mono text-sm font-semibold text-gray-900 hover:text-blue-700" { (name) }
                         } @else {
-                            span class="font-mono text-sm font-semibold text-slate-900" { (name) }
+                            span class="font-mono text-sm font-semibold text-gray-900" { (name) }
                         }
                     }
                     @match &file.contents {
@@ -5520,10 +5546,10 @@ fn browse_sort_heading(
         ViewSortDirection::Desc => "descending",
     };
     html! {
-        th scope="col" aria-sort=(sort.aria_state(field)) class=(format!("whitespace-nowrap px-4 py-3 font-semibold text-slate-700 {align}")) {
+        th scope="col" aria-sort=(sort.aria_state(field)) class=(format!("whitespace-nowrap px-4 py-3 font-semibold text-gray-700 {align}")) {
             @if let Some(location) = page.location.to_str() {
                 a href=(next.carry(&browse_url(location))) aria-label=(format!("Sort by {} {spoken_direction}", heading.to_lowercase())) class="inline-flex items-center gap-1.5 hover:text-indigo-700" {
-                    (heading) span aria-hidden="true" class="text-slate-400" { (sort.indicator(field)) }
+                    (heading) span aria-hidden="true" class="text-gray-400" { (sort.indicator(field)) }
                 }
             } @else {
                 (heading)
@@ -5595,10 +5621,10 @@ fn render_audit_view(
         "/audit",
         views,
         html! {
-            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-slate-500" {
+            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-gray-500" {
                 a href="/" class="font-medium hover:text-blue-700" { "Views" }
                 span aria-hidden="true" { "/" }
-                span class="text-slate-900" { "Audit log" }
+                span class="text-gray-900" { "Audit log" }
             }
             div class="cr-page-heading mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
                 div {
@@ -5612,19 +5638,19 @@ fn render_audit_view(
             }
             form method="get" action=(reset_url) class="cr-surface mb-4 grid gap-3 p-3 sm:grid-cols-[1fr_1fr_1fr_1fr_auto]" {
                 label class="block" {
-                    span class="mb-1 block text-xs font-semibold text-slate-600" { "Collection" }
+                    span class="mb-1 block text-xs font-semibold text-gray-600" { "Collection" }
                     input type="text" name="collection" value=(query.collection.as_deref().unwrap_or("")) placeholder="deals" autocomplete="off" spellcheck="false" class="w-full border px-3 py-2 font-mono text-sm outline-none";
                 }
                 label class="block" {
-                    span class="mb-1 block text-xs font-semibold text-slate-600" { "Record ID" }
+                    span class="mb-1 block text-xs font-semibold text-gray-600" { "Record ID" }
                     input type="text" name="id" value=(query.id.as_deref().unwrap_or("")) placeholder="acme-renewal" autocomplete="off" spellcheck="false" class="w-full border px-3 py-2 font-mono text-sm outline-none";
                 }
                 label class="block" {
-                    span class="mb-1 block text-xs font-semibold text-slate-600" { "Agent" }
+                    span class="mb-1 block text-xs font-semibold text-gray-600" { "Agent" }
                     input type="text" name="agent" value=(query.agent.as_deref().unwrap_or("")) placeholder="claude-code" autocomplete="off" spellcheck="false" class="w-full border px-3 py-2 font-mono text-sm outline-none";
                 }
                 label class="block" {
-                    span class="mb-1 block text-xs font-semibold text-slate-600" { "Agent session" }
+                    span class="mb-1 block text-xs font-semibold text-gray-600" { "Agent session" }
                     input type="text" name="session" value=(query.session.as_deref().unwrap_or("")) placeholder="6d1baa69" autocomplete="off" spellcheck="false" class="w-full border px-3 py-2 font-mono text-sm outline-none";
                 }
                 div class="flex items-end gap-2" {
@@ -5634,7 +5660,7 @@ fn render_audit_view(
             }
             (render_audit_entries(&page.data))
             div class="cr-surface mt-4 flex flex-col gap-3 px-4 py-3 text-sm sm:flex-row sm:items-center sm:justify-between" {
-                p class="text-slate-600" { "Showing events " (first) "–" (last) " newest first" }
+                p class="text-gray-600" { "Showing events " (first) "–" (last) " newest first" }
                 div class="flex items-center gap-2" {
                     @if let Some(offset) = page.pagination.previous_offset {
                         a href=(audit_page_url(query, page.pagination.limit, offset)) class="cr-button" { "Previous" }
@@ -5654,7 +5680,7 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
     html! {
         div class="cr-audit-list" {
             @if entries.is_empty() {
-                div class="p-10 text-center text-sm text-slate-500" {
+                div class="p-10 text-center text-sm text-gray-500" {
                     "No audit events match this filter."
                 }
             } @else {
@@ -5667,21 +5693,21 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
                                     span class="cr-data" { "#" (entry.payload.sequence) }
                                     span class="cr-pill" { (audit_source_label(&entry.payload.source)) }
                                 }
-                                a href=(audit_filter_url(&entry.payload.record.collection, &entry.payload.record.id)) class="mt-3 block truncate font-mono text-sm font-semibold text-slate-950 hover:text-blue-700" {
+                                a href=(audit_filter_url(&entry.payload.record.collection, &entry.payload.record.id)) class="mt-3 block truncate font-mono text-sm font-semibold text-gray-900 hover:text-blue-700" {
                                     (entry.payload.record.reference())
                                 }
-                                p class="mt-1 text-xs text-slate-500" {
-                                    "by " span class="font-medium text-slate-700" { (&entry.payload.actor) }
+                                p class="mt-1 text-xs text-gray-500" {
+                                    "by " span class="font-medium text-gray-700" { (&entry.payload.actor) }
                                     @if let Some(operator) = entry
                                         .payload
                                         .access
                                         .as_ref()
                                         .and_then(|access| access.impersonated_by.as_ref())
                                     {
-                                        " · impersonated by " span class="font-medium text-slate-700" { (&operator.display) }
+                                        " · impersonated by " span class="font-medium text-gray-700" { (&operator.display) }
                                     }
                                     @if let Some(agent) = &entry.payload.agent {
-                                        " · via " a href=(audit_agent_url(&agent.id)) class="font-medium text-slate-700 hover:text-blue-700" { (&agent.id) }
+                                        " · via " a href=(audit_agent_url(&agent.id)) class="font-medium text-gray-700 hover:text-blue-700" { (&agent.id) }
                                     }
                                     " · " time datetime=(&entry.payload.timestamp) { (&entry.payload.timestamp) }
                                 }
@@ -5689,9 +5715,9 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
                                     (render_audit_agent(agent))
                                 }
                                 @if let Some(authorization) = &entry.payload.authorization {
-                                    p class="mt-2 text-xs text-slate-500" {
+                                    p class="mt-2 text-xs text-gray-500" {
                                         "Authorization "
-                                        span class="font-medium text-slate-700" { (authorization.mode.label()) }
+                                        span class="font-medium text-gray-700" { (authorization.mode.label()) }
                                         @if let Some(grant) = &authorization.grant { " · grant " (grant) }
                                         @if let Some(approved_by) = &authorization.approved_by { " · approved by " (approved_by) }
                                         @if let Some(at) = &authorization.at { " · " (at) }
@@ -5710,32 +5736,32 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
                                     }
                                 }
                                 @if let Some(message) = &entry.payload.message {
-                                    p class="mt-2 text-sm text-slate-600" { (message) }
+                                    p class="mt-2 text-sm text-gray-600" { (message) }
                                 }
                             }
                             span class="cr-data shrink-0" title=(&entry.hash) { (short_hash(&entry.hash)) }
                         }
-                        details class="mt-4 border-t border-slate-100 pt-4" {
+                        details class="mt-4 border-t border-gray-100 pt-4" {
                             summary class="cursor-pointer text-sm font-semibold text-blue-700 hover:text-blue-900" {
                                 (entry.payload.changes.len()) " field-level " @if entry.payload.changes.len() == 1 { "change" } @else { "changes" }
                             }
                             div class="mt-3 space-y-3" {
                                 @for change in &entry.payload.changes {
-                                    div class="rounded-lg border border-slate-200 bg-slate-50 p-3" {
+                                    div class="rounded-lg border border-gray-200 bg-gray-50 p-3" {
                                         div class="flex flex-wrap items-center gap-2" {
-                                            span class="rounded bg-slate-200 px-2 py-0.5 text-xs font-bold uppercase text-slate-700" { (audit_change_operation(change)) }
-                                            code class="text-xs text-slate-700" { (audit_change_path(change)) }
+                                            span class="rounded bg-gray-200 px-2 py-0.5 text-xs font-bold uppercase text-gray-700" { (audit_change_operation(change)) }
+                                            code class="text-xs text-gray-700" { (audit_change_path(change)) }
                                         }
                                         div class="mt-3 grid gap-3 lg:grid-cols-2" {
                                             @if let Some(before) = audit_change_before(change) {
                                                 div {
-                                                    p class="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500" { "Before" }
+                                                    p class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500" { "Before" }
                                                     pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-red-100 bg-red-50 p-3 text-xs leading-5 text-red-950" { (json_preview(before)) }
                                                 }
                                             }
                                             @if let Some(after) = audit_change_after(change) {
                                                 div {
-                                                    p class="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500" { "After" }
+                                                    p class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500" { "After" }
                                                     pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-xs leading-5 text-emerald-950" { (json_preview(after)) }
                                                 }
                                             }
@@ -5878,7 +5904,7 @@ fn render_filter_operator_control(
         operators.push(selected_operator);
     }
     html! {
-        select name="filter_operator" data-filter-operator="true" aria-label=(format!("Filter operator {}", index + 1)) class="min-w-0 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 xl:col-span-3" {
+        select name="filter_operator" data-filter-operator="true" aria-label=(format!("Filter operator {}", index + 1)) class="min-w-0 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 xl:col-span-3" {
             @for operator in operators {
                 option value=(operator.as_str()) selected[operator == selected_operator] { (operator.label()) }
             }
@@ -5896,7 +5922,7 @@ fn render_filter_value_control(
     if !selected_operator.requires_value() {
         return html! {
             input type="hidden" name="filter_value" data-filter-value="true" value="";
-            span class="block px-3 py-2 text-sm text-slate-400" { "No value needed" }
+            span class="block px-3 py-2 text-sm text-gray-400" { "No value needed" }
         };
     }
     let definition = fields.iter().find(|field| field.key == selected_field);
@@ -5907,7 +5933,7 @@ fn render_filter_value_control(
                 .iter()
                 .any(|option| serialize_yaml_value(option) == value);
             html! {
-                select name="filter_value" data-filter-value="true" aria-label=(aria_label) class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                select name="filter_value" data-filter-value="true" aria-label=(aria_label) class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
                     option value="" selected[value.is_empty()] { "Select a value…" }
                     @for option in options {
                         @let serialized = serialize_yaml_value(option);
@@ -5920,23 +5946,23 @@ fn render_filter_value_control(
             }
         }
         Some(SchemaFieldKind::Boolean) => html! {
-            select name="filter_value" data-filter-value="true" aria-label=(aria_label) class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+            select name="filter_value" data-filter-value="true" aria-label=(aria_label) class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
                 option value="" selected[value.is_empty()] { "Select a value…" }
                 option value="true" selected[value == "true"] { "True" }
                 option value="false" selected[value == "false"] { "False" }
             }
         },
         Some(SchemaFieldKind::Integer { .. }) => html! {
-            input type="number" step="1" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Exact number" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+            input type="number" step="1" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Exact number" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
         },
         Some(SchemaFieldKind::Number { .. }) => html! {
-            input type="number" step="any" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Exact number" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+            input type="number" step="any" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Exact number" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
         },
         Some(SchemaFieldKind::String { input_type, .. }) => html! {
-            input type=(input_type) name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Exact value" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+            input type=(input_type) name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Exact value" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
         },
         _ => html! {
-            input type="text" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Typed YAML value" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+            input type="text" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Typed YAML value" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
         },
     }
 }
@@ -5950,8 +5976,8 @@ fn render_filter_row(
 ) -> Markup {
     let selected_known = fields.iter().any(|field| field.key == selected_field);
     html! {
-        div data-filter-row="true" class="grid gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 md:grid-cols-2 xl:grid-cols-12 xl:items-center" {
-            select name="filter_field" data-filter-field="true" aria-label=(format!("Filter field {}", index + 1)) class="min-w-0 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 xl:col-span-4" {
+        div data-filter-row="true" class="grid gap-2 rounded-xl border border-gray-200 bg-gray-50 p-3 md:grid-cols-2 xl:grid-cols-12 xl:items-center" {
+            select name="filter_field" data-filter-field="true" aria-label=(format!("Filter field {}", index + 1)) class="min-w-0 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 xl:col-span-4" {
                 option value="" selected[selected_field.is_empty()] data-filter-kind="input" data-filter-input-type="text" data-filter-options="[]" data-filter-operators=(filter_operators_json(&SchemaFieldKind::Yaml)) { "Choose a field…" }
                 @for field in fields {
                     @let (kind, input_type) = filter_kind_data(&field.kind);
@@ -5965,7 +5991,7 @@ fn render_filter_row(
             div data-filter-value-slot="true" class="min-w-0 md:col-span-2 xl:col-span-4" {
                 (render_filter_value_control(fields, index, selected_field, selected_operator, value))
             }
-            button type="button" data-remove-filter="true" aria-label=(format!("Remove filter {}", index + 1)) class="justify-self-start rounded-lg px-3 py-2 text-sm font-semibold text-slate-500 hover:bg-red-50 hover:text-red-700 md:col-span-2 xl:col-span-1 xl:justify-self-end" { "Remove" }
+            button type="button" data-remove-filter="true" aria-label=(format!("Remove filter {}", index + 1)) class="justify-self-start rounded-lg px-3 py-2 text-sm font-semibold text-gray-500 hover:bg-red-50 hover:text-red-700 md:col-span-2 xl:col-span-1 xl:justify-self-end" { "Remove" }
         }
     }
 }
@@ -6052,10 +6078,10 @@ fn render_view_records(
         &format!("/{}", encode_segment(&view.name)),
         navigation,
         html! {
-            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-slate-500" {
+            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-gray-500" {
                 a href="/" class="font-medium hover:text-blue-700" { "Views" }
                 span aria-hidden="true" { "/" }
-                span class="text-slate-900" { (&view.title) }
+                span class="text-gray-900" { (&view.title) }
             }
             div class="cr-page-heading mb-4 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between" {
                 div {
@@ -6121,8 +6147,8 @@ fn render_view_records(
                         data-filter-builder="true" data-max-filters=(MAX_VIEW_FILTERS) class="contents" {
                         div class="relative min-w-48 flex-1 sm:flex-none" {
                             label class="sr-only" { "Search records" }
-                            input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Search records" placeholder="Search records…" autocomplete="off" data-view-search="true" class="w-full border bg-white py-2 pl-3 pr-10 text-sm outline-none placeholder:text-slate-400 sm:w-56";
-                            button type="submit" aria-label="Submit search" title="Search" class="absolute inset-y-1 right-1 inline-flex w-8 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-blue-700" { "⌕" }
+                            input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Search records" placeholder="Search records…" autocomplete="off" data-view-search="true" class="w-full border bg-white py-2 pl-3 pr-10 text-sm outline-none placeholder:text-gray-400 sm:w-56";
+                            button type="submit" aria-label="Submit search" title="Search" class="absolute inset-y-1 right-1 inline-flex w-8 items-center justify-center rounded-md text-gray-400 hover:bg-gray-100 hover:text-blue-700" { "⌕" }
                         }
                         details class="relative" data-filter-disclosure="true" {
                             (view_filter_summary(active_filter_count, OutOfBand::No))
@@ -6131,16 +6157,16 @@ fn render_view_records(
                                     div class="mb-3 flex flex-wrap items-center justify-between gap-3" {
                                         div {
                                             div class="flex items-center gap-2" {
-                                                h2 class="text-sm font-bold text-slate-900" { "Filters" }
+                                                h2 class="text-sm font-bold text-gray-900" { "Filters" }
                                                 label {
                                                     span class="sr-only" { "Condition match mode" }
-                                                    select name="filter_match" aria-label="Condition match mode" class="rounded-full border-0 bg-slate-100 py-1 pl-2.5 pr-8 text-xs font-semibold text-slate-600 outline-none ring-indigo-500 focus:ring-2" {
+                                                    select name="filter_match" aria-label="Condition match mode" class="rounded-full border-0 bg-gray-100 py-1 pl-2.5 pr-8 text-xs font-semibold text-gray-600 outline-none ring-indigo-500 focus:ring-2" {
                                                         option value="all" selected[query.filter_match == ViewFilterMatch::All] { "All conditions match" }
                                                         option value="any" selected[query.filter_match == ViewFilterMatch::Any] { "Any condition matches" }
                                                     }
                                                 }
                                             }
-                                            p class="mt-1 text-xs text-slate-500" { "Field controls and allowed values come from the collection schema." }
+                                            p class="mt-1 text-xs text-gray-500" { "Field controls and allowed values come from the collection schema." }
                                         }
                                         div class="flex items-center gap-2" {
                                             button type="button" data-add-filter="true" class="cr-button disabled:cursor-not-allowed disabled:opacity-40" { "+ Add condition" }
@@ -6156,35 +6182,35 @@ fn render_view_records(
                                         (render_filter_row(&filter_fields, 0, "", ViewFilterOperator::default(), ""))
                                     }
                                 }
-                                div class="border-t border-slate-100 pt-4" {
+                                div class="border-t border-gray-100 pt-4" {
                                     details open[query_columns_custom(query)] {
-                                        summary class="cursor-pointer list-none text-sm font-bold text-slate-900" {
+                                        summary class="cursor-pointer list-none text-sm font-bold text-gray-900" {
                                             span class="inline-flex items-center gap-2" {
                                                 "Columns"
-                                                span class="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-600" { (columns.len()) " shown" }
+                                                span class="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-semibold text-gray-600" { (columns.len()) " shown" }
                                             }
                                         }
                                         input type="hidden" name="columns" value="custom";
-                                        p class="mt-1 text-xs text-slate-500" { "Choose the fields shown in the table or on Kanban cards. Select at least one." }
+                                        p class="mt-1 text-xs text-gray-500" { "Choose the fields shown in the table or on Kanban cards. Select at least one." }
                                         div role="group" aria-label="Visible columns" class="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" {
                                             @for column in available_columns {
-                                                label class="flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 hover:border-indigo-300 hover:bg-indigo-50/40" {
-                                                    input type="checkbox" name="column" value=(column) checked[columns.contains(column)] class="size-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500";
+                                                label class="flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-700 hover:border-indigo-300 hover:bg-indigo-50/40" {
+                                                    input type="checkbox" name="column" value=(column) checked[columns.contains(column)] class="size-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500";
                                                     span class="truncate" title=(column) { (humanize_field_name(column)) }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                                div class="border-t border-slate-100 pt-4" {
+                                div class="border-t border-gray-100 pt-4" {
                                     div class="mb-3" {
-                                        h2 class="text-sm font-bold text-slate-900" { "Sorting" }
-                                        p class="mt-1 text-xs text-slate-500" { "Newest first by default. Missing values stay last; record ID breaks ties." }
+                                        h2 class="text-sm font-bold text-gray-900" { "Sorting" }
+                                        p class="mt-1 text-xs text-gray-500" { "Newest first by default. Missing values stay last; record ID breaks ties." }
                                     }
                                     div class="grid gap-3 sm:grid-cols-2" {
                                         label {
-                                            span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Sort by" }
-                                            select name="sort_field" aria-label="Sort by" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                                            span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Sort by" }
+                                            select name="sort_field" aria-label="Sort by" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
                                                 option value="" selected[view_sort_field(query).is_none()] { "None (record ID order)" }
                                                 option value="$created_at" selected[view_sort_field(query) == Some("$created_at")] { "Created (default)" }
                                                 option value="$updated_at" selected[view_sort_field(query) == Some("$updated_at")] { "Updated" }
@@ -6195,15 +6221,15 @@ fn render_view_records(
                                             }
                                         }
                                         label {
-                                            span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Direction" }
-                                            select name="sort_direction" aria-label="Sort direction" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                                            span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Direction" }
+                                            select name="sort_direction" aria-label="Sort direction" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
                                                 option value="asc" selected[query.sort_direction == ViewSortDirection::Asc] { "Ascending" }
                                                 option value="desc" selected[query.sort_direction == ViewSortDirection::Desc] { "Descending" }
                                             }
                                         }
                                     }
                                 }
-                                div class="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-4" {
+                                div class="flex flex-wrap items-center justify-end gap-2 border-t border-gray-100 pt-4" {
                                     // "Clear all" is the one control in this
                                     // panel that is deliberately *not* a
                                     // targeted swap. It goes to the view's bare
@@ -6482,7 +6508,7 @@ fn view_results(
             } @else {
             div class="cr-table-shell" {
                 div class="overflow-x-auto" {
-                    table class="min-w-full divide-y divide-slate-200 text-left text-sm" {
+                    table class="min-w-full divide-y divide-gray-200 text-left text-sm" {
                         thead {
                             tr {
                                 // One loop over the three kinds of sortable
@@ -6493,25 +6519,25 @@ fn view_results(
                                 // `sort_link_id` and a position is only
                                 // meaningful across the whole row.
                                 @for (index, (field, heading, spoken)) in sortable_headings(columns).iter().enumerate() {
-                                    th scope="col" aria-sort=(sort_aria_state(query, field)) class="whitespace-nowrap px-4 py-3 font-semibold text-slate-700" {
+                                    th scope="col" aria-sort=(sort_aria_state(query, field)) class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" {
                                         a id=(sort_link_id(index)) href=(view_sort_url(view, query, field, page.limit)) aria-label=(sort_link_label(query, spoken, field)) class="inline-flex items-center gap-1.5 hover:text-indigo-700"
                                             hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_FROM_INSIDE) hx-push-url="true" {
-                                            (heading) span aria-hidden="true" class="text-slate-400" { (sort_indicator(query, field)) }
+                                            (heading) span aria-hidden="true" class="text-gray-400" { (sort_indicator(query, field)) }
                                         }
                                     }
                                 }
-                                th scope="col" class="px-4 py-3 text-right font-semibold text-slate-700" { "" }
+                                th scope="col" class="px-4 py-3 text-right font-semibold text-gray-700" { "" }
                             }
                         }
-                        tbody class="divide-y divide-slate-100" {
+                        tbody class="divide-y divide-gray-100" {
                             @if page.records.is_empty() {
-                                tr { td colspan=(columns.len() + ACTIVITY_COLUMNS.len() + 2) class="px-4 py-12 text-center text-slate-500" { "No records match this view." } }
+                                tr { td colspan=(columns.len() + ACTIVITY_COLUMNS.len() + 2) class="px-4 py-12 text-center text-gray-500" { "No records match this view." } }
                             } @else {
                                 @for record in &page.records {
                                     @let record_activity = activity.get(&record.id);
                                     tr {
                                         td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold" {
-                                            a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="text-slate-900 hover:text-indigo-700 hover:underline" { (&record.id) }
+                                            a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="text-gray-900 hover:text-indigo-700 hover:underline" { (&record.id) }
                                         }
                                         td class="whitespace-nowrap px-4 py-3" {
                                             (render_timestamp(record_activity.map(|activity| activity.created_at.as_str())))
@@ -6520,12 +6546,12 @@ fn view_results(
                                             (render_timestamp(record_activity.map(|activity| activity.updated_at.as_str())))
                                         }
                                         @for column in columns {
-                                            td class="max-w-sm px-4 py-3 text-slate-700" {
+                                            td class="max-w-sm px-4 py-3 text-gray-700" {
                                                 a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="line-clamp-2 hover:text-indigo-700 hover:underline" { (record_value(record, column)) }
                                             }
                                         }
                                         td class="whitespace-nowrap px-4 py-3 text-right" {
-                                            a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) aria-label=(format!("View {}", record.id)) title="Open record" class="inline-flex size-6 items-center justify-center rounded text-slate-400 hover:bg-slate-100 hover:text-indigo-700" {
+                                            a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) aria-label=(format!("View {}", record.id)) title="Open record" class="inline-flex size-6 items-center justify-center rounded text-gray-400 hover:bg-gray-100 hover:text-indigo-700" {
                                                 span class="sr-only" { "View" }
                                                 span aria-hidden="true" { "→" }
                                             }
@@ -6536,8 +6562,8 @@ fn view_results(
                         }
                     }
                 }
-                div class="flex flex-col gap-2 border-t border-slate-200 bg-slate-50 px-3 py-2 text-xs sm:flex-row sm:items-center sm:justify-between" {
-                    p class="text-slate-600" {
+                div class="flex flex-col gap-2 border-t border-gray-200 bg-gray-50 px-3 py-2 text-xs sm:flex-row sm:items-center sm:justify-between" {
+                    p class="text-gray-600" {
                         "Showing " (first) "–" (last) " of " (page.total)
                     }
                     (view_pager_links(view, query, page))
@@ -6578,28 +6604,28 @@ fn render_save_view_control(
                         input type="hidden" name="column" value=(column);
                     }
                     div {
-                        h2 class="text-sm font-bold text-slate-900" { "Save current view" }
-                        p class="mt-1 text-xs leading-5 text-slate-500" { "Preserves applied filters, all/any matching, layout, columns, and sorting. Search text remains shareable in the URL." }
+                        h2 class="text-sm font-bold text-gray-900" { "Save current view" }
+                        p class="mt-1 text-xs leading-5 text-gray-500" { "Preserves applied filters, all/any matching, layout, columns, and sorting. Search text remains shareable in the URL." }
                     }
                     label class="block" {
-                        span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "View name" }
-                        input required name="name" placeholder="enterprise-deals" autocomplete="off" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+                        span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "View name" }
+                        input required name="name" placeholder="enterprise-deals" autocomplete="off" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
                     }
                     label class="block" {
-                        span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Title (optional)" }
-                        input name="title" placeholder=(format!("{} copy", view.title)) autocomplete="off" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+                        span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Title (optional)" }
+                        input name="title" placeholder=(format!("{} copy", view.title)) autocomplete="off" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
                     }
                     div class="grid gap-3 sm:grid-cols-2" {
                         label class="block" {
-                            span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Layout" }
-                            select name="layout" aria-label="Layout" data-view-layout="true" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                            span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Layout" }
+                            select name="layout" aria-label="Layout" data-view-layout="true" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
                                 option value="table" selected[view.layout == ViewLayout::Table] { "Table" }
                                 option value="kanban" selected[view.layout == ViewLayout::Kanban] { "Kanban" }
                             }
                         }
                         label class="block" {
-                            span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500" { "Group Kanban by" }
-                            select name="group_by" aria-label="Group Kanban by" data-view-group-by="true" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400" {
+                            span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Group Kanban by" }
+                            select name="group_by" aria-label="Group Kanban by" data-view-group-by="true" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-400" {
                                 option value="" selected[view.group_by.is_none()] { "Choose a field…" }
                                 @for column in available_columns {
                                     option value=(column) selected[view.group_by.as_deref() == Some(column.as_str())] { (humanize_field_name(column)) }
@@ -6607,7 +6633,7 @@ fn render_save_view_control(
                             }
                         }
                     }
-                    p class="text-xs leading-5 text-slate-500" { "Kanban uses the chosen front matter field as lanes; moving a card updates that field through the audited database path." }
+                    p class="text-xs leading-5 text-gray-500" { "Kanban uses the chosen front matter field as lanes; moving a card updates that field through the audited database path." }
                     button type="submit" class="cr-button cr-button-primary w-full" { "Save view" }
                 }
             }
@@ -6637,9 +6663,9 @@ fn render_kanban_board(
     let (first, last) = page_range(page);
 
     html! {
-        div class="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600" {
+        div class="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-gray-600" {
             p {
-                "Kanban grouped by " code class="rounded bg-slate-200 px-1.5 py-0.5 font-mono text-xs font-semibold text-slate-800" { (group_by) }
+                "Kanban grouped by " code class="rounded bg-gray-200 px-1.5 py-0.5 font-mono text-xs font-semibold text-gray-900" { (group_by) }
             }
             @if updatable.is_empty() {
                 p { "This perspective can view cards but cannot move them." }
@@ -6654,15 +6680,15 @@ fn render_kanban_board(
                         data-kanban-lane="true"
                         data-kanban-target=(kanban_target_json(&lane.target))
                         data-kanban-csrf=(csrf_token)
-                        class="cr-kanban-lane w-72 shrink-0 p-2.5 transition-colors"
+                        class="cr-kanban-lane w-72 shrink-0 p-2.5"
                     {
                         div class="mb-2 flex items-center justify-between gap-3 px-1" {
-                            h2 class="text-sm font-semibold text-slate-900" { (&lane.label) }
+                            h2 class="text-sm font-semibold text-gray-900" { (&lane.label) }
                             span class="cr-pill bg-white" { (lane.records.len()) }
                         }
                         div class="min-h-20 space-y-2" {
                             @if lane.records.is_empty() {
-                                p class="rounded-xl border border-dashed border-slate-300 px-4 py-8 text-center text-xs text-slate-500" { "Drop cards here" }
+                                p class="rounded-xl border border-dashed border-gray-300 px-4 py-8 text-center text-xs text-gray-500" { "Drop cards here" }
                             }
                             @for record in &lane.records {
                                 @let can_move = updatable.contains(&record.id);
@@ -6673,27 +6699,27 @@ fn render_kanban_board(
                                     class=(if can_move { "cr-kanban-card cursor-grab p-3 active:cursor-grabbing" } else { "cr-kanban-card p-3" })
                                 {
                                     div class="flex items-start justify-between gap-3" {
-                                        a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="break-all font-mono text-sm font-bold text-slate-950 hover:text-indigo-700 hover:underline" { (&record.id) }
-                                        span aria-hidden="true" class="select-none text-slate-300" { "⠿" }
+                                        a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="break-all font-mono text-sm font-bold text-gray-900 hover:text-indigo-700 hover:underline" { (&record.id) }
+                                        span aria-hidden="true" class="select-none text-gray-300" { "⠿" }
                                     }
                                     @if !card_columns.is_empty() {
                                         dl class="mt-2 space-y-1" {
                                             @for column in &card_columns {
                                                 div {
-                                                    dt class="text-[0.65rem] font-bold uppercase tracking-wide text-slate-400" { (column) }
-                                                    dd class="mt-0.5 line-clamp-2 text-sm text-slate-700" { (record_value(record, column)) }
+                                                    dt class="text-[0.65rem] font-bold uppercase tracking-wide text-gray-400" { (column) }
+                                                    dd class="mt-0.5 line-clamp-2 text-sm text-gray-700" { (record_value(record, column)) }
                                                 }
                                             }
                                         }
                                     }
                                     @if can_move {
-                                        details class="cr-kanban-move mt-3 border-t border-slate-100 pt-2" {
+                                        details class="cr-kanban-move mt-3 border-t border-gray-100 pt-2" {
                                             summary class="cursor-pointer list-none" { "Move card…" }
                                             form method="post" action=(kanban_move_url(view, &record.id)) hx-boost=(UNBOOSTED) class="flex items-center gap-2" {
                                                 input type="hidden" name="_csrf" value=(csrf_token);
                                                 label class="min-w-0 flex-1" {
                                                     span class="sr-only" { "Move " (&record.id) " to" }
-                                                    select name="target" aria-label=(format!("Move {} to", record.id)) class="w-full rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs outline-none ring-indigo-500 focus:ring-2" {
+                                                    select name="target" aria-label=(format!("Move {} to", record.id)) class="w-full rounded-lg border border-gray-300 bg-white px-2 py-1.5 text-xs outline-none ring-indigo-500 focus:ring-2" {
                                                         @for option_lane in &lanes {
                                                             @if option_lane.target == lane.target {
                                                                 option value=(kanban_target_json(&option_lane.target)) selected { (&option_lane.label) }
@@ -6715,7 +6741,7 @@ fn render_kanban_board(
             }
         }
         div class="cr-surface mt-1 flex flex-col gap-2 px-3 py-2 text-xs sm:flex-row sm:items-center sm:justify-between" {
-            p class="text-slate-600" {
+            p class="text-gray-600" {
                 "Showing " (first) "–" (last) " of " (page.total)
             }
             (view_pager_links(view, query, page))
@@ -7102,23 +7128,23 @@ fn render_schema_field(field: &SchemaFormField, diagnostics: &[String]) -> Marku
     html! {
         div class=(field_class) {
             div class="mb-2 flex items-start justify-between gap-3" {
-                label for=(format!("field-{}", field.key)) class="text-sm font-semibold text-slate-900" {
+                label for=(format!("field-{}", field.key)) class="text-sm font-semibold text-gray-900" {
                     (&field.label)
                     @if field.required {
                         span class="ml-1 text-red-500" aria-hidden="true" { "*" }
                     }
                 }
-                span class="shrink-0 rounded-md bg-white px-2 py-0.5 text-[0.65rem] font-bold uppercase tracking-wide text-slate-500 shadow-sm" {
+                span class="shrink-0 rounded-md bg-white px-2 py-0.5 text-[0.65rem] font-bold uppercase tracking-wide text-gray-500 shadow-sm" {
                     (schema_field_type_label(&field.kind))
                 }
             }
             @if let Some(description) = &field.description {
-                p class="mb-3 text-xs leading-5 text-slate-500" { (description) }
+                p class="mb-3 text-xs leading-5 text-gray-500" { (description) }
             }
             (render_field_diagnostics(diagnostics))
             @match &field.kind {
                 SchemaFieldKind::Select(options) => {
-                    select id=(format!("field-{}", field.key)) name=(name) required[field.required] aria-invalid=[invalid] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                    select id=(format!("field-{}", field.key)) name=(name) required[field.required] aria-invalid=[invalid] class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" {
                         option value="" selected[unset] disabled[field.required] {
                             @if field.required { "Select a value…" } @else { "Not set" }
                         }
@@ -7130,7 +7156,7 @@ fn render_schema_field(field: &SchemaFormField, diagnostics: &[String]) -> Marku
                 SchemaFieldKind::MultiSelect(options) => {
                     div id=(format!("field-{}", field.key)) class="flex flex-wrap gap-2" {
                         @for option in options {
-                            label class="inline-flex cursor-pointer items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 has-checked:border-indigo-500 has-checked:bg-indigo-50 has-checked:text-indigo-800" {
+                            label class="inline-flex cursor-pointer items-center gap-2 rounded-full border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 has-checked:border-indigo-500 has-checked:bg-indigo-50 has-checked:text-indigo-800" {
                                 input type="checkbox" name=(name.clone()) value=(serialize_yaml_value(option)) checked[option_is_chosen(field, option)] aria-invalid=[invalid] class="size-4 accent-indigo-600";
                                 (schema_value_label(option))
                             }
@@ -7138,16 +7164,16 @@ fn render_schema_field(field: &SchemaFormField, diagnostics: &[String]) -> Marku
                     }
                 }
                 SchemaFieldKind::String { input_type, min_length, max_length } => {
-                    input id=(format!("field-{}", field.key)) type=(input_type) name=(name) value=(field_control_text(field)) required[field.required] minlength=[*min_length] maxlength=[*max_length] aria-invalid=[invalid] autocomplete=(if *input_type == "email" { "email" } else { "off" }) class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
+                    input id=(format!("field-{}", field.key)) type=(input_type) name=(name) value=(field_control_text(field)) required[field.required] minlength=[*min_length] maxlength=[*max_length] aria-invalid=[invalid] autocomplete=(if *input_type == "email" { "email" } else { "off" }) class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
                 }
                 SchemaFieldKind::Integer { minimum, maximum } => {
-                    input id=(format!("field-{}", field.key)) type="number" step="1" name=(name) value=(field_control_text(field)) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] aria-invalid=[invalid] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
+                    input id=(format!("field-{}", field.key)) type="number" step="1" name=(name) value=(field_control_text(field)) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] aria-invalid=[invalid] class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
                 }
                 SchemaFieldKind::Number { minimum, maximum } => {
-                    input id=(format!("field-{}", field.key)) type="number" step="any" name=(name) value=(field_control_text(field)) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] aria-invalid=[invalid] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
+                    input id=(format!("field-{}", field.key)) type="number" step="any" name=(name) value=(field_control_text(field)) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] aria-invalid=[invalid] class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
                 }
                 SchemaFieldKind::Boolean => {
-                    select id=(format!("field-{}", field.key)) name=(name) required[field.required] aria-invalid=[invalid] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                    select id=(format!("field-{}", field.key)) name=(name) required[field.required] aria-invalid=[invalid] class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" {
                         option value="" selected[unset] disabled[field.required] {
                             @if field.required { "Choose true or false…" } @else { "Not set" }
                         }
@@ -7156,7 +7182,7 @@ fn render_schema_field(field: &SchemaFormField, diagnostics: &[String]) -> Marku
                     }
                 }
                 SchemaFieldKind::Yaml => {
-                    textarea id=(format!("field-{}", field.key)) name=(name) rows="5" spellcheck="false" required[field.required] aria-invalid=[invalid] placeholder="{}" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (field_yaml_text(field)) }
+                    textarea id=(format!("field-{}", field.key)) name=(name) rows="5" spellcheck="false" required[field.required] aria-invalid=[invalid] placeholder="{}" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (field_yaml_text(field)) }
                 }
             }
         }
@@ -7454,8 +7480,8 @@ fn render_record_form(
             section class="cr-form-section p-4 sm:p-5" {
                 div class="mb-4 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" {
                     div {
-                        h2 class="text-lg font-bold text-slate-950" { "Record details" }
-                        p class="mt-1 text-sm text-slate-500" {
+                        h2 class="text-lg font-bold text-gray-900" { "Record details" }
+                        p class="mt-1 text-sm text-gray-500" {
                             @if structured { "Fields and controls follow this collection’s JSON Schema." } @else { "Front matter accepts any YAML mapping." }
                         }
                     }
@@ -7465,7 +7491,7 @@ fn render_record_form(
                 }
                 @if !editing {
                     div class="mb-4 rounded-xl border border-indigo-100 bg-indigo-50/60 p-4" {
-                        label for="record-id" class="mb-1.5 block text-sm font-semibold text-slate-900" { "Record ID " span class="text-red-500" aria-hidden="true" { "*" } }
+                        label for="record-id" class="mb-1.5 block text-sm font-semibold text-gray-900" { "Record ID " span class="text-red-500" aria-hidden="true" { "*" } }
                         (render_field_diagnostics(form_diagnostics(rejection, ID_CONTROL)))
                         // Both characters are escaped, so the rendered attribute
                         // is `[^\/\\]+`. `pattern` is compiled with the
@@ -7477,7 +7503,7 @@ fn render_record_form(
                         // `/` and `\` in a record ID. The server refuses those
                         // characters regardless — this is the hint, not the rule.
                         input id="record-id" type="text" name="id" value=(record_id) required pattern="[^\\/\\\\]+" placeholder="acme-renewal" aria-describedby="record-id-help" aria-invalid=[(!form_diagnostics(rejection, ID_CONTROL).is_empty()).then_some("true")] class="w-full rounded-lg border border-indigo-200 bg-white px-3 py-2.5 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
-                        span id="record-id-help" class="mt-1.5 block text-xs text-slate-500" { "Stable URL and filename identifier. It cannot be changed later." }
+                        span id="record-id-help" class="mt-1.5 block text-xs text-gray-500" { "Stable URL and filename identifier. It cannot be changed later." }
                     }
                 }
                 @if structured {
@@ -7487,32 +7513,32 @@ fn render_record_form(
                         }
                     }
                     @if allows_additional {
-                        details class="mt-5 rounded-xl border border-dashed border-slate-300 bg-slate-50" open[additional_open] {
-                            summary class="cursor-pointer px-4 py-3 text-sm font-semibold text-slate-700 hover:text-indigo-700" { "+ Additional attributes" }
-                            div class="border-t border-slate-200 p-4" {
-                                p class="mb-2 text-xs leading-5 text-slate-500" { "Optional front matter not declared in the schema. Declared fields above cannot be overridden here." }
+                        details class="mt-5 rounded-xl border border-dashed border-gray-300 bg-gray-50" open[additional_open] {
+                            summary class="cursor-pointer px-4 py-3 text-sm font-semibold text-gray-700 hover:text-indigo-700" { "+ Additional attributes" }
+                            div class="border-t border-gray-200 p-4" {
+                                p class="mb-2 text-xs leading-5 text-gray-500" { "Optional front matter not declared in the schema. Declared fields above cannot be overridden here." }
                                 (render_field_diagnostics(additional_diagnostics))
-                                textarea name="_additional_attributes" rows="5" spellcheck="false" aria-invalid=[(!additional_diagnostics.is_empty()).then_some("true")] class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (additional_yaml) }
+                                textarea name="_additional_attributes" rows="5" spellcheck="false" aria-invalid=[(!additional_diagnostics.is_empty()).then_some("true")] class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (additional_yaml) }
                             }
                         }
                     }
                 } @else {
                     label class="block" {
-                        span class="mb-1.5 block text-sm font-semibold text-slate-800" { "Front matter" }
+                        span class="mb-1.5 block text-sm font-semibold text-gray-900" { "Front matter" }
                         (render_field_diagnostics(form_diagnostics(rejection, FRONT_MATTER_CONTROL)))
-                        textarea name="front_matter" rows="14" spellcheck="false" aria-invalid=[(!form_diagnostics(rejection, FRONT_MATTER_CONTROL).is_empty()).then_some("true")] class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (front_matter) }
+                        textarea name="front_matter" rows="14" spellcheck="false" aria-invalid=[(!form_diagnostics(rejection, FRONT_MATTER_CONTROL).is_empty()).then_some("true")] class="w-full rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (front_matter) }
                     }
                 }
             }
             section class="cr-form-section p-4 sm:p-5" {
                 div class="mb-3 flex items-center justify-between gap-3" {
                     div {
-                        h2 class="text-lg font-bold text-slate-950" { "Notes" }
-                        p class="mt-1 text-sm text-slate-500" { "Long-form context stored as the Markdown body." }
+                        h2 class="text-lg font-bold text-gray-900" { "Notes" }
+                        p class="mt-1 text-sm text-gray-500" { "Long-form context stored as the Markdown body." }
                     }
-                    span class="rounded-md bg-slate-100 px-2 py-1 font-mono text-xs font-semibold text-slate-500" { "Markdown" }
+                    span class="rounded-md bg-gray-100 px-2 py-1 font-mono text-xs font-semibold text-gray-500" { "Markdown" }
                 }
-                textarea name="markdown" aria-label="Markdown notes" rows="12" class="w-full rounded-lg border border-slate-300 px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (markdown) }
+                textarea name="markdown" aria-label="Markdown notes" rows="12" class="w-full rounded-lg border border-gray-300 px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (markdown) }
             }
             }
             div class="cr-surface flex flex-wrap items-center justify-between gap-3 p-3" {
@@ -7543,12 +7569,12 @@ fn render_record_form(
         &back,
         navigation,
         html! {
-            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-slate-500" {
+            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-gray-500" {
                 a href="/" class="font-medium hover:text-blue-700" { "Views" }
                 span aria-hidden="true" { "/" }
                 a href=(back.clone()) class="font-medium hover:text-blue-700" { (&view.title) }
                 span aria-hidden="true" { "/" }
-                span class="text-slate-900" { (&title) }
+                span class="text-gray-900" { (&title) }
             }
             div class="mx-auto max-w-7xl" {
                 div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
@@ -7576,8 +7602,8 @@ fn render_record_form(
                     aside id="audit-history" class="cr-record-activity scroll-mt-20" {
                         div class="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between" {
                             div {
-                                h2 class="text-base font-bold text-slate-950" { "Activity" }
-                                p class="mt-0.5 text-xs text-slate-500" { "Newest accepted changes" }
+                                h2 class="text-base font-bold text-gray-900" { "Activity" }
+                                p class="mt-0.5 text-xs text-gray-500" { "Newest accepted changes" }
                             }
                             a href=(audit_filter_url(&view.collection, &record.id)) class="text-xs font-semibold text-indigo-700 hover:text-indigo-900" { "All activity" span aria-hidden="true" { " →" } }
                         }
@@ -7672,14 +7698,14 @@ fn render_delete_confirmation(
         &back,
         navigation,
         html! {
-            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-slate-500" {
+            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-gray-500" {
                 a href="/" class="font-medium hover:text-blue-700" { "Views" }
                 span aria-hidden="true" { "/" }
                 a href=(&back) class="font-medium hover:text-blue-700" { (&view.title) }
                 span aria-hidden="true" { "/" }
                 a href=(&record_url) class="font-medium hover:text-blue-700" { (&record.id) }
                 span aria-hidden="true" { "/" }
-                span class="text-slate-900" { "Delete" }
+                span class="text-gray-900" { "Delete" }
             }
             div class="mx-auto max-w-2xl" {
                 div class="cr-record-danger rounded-xl border border-red-200 bg-red-50 p-6" {
@@ -7721,36 +7747,151 @@ fn render_delete_confirmation(
 
 const GLOBAL_STYLES: &str = r#"
 :root {
-  --cr-canvas: #ffffff;
-  --cr-sidebar: #f7f7f5;
-  --cr-sidebar-hover: #eeeeeb;
-  --cr-surface: #ffffff;
-  --cr-surface-subtle: #fafaf9;
-  --cr-ink: #242424;
-  --cr-muted: #787774;
-  --cr-line: #e8e8e6;
-  --cr-line-strong: #d8d8d5;
+  /* The grey scale, and every neutral in the UI. The rules below use these
+     steps directly, and `src/static/tailwind.input.css` makes them the `gray`
+     and `white` utilities the markup uses, so `text-gray-500` and
+     `var(--cr-gray-500)` are one colour. 0 is the page and every surface on
+     it, 50 to 300 are fills and lines, and 400 to 900 are text. */
+  --cr-gray-0: #ffffff;
+  --cr-gray-50: #f7f7f5;
+  --cr-gray-100: #efefec;
+  --cr-gray-200: #e6e6e3;
+  --cr-gray-300: #d5d5d1;
+  --cr-gray-400: #a3a29e;
+  --cr-gray-500: #72716d;
+  --cr-gray-600: #5b5a57;
+  --cr-gray-700: #464543;
+  --cr-gray-900: #242424;
+
   --cr-accent: #5e6ad2;
   --cr-accent-hover: #4f5abf;
   --cr-accent-soft: #f0f1fb;
+  --cr-focus-halo: rgb(37 99 235 / 0.12);
   --cr-danger: #b91c1c;
+  --cr-info-line: #bfdbfe;
+  --cr-info-soft: #eff6ff;
+  --cr-info-ink: #1e3a8a;
+  --cr-info-strong: #1d4ed8;
+  --cr-warn-line: #fcd34d;
+  --cr-warn-soft: #fffbeb;
+  --cr-warn-ink: #92400e;
+  --cr-invalid-line: #fca5a5;
+  --cr-invalid-soft: #fef2f2;
+
   --cr-radius: 8px;
   --cr-emoji: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
   --cr-sidebar-width: 232px;
   --cr-shadow-popover: 0 18px 44px rgb(36 36 36 / 0.14), 0 2px 8px rgb(36 36 36 / 0.07);
 }
 
+/* Dark mode follows the operating system; there is no switch of its own.
+   `color-scheme` on `html` tells the browser both schemes are supported, which
+   is what darkens scrollbars, date pickers and select menus, and this block
+   swaps the palette when the system asks for dark. Every colour the rules
+   below use is a token above, so no rule has a dark variant to keep in step;
+   the only literals left are a card's faint shadows, which a dark canvas
+   simply swallows.
+
+   The grey scale runs the other way here, 0 the darkest step and 900 the
+   lightest, and because the `gray` and `white` utilities are these same
+   properties that one flip recolours the markup's greys too: `text-white` on
+   a `bg-gray-900` button is still the opposite of its fill. The markup's
+   other hues are Tailwind's own, which v4 resolves through `--color-*`
+   properties declared inside a cascade layer. A declaration outside any
+   layer beats every declaration inside one, so redefining them here recolours
+   every use at once, including the ones `cr.js` adds. Each is mapped the same
+   way round — a 50 becomes the darkest tint and a 950 the lightest ink — so
+   `bg-red-50 text-red-900` is still a quiet panel with legible text; the 500s
+   are the middle of their scales and keep their value. A colour a utility
+   reads with no dark value here would stay light on a dark page, which
+   `tests/stylesheet_http.rs` refuses. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --cr-gray-0: #191919;
+    --cr-gray-50: #1f1f1f;
+    --cr-gray-100: #272726;
+    --cr-gray-200: #30302f;
+    --cr-gray-300: #3f3f3d;
+    --cr-gray-400: #6e6d6a;
+    --cr-gray-500: #9b9a96;
+    --cr-gray-600: #b4b3af;
+    --cr-gray-700: #cac9c5;
+    --cr-gray-900: #ecebe7;
+
+    --cr-accent: #7d87e6;
+    --cr-accent-hover: #959df0;
+    --cr-accent-soft: #25273d;
+    --cr-focus-halo: rgb(125 135 230 / 0.3);
+    --cr-danger: #f87171;
+    --cr-info-line: #27406c;
+    --cr-info-soft: #172136;
+    --cr-info-ink: #bfd3fa;
+    --cr-info-strong: #9db9f9;
+    --cr-warn-line: #5b4517;
+    --cr-warn-soft: #2a2211;
+    --cr-warn-ink: #f3c46a;
+    --cr-invalid-line: #7a2f2f;
+    --cr-invalid-soft: #2c1b1b;
+
+    --cr-shadow-popover: 0 18px 44px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.4);
+
+    --color-red-50: oklch(25.5% 0.045 20);
+    --color-red-100: oklch(29% 0.065 21);
+    --color-red-200: oklch(35% 0.09 22);
+    --color-red-300: oklch(42% 0.12 24);
+    --color-red-400: oklch(57.7% 0.245 27.325);
+    --color-red-600: oklch(70.4% 0.191 22.216);
+    --color-red-700: oklch(80.8% 0.114 19.571);
+    --color-red-800: oklch(88.5% 0.062 18.334);
+    --color-red-900: oklch(93.6% 0.032 17.717);
+    --color-red-950: oklch(97.1% 0.013 17.38);
+
+    --color-emerald-50: oklch(25.5% 0.035 165);
+    --color-emerald-100: oklch(29% 0.05 165);
+    --color-emerald-200: oklch(35% 0.07 165);
+    --color-emerald-300: oklch(42% 0.09 164);
+    --color-emerald-400: oklch(59.6% 0.145 163.225);
+    --color-emerald-600: oklch(76.5% 0.177 163.223);
+    --color-emerald-700: oklch(84.5% 0.143 164.978);
+    --color-emerald-800: oklch(90.5% 0.093 164.15);
+    --color-emerald-900: oklch(95% 0.052 163.051);
+    --color-emerald-950: oklch(97.9% 0.021 166.113);
+
+    --color-indigo-50: oklch(25.5% 0.04 275);
+    --color-indigo-100: oklch(29% 0.06 275);
+    --color-indigo-200: oklch(35% 0.09 276);
+    --color-indigo-300: oklch(42% 0.12 277);
+    --color-indigo-400: oklch(51.1% 0.262 276.966);
+    --color-indigo-600: oklch(67.3% 0.182 276.935);
+    --color-indigo-700: oklch(78.5% 0.115 274.713);
+    --color-indigo-800: oklch(87% 0.065 274.039);
+    --color-indigo-900: oklch(93% 0.034 272.788);
+    --color-indigo-950: oklch(96.2% 0.018 272.314);
+
+    --color-blue-50: oklch(25.5% 0.04 260);
+    --color-blue-100: oklch(29% 0.06 260);
+    --color-blue-200: oklch(35% 0.08 258);
+    --color-blue-300: oklch(42% 0.11 257);
+    --color-blue-400: oklch(54.6% 0.245 262.881);
+    --color-blue-600: oklch(70.7% 0.165 254.624);
+    --color-blue-700: oklch(80.9% 0.105 251.813);
+    --color-blue-800: oklch(88.2% 0.059 254.128);
+    --color-blue-900: oklch(93.2% 0.032 255.585);
+    --color-blue-950: oklch(97% 0.014 254.604);
+  }
+}
+
 * { box-sizing: border-box; }
 
 html {
-  background: var(--cr-canvas);
-  color-scheme: light;
+  background: var(--cr-gray-0);
+  color-scheme: light dark;
   scroll-behavior: smooth;
 }
 
 .cr-app {
-  background: var(--cr-canvas);
-  color: var(--cr-ink);
+  background: var(--cr-gray-0);
+  color: var(--cr-gray-900);
   font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: 14px;
   font-feature-settings: "cv02", "cv03", "cv04", "cv11";
@@ -7777,12 +7918,11 @@ html {
   z-index: 100;
   transform: translateY(-150%);
   border-radius: 6px;
-  background: var(--cr-ink);
-  color: white;
+  background: var(--cr-gray-900);
+  color: var(--cr-gray-0);
   padding: 8px 12px;
   font-size: 0.875rem;
   font-weight: 600;
-  transition: transform 120ms ease-out;
 }
 
 .cr-skip-link:focus { transform: translateY(0); }
@@ -7853,7 +7993,7 @@ html {
   min-height: 100vh;
 }
 
-.cr-workspace { min-width: 0; background: var(--cr-canvas); }
+.cr-workspace { min-width: 0; background: var(--cr-gray-0); }
 
 .cr-sidebar {
   position: sticky;
@@ -7863,9 +8003,9 @@ html {
   height: 100vh;
   min-width: 0;
   flex-direction: column;
-  border-right: 1px solid var(--cr-line);
-  background: var(--cr-sidebar);
-  color: #5f5e5b;
+  border-right: 1px solid var(--cr-gray-200);
+  background: var(--cr-gray-50);
+  color: var(--cr-gray-600);
 }
 
 .cr-sidebar-brand {
@@ -7883,7 +8023,7 @@ html {
   gap: 8px;
   align-items: center;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  color: var(--cr-ink);
+  color: var(--cr-gray-900);
   font-size: 0.9rem;
   font-weight: 700;
   letter-spacing: -0.04em;
@@ -7894,17 +8034,17 @@ html {
   width: 24px;
   height: 24px;
   place-items: center;
-  border: 1px solid #d1d1ce;
+  border: 1px solid var(--cr-gray-300);
   border-radius: 6px;
-  background: white;
+  background: var(--cr-gray-0);
   box-shadow: 0 1px 1px rgb(36 36 36 / 0.04);
   font-size: 0.78rem;
 }
 
 .cr-local-badge {
-  border: 1px solid var(--cr-line-strong);
+  border: 1px solid var(--cr-gray-300);
   border-radius: 999px;
-  color: #8b8a87;
+  color: var(--cr-gray-500);
   padding: 2px 6px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.62rem;
@@ -7921,7 +8061,7 @@ html {
 
 .cr-sidebar-label {
   margin: 17px 8px 5px;
-  color: #9a9996;
+  color: var(--cr-gray-400);
   font-size: 0.68rem;
   font-weight: 650;
   letter-spacing: 0.015em;
@@ -7935,16 +8075,15 @@ html {
   align-items: center;
   gap: 8px;
   border-radius: 5px;
-  color: #5f5e5b;
+  color: var(--cr-gray-600);
   padding: 5px 8px;
   font-size: 0.79rem;
   font-weight: 520;
   line-height: 1.25;
-  transition: background-color 90ms ease-out, color 90ms ease-out;
 }
 
-.cr-sidebar-link:hover { background: var(--cr-sidebar-hover); color: var(--cr-ink); }
-.cr-sidebar-link.is-active { background: #e8e8e4; color: var(--cr-ink); font-weight: 620; }
+.cr-sidebar-link:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
+.cr-sidebar-link.is-active { background: var(--cr-gray-200); color: var(--cr-gray-900); font-weight: 620; }
 
 /* Every navigation entry is marked by an emoji: a collection's own when its
    schema names one, a fixed one otherwise. The box is a fixed square so that
@@ -7963,18 +8102,18 @@ html {
   line-height: 1;
 }
 
-.cr-nav-note { margin-left: auto; color: #aaa9a5; font-size: 0.62rem; font-weight: 550; }
-.cr-sidebar-notice { margin: 4px 8px; color: #92400e; font-size: 0.68rem; line-height: 1.35; overflow-wrap: anywhere; }
+.cr-nav-note { margin-left: auto; color: var(--cr-gray-400); font-size: 0.62rem; font-weight: 550; }
+.cr-sidebar-notice { margin: 4px 8px; color: var(--cr-warn-ink); font-size: 0.68rem; line-height: 1.35; overflow-wrap: anywhere; }
 
 .cr-mobile-icon { margin-right: 4px; font-family: var(--cr-emoji); }
 .cr-title-icon { font-family: var(--cr-emoji); font-size: 1.35rem; line-height: 1; }
 .cr-file-icon { display: inline-block; width: 1.4em; font-family: var(--cr-emoji); }
 
-.cr-external { margin-left: auto; color: #aaa9a5; font-size: 0.7rem; }
+.cr-external { margin-left: auto; color: var(--cr-gray-400); font-size: 0.7rem; }
 
 .cr-sidebar-utility {
   flex: 0 0 auto;
-  border-top: 1px solid var(--cr-line);
+  border-top: 1px solid var(--cr-gray-200);
   padding: 8px;
 }
 
@@ -7983,7 +8122,7 @@ html {
   align-items: center;
   justify-content: space-between;
   padding: 9px 8px 2px;
-  color: #aaa9a5;
+  color: var(--cr-gray-400);
   font-size: 0.62rem;
 }
 
@@ -7991,31 +8130,31 @@ html {
 
 .cr-nav-link {
   border-radius: 6px;
-  color: #52525b;
+  color: var(--cr-gray-600);
   padding: 6px 8px;
   font-size: 0.825rem;
   font-weight: 550;
-  transition: background-color 120ms ease-out, color 120ms ease-out;
 }
 
-.cr-nav-link:hover { background: #f4f4f5; color: var(--cr-ink); }
+.cr-nav-link:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
 
-.cr-perspective { display: grid; gap: 5px; margin-top: 8px; border-top: 1px solid var(--cr-line); padding: 10px 8px 2px; }
+.cr-perspective { display: grid; gap: 5px; margin-top: 8px; border-top: 1px solid var(--cr-gray-200); padding: 10px 8px 2px; }
 
-.cr-perspective-label { color: #8b8a87; font-size: 0.65rem; font-weight: 650; }
+.cr-perspective-label { color: var(--cr-gray-500); font-size: 0.65rem; font-weight: 650; }
 
 .cr-perspective select {
   width: 100%;
   min-height: 30px;
+  border: 1px solid var(--cr-gray-300);
   padding: 4px 28px 4px 8px;
   font-size: 0.72rem;
   font-weight: 600;
 }
 
 .cr-perspective-banner {
-  border-bottom: 1px solid #bfdbfe;
-  background: #eff6ff;
-  color: #1e3a8a;
+  border-bottom: 1px solid var(--cr-info-line);
+  background: var(--cr-info-soft);
+  color: var(--cr-info-ink);
 }
 
 .cr-main { min-height: 100vh; }
@@ -8029,7 +8168,7 @@ html {
 }
 
 .cr-title {
-  color: var(--cr-ink);
+  color: var(--cr-gray-900);
   font-size: clamp(1.5rem, 2vw, 1.8rem);
   font-weight: 670;
   letter-spacing: -0.028em;
@@ -8038,7 +8177,7 @@ html {
 }
 
 .cr-lede {
-  color: #52525b;
+  color: var(--cr-gray-600);
   font-size: 0.82rem;
   line-height: 1.45;
   text-wrap: pretty;
@@ -8049,44 +8188,43 @@ html {
   min-height: 32px;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--cr-line-strong);
+  border: 1px solid var(--cr-gray-300);
   border-radius: 7px;
-  background: var(--cr-surface);
-  color: #3f3f46;
+  background: var(--cr-gray-0);
+  color: var(--cr-gray-700);
   padding: 6px 10px;
   font-size: 0.77rem;
   font-weight: 600;
   line-height: 1;
   white-space: nowrap;
-  transition: border-color 120ms ease-out, background-color 120ms ease-out, color 120ms ease-out, transform 80ms ease-out;
 }
 
 .cr-button > span[aria-hidden="true"] { margin-left: 0.2em; }
 
-.cr-button:hover { border-color: #a1a1aa; background: #fafafa; color: var(--cr-ink); }
+.cr-button:hover { border-color: var(--cr-gray-400); background: var(--cr-gray-50); color: var(--cr-gray-900); }
 .cr-button:active { transform: translateY(1px); }
 
 .cr-button-primary {
-  border-color: var(--cr-ink);
-  background: var(--cr-ink);
-  color: white;
+  border-color: var(--cr-gray-900);
+  background: var(--cr-gray-900);
+  color: var(--cr-gray-0);
 }
 
-.cr-button-primary:hover { border-color: #27272a; background: #27272a; color: white; }
+.cr-button-primary:hover { border-color: var(--cr-gray-700); background: var(--cr-gray-700); color: var(--cr-gray-0); }
 
 .cr-empty-state {
-  border: 1px dashed var(--cr-line-strong);
+  border: 1px dashed var(--cr-gray-300);
   border-radius: var(--cr-radius);
-  background: var(--cr-surface);
+  background: var(--cr-gray-0);
   padding: 40px 24px;
   text-align: center;
 }
 
 .cr-view-index {
   overflow: hidden;
-  border: 1px solid var(--cr-line);
+  border: 1px solid var(--cr-gray-200);
   border-radius: var(--cr-radius);
-  background: var(--cr-surface);
+  background: var(--cr-gray-0);
 }
 
 .cr-view-index-header,
@@ -8098,9 +8236,9 @@ html {
 }
 
 .cr-view-index-header {
-  border-bottom: 1px solid var(--cr-line);
-  background: var(--cr-surface-subtle);
-  color: #71717a;
+  border-bottom: 1px solid var(--cr-gray-200);
+  background: var(--cr-gray-50);
+  color: var(--cr-gray-500);
   padding: 7px 14px;
   font-size: 0.66rem;
   font-weight: 650;
@@ -8110,21 +8248,20 @@ html {
 
 .cr-view-row {
   min-height: 38px;
-  border-bottom: 1px solid var(--cr-line);
+  border-bottom: 1px solid var(--cr-gray-200);
   padding: 5px 14px;
-  transition: background-color 120ms ease-out;
 }
 
 .cr-view-row:last-child { border-bottom: 0; }
-.cr-view-row:hover { background: #fafafa; }
+.cr-view-row:hover { background: var(--cr-gray-50); }
 .cr-view-row:hover h2 { color: var(--cr-accent); }
 
 .cr-view-name { display: flex; min-width: 0; align-items: center; gap: 8px; }
-.cr-view-name h2 { min-width: 0; color: var(--cr-ink); font-size: 0.85rem; font-weight: 600; }
+.cr-view-name h2 { min-width: 0; color: var(--cr-gray-900); font-size: 0.85rem; font-weight: 600; }
 .cr-view-icon { flex: 0 0 auto; width: 18px; overflow: hidden; font-family: var(--cr-emoji); font-size: 0.95rem; line-height: 1; text-align: center; }
-.cr-view-source { flex: 0 1 auto; min-width: 0; overflow: hidden; color: var(--cr-muted); font-size: 0.72rem; text-overflow: ellipsis; white-space: nowrap; }
+.cr-view-source { flex: 0 1 auto; min-width: 0; overflow: hidden; color: var(--cr-gray-500); font-size: 0.72rem; text-overflow: ellipsis; white-space: nowrap; }
 .cr-view-source::before { content: "in "; }
-.cr-view-count { color: var(--cr-ink); font-size: 0.8rem; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.cr-view-count { color: var(--cr-gray-900); font-size: 0.8rem; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
 .cr-view-updated { white-space: nowrap; }
 .cr-view-kind { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px; }
 
@@ -8140,17 +8277,16 @@ html {
 }
 
 .cr-view-arrow {
-  color: #a1a1aa;
+  color: var(--cr-gray-400);
   font-size: 1rem;
   text-align: right;
-  transition: color 120ms ease-out, transform 120ms ease-out;
 }
 
 .cr-view-row:hover .cr-view-arrow { color: var(--cr-accent); transform: translateX(2px); }
 
 .cr-path,
 .cr-data {
-  color: var(--cr-muted);
+  color: var(--cr-gray-500);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.72rem;
   font-variant-numeric: tabular-nums;
@@ -8160,18 +8296,18 @@ html {
 .cr-filter-tag {
   display: inline-flex;
   align-items: center;
-  border: 1px solid var(--cr-line);
+  border: 1px solid var(--cr-gray-200);
   border-radius: 999px;
-  background: #fafafa;
-  color: #52525b;
+  background: var(--cr-gray-50);
+  color: var(--cr-gray-600);
   padding: 3px 7px;
   font-size: 0.68rem;
   font-weight: 600;
   line-height: 1.2;
 }
 
-.cr-pill-accent { border-color: #bfdbfe; background: var(--cr-accent-soft); color: #1d4ed8; }
-.cr-pill-warn { border-color: #fcd34d; background: #fffbeb; color: #92400e; }
+.cr-pill-accent { border-color: var(--cr-info-line); background: var(--cr-accent-soft); color: var(--cr-info-strong); }
+.cr-pill-warn { border-color: var(--cr-warn-line); background: var(--cr-warn-soft); color: var(--cr-warn-ink); }
 
 .cr-filter-tag {
   border-radius: 5px;
@@ -8180,40 +8316,38 @@ html {
 }
 
 .cr-surface {
-  border: 1px solid var(--cr-line);
+  border: 1px solid var(--cr-gray-200);
   border-radius: var(--cr-radius);
-  background: var(--cr-surface);
+  background: var(--cr-gray-0);
   box-shadow: none;
 }
 
 .cr-app input:not([type="checkbox"]):not([type="radio"]),
 .cr-app select,
 .cr-app textarea {
-  border-color: var(--cr-line-strong);
+  border-color: var(--cr-gray-300);
   border-radius: 7px;
-  background-color: white;
-  color: var(--cr-ink);
+  background-color: var(--cr-gray-0);
+  color: var(--cr-gray-900);
 }
 
 .cr-app input:not([type="checkbox"]):not([type="radio"]):hover,
 .cr-app select:hover,
-.cr-app textarea:hover { border-color: #a1a1aa; }
+.cr-app textarea:hover { border-color: var(--cr-gray-400); }
 
 .cr-app input:not([type="checkbox"]):not([type="radio"]):focus,
 .cr-app select:focus,
-.cr-app textarea:focus { border-color: var(--cr-accent); box-shadow: 0 0 0 3px rgb(37 99 235 / 0.12); }
+.cr-app textarea:focus { border-color: var(--cr-accent); box-shadow: 0 0 0 3px var(--cr-focus-halo); }
 
-.cr-table-shell { overflow: hidden; border: 1px solid var(--cr-line); border-radius: var(--cr-radius); background: white; }
+.cr-table-shell { overflow: hidden; border: 1px solid var(--cr-gray-200); border-radius: var(--cr-radius); background: var(--cr-gray-0); }
 
-/* File previews in the filesystem browser. In this sheet rather than utility
-   classes because the sheet is server-rendered and the utilities are compiled
-   by a script, so the panel stays legible with JavaScript off. */
+/* File previews in the filesystem browser. */
 .cr-file-preview {
   max-height: 70vh;
   margin: 0;
   overflow: auto;
-  background: #020617;
-  color: #f1f5f9;
+  background: var(--cr-gray-50);
+  color: var(--cr-gray-900);
   padding: 16px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.75rem;
@@ -8224,16 +8358,15 @@ html {
    no spaces at all — a URL, a minified line — rather than overflow. */
 .cr-file-preview-wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
 .cr-table-shell table { font-variant-numeric: tabular-nums; }
-.cr-table-shell thead { background: var(--cr-surface-subtle); }
-.cr-table-shell th { padding: 8px 12px !important; color: #666561 !important; font-size: 0.72rem; font-weight: 620 !important; }
+.cr-table-shell thead { background: var(--cr-gray-50); }
+.cr-table-shell th { padding: 8px 12px !important; color: var(--cr-gray-600) !important; font-size: 0.72rem; font-weight: 620 !important; }
 .cr-table-shell td { padding: 8px 12px !important; font-size: 0.79rem; }
-.cr-table-shell tbody tr { transition: background-color 100ms ease-out; }
-.cr-table-shell tbody tr:hover { background: #f8f8f6; }
+.cr-table-shell tbody tr:hover { background: var(--cr-gray-50); }
 
 .cr-popover {
-  border: 1px solid var(--cr-line);
+  border: 1px solid var(--cr-gray-200);
   border-radius: var(--cr-radius);
-  background: white;
+  background: var(--cr-gray-0);
   box-shadow: var(--cr-shadow-popover);
 }
 
@@ -8246,50 +8379,49 @@ html {
   overscroll-behavior: contain;
 }
 
-.cr-audit-list { overflow: hidden; border: 1px solid var(--cr-line); border-radius: var(--cr-radius); background: white; }
-.cr-audit-entry { border-bottom: 1px solid var(--cr-line); background: white; padding: 13px 14px; }
+.cr-audit-list { overflow: hidden; border: 1px solid var(--cr-gray-200); border-radius: var(--cr-radius); background: var(--cr-gray-0); }
+.cr-audit-entry { border-bottom: 1px solid var(--cr-gray-200); background: var(--cr-gray-0); padding: 13px 14px; }
 .cr-audit-entry:last-child { border-bottom: 0; }
 .cr-audit-entry:target { background: var(--cr-accent-soft); }
 
 .cr-kanban-lane {
-  border: 1px solid var(--cr-line);
+  border: 1px solid var(--cr-gray-200);
   border-radius: var(--cr-radius);
-  background: #f6f6f4;
+  background: var(--cr-gray-50);
   box-shadow: none;
 }
 
 .cr-kanban-card {
-  border: 1px solid var(--cr-line-strong);
+  border: 1px solid var(--cr-gray-300);
   border-radius: 8px;
-  background: white;
+  background: var(--cr-gray-0);
   box-shadow: 0 1px 2px rgb(36 36 36 / 0.04);
-  transition: border-color 120ms ease-out, box-shadow 120ms ease-out, transform 80ms ease-out;
 }
 
-.cr-kanban-card:hover { border-color: #b6b5b2; box-shadow: 0 3px 8px rgb(36 36 36 / 0.07); }
+.cr-kanban-card:hover { border-color: var(--cr-gray-400); box-shadow: 0 3px 8px rgb(36 36 36 / 0.07); }
 .cr-kanban-card:active { transform: rotate(0.25deg); }
 .cr-kanban-card dl > div { display: grid; grid-template-columns: minmax(64px, 0.42fr) minmax(0, 1fr); align-items: baseline; gap: 8px; }
 .cr-kanban-card dl dt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cr-kanban-card dl dd { margin-top: 0 !important; min-width: 0; }
-.cr-kanban-move summary { color: #6f6e6b; font-size: 0.72rem; font-weight: 620; }
+.cr-kanban-move summary { color: var(--cr-gray-500); font-size: 0.72rem; font-weight: 620; }
 .cr-kanban-move[open] summary { margin-bottom: 8px; }
 
 .cr-form-section,
 .cr-field {
-  border: 1px solid var(--cr-line);
+  border: 1px solid var(--cr-gray-200);
   border-radius: var(--cr-radius);
-  background: white;
+  background: var(--cr-gray-0);
   box-shadow: none;
 }
 
-.cr-field { background: var(--cr-surface-subtle); }
+.cr-field { background: var(--cr-gray-50); }
 
 /* A field a refused submission had something to say about. Colour alone never
    carries the message: the reason is rendered above the control as text, and the
    control itself is marked `aria-invalid`. */
 .cr-field-invalid {
-  border-color: #fca5a5;
-  background: #fef2f2;
+  border-color: var(--cr-invalid-line);
+  background: var(--cr-invalid-soft);
 }
 
 .cr-record-layout { display: grid; grid-template-columns: minmax(0, 1fr) 350px; align-items: start; gap: 18px; }
@@ -8317,17 +8449,17 @@ html {
     top: 0;
     z-index: 40;
     display: block;
-    border-bottom: 1px solid var(--cr-line);
-    background: rgb(255 255 255 / 0.96);
+    border-bottom: 1px solid var(--cr-gray-200);
+    background: color-mix(in srgb, var(--cr-gray-0) 96%, transparent);
     backdrop-filter: blur(14px);
   }
   .cr-mobile-topbar { display: flex; min-height: 46px; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 16px; }
   .cr-mobile-utilities { display: flex; align-items: center; gap: 2px; }
-  .cr-mobile-view-strip { display: flex; gap: 4px; overflow-x: auto; border-top: 1px solid #f1f1ef; padding: 5px 12px 6px; scrollbar-width: none; }
+  .cr-mobile-view-strip { display: flex; gap: 4px; overflow-x: auto; border-top: 1px solid var(--cr-gray-100); padding: 5px 12px 6px; scrollbar-width: none; }
   .cr-mobile-view-strip::-webkit-scrollbar { display: none; }
-  .cr-mobile-view-strip a { flex: 0 0 auto; border-radius: 5px; color: #6f6e6b; padding: 4px 7px; font-size: 0.72rem; font-weight: 550; }
+  .cr-mobile-view-strip a { flex: 0 0 auto; border-radius: 5px; color: var(--cr-gray-500); padding: 4px 7px; font-size: 0.72rem; font-weight: 550; }
   .cr-mobile-view-strip a:hover,
-  .cr-mobile-view-strip a.is-active { background: #f0f0ed; color: var(--cr-ink); }
+  .cr-mobile-view-strip a.is-active { background: var(--cr-gray-100); color: var(--cr-gray-900); }
   .cr-mobile-header .cr-perspective { display: flex; align-items: center; gap: 6px; margin: 0; border: 0; padding: 0; }
   .cr-mobile-header .cr-perspective-label { display: none; }
   .cr-mobile-header .cr-perspective select { width: auto; max-width: 210px; }
@@ -8339,7 +8471,7 @@ html {
   .cr-view-index-header { display: none; }
   .cr-view-row { grid-template-columns: minmax(0, 1fr) auto 20px; column-gap: 10px; row-gap: 4px; padding: 8px 12px; }
   .cr-view-name { grid-column: 1; grid-row: 1; }
-  .cr-view-count { grid-column: 2; grid-row: 1; color: var(--cr-muted); font-size: 0.72rem; }
+  .cr-view-count { grid-column: 2; grid-row: 1; color: var(--cr-gray-500); font-size: 0.72rem; }
   .cr-view-updated { display: none; }
   .cr-view-kind { grid-column: 1 / span 2; grid-row: 2; }
   .cr-view-arrow { grid-column: 3; grid-row: 1 / span 2; }
@@ -8592,9 +8724,9 @@ const ANNOUNCE_REGION: &str = "cr-announce";
 /// removes an element from the accessibility tree along with the viewport and
 /// would make this a no-op. The class is in the server's own stylesheet rather
 /// than Tailwind's `sr-only`, because this is the one element whose styling is
-/// load bearing for correctness: if the CDN in `<head>` is blocked, every other
-/// page element degrades to unstyled but readable, and this one would degrade to
-/// a duplicate sentence in the middle of the layout.
+/// load bearing for correctness: if the linked utility stylesheet fails to load,
+/// every other page element degrades to unstyled but readable, and this one
+/// would degrade to a duplicate sentence in the middle of the layout.
 fn live_region() -> Markup {
     html! {
         div id=(ANNOUNCE_REGION) class="cr-visually-hidden" role="status" aria-live="polite" aria-atomic="true" {}
@@ -8847,12 +8979,20 @@ fn page_layout(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                meta name="color-scheme" content="light";
-                meta name="theme-color" content="#ffffff";
+                // Both schemes, matching `color-scheme` in `GLOBAL_STYLES`:
+                // said here as well so the browser paints the right canvas
+                // before the sheet has been parsed, instead of flashing white.
+                meta name="color-scheme" content="light dark";
+                meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff";
+                meta name="theme-color" media="(prefers-color-scheme: dark)" content="#191919";
                 meta name="robots" content="noindex, nofollow";
                 link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='1' y='1' width='30' height='30' rx='7' fill='%23fff' stroke='%23d4d4d0'/%3E%3Cpath d='M20.5 20.2c-1.1 1-2.4 1.5-4 1.5-3.5 0-6-2.4-6-5.8s2.5-5.8 6-5.8c1.6 0 3 .5 4 1.5l-1.7 2a3.2 3.2 0 0 0-2.2-.8c-1.8 0-3 1.2-3 3.1s1.2 3.1 3 3.1c.9 0 1.6-.3 2.2-.8l1.7 2z' fill='%23242424'/%3E%3C/svg%3E";
                 (document_title(title))
-                script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4" {}
+                // Linked, so it blocks the first paint until it has loaded
+                // rather than restyling a page the reader is already looking
+                // at. Its rules are all inside cascade layers and the sheet
+                // below is not, so the two need no particular order.
+                link rel="stylesheet" href=(TAILWIND_STYLESHEET_PATH.as_str());
                 // htmx is linked before `cr.js` because `cr.js` configures
                 // it, and two deferred scripts run in document order.
                 script src=(HTMX_SCRIPT_PATH.as_str()) defer {}
@@ -9106,8 +9246,8 @@ fn short_hash(hash: &str) -> String {
 fn render_audit_agent(agent: &AuditAgent) -> Markup {
     let chain: Vec<&AuditAgent> = agent.via.iter().flatten().collect();
     html! {
-        p class="mt-2 text-xs text-slate-500" {
-            "Agent " span class="font-medium text-slate-700" { (&agent.id) }
+        p class="mt-2 text-xs text-gray-500" {
+            "Agent " span class="font-medium text-gray-700" { (&agent.id) }
             @if let Some(version) = &agent.version { " " (version) }
             @if let Some(model) = &agent.model { " · model " (model) }
             @if let Some(session) = &agent.session {
@@ -9123,8 +9263,8 @@ fn render_audit_agent(agent: &AuditAgent) -> Markup {
 /// One intent half, bounded for display. The complete text stays in the event.
 fn render_intent_part(label: &str, part: &AuditIntentPart) -> Markup {
     html! {
-        p class="mt-2 text-sm text-slate-600" {
-            span class="text-xs font-semibold uppercase tracking-wide text-slate-500" { (label) }
+        p class="mt-2 text-sm text-gray-600" {
+            span class="text-xs font-semibold uppercase tracking-wide text-gray-500" { (label) }
             " (" (part.author.label()) ") "
             @if let Some(text) = &part.text { (text_preview(text)) }
             @else if let Some(digest) = &part.digest { "text not retained; digest " (digest) }
@@ -9319,7 +9459,7 @@ fn render_timestamp(value: Option<&str>) -> Markup {
             time datetime=(value) title=(value) class="cr-data" { (compact_timestamp(value)) }
         },
         // No audit history: a file created outside `cr` and not yet saved.
-        None => html! { span class="text-slate-400" { "—" } },
+        None => html! { span class="text-gray-400" { "—" } },
     }
 }
 
@@ -9993,10 +10133,10 @@ fn html_error(error: ApiError) -> Response {
         html! {
             div class="mx-auto max-w-2xl rounded-2xl border border-red-200 bg-white p-8 shadow-sm" {
                 p class="text-sm font-semibold uppercase tracking-wide text-red-600" { (status.as_u16()) " " (status.canonical_reason().unwrap_or("Error")) }
-                h1 class="mt-2 text-2xl font-bold text-slate-950" { "Request could not be completed" }
-                p class="mt-3 text-sm text-slate-700" { (error.message) }
-                p class="mt-3 text-xs text-slate-500" { "Request ID " (error.request_id) }
-                a href="/" class="mt-6 inline-flex rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700" { "Back to views" }
+                h1 class="mt-2 text-2xl font-bold text-gray-900" { "Request could not be completed" }
+                p class="mt-3 text-sm text-gray-700" { (error.message) }
+                p class="mt-3 text-xs text-gray-500" { "Request ID " (error.request_id) }
+                a href="/" class="mt-6 inline-flex rounded-lg bg-gray-900 px-4 py-2 text-sm font-semibold text-white hover:bg-gray-700" { "Back to views" }
             }
         },
         None,

@@ -210,7 +210,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(
         automatic
             .text()
-            .contains("https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4")
+            .contains(r#"<link rel="stylesheet" href="/static/tailwind-"#)
     );
     assert!(automatic.text().contains("alpha"));
     assert!(automatic.text().contains("beta"));
@@ -1095,7 +1095,7 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
     assert!(
         edit_page
             .text()
-            .contains("<h2 class=\"text-base font-bold text-slate-950\">Activity</h2>")
+            .contains("<h2 class=\"text-base font-bold text-gray-900\">Activity</h2>")
     );
     assert_eq!(edit_page.status, StatusCode::OK);
     assert!(edit_page.text().contains("Schema-powered"));
@@ -1644,7 +1644,7 @@ async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
         .1;
     let start = degraded_index.find(">Inbound ratings</h2>").unwrap();
     let broken_row = &degraded_index[start..start + degraded_index[start..].find("</a>").unwrap()];
-    assert!(broken_row.contains("cr-view-count\"><span class=\"text-slate-400\">—<"));
+    assert!(broken_row.contains("cr-view-count\"><span class=\"text-gray-400\">—<"));
     assert!(!degraded.text().contains(">5 records<"));
 
     // Clearing a label returns the sentence-cased directory name.
