@@ -3,12 +3,13 @@
 //! The scripts that enhance the filter panel, the save-view control, and the
 //! Kanban board used to be Rust string constants inlined into every page that
 //! needed them. They are now one file compiled into the binary and served from
-//! `/static/<name>`, alongside a vendored copy of htmx. These tests pin the
-//! properties that move made load bearing: each URL is content addressed so it
-//! can be cached forever, the route reaches nothing but the constants it was
-//! compiled with, rendered pages link both files rather than carrying script
-//! bodies around, and the htmx we serve is a named release whose exact bytes
-//! cannot change without a test failing.
+//! `/static/<name>`, alongside a vendored copy of htmx and the compiled Tailwind
+//! utilities that replaced the Play CDN. These tests pin the properties that
+//! move made load bearing: each URL is content addressed so it can be cached
+//! forever, the route reaches nothing but the constants it was compiled with,
+//! rendered pages link the files rather than carrying their bodies around or
+//! fetching anything from another origin, and the htmx we serve is a named
+//! release whose exact bytes cannot change without a test failing.
 
 use std::str::FromStr;
 
@@ -83,6 +84,16 @@ fn asset_path(html: &str, prefix: &str) -> String {
     format!("/static/{prefix}{}", rest.split_once('"').unwrap().0)
 }
 
+/// The compiled stylesheet a page links, found the same way as `asset_path`.
+fn stylesheet_path(html: &str) -> String {
+    let needle = "<link rel=\"stylesheet\" href=\"";
+    let rest = html
+        .split_once(needle)
+        .unwrap_or_else(|| panic!("no stylesheet link in HTML:\n{html}"))
+        .1;
+    rest.split_once('"').unwrap().0.to_owned()
+}
+
 /// The vendored release, as it appears in the served file name.
 ///
 /// Spelled out rather than derived: the point of a content-addressed name is
@@ -103,6 +114,13 @@ const HTMX_SOURCE: &str = include_str!("../src/static/htmx-2.0.10.min.js");
 /// courtesy rather than compliance — which is exactly why a test has to keep it
 /// from being deleted as dead weight.
 const HTMX_LICENSE: &str = include_str!("../src/static/htmx-2.0.10.LICENSE.txt");
+
+/// The committed output of `scripts/tailwind.sh`, which the binary serves.
+const TAILWIND_SOURCE: &str = include_str!("../src/static/tailwind.css");
+
+/// Tailwind is MIT, which asks for its notice to travel with substantial
+/// portions of it — and the compiled sheet opens with Tailwind's own reset.
+const TAILWIND_LICENSE: &str = include_str!("../src/static/tailwindcss-4.3.3.LICENSE.txt");
 
 fn kanban_database(name: &str) -> (TempDir, Database) {
     let temporary = tempfile::tempdir().unwrap();
@@ -197,6 +215,9 @@ async fn the_asset_route_cannot_be_walked_outside_the_binary() {
         "/static/htmx.min.js",
         "/static/htmx-2.0.10.min.js",
         "/static/htmx-2.0.10.LICENSE.txt",
+        "/static/tailwind.css",
+        "/static/tailwind.input.css",
+        "/static/tailwindcss-4.3.3.LICENSE.txt",
         "/static/",
         &format!("{real}%00"),
         &format!("{real}.map"),
@@ -307,6 +328,58 @@ async fn htmx_is_served_from_the_binary_at_the_exact_vendored_release() {
 }
 
 #[tokio::test]
+async fn the_utility_stylesheet_is_compiled_in_and_served_from_this_origin() {
+    let (_temporary, database) = kanban_database("static-stylesheet");
+    let app = router(database, ServerConfig::default()).unwrap();
+
+    let path = stylesheet_path(request(&app, "/", &[]).await.text());
+    let digest = path
+        .strip_prefix("/static/tailwind-")
+        .and_then(|rest| rest.strip_suffix(".css"))
+        .unwrap_or_else(|| panic!("unexpected stylesheet path {path}"));
+    assert_eq!(digest.len(), 16);
+    assert!(
+        digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    );
+
+    let asset = request(&app, &path, &[]).await;
+    assert_eq!(asset.status, StatusCode::OK);
+    assert_eq!(
+        asset.header(header::CONTENT_TYPE),
+        "text/css; charset=utf-8"
+    );
+    assert_eq!(
+        asset.header(header::CACHE_CONTROL),
+        "public, max-age=31536000, immutable"
+    );
+    // The committed bytes, served verbatim, and compiled by the release
+    // `scripts/tailwind.sh` pins.
+    assert_eq!(asset.text(), TAILWIND_SOURCE);
+    assert!(
+        asset
+            .text()
+            .starts_with("/*! tailwindcss v4.3.3 | MIT License")
+    );
+    assert!(TAILWIND_LICENSE.contains("Copyright (c) Tailwind Labs, Inc."));
+    assert!(TAILWIND_LICENSE.contains("Permission is hereby granted, free of charge"));
+
+    let link = format!("<link rel=\"stylesheet\" href=\"{path}\">");
+    for uri in ["/", "/deals", "/pipeline", "/deals/new", "/audit"] {
+        let page = request(&app, uri, &[]).await;
+        let head = page.text().split_once("</head>").unwrap().0;
+        assert!(head.contains(&link), "{uri} does not link the stylesheet");
+        // Nothing a page needs comes from another origin: the Play CDN used to
+        // make every page wait on jsDelivr, and fail to style without it.
+        assert!(
+            !head.contains("https://"),
+            "{uri} loads from another origin"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_asset_stays_reachable_when_an_api_token_guards_every_other_route() {
     let (_temporary, database) = kanban_database("static-token");
     let config = ServerConfig {
@@ -333,4 +406,7 @@ async fn the_asset_stays_reachable_when_an_api_token_guards_every_other_route() 
         asset.header(header::CACHE_CONTROL),
         "public, max-age=31536000, immutable"
     );
+    // A `<link>` cannot carry one either, and an unstyled page is the result.
+    let stylesheet = stylesheet_path(page.text());
+    assert_eq!(request(&app, &stylesheet, &[]).await.status, StatusCode::OK);
 }

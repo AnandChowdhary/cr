@@ -43,7 +43,7 @@ use tower::ServiceExt;
 const VIEW_INDEX_REGION: &str = "cr-view-index";
 const VIEW_INDEX_TOTAL_ID: &str = "cr-view-index-total";
 const SUMMARY_URL: &str = "/?summary=inline";
-const PLACEHOLDER: &str = "<span class=\"text-slate-400\" aria-hidden=\"true\">…</span>";
+const PLACEHOLDER: &str = "<span class=\"text-gray-400\" aria-hidden=\"true\">…</span>";
 
 struct TestResponse {
     status: StatusCode,

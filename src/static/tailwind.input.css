@@ -1,0 +1,30 @@
+/* The source of `tailwind.css`, the utility stylesheet compiled into the
+   binary and served from `/static/`. Tailwind reads class names out of the two
+   files that write markup and generates a rule for each one it finds, so after
+   adding or changing a class in either, regenerate the stylesheet with
+
+     scripts/tailwind.sh
+
+   and commit the result. CI runs the same script and fails if the committed
+   stylesheet is not what it produces. */
+@import "tailwindcss" source(none);
+@source "../server.rs";
+@source "./cr.js";
+
+/* The greys are the server sheet's own scale rather than a Tailwind palette:
+   `text-gray-500` compiles to `var(--cr-gray-500)`, which `GLOBAL_STYLES` in
+   `src/server.rs` defines for both colour schemes, so the markup and the sheet
+   cannot drift apart and dark mode needs nothing here. The other hues are
+   Tailwind's defaults; the sheet gives each one it uses a dark value. */
+@theme inline {
+  --color-white: var(--cr-gray-0);
+  --color-gray-50: var(--cr-gray-50);
+  --color-gray-100: var(--cr-gray-100);
+  --color-gray-200: var(--cr-gray-200);
+  --color-gray-300: var(--cr-gray-300);
+  --color-gray-400: var(--cr-gray-400);
+  --color-gray-500: var(--cr-gray-500);
+  --color-gray-600: var(--cr-gray-600);
+  --color-gray-700: var(--cr-gray-700);
+  --color-gray-900: var(--cr-gray-900);
+}
