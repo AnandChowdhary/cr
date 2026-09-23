@@ -1,0 +1,262 @@
+name: Release
+
+# Build cr for every supported platform and attach the archives, a SHA256SUMS
+# file, and a signed build-provenance attestation to the release for a tag, so
+# installing a release never needs a Rust toolchain. Every archive is named
+# `cr-<tag>-<target>.tar.gz`, which lets a script build the download URL from
+# the tag alone.
+on:
+  push:
+    tags: ["v*"]
+  # Attach binaries to a release whose tag predates this workflow, or finish
+  # one whose publish job failed. Assets already on the release are never
+  # replaced; delete one first to rebuild it.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build, for example v0.2.0
+        required: true
+        type: string
+  # A dry run: build, check, and package every target without publishing, so a
+  # change that breaks one platform is caught before a tag is pushed rather
+  # than after.
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+
+# Only the publish job writes, and it asks for exactly what it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # The newest glibc a linux-gnu binary may require. Linking against a newer
+  # glibc raises the floor silently, so the build proves it instead: 2.35 is
+  # Ubuntu 22.04, which covers 22.04, 24.04, and Debian 12. Distributions older
+  # than that can use the static musl build.
+  GLIBC_FLOOR: "2.35"
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      ref: ${{ steps.ref.outputs.ref }}
+      publish: ${{ steps.ref.outputs.publish }}
+    steps:
+      # The tag reaches shell commands and a release, so it is validated
+      # before it is used for anything.
+      - name: Resolve the tag to build
+        id: ref
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSHED_TAG: ${{ github.ref_name }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          case "$EVENT" in
+            push) tag="$PUSHED_TAG" ;;
+            workflow_dispatch) tag="$REQUESTED_TAG" ;;
+            *)
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::the tag to build must look like v1.2.3"
+            exit 1
+          fi
+          echo "ref=refs/tags/$tag" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          persist-credentials: false
+
+      # A release named v1.2.3 must contain a binary that says it is 1.2.3.
+      # A dry run takes its name from Cargo.toml.
+      - name: Check the tag against the crate version
+        id: version
+        env:
+          REF: ${{ steps.ref.outputs.ref }}
+        run: |
+          version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')"
+          if [ -n "$REF" ] && [ "$REF" != "refs/tags/v$version" ]; then
+            echo "::error file=Cargo.toml::the tag does not match package.version $version"
+            exit 1
+          fi
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc builds run on the oldest supported Ubuntu so they link
+          # against the oldest glibc; see GLIBC_FLOOR.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          # Fully static: no glibc, no loader, any distribution.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          # Cross-compiled on Apple silicon; the Apple SDK carries both.
+          - target: x86_64-apple-darwin
+            runner: macos-15
+    env:
+      TARGET: ${{ matrix.target }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+
+      # No build cache: a release binary is built from the tagged source and
+      # nothing else, which is the claim its provenance attestation makes.
+      - name: Install Rust toolchain
+        run: |
+          if ! command -v rustup > /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --profile minimal --target "$TARGET" --no-self-update
+          rustup default stable
+          rustc --version && cargo --version
+
+      - name: Build
+        run: cargo build --locked --release --target "$TARGET"
+
+      - name: Check the binary
+        run: |
+          bin="target/$TARGET/release/cr"
+          expected="cr ${TAG#v}"
+          run="$bin"
+          if [ "$TARGET" = x86_64-apple-darwin ]; then
+            lipo -archs "$bin" | grep -qx x86_64
+            # Without Rosetta an Apple silicon runner cannot execute it; the
+            # architecture check above is then the whole check.
+            if arch -x86_64 /usr/bin/true 2>/dev/null; then
+              run="arch -x86_64 $bin"
+            else
+              run=""
+            fi
+          fi
+          if [ -n "$run" ]; then
+            actual="$($run --version)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::expected '$expected' but the binary reports '$actual'"
+              exit 1
+            fi
+          fi
+          case "$TARGET" in
+            *-linux-gnu)
+              newest="$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/^GLIBC_//' | sort -Vu | tail -n 1)"
+              echo "requires glibc $newest"
+              if [ "$(printf '%s\n%s\n' "$newest" "$GLIBC_FLOOR" | sort -V | tail -n 1)" != "$GLIBC_FLOOR" ]; then
+                echo "::error::the binary requires glibc $newest, newer than the supported $GLIBC_FLOOR"
+                exit 1
+              fi
+              ;;
+            *-linux-musl)
+              if readelf -lW "$bin" | grep -q INTERP || readelf -dW "$bin" | grep -q NEEDED; then
+                echo "::error::the musl binary is not statically linked"
+                exit 1
+              fi
+              ;;
+          esac
+
+      # One directory per archive, owned by root rather than by the runner's
+      # account, so extracting as root never leaves files owned by a stranger.
+      - name: Package
+        run: |
+          name="cr-$TAG-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/cr" README.md LICENSE "dist/$name/"
+          chmod 0755 "dist/$name" "dist/$name/cr"
+          chmod 0644 "dist/$name/README.md" "dist/$name/LICENSE"
+          if [ "$RUNNER_OS" = macOS ]; then
+            COPYFILE_DISABLE=1 tar --no-mac-metadata --uid 0 --gid 0 --numeric-owner \
+              -C dist -czf "dist/$name.tar.gz" "$name"
+          else
+            tar --owner=0 --group=0 --numeric-owner -C dist -czf "dist/$name.tar.gz" "$name"
+          fi
+          tar -tzvf "dist/$name.tar.gz"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cr-${{ matrix.target }}
+          path: dist/cr-*.tar.gz
+          if-no-files-found: error
+          # Already gzipped.
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # attach assets to the release
+      id-token: write # sign the attestation with a Sigstore certificate
+      attestations: write # store the attestation on this repository
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cr-*
+          path: dist
+          merge-multiple: true
+
+      # The standard `sha256sum` format, so `sha256sum --check` and
+      # `shasum -a 256 --check` both read it.
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum -- cr-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      # One SLSA build-provenance attestation covering every archive, verifiable
+      # with `gh attestation verify <archive> --repo <owner>/<repo>`.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      # Normally the release already exists, written by hand while the builds
+      # ran. If not, create it with generated notes so the binaries are never
+      # held back waiting for prose. Uploading never replaces an asset: a
+      # published checksum has to stay true.
+      - name: Attach to the release
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/cr-*.tar.gz dist/SHA256SUMS
+          else
+            gh release create "$TAG" --verify-tag --title "cr $TAG" --generate-notes \
+              dist/cr-*.tar.gz dist/SHA256SUMS
+          fi
