@@ -11,8 +11,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
     AccessAction, AccessResource, AgentEvidence, Assignment, AttributionOverrides, AuditFilter,
     CheckReport, CheckScope, CollectionAccessPolicy, CollectionPresentation, Database, DomainError,
-    Filter, FilterExpression, Record, RecordPrecondition, RecordVisibility, Role, SchemaReview,
-    SearchQuery, SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions,
+    Filter, FilterExpression, Projection, Record, RecordPrecondition, RecordVisibility, Role,
+    SchemaReview, SearchQuery, SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions,
     UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout,
     parse_threshold, sort_by_record_field, sort_records_by_field,
 };
@@ -292,6 +292,11 @@ enum Command {
         /// Write a string field's exact UTF-8 bytes without a trailing newline.
         #[arg(long, requires = "field", conflicts_with = "json")]
         raw: bool,
+
+        /// Return only these fields: dotted front matter paths, or $id, $collection, $path, $version, and $body.
+        /// Comma-separated or repeated. Plain output is one tab-separated row.
+        #[arg(long = "select", value_name = "FIELDS", conflicts_with = "field")]
+        select: Vec<String>,
     },
 
     /// List and filter records in a collection.
@@ -310,6 +315,11 @@ enum Command {
         /// such as "stage in [open, won] AND (value >= 10000 OR owner is null)".
         #[arg(long, value_name = "FILTER")]
         filter: Option<Filter>,
+
+        /// Return only these fields: dotted front matter paths, or $id, $collection, $path, $version, and $body.
+        /// Comma-separated or repeated. Plain output becomes one tab-separated row per record.
+        #[arg(long = "select", value_name = "FIELDS")]
+        select: Vec<String>,
 
         /// Sort by a dotted field, $id, $collection, or $path. Missing fields stay last.
         #[arg(long, value_name = "FIELD")]
@@ -353,6 +363,11 @@ enum Command {
         #[arg(long, value_name = "FILTER")]
         filter: Option<Filter>,
 
+        /// Return only these fields: dotted front matter paths, or $id, $collection, $path, $version, and $body.
+        /// Comma-separated or repeated. Plain output becomes one tab-separated row per record.
+        #[arg(long = "select", value_name = "FIELDS")]
+        select: Vec<String>,
+
         /// Sort by a dotted field, $id, $collection, or $path. Missing fields stay last.
         #[arg(long, value_name = "FIELD")]
         sort: Option<String>,
@@ -390,6 +405,11 @@ enum Command {
         /// With --json, nest each record's linked records under it instead.
         #[arg(long, requires = "json")]
         expand: bool,
+
+        /// With --json, give each record only these fields, under "fields": dotted front matter
+        /// paths, or $path, $version, and $body. Comma-separated or repeated.
+        #[arg(long = "select", value_name = "FIELDS", requires = "json")]
+        select: Vec<String>,
     },
 
     /// Search record paths, front matter, and Markdown bodies.
@@ -412,6 +432,11 @@ enum Command {
         /// First match a filter with AND, OR, NOT, parentheses, in, exists, and is null.
         #[arg(long, value_name = "FILTER")]
         filter: Option<Filter>,
+
+        /// Return only these fields: dotted front matter paths, or $id, $collection, $path, $version, and $body.
+        /// Comma-separated or repeated. Plain output becomes one tab-separated row per record.
+        #[arg(long = "select", value_name = "FIELDS")]
+        select: Vec<String>,
 
         /// Sort by a dotted field, $id, $collection, or $path. Missing fields stay last.
         #[arg(long, value_name = "FIELD")]
@@ -1438,9 +1463,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             json,
             field,
             raw,
+            select,
         } => {
             let record = database.get(&collection, &id)?;
-            if json {
+            if let Some(projection) = Projection::from_lists(&select)? {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&projection.object(&record)?)?
+                    );
+                } else {
+                    println!("{}", projection.row(&record)?);
+                }
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&record)?);
             } else if let Some(path) = field {
                 let value = record
@@ -1466,10 +1501,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             filters,
             expressions,
             filter,
+            select,
             sort,
             desc,
             json,
         } => {
+            let projection = Projection::from_lists(&select)?;
             let mut records = database.list(&collection, &filters)?;
             records.retain(|record| {
                 expressions
@@ -1488,7 +1525,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     },
                 )?;
             }
-            print_records(records, json)?;
+            print_records(records, projection.as_ref(), json)?;
         }
         Command::Backlinks {
             collection,
@@ -1498,10 +1535,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             filters,
             expressions,
             filter,
+            select,
             sort,
             desc,
             json,
         } => {
+            let projection = Projection::from_lists(&select)?;
             let mut backlinks = database.backlinks(
                 &collection,
                 &id,
@@ -1529,7 +1568,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     },
                 )?;
             }
-            if json {
+            if let Some(projection) = &projection {
+                print_projected(
+                    backlinks.iter().map(|backlink| &backlink.record),
+                    projection,
+                    json,
+                )?;
+            } else if json {
                 let listed: Vec<_> = backlinks
                     .into_iter()
                     .map(|backlink| ListedBacklink {
@@ -1558,13 +1603,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             depth,
             json,
             expand,
+            select,
         } => {
+            let projection = Projection::from_lists(&select)?;
             let traversal = database.traverse(&collection, &id, &relations, depth)?;
             if json {
                 let rendered = if expand {
-                    traversal.tree_json()?
+                    traversal.tree_json(projection.as_ref())?
                 } else {
-                    traversal.graph_json()?
+                    traversal.graph_json(projection.as_ref())?
                 };
                 println!("{}", serde_json::to_string_pretty(&rendered)?);
             } else {
@@ -1577,6 +1624,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             filters,
             expressions,
             filter,
+            select,
             sort,
             desc,
             front_matter,
@@ -1598,6 +1646,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 SearchTarget::Document
             };
+            let projection = Projection::from_lists(&select)?;
             let query = SearchQuery::new(&pattern, target, regex, ignore_case)?;
             let mut records = database.search(collection.as_deref(), &filters, &query)?;
             records.retain(|record| {
@@ -1617,7 +1666,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     },
                 )?;
             }
-            print_records(records, json)?;
+            print_records(records, projection.as_ref(), json)?;
         }
         Command::Serve {
             bind,
@@ -2769,7 +2818,10 @@ fn print_attribution(attribution: &cr::Attribution) {
     }
 }
 
-fn print_records(records: Vec<Record>, json: bool) -> Result<()> {
+fn print_records(records: Vec<Record>, projection: Option<&Projection>, json: bool) -> Result<()> {
+    if let Some(projection) = projection {
+        return print_projected(records.iter(), projection, json);
+    }
     if json {
         let records: Vec<ListedRecord> = records.into_iter().map(Into::into).collect();
         println!("{}", serde_json::to_string_pretty(&records)?);
@@ -2833,6 +2885,26 @@ fn print_schema_review(review: &SchemaReview, json: bool, checking: bool) -> Res
         (false, true, _) => println!("Installed the schema for {collection}: {judged}."),
         (false, false, _) => {
             println!("The schema for {collection} is already installed: {judged}.")
+        }
+    }
+    Ok(())
+}
+
+/// Print projected records as a JSON array of flat objects, or as one
+/// tab-separated row each.
+fn print_projected<'a>(
+    records: impl Iterator<Item = &'a Record>,
+    projection: &Projection,
+    json: bool,
+) -> Result<()> {
+    if json {
+        let objects = records
+            .map(|record| projection.object(record))
+            .collect::<Result<Vec<_>>>()?;
+        println!("{}", serde_json::to_string_pretty(&objects)?);
+    } else {
+        for record in records {
+            println!("{}", projection.row(record)?);
         }
     }
     Ok(())

@@ -215,6 +215,14 @@ curl -G 'http://127.0.0.1:3000/api/v1/collections/deals/records' \
 A filter that does not parse is refused with `422 validation_failed` and a
 message naming the column.
 
+`select` returns only the named fields, on lists, search, backlinks, a single
+record, and `traverse`. Each result becomes a flat object keyed by the
+selectors, and a single record keeps its `ETag`:
+
+```sh
+curl 'http://127.0.0.1:3000/api/v1/collections/deals/records?select=$id,value,owner.name'
+```
+
 List and search responses contain compact `{ path, front_matter }` records inside a page:
 
 ```json

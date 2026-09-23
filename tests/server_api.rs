@@ -2182,3 +2182,64 @@ async fn rest_filter_parameter_applies_boolean_filters_to_list_search_and_backli
         );
     }
 }
+
+#[tokio::test]
+async fn rest_select_parameter_projects_records_on_every_read_route() {
+    let (_temporary, database) = test_database("server-select");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    database
+        .create(
+            "companies",
+            "acme",
+            &[Assignment::from_str("name=Acme").unwrap()],
+            "",
+        )
+        .unwrap();
+    for (id, value) in [("alpha", 5000), ("beta", 20000)] {
+        database
+            .create(
+                "deals",
+                id,
+                &[Assignment::from_str(&format!("value={value}")).unwrap()],
+                "Notes\n",
+            )
+            .unwrap();
+        database
+            .link("deals", id, "company", "companies", "acme")
+            .unwrap();
+    }
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move { request(&app, Method::GET, uri, None, &[]).await }
+    };
+
+    let listed = get("/api/v1/collections/deals/records?select=%24id,value&select=missing").await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.text());
+    assert_eq!(
+        listed.json()["data"],
+        json!([{ "$id": "alpha", "value": 5000 }, { "$id": "beta", "value": 20000 }])
+    );
+    assert_eq!(listed.json()["pagination"]["total"], 2);
+
+    let one = get("/api/v1/collections/deals/records/alpha?select=%24body,value").await;
+    assert_eq!(one.json(), json!({ "$body": "Notes\n", "value": 5000 }));
+    assert!(one.headers.contains_key(header::ETAG));
+
+    let searched = get("/api/v1/search?q=beta&target=path&select=%24id").await;
+    assert_eq!(searched.json()["data"], json!([{ "$id": "beta" }]));
+    let backlinks = get("/api/v1/collections/companies/records/acme/backlinks?select=%24id").await;
+    assert_eq!(
+        backlinks.json()["data"],
+        json!([{ "$id": "alpha" }, { "$id": "beta" }])
+    );
+    let traversal = get("/api/v1/collections/deals/records/alpha/traverse?select=name").await;
+    assert_eq!(
+        traversal.json()["nodes"][1]["fields"],
+        json!({ "name": "Acme" })
+    );
+
+    let refused = get("/api/v1/collections/deals/records?select=%24nope").await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let unknown = get("/api/v1/collections/deals/records/alpha?nope=1").await;
+    assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
+}
