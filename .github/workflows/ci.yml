@@ -22,10 +22,15 @@ env:
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
 
+# Every job has a timeout of several times its slowest recent run, so a hung
+# test fails in minutes rather than holding a runner for GitHub's six-hour
+# default. Pushes to main queue behind one another (see `concurrency` above),
+# so one hung run would otherwise stall CI for every later push too.
 jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -48,6 +53,7 @@ jobs:
   stylesheet:
     name: tailwind.css
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -65,6 +71,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -86,6 +93,7 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -119,6 +127,7 @@ jobs:
   msrv:
     name: msrv
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
