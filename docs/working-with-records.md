@@ -271,6 +271,32 @@ backslashes inside a value are escaped as `\t`, `\n`, `\r`, and `\\` so every
 record stays on one line. On `traverse --json`, `--select` puts each record's
 chosen fields under `fields` in place of its path, version, and front matter.
 
+### Count and summarize
+
+`cr count` counts a collection's records, taking the same `--where`,
+`--where-expr`, and `--filter` as `list`. `--by FIELD` counts once per
+distinct value of a field, and `--sum`, `--avg`, `--min`, and `--max` summarize
+fields, overall and for each group:
+
+```sh
+cr count deals --filter 'stage != lost'
+cr count deals --by stage --sum value --avg value --max expected_close
+# stage     count  sum(value)  avg(value)  max(expected_close)
+# open      2      5000        2500.0      2027-03-01
+# won       1      2500        2500.0      2026-12-01
+#           1      10          10.0
+```
+
+Plain output is a tab-separated table with a header row. Groups follow the
+order `--sort` uses, and records without the `--by` field come last, with an
+empty key; in `--json` that group has `"missing": true` instead of a `value`.
+`--sum` and `--avg` use numeric values only, skipping anything else: the sum of
+no numbers is `0` and their average `null`. A sum of integers stays exact.
+`--min` and `--max` use every present, non-null value, ordered as `--sort`
+orders them, so they work on ISO dates and text as well as numbers. A `--by`
+field holding a list groups by the whole list. Counting reads front matter
+only and never returns a record body.
+
 ## Search
 
 Search literal text across every Markdown record:

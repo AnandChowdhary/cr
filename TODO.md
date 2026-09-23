@@ -155,8 +155,8 @@ Priorities:
 - [x] **P1 — Field projections.**
   `--select` on `get`, `list`, `search`, `backlinks`, and `traverse`, and `select` on the equivalent HTTP routes, take comma-separated or repeated selectors: dotted front matter paths and `$id`, `$collection`, `$path`, `$version`, and `$body`. A projected record is a flat object keyed by the selectors as written, leaving out fields the record does not have, or in plain CLI output one tab-separated row with escaped tabs, newlines, carriage returns, and backslashes. `traverse` puts the projection under `fields` in place of path, version, and front matter, and a projected single record keeps its `ETag`. `src/projection.rs` is the one implementation. Projected results are still computed from fully read records; the index entry above is what would avoid reading unselected fields. `tests/select_cli.rs` and `tests/server_api.rs` cover it.
 
-- [ ] **P1 — Counts and aggregation.**
-  Add count, distinct values, grouping, and basic numeric aggregation without requiring record bodies in the response.
+- [x] **P1 — Counts and aggregation.**
+  `cr count COLLECTION` and `GET /api/v1/collections/{collection}/count` count the records `list` would return under the same `where`, `where_expr`, and `filter`. `--by`/`by` counts once per distinct value, in sort order with records missing the field last (`missing: true` in JSON), which is also how distinct values are listed; `--sum` and `--avg` summarize numeric values only, with exact integer sums; and `--min` and `--max` take any present, non-null value in sort order, so they work on ISO dates. Output is a tab-separated table with a header, or JSON; no body is ever returned. `src/aggregate.rs` is the one implementation. Two things are deliberately left out: grouping by each element of a list field (such as counting by tag) rather than by the whole list, and grouping by more than one field. Like `list`, counting reads every matching record.
 
 - [ ] **P2 — Additional streaming output formats.**
   Add JSON Lines and CSV where the projection is tabular. Large results should stream rather than building the complete response in memory.

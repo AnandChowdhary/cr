@@ -1,4 +1,5 @@
 mod access;
+mod aggregate;
 mod attribution;
 mod audit;
 mod check;
@@ -24,6 +25,7 @@ pub use access::{
     UserDeleteOptions, UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus,
     UserUpdate, principal_id,
 };
+pub use aggregate::{Aggregation, Summary};
 pub use attribution::{
     AgentEvidence, Attribution, AttributionOverrides, AuditAgent, AuditAuthorization, AuditIntent,
     AuditIntentPart, AuthorizationMode, IntentAuthor, parse_agent, parse_authorization,

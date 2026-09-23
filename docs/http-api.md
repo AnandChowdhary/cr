@@ -223,6 +223,14 @@ selectors, and a single record keeps its `ETag`:
 curl 'http://127.0.0.1:3000/api/v1/collections/deals/records?select=$id,value,owner.name'
 ```
 
+Count and summarize a collection with `count`, which takes the same filters as
+a list plus `by`, `sum`, `avg`, `min`, and `max`, and answers with the same
+JSON as `cr count --json`:
+
+```sh
+curl 'http://127.0.0.1:3000/api/v1/collections/deals/count?by=stage&sum=value&avg=value'
+```
+
 List and search responses contain compact `{ path, front_matter }` records inside a page:
 
 ```json
@@ -306,6 +314,7 @@ The complete endpoint list is discoverable from that document. The main resource
 
 ```text
 GET    /api/v1/collections
+GET    /api/v1/collections/{collection}/count
 GET    /api/v1/collections/{collection}/schema
 PUT    /api/v1/collections/{collection}/schema
 DELETE /api/v1/collections/{collection}/schema

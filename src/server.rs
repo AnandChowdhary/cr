@@ -36,15 +36,15 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
-    AccessAction, AccessIdentity, AccessResource, AgentEvidence, Assignment, Attribution,
-    AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter, AuditIntent,
-    AuditIntentPart, AuditSource, Backlink, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary,
-    CollectionModel, CollectionPresentation, Database, DomainError, Filter, FilterExpression,
-    FilterOperator, Finding, MAX_TRAVERSAL_DEPTH, Projection, RECORD_ACCESS_FIELD, Record,
-    RecordActivity, RecordPrecondition, SchemaReview, SchemaViolation, SearchQuery, SearchTarget,
-    SortDirection, USERS_COLLECTION, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup,
-    ViewLayout, ViewPredicateMatch, audit::AuditChange, sort_by_record_field,
-    sort_records_by_field,
+    AccessAction, AccessIdentity, AccessResource, AgentEvidence, Aggregation, Assignment,
+    Attribution, AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter,
+    AuditIntent, AuditIntentPart, AuditSource, Backlink, COLLECTION_ACCESS_EXTENSION, CheckScope,
+    CheckSummary, CollectionModel, CollectionPresentation, Database, DomainError, Filter,
+    FilterExpression, FilterOperator, Finding, MAX_TRAVERSAL_DEPTH, Projection,
+    RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SchemaReview, SchemaViolation,
+    SearchQuery, SearchTarget, SortDirection, USERS_COLLECTION, User, UserKind, UserStatus,
+    ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch, audit::AuditChange,
+    sort_by_record_field, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -608,6 +608,25 @@ struct TraverseQuery {
     expand: bool,
     #[serde(default)]
     select: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CountQuery {
+    #[serde(default, rename = "where")]
+    filters: Vec<String>,
+    #[serde(default)]
+    where_expr: Vec<String>,
+    filter: Option<String>,
+    by: Option<String>,
+    #[serde(default)]
+    sum: Vec<String>,
+    #[serde(default)]
+    avg: Vec<String>,
+    #[serde(default)]
+    min: Vec<String>,
+    #[serde(default)]
+    max: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1455,6 +1474,7 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
             Router::new()
                 .route("/identity", get(identity))
                 .route("/collections", get(collections))
+                .route("/collections/{collection}/count", get(count_records))
                 .route(
                     "/collections/{collection}/schema",
                     get(get_schema).put(put_schema).delete(delete_schema),
@@ -3328,6 +3348,40 @@ async fn list_records(
     record_page_response(paginate(records, bounds), projection.as_ref())
 }
 
+/// Count a collection's records, optionally per value of a field, with sums,
+/// averages, minimums, and maximums.
+async fn count_records(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(collection): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<JsonValue>> {
+    let query: CountQuery = parse_query(raw)?;
+    let filters = parse_filters(query.filters)?;
+    let expressions = parse_filter_expressions(query.where_expr)?;
+    let filter = parse_filter(query.filter)?;
+    let aggregation = Aggregation::new(
+        query.by.as_deref(),
+        &query.sum,
+        &query.avg,
+        &query.min,
+        &query.max,
+    )
+    .map_err(ApiError::from_domain)?;
+    let summary = run_database(&state, &headers, move |database| {
+        let mut records = database.list(&collection, &filters)?;
+        records.retain(|record| {
+            expressions
+                .iter()
+                .all(|expression| expression.matches(&record.attributes))
+                && filter.as_ref().is_none_or(|filter| filter.matches(record))
+        });
+        aggregation.run(&records).json()
+    })
+    .await?;
+    Ok(Json(summary))
+}
+
 async fn get_record(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4174,6 +4228,34 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
     }))
     .expect("static OpenAPI schemas are objects");
     let rest: Map<String, JsonValue> = serde_json::from_value(json!({
+        "CountMetrics": {
+            "type": "object",
+            "required": ["count"],
+            "properties": {
+                "count": { "type": "integer", "minimum": 0 },
+                "sum": { "type": "object", "additionalProperties": { "type": "number" } },
+                "avg": { "type": "object", "additionalProperties": { "type": ["number", "null"] } },
+                "min": { "type": "object", "additionalProperties": true },
+                "max": { "type": "object", "additionalProperties": true }
+            }
+        },
+        "CountSummary": {
+            "allOf": [
+                { "$ref": "#/components/schemas/CountMetrics" },
+                {
+                    "type": "object",
+                    "properties": {
+                        "by": { "type": "string" },
+                        "groups": { "type": "array", "items": {
+                            "allOf": [
+                                { "$ref": "#/components/schemas/CountMetrics" },
+                                { "type": "object", "properties": { "value": {}, "missing": { "type": "boolean", "const": true } } }
+                            ]
+                        } }
+                    }
+                }
+            ]
+        },
         "ChangePreview": {
             "type": "object",
             "required": ["preview", "action", "record", "changes", "digest"],
@@ -4528,6 +4610,19 @@ fn openapi_paths() -> JsonValue {
         },
         "/api/v1/collections": {
             "get": { "operationId": "listCollections", "parameters": page_parameters.clone(), "responses": ok("#/components/schemas/CollectionPage") }
+        },
+        "/api/v1/collections/{collection}/count": {
+            "get": { "operationId": "countRecords", "description": "Count records, optionally once per distinct value of a field, with sums and averages of numeric fields and minimums and maximums ordered as sort orders them. Never returns record bodies.", "parameters": [
+                collection.clone(),
+                { "name": "where", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
+                { "name": "where_expr", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
+                { "name": "filter", "in": "query", "schema": { "type": "string" } },
+                { "name": "by", "in": "query", "description": "Group by this dotted field; records without it form the last group, marked missing.", "schema": { "type": "string" } },
+                { "name": "sum", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
+                { "name": "avg", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
+                { "name": "min", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
+                { "name": "max", "in": "query", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }
+            ], "responses": ok("#/components/schemas/CountSummary") }
         },
         "/api/v1/collections/{collection}/schema": {
             "get": { "operationId": "getCollectionSchema", "description": "The JSON Schema the collection's records are judged against. users answers with its built-in schema.", "parameters": [collection.clone()], "responses": ok("#/components/schemas/JsonSchema") },
