@@ -6963,25 +6963,34 @@ const RECORD_ID_KEPT_TAIL_CHARS: usize = 10;
 /// hover. An ID short enough never to be cut is one span and has no `title`,
 /// because a tooltip repeating the visible text is noise.
 fn render_record_id_link(href: &str, id: &str) -> Markup {
-    let tail_start = id
-        .char_indices()
+    let shortened = id_tail_start(id).is_some();
+    html! {
+        a href=(href) title=[shortened.then_some(id)] class="flex max-w-80 font-mono text-gray-600 hover:text-indigo-700 hover:underline" {
+            (render_id_halves(id))
+        }
+    }
+}
+
+/// Where the kept end of a long ID starts, or `None` for an ID short enough
+/// never to be shortened.
+fn id_tail_start(id: &str) -> Option<usize> {
+    id.char_indices()
         .rev()
         .nth(RECORD_ID_KEPT_TAIL_CHARS - 1)
         .map(|(index, _)| index)
-        .filter(|_| id.chars().count() > 2 * RECORD_ID_KEPT_TAIL_CHARS);
+        .filter(|_| id.chars().count() > 2 * RECORD_ID_KEPT_TAIL_CHARS)
+}
+
+/// An ID as the spans that shorten it in the middle inside a flex container:
+/// a start that gives way to an ellipsis and an end that does not.
+fn render_id_halves(id: &str) -> Markup {
     html! {
-        @match tail_start {
+        @match id_tail_start(id) {
             Some(tail_start) => {
-                a href=(href) title=(id) class="flex max-w-80 font-mono text-gray-600 hover:text-indigo-700 hover:underline" {
-                    span class="truncate" { (&id[..tail_start]) }
-                    span class="shrink-0" { (&id[tail_start..]) }
-                }
+                span class="truncate" { (&id[..tail_start]) }
+                span class="shrink-0" { (&id[tail_start..]) }
             }
-            None => {
-                a href=(href) class="flex max-w-80 font-mono text-gray-600 hover:text-indigo-700 hover:underline" {
-                    span class="truncate" { (id) }
-                }
-            }
+            None => span class="truncate" { (id) },
         }
     }
 }
@@ -7631,9 +7640,9 @@ fn render_kanban_board(
                             h2 class="text-sm font-semibold text-gray-900" { (&lane.label) }
                             span class="cr-pill bg-white" { (lane.records.len()) }
                         }
-                        div class="min-h-20 space-y-2" {
+                        div class="min-h-20 space-y-1.5" {
                             @if lane.records.is_empty() {
-                                p class="rounded-xl border border-dashed border-gray-300 px-4 py-8 text-center text-xs text-gray-500" { "Drop cards here" }
+                                p class="rounded-lg border border-dashed border-gray-300 px-3 py-5 text-center text-xs text-gray-500" { "Drop cards here" }
                             }
                             @for record in &lane.records {
                                 @let can_move = updatable.contains(&record.id);
@@ -7641,36 +7650,22 @@ fn render_kanban_board(
                                     draggable=(if can_move { "true" } else { "false" })
                                     data-kanban-card=(if can_move { "true" } else { "false" })
                                     data-move-url=(kanban_move_url(view, &record.id))
-                                    class=(if can_move { "cr-kanban-card cursor-grab p-3 active:cursor-grabbing" } else { "cr-kanban-card p-3" })
+                                    class=(if can_move { "cr-kanban-card cursor-grab active:cursor-grabbing" } else { "cr-kanban-card" })
                                 {
-                                    div class="flex items-start justify-between gap-3" {
-                                        @let href = format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id));
-                                        @match title_field.and_then(|field| record_title(record, field)) {
-                                            Some(title) => {
-                                                div class="min-w-0" {
-                                                    a href=(href) class="text-sm font-semibold text-gray-900 hover:text-indigo-700 hover:underline" { (title) }
-                                                    p class="mt-0.5 break-all font-mono text-xs text-gray-500" { (&record.id) }
-                                                }
-                                            }
-                                            None => {
-                                                a href=(href) class="break-all font-mono text-sm font-bold text-gray-900 hover:text-indigo-700 hover:underline" { (&record.id) }
-                                            }
+                                    @let href = format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id));
+                                    @match title_field.and_then(|field| record_title(record, field)) {
+                                        Some(title) => {
+                                            a href=(href) class="cr-card-title" { (title) }
+                                            p class="cr-card-id" title=[id_tail_start(&record.id).map(|_| record.id.as_str())] { (render_id_halves(&record.id)) }
                                         }
-                                        span aria-hidden="true" class="select-none text-gray-300" { "⠿" }
-                                    }
-                                    @if !card_columns.is_empty() {
-                                        dl class="mt-2 space-y-1" {
-                                            @for column in &card_columns {
-                                                div {
-                                                    dt class="text-[0.65rem] font-bold uppercase tracking-wide text-gray-400" { (field_label(schema, column)) }
-                                                    dd class="mt-0.5 line-clamp-2 text-sm text-gray-700" { (render_field_value(record, column, schema, &display_field(record, column, schema))) }
-                                                }
-                                            }
+                                        None => {
+                                            a href=(href) class="cr-card-title cr-card-title-id" title=[id_tail_start(&record.id).map(|_| record.id.as_str())] { (render_id_halves(&record.id)) }
                                         }
                                     }
+                                    (render_card_properties(record, &card_columns, schema))
                                     @if can_move {
-                                        details class="cr-kanban-move mt-3 border-t border-gray-100 pt-2" {
-                                            summary class="cursor-pointer list-none" { "Move card…" }
+                                        details class="cr-kanban-move" {
+                                            summary { "Move…" }
                                             form method="post" action=(kanban_move_url(view, &record.id)) hx-boost=(UNBOOSTED) class="flex items-center gap-2" {
                                                 input type="hidden" name="_csrf" value=(csrf_token);
                                                 label class="min-w-0 flex-1" {
@@ -8123,6 +8118,45 @@ fn badge_tone(value: &str) -> Option<&'static str> {
         | "paused" | "on_hold" | "backlog" => "cr-pill-warn",
         _ => return None,
     })
+}
+
+/// A card's details: each field in `columns` that holds something, as a small
+/// chip, or as the badge a state already is.
+///
+/// Cards used to list every chosen field as a labelled row, `ASKED BY` over
+/// its value, empty ones included, so a card with five fields was a dozen
+/// lines whatever it held. Now a card shows only the values it has, side by
+/// side and wrapping, and says what each one is in its tooltip and to a screen
+/// reader rather than in a label that repeats down every card of the lane.
+fn render_card_properties(
+    record: &Record,
+    columns: &[&String],
+    schema: Option<&JsonValue>,
+) -> Markup {
+    let shown = columns
+        .iter()
+        .map(|column| (column.as_str(), display_field(record, column, schema)))
+        .filter(|(_, text)| text != EMPTY_VALUE)
+        .collect::<Vec<_>>();
+    html! {
+        @if !shown.is_empty() {
+            div class="cr-card-props" {
+                @for (column, text) in shown {
+                    @let label = field_label(schema, column);
+                    @let definition = property_definition(schema, column);
+                    @let badge = match record.field(column).ok().flatten() {
+                        Some(YamlValue::String(_)) => shows_as_badge(column, definition),
+                        Some(YamlValue::Mapping(_)) => true,
+                        _ => false,
+                    };
+                    span class=(if badge { "cr-card-prop-badge" } else { "cr-card-prop" }) title=(format!("{label}: {text}")) {
+                        span class="sr-only" { (label) ": " }
+                        (render_field_value(record, column, schema, &text))
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The badge or chips [`render_field_value`] shows for one object.
@@ -10577,20 +10611,62 @@ html {
   box-shadow: none;
 }
 
+/* A card: its title in two lines at most, the ID in one quiet line under it,
+   then a row of the values it holds. */
 .cr-kanban-card {
-  border: 1px solid var(--cr-gray-300);
+  border: 1px solid var(--cr-gray-200);
   border-radius: 8px;
   background: var(--cr-gray-0);
   box-shadow: 0 1px 2px rgb(36 36 36 / 0.04);
+  padding: 9px 10px;
 }
 
-.cr-kanban-card:hover { border-color: var(--cr-gray-400); box-shadow: 0 3px 8px rgb(36 36 36 / 0.07); }
+.cr-kanban-card:hover { border-color: var(--cr-gray-300); box-shadow: 0 3px 8px rgb(36 36 36 / 0.07); }
 .cr-kanban-card:active { transform: rotate(0.25deg); }
-.cr-kanban-card dl > div { display: grid; grid-template-columns: minmax(64px, 0.42fr) minmax(0, 1fr); align-items: baseline; gap: 8px; }
-.cr-kanban-card dl dt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cr-kanban-card dl dd { margin-top: 0 !important; min-width: 0; }
-.cr-kanban-move summary { color: var(--cr-gray-500); font-size: 0.72rem; font-weight: 620; }
-.cr-kanban-move[open] summary { margin-bottom: 8px; }
+.cr-card-title {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--cr-gray-900);
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.cr-card-title:hover { color: var(--cr-accent); }
+/* A card with no title leads with its ID, on one line. */
+.cr-card-title-id { display: flex; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.74rem; }
+.cr-card-id {
+  display: flex;
+  margin-top: 2px;
+  color: var(--cr-gray-400);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.66rem;
+}
+.cr-card-props { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.cr-card-prop,
+.cr-card-prop-badge { display: inline-flex; min-width: 0; max-width: 100%; align-items: center; }
+.cr-card-prop {
+  border: 1px solid var(--cr-gray-200);
+  border-radius: 5px;
+  color: var(--cr-gray-600);
+  padding: 1px 6px;
+  font-size: 0.68rem;
+  line-height: 1.4;
+}
+.cr-card-prop > :last-child,
+.cr-card-prop { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The keyboard's and a touch screen's way to move a card. On a screen with a
+   pointer, which can drag, it waits until the card is pointed at or has focus
+   inside it, so a lane is not a column of Move links; it is transparent rather
+   than hidden, so it can still be tabbed to. */
+.cr-kanban-move { margin-top: 4px; }
+.cr-kanban-move summary { cursor: pointer; list-style: none; color: var(--cr-gray-500); font-size: 0.68rem; font-weight: 600; text-align: right; }
+.cr-kanban-move summary::-webkit-details-marker { display: none; }
+.cr-kanban-move[open] summary { margin-bottom: 6px; }
+@media (hover: hover) {
+  .cr-kanban-card:not(:hover):not(:focus-within) .cr-kanban-move:not([open]) summary { opacity: 0; }
+}
 
 /* The record form: fields straight on the page with a label above each
    control, the notes under them, and the actions held at the bottom edge of
