@@ -7440,7 +7440,7 @@ fn view_results(
         div id=(VIEW_TABLE_REGION) {
             (render_active_filters(view, query, page, schema))
             @if view.layout == ViewLayout::Kanban {
-                (render_kanban_board(view, columns, page, query, schema, csrf_token, updatable))
+                (render_kanban_board(view, columns, page, activity, query, schema, csrf_token, updatable))
             } @else {
             @if let Some(quick_filter) = quick_filter {
                 (render_quick_filter(view, query, page, quick_filter, schema))
@@ -7594,10 +7594,12 @@ fn render_save_view_control(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_kanban_board(
     view: &ViewDefinition,
     columns: &[String],
     page: &ViewPage,
+    activity: &BTreeMap<String, RecordActivity>,
     query: &ViewQuery,
     schema: Option<&JsonValue>,
     csrf_token: &str,
@@ -7612,8 +7614,14 @@ fn render_kanban_board(
     let card_columns = columns
         .iter()
         .filter(|column| column.as_str() != group_by && Some(column.as_str()) != title_field)
-        .take(5)
         .collect::<Vec<_>>();
+    // A card says when its record was made, or last changed when that is what
+    // the board is ordered by.
+    let card_time: fn(&RecordActivity) -> &str = if view_sort_field(query) == Some("$updated_at") {
+        |activity| activity.updated_at.as_str()
+    } else {
+        |activity| activity.created_at.as_str()
+    };
     let (first, last) = page_range(page);
 
     html! {
@@ -7663,6 +7671,12 @@ fn render_kanban_board(
                                         }
                                     }
                                     (render_card_properties(record, &card_columns, schema))
+                                    @let time = activity.get(&record.id).map(card_time);
+                                    @if time.is_some() || can_move {
+                                    div class="cr-card-foot" {
+                                    @if let Some(time) = time {
+                                        (render_timestamp(Some(time)))
+                                    }
                                     @if can_move {
                                         details class="cr-kanban-move" {
                                             summary { "Move…" }
@@ -7683,6 +7697,8 @@ fn render_kanban_board(
                                                 button type="submit" class="cr-button cr-button-primary cr-button-small" { "Move" }
                                             }
                                         }
+                                    }
+                                    }
                                     }
                                 }
                             }
@@ -10660,7 +10676,10 @@ html {
    pointer, which can drag, it waits until the card is pointed at or has focus
    inside it, so a lane is not a column of Move links; it is transparent rather
    than hidden, so it can still be tabbed to. */
-.cr-kanban-move { margin-top: 4px; }
+.cr-card-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 8px; margin-top: 7px; font-size: 0.68rem; }
+.cr-card-foot .cr-time { font-size: 0.68rem; }
+.cr-kanban-move { margin-left: auto; }
+.cr-kanban-move[open] { flex-basis: 100%; }
 .cr-kanban-move summary { cursor: pointer; list-style: none; color: var(--cr-gray-500); font-size: 0.68rem; font-weight: 600; text-align: right; }
 .cr-kanban-move summary::-webkit-details-marker { display: none; }
 .cr-kanban-move[open] summary { margin-bottom: 6px; }
@@ -11754,7 +11773,12 @@ fn selected_view_columns(
 ) -> ApiResult<Vec<String>> {
     if !query_columns_custom(query) {
         return Ok(if view.columns.is_empty() {
-            default_view_columns(available, schema, records)
+            match (view.layout, view.group_by.as_deref()) {
+                (ViewLayout::Kanban, Some(group_by)) => {
+                    default_card_columns(available, schema, records, group_by)
+                }
+                _ => default_view_columns(available, schema, records),
+            }
         } else {
             view.columns.clone()
         });
@@ -11823,6 +11847,79 @@ fn default_view_columns(
         .take(DEFAULT_VIEW_COLUMNS)
         .cloned()
         .collect()
+}
+
+/// How many values a Kanban card shows before the reader picks others.
+const DEFAULT_CARD_COLUMNS: usize = 4;
+
+/// A text field whose values average more characters than this is prose, which
+/// a card's chip could only cut short.
+const CARD_TEXT_MAX_CHARS: usize = 40;
+
+/// The values a Kanban card shows when its view names none.
+///
+/// A card has a fraction of a table row's room and a board shows dozens of
+/// them at once, so every value on one has to earn its place. The table's
+/// rules come first: not the title, which heads the card; nothing inside an
+/// object; no objects. Then three of a card's own. Not the field the board is
+/// grouped by, which the lane already says. Not prose, whose chip would be an
+/// ellipsis. And not a field with a single value across the board — the same
+/// requester on every task, `attempts: 0` everywhere — which tells a reader
+/// nothing about the card it is on, however true it is. Four at most, in
+/// column order. Every field can still be chosen in the column picker.
+fn default_card_columns(
+    available: &[String],
+    schema: Option<&JsonValue>,
+    records: &[Record],
+    group_by: &str,
+) -> Vec<String> {
+    let title = view_title_field(schema, records);
+    available
+        .iter()
+        .filter(|column| Some(column.as_str()) != title && column.as_str() != group_by)
+        .filter(|column| !column.contains('.'))
+        .filter(|column| !field_holds_objects(column, schema, records))
+        .filter(|column| !field_holds_prose(column, schema, records))
+        .filter(|column| !field_has_one_value(column, records))
+        .take(DEFAULT_CARD_COLUMNS)
+        .cloned()
+        .collect()
+}
+
+/// Whether `field` holds prose: text, not an enum's option, averaging more than
+/// [`CARD_TEXT_MAX_CHARS`] characters where it is set.
+fn field_holds_prose(field: &str, schema: Option<&JsonValue>, records: &[Record]) -> bool {
+    if property_definition(schema, field).is_some_and(|definition| definition.get("enum").is_some())
+    {
+        return false;
+    }
+    let key = YamlValue::String(field.to_owned());
+    let lengths = records
+        .iter()
+        .filter_map(|record| match record.attributes.get(&key) {
+            Some(YamlValue::String(text)) if !text.trim().is_empty() => Some(text.chars().count()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    !lengths.is_empty() && lengths.iter().sum::<usize>() / lengths.len() > CARD_TEXT_MAX_CHARS
+}
+
+/// Whether every record that sets `field` sets it to the same value, on a
+/// board with enough records for that to mean something. A field no record
+/// sets counts too: it has nothing to show.
+fn field_has_one_value(field: &str, records: &[Record]) -> bool {
+    if records.len() < 3 {
+        return false;
+    }
+    let key = YamlValue::String(field.to_owned());
+    let mut values = records
+        .iter()
+        .filter_map(|record| record.attributes.get(&key))
+        .filter(|value| !is_empty_value(value));
+    match values.next() {
+        None => true,
+        Some(first) => values.all(|value| value == first),
+    }
 }
 
 /// Whether the schema declares `field` an object or a list of objects, or a

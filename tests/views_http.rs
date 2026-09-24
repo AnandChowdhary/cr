@@ -1128,6 +1128,104 @@ async fn kanban_cards_show_their_values_as_chips_without_labels_or_blanks() {
 }
 
 #[tokio::test]
+async fn kanban_cards_show_the_values_that_tell_cards_apart_by_default() {
+    let (_temporary, database) = test_database("views-kanban-defaults");
+    fs::create_dir_all(database.root().join(".cr/schemas")).unwrap();
+    fs::write(
+        database.root().join(".cr/schemas/tasks.json"),
+        r#"{ "type": "object", "properties": {
+             "status": { "enum": ["queued", "done"] },
+             "kind": { "enum": ["scheduled", "triggered"] },
+             "never_set": { "type": "string" } } }"#,
+    )
+    .unwrap();
+    let tasks = [
+        ("a", "queued", "triggered", "anik", "p1"),
+        ("b", "queued", "scheduled", "khoi", "p2"),
+        ("c", "done", "triggered", "priya", "p1"),
+    ];
+    for (id, status, kind, person, priority) in tasks {
+        database
+            .create(
+                "tasks",
+                id,
+                &[
+                    Assignment::from_str(&format!("title=Rate {person}")).unwrap(),
+                    Assignment::from_str(&format!("status={status}")).unwrap(),
+                    Assignment::from_str(&format!("kind={kind}")).unwrap(),
+                    Assignment::from_str("asked_by=anand").unwrap(),
+                    Assignment::from_str("attempts=0").unwrap(),
+                    Assignment::from_str(&format!("person={person}")).unwrap(),
+                    Assignment::from_str(
+                        "prompt=\"Rate the inbound applicant against the rubric and draft a note.\"",
+                    )
+                    .unwrap(),
+                    Assignment::from_str("claim.pid=1").unwrap(),
+                    Assignment::from_str(&format!("priority={priority}")).unwrap(),
+                    Assignment::from_str("region=eu").unwrap(),
+                    Assignment::from_str(&format!("owner={person}-owner")).unwrap(),
+                ],
+                "",
+            )
+            .unwrap();
+    }
+    database
+        .create_view_with_layout(
+            "board",
+            Some("Board"),
+            "tasks",
+            vec![],
+            vec![],
+            25,
+            ViewLayout::Kanban,
+            Some("status".into()),
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let board = request(&app, Method::GET, "/board", None, &[]).await;
+    assert_eq!(board.status, StatusCode::OK);
+    let shown = |label: &str| board.text().contains(&format!(r#"title="{label}: "#));
+    // The values that differ from card to card, four at most, in column order.
+    for label in ["Kind", "Person", "Priority", "Owner"] {
+        assert!(shown(label), "{label} is on the cards");
+    }
+    // Not the lane's own field, the same value everywhere, prose, an object,
+    // a field nothing sets, or a fifth.
+    for label in [
+        "Status",
+        "Asked By",
+        "Attempts",
+        "Region",
+        "Prompt",
+        "Claim",
+        "Never Set",
+    ] {
+        assert!(!shown(label), "{label} is not on the cards");
+    }
+    assert!(board.text().contains("4 shown"));
+    // Each card says when its record was made.
+    let card = &board.text()[board.text().find("/board/records/a\"").unwrap()..];
+    let card = &card[..card.find("</article>").unwrap()];
+    assert!(card.contains(r#"<div class="cr-card-foot"><time datetime=""#));
+    // A view that names its columns gets all of them.
+    let chosen = request(
+        &app,
+        Method::GET,
+        "/board?columns=custom&column=asked_by&column=attempts&column=region&column=prompt&column=kind",
+        None,
+        &[],
+    )
+    .await;
+    for label in ["Asked By", "Attempts", "Region", "Prompt", "Kind"] {
+        assert!(
+            chosen.text().contains(&format!(r#"title="{label}: "#)),
+            "{label} was chosen"
+        );
+    }
+}
+
+#[tokio::test]
 async fn html_forms_create_update_and_delete_through_validated_audited_database_methods() {
     let (_temporary, database) = test_database("views-forms");
     fs::write(
