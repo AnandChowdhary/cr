@@ -75,14 +75,19 @@ and the total in the heading with one more request. With JavaScript off, a
 `/?summary=inline`.
 
 A collection is called by its directory name in sentence case, so
-`inbound-ratings` reads **Inbound ratings**, and is marked 🗃️ in the sidebar
-and index. Give it a better name or its own emoji with
+`inbound-ratings` reads **Inbound ratings**, and is marked 🗃️ in the index. Give it a better name or its own emoji with
 [`cr schema label` and `cr schema icon`](#name-collections-and-give-them-icons).
 
 The default UI uses a compact workspace shell rather than a documentation-style
-page frame. On desktop, saved views, then collections, then internal records
-stay visible in a persistent sidebar with audit, OpenAPI, and the RBAC
-perspective control anchored below. Once the list is longer than the window it
+page frame. On desktop, a persistent sidebar holds **All views**, then your
+saved views, then internal records, with audit, OpenAPI, and the RBAC
+perspective control anchored below. Collections are not listed in it: they are
+on the **All views** index, under their own **Collections** heading after the
+saved views, and **All views** stays highlighted while you are on a
+collection's page or one of its records, as the breadcrumb says. Saving a view
+is how a collection, or a filtered, sorted, or Kanban way of reading one, gets
+a place in the sidebar; until there is one, the section says so to anyone who
+may save views. Once the list is longer than the window it
 scrolls between the brand and that anchored section, which stay put, and a
 fade above the section and under the brand shows while entries are hidden
 beyond either edge, where the browser supports scroll-driven animations. The
@@ -429,7 +434,7 @@ or by hand:
 }
 ```
 
-The label replaces the collection's name in the sidebar, the view index, page
+The label replaces the collection's name in the view index, page
 headings, and `cr view show`; the icon marks the collection and every saved
 view of it. A label is one line of at most 80 characters, and an icon is a
 single emoji of at most 8 characters, so the joiners and selectors that build
