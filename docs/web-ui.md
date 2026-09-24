@@ -117,6 +117,9 @@ table is not grouped. A view
 definition's own `sort_by` still wins, and any column heading or the sorting
 panel overrides both for the current URL.
 
+The search box above the table searches each record's whole Markdown file,
+front matter and body; its magnifier, at the start of the box, submits it.
+
 The table infers other columns from the collection schema and current front
 matter. A saved view's own columns come first. The rest follow the schema's
 `x-cr-ui.order`, the order the record form uses, then its `required` fields in

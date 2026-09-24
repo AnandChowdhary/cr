@@ -6546,8 +6546,15 @@ fn render_view_records(
                         data-filter-builder="true" data-max-filters=(MAX_VIEW_FILTERS) class="contents" {
                         div class="relative min-w-48 flex-1 sm:flex-none" {
                             label class="sr-only" { "Search records" }
-                            input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Search records" placeholder="Search records…" autocomplete="off" data-view-search="true" class="w-full border bg-white py-2 pl-3 pr-10 text-sm outline-none placeholder:text-gray-400 sm:w-56";
-                            button type="submit" aria-label="Submit search" title="Search" class="absolute inset-y-1 right-1 inline-flex w-8 items-center justify-center rounded-md text-gray-400 hover:bg-gray-100 hover:text-blue-700" { "⌕" }
+                            // The magnifier leads the box, where a search field's
+                            // icon is expected, and is drawn rather than typed:
+                            // `⌕` is a tiny glyph on macOS and a missing one in
+                            // fonts without it. The button stays the submit
+                            // control, so its accessible name is its label.
+                            input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Search records" placeholder="Search records…" autocomplete="off" data-view-search="true" class="w-full border bg-white py-2 pl-9 pr-3 text-sm outline-none placeholder:text-gray-400 sm:w-56";
+                            button type="submit" aria-label="Submit search" title="Search" class="absolute inset-y-1 left-1 inline-flex w-7 items-center justify-center rounded-md text-gray-400 hover:bg-gray-100 hover:text-blue-700" {
+                                (PreEscaped(SEARCH_ICON))
+                            }
                         }
                         details class="relative" data-filter-disclosure="true" {
                             (view_filter_summary(active_filter_count, OutOfBand::No))
@@ -7240,6 +7247,9 @@ fn quick_filter_selection(query: &ViewQuery, field: &str) -> QuickFilterSelectio
         _ => QuickFilterSelection::Other,
     }
 }
+
+/// A magnifier for the search box's submit button, in the text's colour.
+const SEARCH_ICON: &str = r#"<svg aria-hidden="true" focusable="false" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="7" cy="7" r="4.75"/><path d="m10.5 10.5 3.25 3.25"/></svg>"#;
 
 /// Which timestamp a table's rows are grouped by day on, when it is ordered by
 /// one.
