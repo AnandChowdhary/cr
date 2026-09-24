@@ -476,8 +476,12 @@ async fn records_are_named_and_tables_read_like_the_form() {
     assert!(table.body.contains(">Close date<"));
     assert!(table.body.contains(">Probability<"));
     assert!(!table.body.contains(">expected_close<"));
-    // An enum reads as the form's option does.
-    assert!(table.body.contains(">Negotiation</a>"));
+    // An enum reads as the form's option does, as a badge.
+    assert!(
+        table
+            .body
+            .contains(r#"<span class="cr-pill">Negotiation</span></a>"#)
+    );
     // An amount is grouped and carries its unit, read from the record when the
     // schema says so, and a number with no unit is left exactly as stored.
     assert!(

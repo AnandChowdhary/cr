@@ -2088,15 +2088,13 @@ async fn object_values_are_summarised_as_a_badge_or_chips_rather_than_yaml() {
     assert_eq!(page.status, StatusCode::OK);
     let cell = |content: &str| format!(r#"hover:text-indigo-700 hover:underline">{content}</a>"#);
     // A state is the whole summary, read like an enum.
-    assert!(
-        page.text()
-            .contains(&cell(r#"<span class="cr-pill">In Progress</span>"#))
-    );
+    assert!(page.text().contains(&cell(
+        r#"<span class="cr-pill cr-pill-active">In Progress</span>"#
+    )));
     // So is the field the schema gives an enum.
-    assert!(
-        page.text()
-            .contains(&cell(r#"<span class="cr-pill">Advance</span>"#))
-    );
+    assert!(page.text().contains(&cell(
+        r#"<span class="cr-pill cr-pill-positive">Advance</span>"#
+    )));
     // Otherwise the first fields that hold something, and a count of the rest.
     let chip = |key: &str, value: &str| {
         format!(
@@ -2183,7 +2181,11 @@ async fn fields_inside_objects_can_be_chosen_as_columns_of_their_own() {
     .await;
     assert_eq!(chosen.status, StatusCode::OK);
     assert!(chosen.text().contains("Sort by Learning state ascending"));
-    assert!(chosen.text().contains(">In Progress</a>"));
+    assert!(
+        chosen
+            .text()
+            .contains(r#"<span class="cr-pill cr-pill-active">In Progress</span></a>"#)
+    );
     assert!(
         chosen.text().find("/tasks/records/beta").unwrap()
             < chosen.text().find("/tasks/records/alpha").unwrap()
@@ -2204,6 +2206,85 @@ async fn fields_inside_objects_can_be_chosen_as_columns_of_their_own() {
     .await;
     assert!(filtered.text().contains("/tasks/records/alpha"));
     assert!(!filtered.text().contains("/tasks/records/beta"));
+}
+
+#[tokio::test]
+async fn states_are_coloured_badges_by_what_they_say() {
+    let (_temporary, database) = test_database("views-badges");
+    fs::create_dir_all(database.root().join(".cr/schemas")).unwrap();
+    fs::write(
+        database.root().join(".cr/schemas/tasks.json"),
+        r#"{ "type": "object", "properties": {
+             "stage": { "enum": ["in-progress", "failed", "queued", "proposal", "won"] },
+             "labels": { "type": "array", "items": { "enum": ["urgent", "done"] } },
+             "notes": { "type": "string" } } }"#,
+    )
+    .unwrap();
+    let badge = |tone: &str, text: &str| match tone {
+        "" => format!(r#"<span class="cr-pill">{text}</span>"#),
+        tone => format!(r#"<span class="cr-pill cr-pill-{tone}">{text}</span>"#),
+    };
+    for (id, stage) in [
+        ("a", "in-progress"),
+        ("b", "failed"),
+        ("c", "queued"),
+        ("d", "proposal"),
+        ("e", "won"),
+    ] {
+        database
+            .create(
+                "tasks",
+                id,
+                &[
+                    Assignment::from_str(&format!("stage={stage}")).unwrap(),
+                    Assignment::from_str("labels=[urgent, done]").unwrap(),
+                    Assignment::from_str("status=done").unwrap(),
+                    Assignment::from_str("notes=done").unwrap(),
+                    Assignment::from_str("run.state=running").unwrap(),
+                ],
+                "",
+            )
+            .unwrap();
+    }
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(
+        &app,
+        Method::GET,
+        "/tasks?columns=custom&column=stage&column=labels&column=status&column=notes&column=run",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK);
+    // An enum's value is a badge coloured by what it says, and grey when the
+    // word says nothing about how things went.
+    assert!(page.text().contains(&badge("active", "In Progress")));
+    assert!(page.text().contains(&badge("negative", "Failed")));
+    assert!(page.text().contains(&badge("warn", "Queued")));
+    assert!(page.text().contains(&badge("", "Proposal")));
+    assert!(page.text().contains(&badge("positive", "Won")));
+    // Each value of a list of enums is its own badge.
+    assert!(page.text().contains(&format!(
+        r#"<span class="mr-1">{}</span><span class="mr-1">{}</span>"#,
+        badge("", "Urgent"),
+        badge("positive", "Done")
+    )));
+    // A `status` or `state` field is one even without a schema, and so is an
+    // object's state; any other text stays text.
+    assert!(page.text().contains(&format!(
+        r#"hover:underline">{}</a>"#,
+        badge("positive", "Done")
+    )));
+    assert!(page.text().contains(&badge("active", "Running")));
+    assert!(page.text().contains(r#"hover:underline">done</a>"#));
+    // The tones have colours in both schemes.
+    for tone in ["positive", "negative", "active", "warn"] {
+        assert!(
+            page.text()
+                .contains(&format!(".cr-pill-{tone} {{ border-color: var("))
+        );
+    }
 }
 
 #[tokio::test]

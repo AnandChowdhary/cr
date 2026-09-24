@@ -7628,10 +7628,9 @@ fn render_field_value(
     schema: Option<&JsonValue>,
     text: &str,
 ) -> Markup {
+    let definition = property_definition(schema, column);
     match record.field(column).ok().flatten() {
-        Some(YamlValue::Mapping(object)) => {
-            render_object_summary(object, property_definition(schema, column))
-        }
+        Some(YamlValue::Mapping(object)) => render_object_summary(object, definition),
         Some(YamlValue::Sequence(items))
             if items
                 .iter()
@@ -7643,8 +7642,67 @@ fn render_field_value(
                 }
             }
         }
+        Some(YamlValue::String(value)) if shows_as_badge(column, definition) => render_badge(value),
+        Some(YamlValue::Sequence(items))
+            if definition
+                .and_then(|definition| definition.get("items"))
+                .is_some_and(|items| items.get("enum").is_some()) =>
+        {
+            html! {
+                @for item in items {
+                    @if let YamlValue::String(item) = item {
+                        span class="mr-1" { (render_badge(item)) }
+                    }
+                }
+            }
+        }
         _ => html! { (text) },
     }
+}
+
+/// Whether a field's string values are badges: an enum's, whose values are a
+/// fixed set of states, and a `status` or `state` field's, which is what a
+/// schemaless collection calls its states.
+fn shows_as_badge(column: &str, definition: Option<&JsonValue>) -> bool {
+    definition.is_some_and(|definition| definition.get("enum").is_some())
+        || matches!(column.rsplit('.').next(), Some("status" | "state"))
+            && definition
+                .is_none_or(|definition| definition.get("type").is_none_or(|kind| kind == "string"))
+}
+
+/// A state as a badge, read like an enum's option and coloured by what it
+/// says.
+fn render_badge(value: &str) -> Markup {
+    html! {
+        span class=(match badge_tone(value) {
+            Some(tone) => format!("cr-pill {tone}"),
+            None => "cr-pill".to_owned(),
+        }) { (humanize_field_name(value)) }
+    }
+}
+
+/// The colour a state's badge takes, from the words collections most often
+/// use for them: green when something finished well, red when it did not,
+/// blue while it is under way, and amber while it waits its turn. Anything
+/// else stays grey, because a colour guessed from an unfamiliar word would be
+/// a claim about it the data never made. `in-progress`, `In progress` and
+/// `in_progress` are one word here.
+fn badge_tone(value: &str) -> Option<&'static str> {
+    let word = value.trim().to_lowercase().replace([' ', '-'], "_");
+    Some(match word.as_str() {
+        "done" | "complete" | "completed" | "success" | "succeeded" | "successful" | "won"
+        | "approved" | "accepted" | "resolved" | "passed" | "shipped" | "delivered" | "sent"
+        | "paid" | "published" | "merged" | "hired" | "advance" | "advanced" | "active"
+        | "healthy" | "ok" => "cr-pill-positive",
+        "failed" | "failure" | "error" | "errored" | "lost" | "rejected" | "reject"
+        | "declined" | "denied" | "cancelled" | "canceled" | "blocked" | "expired"
+        | "timed_out" | "timeout" | "overdue" | "broken" | "unhealthy" => "cr-pill-negative",
+        "running" | "in_progress" | "processing" | "started" | "working" | "doing" | "claimed"
+        | "in_review" | "reviewing" | "retrying" => "cr-pill-active",
+        "queued" | "pending" | "waiting" | "scheduled" | "todo" | "to_do" | "draft" | "new"
+        | "paused" | "on_hold" | "backlog" => "cr-pill-warn",
+        _ => return None,
+    })
 }
 
 /// The badge or chips [`render_field_value`] shows for one object.
@@ -7667,7 +7725,7 @@ fn render_object_summary(object: &Mapping, definition: Option<&JsonValue>) -> Ma
         })
         .and_then(scalar);
     if let Some(state) = state {
-        return html! { span class="cr-pill" { (humanize_field_name(&state)) } };
+        return render_badge(&state);
     }
     let fields = object
         .iter()
@@ -9784,6 +9842,11 @@ html {
 
 .cr-pill-accent { border-color: var(--cr-info-line); background: var(--cr-accent-soft); color: var(--cr-info-strong); }
 .cr-pill-warn { border-color: var(--cr-warn-line); background: var(--cr-warn-soft); color: var(--cr-warn-ink); }
+/* A state's badge: finished well, did not, under way. Waiting is the warn
+   pill above. */
+.cr-pill-positive { border-color: var(--color-emerald-200); background: var(--color-emerald-50); color: var(--color-emerald-700); }
+.cr-pill-negative { border-color: var(--cr-invalid-line); background: var(--cr-invalid-soft); color: var(--cr-danger); }
+.cr-pill-active { border-color: var(--cr-info-line); background: var(--cr-info-soft); color: var(--cr-info-ink); }
 
 .cr-filter-tag {
   border-radius: 5px;
