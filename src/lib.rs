@@ -55,5 +55,6 @@ pub use traverse::{
 };
 pub use value::{Assignment, FilterExpression, FilterOperator, compare_yaml_values};
 pub use views::{
-    CollectionPresentation, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
+    CollectionPresentation, DEFAULT_VIEW_PAGE_SIZE, ViewDefinition, ViewFilterGroup, ViewLayout,
+    ViewPredicateMatch,
 };

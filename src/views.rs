@@ -19,12 +19,15 @@ use crate::{
 pub(crate) const VIEW_DIRECTORY: &str = ".cr/views";
 const VIEW_DIRECTORY_LABEL: &str = "the view directory";
 const VIEW_FORMAT_VERSION: u32 = 1;
-/// Rows per page before a view or URL asks for more.
+/// Rows per page before a view or URL asks for another number.
 ///
 /// Small on purpose: tables open newest-first, so the first page is the answer
 /// to "what changed?" and the cursor links carry a reader further back without
-/// loading a collection's whole history into one response.
-const DEFAULT_VIEW_PAGE_SIZE: usize = 10;
+/// loading a collection's whole history into one response. Not as small as it
+/// was, though: ten one-line rows left most of a laptop screen empty and made a
+/// collection of a hundred and fifty records sixteen pages long. Twenty-five
+/// fill the screen, and the table's footer offers other sizes.
+pub const DEFAULT_VIEW_PAGE_SIZE: usize = 25;
 const MAX_VIEW_PAGE_SIZE: usize = 1_000;
 const MAX_VIEW_FILTER_GROUPS: usize = 20;
 const MAX_VIEW_GROUP_EXPRESSIONS: usize = 20;

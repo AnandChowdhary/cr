@@ -2841,7 +2841,12 @@ async fn view_records(
             query.offset,
             state.max_page_size,
         )?;
-        let page = paginate_view(records, bounds.limit, view_position(&query, bounds.offset));
+        let page = paginate_view(
+            records,
+            bounds.limit,
+            state.max_page_size,
+            view_position(&query, bounds.offset),
+        );
         let ui = ui_context(&state, &headers).await?;
         Ok(render_view_records(
             &Representation::requested(&headers),
@@ -6701,10 +6706,19 @@ fn view_pager_links(view: &ViewDefinition, query: &ViewQuery, page: &ViewPage) -
             @if let Some(cursor) = page.previous.as_deref() {
                 a id="cr-page-previous" href=(view_page_url(view, query, page.limit, ViewPosition::Before(cursor))) rel="prev" class="cr-button"
                     hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_FROM_INSIDE) hx-push-url="true" { "Previous" }
+            } @else if page.next.is_some() {
+                // The first of several pages. The button is drawn, unusable,
+                // so that Next does not move the first time it is pressed; the
+                // page number beside the range already says where the reader
+                // is, so a screen reader is not told about a control it cannot
+                // use.
+                span class="cr-button" data-disabled="true" aria-hidden="true" { "Previous" }
             }
             @if let Some(cursor) = page.next.as_deref() {
                 a id="cr-page-next" href=(view_page_url(view, query, page.limit, ViewPosition::After(cursor))) rel="next" class="cr-button"
                     hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_FROM_INSIDE) hx-push-url="true" { "Next" }
+            } @else if page.previous.is_some() {
+                span class="cr-button" data-disabled="true" aria-hidden="true" { "Next" }
             }
         }
     }
@@ -6768,6 +6782,62 @@ fn page_range(page: &ViewPage) -> (usize, usize) {
         page.start + 1
     };
     (first, page.start + page.records.len())
+}
+
+/// Which page of how many this is, when there are records on it.
+///
+/// Cursor pages are addressed by record rather than by number, and a write
+/// while someone is paging can leave a page starting part of the way into
+/// what would be a numbered page. The number is then the page the first row
+/// falls on, which is where the reader would find it again.
+fn page_number(page: &ViewPage) -> Option<(usize, usize)> {
+    if page.records.is_empty() || page.limit == 0 {
+        return None;
+    }
+    let pages = page.total.div_ceil(page.limit).max(1);
+    Some(((page.start / page.limit + 1).min(pages), pages))
+}
+
+/// The page sizes a table's footer offers.
+const VIEW_PAGE_SIZE_CHOICES: [usize; 4] = [10, 25, 50, 100];
+
+/// The sizes offered under this page: the standard ones the server allows,
+/// plus the current size if a view or URL asked for another.
+fn view_page_size_choices(page: &ViewPage) -> Vec<usize> {
+    let mut choices = VIEW_PAGE_SIZE_CHOICES
+        .into_iter()
+        .filter(|size| *size <= page.max_limit)
+        .collect::<Vec<_>>();
+    if !choices.contains(&page.limit) {
+        choices.push(page.limit);
+        choices.sort_unstable();
+    }
+    choices
+}
+
+/// Links that show the same view with another number of rows per page.
+///
+/// Links rather than a `<select>`, like the pager beside them: each is the URL
+/// the page would be at, so it works without JavaScript, can be opened in a
+/// new tab, and swaps only the results when htmx is there. A new size starts
+/// again at the first page, because the cursor the reader was at would put a
+/// different set of rows on screen under a different size. Nothing is offered
+/// when every record already fits on a page of the smallest size.
+fn view_page_size_links(view: &ViewDefinition, query: &ViewQuery, page: &ViewPage) -> Markup {
+    let choices = view_page_size_choices(page);
+    html! {
+        @if choices.len() > 1 && choices.first().is_some_and(|smallest| page.total > *smallest) {
+            div role="group" aria-label="Rows per page" class="flex items-center gap-1" {
+                span class="mr-1 text-gray-500" aria-hidden="true" { "Rows" }
+                @for size in choices {
+                    a id=(format!("cr-page-size-{size}")) href=(view_page_url(view, query, size, ViewPosition::Start))
+                        aria-label=(format!("{size} rows per page")) aria-current=[(size == page.limit).then_some("true")]
+                        class=(if size == page.limit { "rounded bg-gray-200 px-1.5 py-0.5 font-semibold text-gray-900" } else { "rounded px-1.5 py-0.5 text-gray-600 hover:bg-gray-100 hover:text-gray-900" })
+                        hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_FROM_INSIDE) hx-push-url="true" { (size) }
+                }
+            }
+        }
+    }
 }
 
 /// What a reader who cannot see the table is told after a page turn, a re-sort,
@@ -6990,10 +7060,16 @@ fn view_results(
                     }
                 }
                 div class="flex flex-col gap-2 border-t border-gray-200 bg-gray-50 px-3 py-2 text-xs sm:flex-row sm:items-center sm:justify-between" {
-                    p class="text-gray-600" {
-                        "Showing " (first) "–" (last) " of " (page.total)
+                    div class="flex items-center gap-3 text-gray-600" {
+                        p { "Showing " (first) "–" (last) " of " (page.total) }
+                        @if let Some((current, pages)) = page_number(page) {
+                            p class="text-gray-500" { "Page " (current) " of " (pages) }
+                        }
                     }
-                    (view_pager_links(view, query, page))
+                    div class="flex flex-wrap items-center gap-x-4 gap-y-2" {
+                        (view_page_size_links(view, query, page))
+                        (view_pager_links(view, query, page))
+                    }
                 }
             }
             }
@@ -9410,6 +9486,7 @@ html {
 
 .cr-button:hover { border-color: var(--cr-gray-400); background: var(--cr-gray-50); color: var(--cr-gray-900); }
 .cr-button:active { transform: translateY(1px); }
+.cr-button[data-disabled="true"] { border-color: var(--cr-gray-200); background: transparent; color: var(--cr-gray-400); cursor: default; transform: none; }
 
 .cr-button-primary {
   border-color: var(--cr-gray-900);
@@ -11020,6 +11097,9 @@ fn sort_view_records(
 struct ViewPage {
     records: Vec<Record>,
     limit: usize,
+    /// The largest page the server will serve, which bounds the page sizes the
+    /// footer offers.
+    max_limit: usize,
     start: usize,
     total: usize,
     next: Option<String>,
@@ -11055,7 +11135,12 @@ fn view_position<'a>(query: &'a ViewQuery, offset: usize) -> ViewPosition<'a> {
 /// filtered out by a change to the query — resolves to the first page rather
 /// than failing: the reader asked for records, and the honest answer to "the
 /// row you were at is gone" is the beginning of the current ordering.
-fn paginate_view(records: Vec<Record>, limit: usize, position: ViewPosition<'_>) -> ViewPage {
+fn paginate_view(
+    records: Vec<Record>,
+    limit: usize,
+    max_limit: usize,
+    position: ViewPosition<'_>,
+) -> ViewPage {
     let total = records.len();
     let locate = |id: &str| records.iter().position(|record| record.id == id);
     let start = match position {
@@ -11076,6 +11161,7 @@ fn paginate_view(records: Vec<Record>, limit: usize, position: ViewPosition<'_>)
     ViewPage {
         records,
         limit,
+        max_limit,
         start,
         total,
         next,
