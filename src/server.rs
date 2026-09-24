@@ -7641,14 +7641,14 @@ fn render_kanban_board(
                 p { "Drag permitted cards between lanes or use each card’s move control." }
             }
         }
-        div class="overflow-x-auto pb-3" {
-            div data-kanban-board="true" class="flex min-w-max items-start gap-3" {
+        div class="cr-board-scroll" {
+            div data-kanban-board="true" class="cr-board" {
                 @for (lane_index, lane) in lanes.iter().enumerate() {
                     section
                         data-kanban-lane="true"
                         data-kanban-target=(kanban_target_json(&lane.target))
                         data-kanban-csrf=(csrf_token)
-                        class="cr-kanban-lane w-72 shrink-0 p-2.5"
+                        class="cr-kanban-lane"
                     {
                         @let lane_total = lane_total(page, &lane.target).max(lane.records.len());
                         div class="cr-lane-head" {
@@ -7662,7 +7662,7 @@ fn render_kanban_board(
                             h2 { (&lane.label) }
                             span class="cr-lane-count" { (lane_total) }
                         }
-                        div class="min-h-20 space-y-1.5" {
+                        div class="cr-lane-cards" {
                             @if lane.records.is_empty() {
                                 p class="rounded-lg border border-dashed border-gray-300 px-3 py-5 text-center text-xs text-gray-500" { "Drop cards here" }
                             }
@@ -10676,11 +10676,73 @@ html {
 .cr-audit-entry:last-child { border-bottom: 0; }
 .cr-audit-entry:target { background: var(--cr-accent-soft); }
 
+/* A board fits the window: it scrolls sideways once its lanes are wider than
+   the workspace, and each lane is at most as tall as the window leaves room
+   for, its cards scrolling inside it under a heading that stays put, so a
+   lane of a hundred cards neither stretches the page nor hides the lanes
+   beside it. */
+.cr-board-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  padding-bottom: 8px;
+  scroll-timeline: --cr-board-x inline;
+}
+.cr-board { display: flex; width: max-content; align-items: flex-start; gap: 10px; }
 .cr-kanban-lane {
+  display: flex;
+  width: 272px;
+  max-height: max(22rem, calc(100dvh - 10.5rem));
+  flex: 0 0 auto;
+  flex-direction: column;
   border: 1px solid var(--cr-gray-200);
   border-radius: var(--cr-radius);
   background: var(--cr-gray-50);
   box-shadow: none;
+  padding: 10px 8px 8px;
+}
+/* The lane a dragged card would drop into. */
+.cr-kanban-lane[data-drop-target] { outline: 2px solid var(--cr-accent); outline-offset: -1px; }
+.cr-lane-cards {
+  display: flex;
+  min-height: 5rem;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin: 0 -4px;
+  padding: 0 4px 2px;
+  scrollbar-width: thin;
+}
+/* Whether the board goes on past either side, as a table's edges say. */
+@supports (animation-timeline: scroll()) {
+  .cr-board::before,
+  .cr-board::after {
+    position: sticky;
+    z-index: 2;
+    width: 32px;
+    flex: 0 0 auto;
+    align-self: stretch;
+    content: "";
+    opacity: 0;
+    pointer-events: none;
+  }
+  /* Each takes no room: its width and the gap after or before it are given
+     back by a negative margin. */
+  .cr-board::before {
+    left: 0;
+    margin-right: -42px;
+    background: linear-gradient(to left, transparent, var(--cr-gray-0));
+    animation: cr-more-behind linear both;
+    animation-timeline: --cr-board-x;
+  }
+  .cr-board::after {
+    right: 0;
+    margin-left: -42px;
+    background: linear-gradient(to right, transparent, var(--cr-gray-0));
+    animation: cr-more-ahead linear both;
+    animation-timeline: --cr-board-x;
+  }
 }
 /* A lane's heading: a dot in its state's colour, its name, and how many
    records it holds in the whole view. */

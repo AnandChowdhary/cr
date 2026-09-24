@@ -405,16 +405,18 @@ const enhanceKanbanBoard = () => {
     card.addEventListener('dragend', () => {
       draggedCard = null;
       card.classList.remove('opacity-50');
-      board.querySelectorAll('[data-kanban-lane]').forEach((lane) => lane.classList.remove('ring-2', 'ring-blue-400'));
+      board.querySelectorAll('[data-kanban-lane]').forEach((lane) => delete lane.dataset.dropTarget);
     });
   });
 
   board.querySelectorAll('[data-kanban-lane]').forEach((lane) => {
     lane.addEventListener('dragover', (event) => {
       event.preventDefault();
-      lane.classList.add('ring-2', 'ring-blue-400');
+      lane.dataset.dropTarget = 'true';
     });
-    lane.addEventListener('dragleave', () => lane.classList.remove('ring-2', 'ring-blue-400'));
+    // A data attribute rather than a ring utility: a ring is a box-shadow, and
+    // the lane's own rule in the server's sheet is unlayered, so it would win.
+    lane.addEventListener('dragleave', () => delete lane.dataset.dropTarget);
     lane.addEventListener('drop', (event) => {
       event.preventDefault();
       if (!draggedCard) return;
