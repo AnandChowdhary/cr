@@ -39,7 +39,7 @@ my-database/
 - `.cr/` identifies the database root.
 - `.cr/config.yaml` is optional and contains only overrides from the defaults.
 
-Without a config file, `cr` uses format version 1, stores records under `records/`, and rotates audit segments after 256 events or 8 MiB. Add only the settings you want to change; omitted fields retain their defaults:
+Without a config file, `cr` uses format version 1, stores records under `records/`, rotates audit segments after 256 events or 8 MiB, and has a write verify the whole audit journal from its first event once every 64 events (`audit.full_walk_after_events`; see [the audit guide](audit.md#reads-writes-and-the-saved-walk)). Add only the settings you want to change; omitted fields retain their defaults:
 
 ```yaml
 data_dir: content/data

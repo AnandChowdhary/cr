@@ -93,6 +93,10 @@ struct Config {
 struct AuditConfig {
     segment_max_events: usize,
     segment_max_bytes: u64,
+    /// How many events a write may resume the saved walk of the journal for
+    /// before one write verifies every event from the first again. `1` makes
+    /// every write do so.
+    full_walk_after_events: u64,
 }
 
 impl Default for AuditConfig {
@@ -100,6 +104,7 @@ impl Default for AuditConfig {
         Self {
             segment_max_events: 256,
             segment_max_bytes: 8 * 1024 * 1024,
+            full_walk_after_events: 64,
         }
     }
 }
@@ -689,6 +694,9 @@ impl Database {
         }
         if config.audit.segment_max_bytes == 0 {
             bail!("audit.segment_max_bytes must be greater than zero");
+        }
+        if config.audit.full_walk_after_events == 0 {
+            bail!("audit.full_walk_after_events must be greater than zero");
         }
 
         let database = Self {
@@ -5255,14 +5263,19 @@ impl Database {
     /// Keep one verified walk of the journal for this process, save it on
     /// disk after every append, and, when `verification` is
     /// [`JournalVerification::Resume`], start from the walk the last write
-    /// saved rather than from the first event.
+    /// saved rather than from the first event: every read, and every write
+    /// until `audit.full_walk_after_events` events have been appended since a
+    /// write last verified every event from the first.
     ///
     /// For the CLI, and the server it launches. Without it every command that
-    /// needs audited state replays the whole journal, so reads cost more with
-    /// every write ever made. `JournalCache` in `src/audit.rs` states what a
-    /// saved walk is trusted with, and what never uses one.
+    /// needs audited state replays the whole journal, so reads and writes cost
+    /// more with every write ever made. `JournalCache` in `src/audit.rs`
+    /// states what a saved walk is trusted with, and what never uses one.
     pub fn with_journal_verification(mut self, verification: JournalVerification) -> Self {
-        self.journal = Some(Arc::new(JournalCache::persistent(verification)));
+        self.journal = Some(Arc::new(JournalCache::persistent(
+            verification,
+            self.config.audit.full_walk_after_events,
+        )));
         self
     }
 

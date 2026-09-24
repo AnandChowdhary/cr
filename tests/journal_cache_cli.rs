@@ -1,5 +1,5 @@
-//! A CLI read resumes the walk of the journal the last write saved, and still
-//! notices when the journal is forged.
+//! A CLI command resumes the walk of the journal the last write saved, and
+//! still notices when the journal is forged.
 //!
 //! Every read of a plaintext collection needs audited state, and verifying it
 //! from the first event made each `cr get` cost more with every write ever made.
@@ -140,9 +140,41 @@ fn a_read_still_refuses_a_forged_segment_and_recovers_when_it_is_restored() {
             );
         }
 
+        // A write resumes the saved walk too, and is refused the same way,
+        // with nothing written.
+        let before = fs::read(database.root.join("records/deals/deal-0.md")).unwrap();
+        let error = run_failure(
+            database
+                .command()
+                .args(["update", "deals", "deal-0", "--set", "value=9"]),
+        );
+        assert!(
+            error.contains("audit event hash mismatch"),
+            "{which} update: {error}"
+        );
+        assert_eq!(
+            fs::read(database.root.join("records/deals/deal-0.md")).unwrap(),
+            before
+        );
+
         rewrite(&original);
         run_success(database.command().args(["get", "deals", "deal-0"]));
     }
+}
+
+#[test]
+fn a_full_walk_interval_of_zero_is_refused() {
+    let database = seeded("saved-walk-interval");
+    fs::write(
+        database.root.join(".cr/config.yaml"),
+        "version: 1\ndata_dir: records\naudit:\n  full_walk_after_events: 0\n",
+    )
+    .unwrap();
+    let error = run_failure(database.command().args(["get", "deals", "deal-0"]));
+    assert!(
+        error.contains("audit.full_walk_after_events must be greater than zero"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -171,6 +203,6 @@ fn a_damaged_saved_walk_is_ignored_rather_than_believed() {
     );
     let saved: serde_json::Value =
         serde_json::from_slice(&fs::read(database.root.join(SAVED_WALK)).unwrap()).unwrap();
-    assert_eq!(saved["version"], 1);
+    assert_eq!(saved["version"], 2);
     assert_eq!(saved["cr"], env!("CARGO_PKG_VERSION"));
 }

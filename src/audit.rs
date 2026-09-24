@@ -124,7 +124,7 @@ const CACHE_IGNORE_LABEL: &str = "the cache's Git ignore file";
 /// Format version of the saved walk. It also names the `cr` release that
 /// wrote it, and any other release ignores it, because what a walk derives is
 /// only as good as the replay rules that derived it.
-const JOURNAL_CACHE_VERSION: u32 = 1;
+const JOURNAL_CACHE_VERSION: u32 = 2;
 const JOURNAL_CACHE_HASH_DOMAIN: &[u8] = b"cr:audit:journal-cache:v1\0";
 const VERIFIED_PREFIX_HASH_DOMAIN: &[u8] = b"cr:audit:verified-prefix:v1\0";
 
@@ -749,6 +749,11 @@ impl ChainWalk {
         }
     }
 
+    /// How many events the walk has verified.
+    fn entries(&self) -> u64 {
+        self.expected_sequence - 1
+    }
+
     /// [`Self::finish`] for a walk that goes on.
     fn state(&self) -> ChainState {
         ChainState {
@@ -772,7 +777,9 @@ pub(crate) type CollectionsActivity = BTreeMap<String, BTreeMap<String, RecordAc
 pub enum JournalVerification {
     /// Resume from the verified walk the last write saved, while it still
     /// describes the segments on disk, and verify only the events appended
-    /// since. `JournalCache` in `src/audit.rs` states what that trusts.
+    /// since. Reads always may; a write may until `audit.full_walk_after_events`
+    /// events have been appended since a write last verified every event from
+    /// the first. `JournalCache` in `src/audit.rs` states what that trusts.
     #[default]
     Resume,
     /// Verify every event from the first, whatever walk was saved.
@@ -820,28 +827,37 @@ pub enum JournalVerification {
 /// length and digest rather than the bytes, and a digest of its own body so a
 /// torn or damaged file is ignored rather than believed.
 ///
+/// With `full_walk_after`, a write starts from the saved walk too, so a write
+/// costs what the events appended since it cost rather than what the whole
+/// history does. Every walk records how long the journal was when it, or the
+/// walk it was resumed from, last verified every event from the first, and a
+/// write walks from the first event again once the journal has grown past
+/// that by `full_walk_after` events (`audit.full_walk_after_events`, 64 by
+/// default). So every write verifies at least the events appended since the
+/// walk it resumes, and one write in that many verifies all of them.
+///
 /// That extends the trade above by one file. The saved walk is derived state
 /// and as writable as the journal, so whoever can rewrite `.cr/` can write one
-/// that claims any replayed state for segments that have not changed. What
-/// bounds it:
+/// that claims any replayed state for segments that have not changed, and a
+/// command that resumes it believes the claim. What bounds it:
 ///
-/// * A walk is only ever saved if it began at the first event in the saving
-///   process, which every write makes anyway, so one saved walk is never
-///   built on another and the next write replaces a forged one with a
-///   verified one.
 /// * A saved walk that is unreadable, from another release of `cr`, or no
 ///   longer matches the segments on disk is ignored, and so is one whose
 ///   continuation fails: the walk starts again from the first event and its
-///   result, success or failure, is the answer. A saved walk can make a
-///   command skip work, never fail.
+///   result, success or failure, is the answer.
+/// * A forged walk can steer writes only until the next full walk, at most
+///   `full_walk_after` events later. That walk replays the real history, so
+///   an event appended on a state only the forgery claimed is refused there,
+///   by sequence, along with every write after it until the journal is
+///   repaired, and `cr audit verify` reports the same event.
 /// * Nothing that decides whether the journal is intact uses it: `cr audit
 ///   verify`, `cr check`, and their API routes walk the whole chain every
-///   time. Neither does any write: each walks the whole chain from its first
-///   event under the audit lock before it extends it, once, and checks at the
-///   append that the journal on disk is still what that walk verified (see
-///   [`Admission`]), so a mutation never builds on a journal only the cache
-///   believed. [`JournalVerification::Full`] (`--verify-audit`) makes any
-///   other command start from the first event too.
+///   time. [`JournalVerification::Full`] (`--verify-audit`) makes any other
+///   command, write or read, start from the first event, and
+///   `audit.full_walk_after_events: 1` makes every write do so.
+///
+/// Every write, resumed or not, then checks at the append that the journal on
+/// disk is still what its walk verified (see [`Admission`]).
 #[derive(Default)]
 pub(crate) struct JournalCache {
     verified: Mutex<Option<VerifiedJournal>>,
@@ -849,6 +865,11 @@ pub(crate) struct JournalCache {
     resume: bool,
     /// Save the walk on disk after every append.
     save: bool,
+    /// Let a write start from the cached or saved walk while the journal has
+    /// grown by fewer than this many events since that walk last verified
+    /// every event from the first. `None` makes every write start from the
+    /// first event.
+    full_walk_after: Option<u64>,
 }
 
 impl fmt::Debug for JournalCache {
@@ -857,18 +878,23 @@ impl fmt::Debug for JournalCache {
             .debug_struct("JournalCache")
             .field("resume", &self.resume)
             .field("save", &self.save)
+            .field("full_walk_after", &self.full_walk_after)
             .finish_non_exhaustive()
     }
 }
 
 impl JournalCache {
-    /// A cache that saves its walk after every append, and starts from the
-    /// saved walk when `verification` allows it.
-    pub(crate) fn persistent(verification: JournalVerification) -> Self {
+    /// A cache that saves its walk after every append and, when
+    /// `verification` allows it, starts from the saved walk: every read, and
+    /// every write until the journal has grown by `full_walk_after` events
+    /// since that walk last verified every event from the first.
+    pub(crate) fn persistent(verification: JournalVerification, full_walk_after: u64) -> Self {
+        let resume = verification == JournalVerification::Resume;
         Self {
             verified: Mutex::default(),
-            resume: verification == JournalVerification::Resume,
+            resume,
             save: true,
+            full_walk_after: resume.then_some(full_walk_after),
         }
     }
 
@@ -902,8 +928,13 @@ struct VerifiedJournal {
     /// The newest segment and exactly the part of it that was verified.
     tail: Option<(PathBuf, VerifiedPrefix)>,
     /// Whether this process verified every event itself rather than resuming
-    /// from a saved walk. Only such a walk is saved.
+    /// from a saved walk.
     walked: bool,
+    /// How many events the journal held when this walk, or the walk it was
+    /// resumed from, last verified every event from the first. A write starts
+    /// from the first event again once the journal has grown past it by
+    /// [`JournalCache::full_walk_after`].
+    last_full_walk: u64,
 }
 
 impl VerifiedJournal {
@@ -915,6 +946,7 @@ impl VerifiedJournal {
             sealed: Vec::new(),
             tail: None,
             walked: true,
+            last_full_walk: 0,
         }
     }
 
@@ -981,6 +1013,7 @@ impl VerifiedJournal {
         records.sort_by(|left, right| left.0.cmp(right.0));
         let body = serde_json::to_string(&StoredJournalRef {
             walk: &self.walk,
+            last_full_walk: self.last_full_walk,
             records,
             activity: &self.activity,
             sealed: &self.sealed,
@@ -1018,7 +1051,10 @@ impl VerifiedJournal {
         let journal = serde_json::from_str::<StoredJournal>(stored.journal.get()).ok()?;
         let records = journal.records.len();
         let states = journal.records.into_iter().collect::<AuditedRecordStates>();
-        if states.len() != records || journal.walk.expected_sequence == 0 {
+        if states.len() != records
+            || journal.walk.expected_sequence == 0
+            || journal.last_full_walk > journal.walk.entries()
+        {
             return None;
         }
         Some(Self {
@@ -1036,6 +1072,7 @@ impl VerifiedJournal {
                 )
             }),
             walked: false,
+            last_full_walk: journal.last_full_walk,
         })
     }
 }
@@ -1099,6 +1136,7 @@ struct StoredJournalCache {
 #[derive(Serialize)]
 struct StoredJournalRef<'a> {
     walk: &'a ChainWalk,
+    last_full_walk: u64,
     records: Vec<(&'a (String, String), &'a AuditedRecordState)>,
     activity: &'a CollectionsActivity,
     sealed: &'a [(PathBuf, SegmentStamp)],
@@ -1108,6 +1146,7 @@ struct StoredJournalRef<'a> {
 #[derive(Deserialize)]
 struct StoredJournal {
     walk: ChainWalk,
+    last_full_walk: u64,
     records: Vec<((String, String), AuditedRecordState)>,
     activity: CollectionsActivity,
     sealed: Vec<(PathBuf, SegmentStamp)>,
@@ -1271,16 +1310,17 @@ impl ReconciliationSnapshot {
     }
 }
 
-/// The walk from the first event that one single-record write makes, under
-/// the audit lock, before it extends the chain.
+/// The verified walk one single-record write makes, under the audit lock,
+/// before it extends the chain.
 ///
-/// [`AuditLog::admit`] makes it. The write may read the audited state it
-/// needs from it, then prepares its event against it, and [`AuditLog::commit`]
-/// appends the event to it after checking that the journal on disk is still
-/// what it verified, rather than walking the journal a second time. That is
-/// the one walk the write makes, whatever cache is attached, and it is never
-/// taken from a cache: a cache can hold a walk resumed from a saved one, and
-/// in `cr serve` other requests move it along.
+/// [`AuditLog::admit`] makes it: from the first event, or, when the attached
+/// cache allows it, by resuming the cached or saved walk and verifying what
+/// was appended since (see [`JournalCache`]). The write may read the audited
+/// state it needs from it, then prepares its event against it, and
+/// [`AuditLog::commit`] appends the event to it after checking that the
+/// journal on disk is still what it verified, rather than walking the journal
+/// a second time. The write owns its copy: in `cr serve` other requests move
+/// the cache along.
 pub(crate) struct Admission {
     journal: VerifiedJournal,
 }
@@ -1342,8 +1382,10 @@ impl<'a> AuditLog<'a> {
         Ok(lock)
     }
 
-    /// Verify the whole journal from its first event for a write that is
-    /// about to extend it, and keep the walk for [`Self::prepare_admitted`].
+    /// Verify the journal for a write that is about to extend it, and keep the
+    /// walk for [`Self::prepare_admitted`]: from the first event, or from the
+    /// cached or saved walk while [`JournalCache`] allows a write to resume
+    /// one.
     ///
     /// Call it while holding [`Self::lock`], and hold the lock until the
     /// event is committed: the append trusts the lock to have kept every
@@ -1351,9 +1393,42 @@ impl<'a> AuditLog<'a> {
     /// copy of the walk is left there for the readers after it, and a walk
     /// that fails leaves nothing cached.
     pub(crate) fn admit(&self) -> Result<Admission> {
-        let journal = self.walk_fresh()?;
+        let journal = match self.resumed_admission() {
+            Some(journal) => journal,
+            None => self.walk_fresh()?,
+        };
         self.verify_legacy_representation_heads(&journal.states)?;
         Ok(Admission { journal })
+    }
+
+    /// The walk the cache holds, or the one the last write saved, brought up
+    /// to date with the journal on disk, when a write may start from it rather
+    /// than from the first event.
+    ///
+    /// That is while the journal has grown by fewer than
+    /// [`JournalCache::full_walk_after`] events since the walk, or the one it
+    /// was resumed from, last verified every event from the first. Anything
+    /// else — no cache that allows it, no walk, a walk that no longer
+    /// describes the segments on disk, one whose continuation fails, or one
+    /// that has gone too long without a full walk — is `None`, and the write
+    /// walks from the first event, whose verdict stands.
+    fn resumed_admission(&self) -> Option<VerifiedJournal> {
+        let journal = self.journal?;
+        let limit = journal.full_walk_after?;
+        let paths = self.segment_paths().ok()?;
+        let mut resumed = {
+            let mut verified = journal.lock();
+            if verified.is_none() {
+                *verified = self.load_journal_cache();
+            }
+            verified.clone()?
+        };
+        let current = self.extend_journal(&mut resumed, &paths).ok()?;
+        let since = resumed
+            .walk
+            .entries()
+            .saturating_sub(resumed.last_full_walk);
+        (current && since < limit).then_some(resumed)
     }
 
     /// Prepare one event against a walk of the whole journal made here.
@@ -2298,8 +2373,10 @@ impl<'a> AuditLog<'a> {
     /// holds, and leave a copy of the walk in the attached cache for the
     /// readers after it. A walk that fails leaves nothing cached.
     ///
-    /// This is the walk a write makes before it extends the chain, so every
-    /// walk [`Self::save_journal_cache`] saves descends from one.
+    /// This is the walk a write makes before it extends the chain whenever it
+    /// may not resume one, so every walk [`Self::save_journal_cache`] saves
+    /// descends from one at most [`JournalCache::full_walk_after`] events
+    /// back.
     fn walk_fresh(&self) -> Result<VerifiedJournal> {
         let walked = self
             .segment_paths()
@@ -2357,6 +2434,7 @@ impl<'a> AuditLog<'a> {
                 journal.sealed.push((path.clone(), stamp));
             }
         }
+        journal.last_full_walk = journal.walk.entries();
         Ok(journal)
     }
 
@@ -2364,16 +2442,17 @@ impl<'a> AuditLog<'a> {
     /// command resumes from it instead of from the first event.
     ///
     /// Called after an append, while the audit lock is still held, which is
-    /// what keeps two saves from overlapping. Only a walk this process began
-    /// at the first event is saved; see [`JournalCache`]. Failing to save one
-    /// costs the next reader time and nothing else, so nothing here can fail
-    /// the write that has already been committed.
+    /// what keeps two saves from overlapping. The walk saved is the one the
+    /// write was admitted on, which carries when it last verified every event
+    /// from the first; see [`JournalCache`]. Failing to save one costs the
+    /// next command time and nothing else, so nothing here can fail the write
+    /// that has already been committed.
     pub(crate) fn save_journal_cache(&self) {
         let Some(journal) = self.journal.filter(|journal| journal.save) else {
             return;
         };
         let mut verified = journal.lock();
-        let Some(cached) = verified.as_mut().filter(|cached| cached.walked) else {
+        let Some(cached) = verified.as_mut() else {
             return;
         };
         let extended = self
@@ -2584,10 +2663,10 @@ impl<'a> AuditLog<'a> {
         Ok(chain)
     }
 
-    /// Publish `entry` on a journal verified from its first event in this
-    /// process: `admission`, the walk it was prepared against, once
-    /// [`Self::recheck`] has found the journal on disk still to be what it
-    /// verified, or without one a walk made here.
+    /// Publish `entry` on a verified journal: `admission`, the walk it was
+    /// prepared against, once [`Self::recheck`] has found the journal on disk
+    /// still to be what it verified, or without one a walk from the first
+    /// event made here.
     ///
     /// Either way, [`Self::append_in_snapshot`] then compares the head on disk
     /// with the verified one, registers the event's idempotency identity, and
@@ -4602,8 +4681,9 @@ mod tests {
         }
 
         // A consistent forgery that no later event contradicts is believed:
-        // that is the trade `JournalCache` states. The next write verifies
-        // the whole journal and replaces it.
+        // that is the trade `JournalCache` states. Writes that resume it carry
+        // it forward, and the first write that walks from the first event
+        // replaces it with what the journal says.
         std::fs::write(saved_walk(root.path()), &original).unwrap();
         forge_saved_walk(root.path(), |journal| {
             forge_record_hash(journal, "item-1", &hash);
@@ -4613,9 +4693,157 @@ mod tests {
         assert_eq!(replayed(&reader)[&key].0.as_deref(), Some(hash.as_str()));
         create_items(&process(root.path(), JournalVerification::Resume), 5..6);
         let reader = process(root.path(), JournalVerification::Resume);
+        assert_eq!(replayed(&reader)[&key].0.as_deref(), Some(hash.as_str()));
+        create_items(&process(root.path(), JournalVerification::Full), 6..7);
+        let reader = process(root.path(), JournalVerification::Resume);
         let (states, count) = walks(|| replayed(&reader));
         assert_eq!(count, 0);
         assert_eq!(states, replayed(&uncached));
+    }
+
+    /// Let a write resume a saved walk for `events` events after the last
+    /// write that walked from the first event.
+    fn full_walk_after(root: &std::path::Path, events: u64) {
+        let path = root.join(".cr/config.yaml");
+        let mut config = std::fs::read_to_string(&path).unwrap();
+        config.push_str(&format!("  full_walk_after_events: {events}\n"));
+        std::fs::write(path, config).unwrap();
+    }
+
+    fn head(database: &Database) -> u64 {
+        database.audit().head().unwrap().sequence
+    }
+
+    #[test]
+    fn a_write_resumes_the_saved_walk_until_the_journal_outgrows_its_last_full_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, uncached) = cached_and_uncached(root.path(), 2);
+        full_walk_after(root.path(), 3);
+        create_items(&uncached, 0..2);
+
+        // The first write has no saved walk to resume. Each one after it
+        // resumes until three events have been appended since the last write
+        // that walked from the first event, and that one walks again.
+        let mut counts = Vec::new();
+        for index in 2..10 {
+            let writer = process(root.path(), JournalVerification::Resume);
+            let (_, count) = walks(|| create_items(&writer, index..index + 1));
+            counts.push(count);
+
+            let reader = process(root.path(), JournalVerification::Resume);
+            let (states, count) = walks(|| replayed(&reader));
+            assert_eq!(count, 0, "after item {index}");
+            assert_eq!(states, replayed(&uncached), "after item {index}");
+        }
+        assert_eq!(counts, [1, 0, 0, 1, 0, 0, 1, 0]);
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(saved_walk(root.path())).unwrap()).unwrap();
+        assert_eq!(saved["journal"]["last_full_walk"], 8);
+        assert_eq!(head(&uncached), 10);
+    }
+
+    #[test]
+    fn a_write_does_not_resume_a_walk_that_no_longer_describes_the_segments() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let (_, uncached) = cached_and_uncached(root.path(), 2);
+        create_items(&process(root.path(), JournalVerification::Resume), 0..5);
+
+        let path = root
+            .path()
+            .join(".cr/audit/segments/00000000000000000001.jsonl");
+        let original = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let forged = String::from_utf8(original.clone())
+            .unwrap()
+            .replacen("tester", "forger", 1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let rewrite = |contents: &[u8]| {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.write_all(contents).unwrap();
+            file.set_modified(modified).unwrap();
+        };
+        rewrite(forged.as_bytes());
+
+        let writer = process(root.path(), JournalVerification::Resume);
+        let assignment: Assignment = "value=5".parse().unwrap();
+        let error = writer
+            .create("items", "item-5", &[assignment], "")
+            .expect_err("a write resumed a walk of a rewritten segment");
+        assert!(
+            format!("{error:#}").contains("audit event hash mismatch"),
+            "{error:#}"
+        );
+        rewrite(&original);
+        assert_eq!(head(&uncached), 5, "the refused write appended an event");
+        create_items(&process(root.path(), JournalVerification::Resume), 5..6);
+        assert_eq!(head(&uncached), 6);
+    }
+
+    /// The bound `JournalCache` states, executable: a forged saved walk that
+    /// vouches for a hand-edited record lets a resumed write build on it, and
+    /// the next write that walks from the first event refuses the journal at
+    /// that write's event, as `cr audit verify` does.
+    #[test]
+    fn a_forged_saved_walk_steers_writes_only_until_the_next_full_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, uncached) = cached_and_uncached(root.path(), 2);
+        full_walk_after(root.path(), 3);
+        create_items(&uncached, 0..3);
+        // Walks from the first event, since nothing is saved yet.
+        create_items(&process(root.path(), JournalVerification::Resume), 3..4);
+
+        let record = root.path().join("records/items/item-1.md");
+        let edited = std::fs::read_to_string(&record)
+            .unwrap()
+            .replace("value: 1", "value: 99");
+        std::fs::write(&record, &edited).unwrap();
+        forge_saved_walk(root.path(), |journal| {
+            forge_record_hash(journal, "item-1", &record_hash(edited.as_bytes()));
+            let entry = journal["records"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|record| record[0][1] == "item-1")
+                .unwrap();
+            entry[1]["document"]["attributes"]["value"] = serde_json::Value::from(99);
+        });
+
+        // Without the forgery this write is refused: the file is not what the
+        // journal says. With it, a resumed write believes the file.
+        let assignment: Assignment = "note=after".parse().unwrap();
+        let resumed = process(root.path(), JournalVerification::Resume);
+        let (updated, count) = walks(|| resumed.update("items", "item-1", &[assignment], None));
+        updated.unwrap();
+        assert_eq!(count, 0);
+        let believed = head(&uncached);
+        create_items(&process(root.path(), JournalVerification::Resume), 4..5);
+
+        // Three events since the last full walk: this write walks from the
+        // first event, replays the real history, and refuses it at the event
+        // the forgery let through.
+        let writer = process(root.path(), JournalVerification::Resume);
+        let (refused, count) = walks(|| create_items_result(&writer, 5));
+        assert_eq!(count, 1);
+        let error = refused.expect_err("the full walk accepted a forged history");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("inconsistent at sequence {believed}")),
+            "{message}"
+        );
+        assert_eq!(head(&uncached), believed + 1, "the refused write appended");
+        let error = uncached.audit_verify(None).expect_err("verify accepted it");
+        assert!(
+            format!("{error:#}").contains(&format!("sequence {believed}")),
+            "{error:#}"
+        );
+    }
+
+    fn create_items_result(database: &Database, index: usize) -> anyhow::Result<Record> {
+        let assignment: Assignment = format!("value={index}").parse().unwrap();
+        database.create("items", &format!("item-{index}"), &[assignment], "")
     }
 
     #[test]
@@ -4691,22 +4919,26 @@ mod tests {
         // As a library calls it, with no cache; as `cr serve` does, one cache
         // for every request; and as the CLI does, a new process per command,
         // with `--verify-audit` and without.
+        // Resuming the saved walk, a write verifies only what was appended
+        // since, and walks from the first event not at all.
         type Open<'a> = Box<dyn Fn() -> Database + 'a>;
-        let modes: [(&str, Open<'_>, bool); 4] = [
-            ("no cache", Box::new(|| uncached.clone()), false),
-            ("a server's cache", Box::new(|| served.clone()), false),
+        let modes: [(&str, Open<'_>, bool, usize); 4] = [
+            ("no cache", Box::new(|| uncached.clone()), false, 1),
+            ("a server's cache", Box::new(|| served.clone()), false, 1),
             (
                 "full verification",
                 Box::new(|| process(root.path(), JournalVerification::Full)),
                 true,
+                1,
             ),
             (
                 "a saved walk",
                 Box::new(|| process(root.path(), JournalVerification::Resume)),
                 true,
+                0,
             ),
         ];
-        for (index, (mode, open, saves)) in modes.into_iter().enumerate() {
+        for (index, (mode, open, saves, expected_walks)) in modes.into_iter().enumerate() {
             let id = format!("written-{index}");
             let changed: Assignment = "value=changed".parse().unwrap();
             type Write<'a> = Box<dyn Fn(&Database) -> anyhow::Result<Record> + 'a>;
@@ -4737,7 +4969,7 @@ mod tests {
                 let database = open();
                 let (written, count) = walks(|| run(&database));
                 written.unwrap();
-                assert_eq!(count, 1, "{mode}: {write}");
+                assert_eq!(count, expected_walks, "{mode}: {write}");
 
                 // And what it leaves for the next reader is the journal with
                 // its own event on the end, verified.
@@ -4759,42 +4991,50 @@ mod tests {
 
     #[test]
     fn registering_a_user_checks_for_a_deleted_id_on_the_write_s_one_walk() {
-        let root = tempfile::tempdir().unwrap();
-        let database = Database::init(root.path())
-            .unwrap()
-            .with_actor("owner@example.com")
-            .unwrap();
-        // A new process per command, as the CLI runs them, each resuming the
-        // walk the command before it saved.
-        let owner = || {
-            database
-                .clone()
-                .with_journal_verification(JournalVerification::Resume)
-        };
-        owner()
-            .initialize_access(Some("Owner"), Some("owner@example.com"))
-            .unwrap();
-        let register = || {
-            owner().add_user(
-                "reader@example.com",
-                "Reader",
-                Some("reader@example.com"),
-                crate::UserKind::Human,
-            )
-        };
+        // Resuming the walk the command before it saved, no command walks from
+        // the first event. Walking from it, each walks twice: user management
+        // pins the operator's policy before the write's own walk, which
+        // `TODO.md` records.
+        for (verification, expected) in [
+            (JournalVerification::Full, 2),
+            (JournalVerification::Resume, 0),
+        ] {
+            let which = format!("{verification:?}");
+            let root = tempfile::tempdir().unwrap();
+            let database = Database::init(root.path())
+                .unwrap()
+                .with_actor("owner@example.com")
+                .unwrap();
+            // A new process per command, as the CLI runs them.
+            let owner = || database.clone().with_journal_verification(verification);
+            owner()
+                .initialize_access(Some("Owner"), Some("owner@example.com"))
+                .unwrap();
+            let register = || {
+                owner().add_user(
+                    "reader@example.com",
+                    "Reader",
+                    Some("reader@example.com"),
+                    crate::UserKind::Human,
+                )
+            };
 
-        let (registered, count) = walks(register);
-        registered.unwrap();
-        assert_eq!(count, 1, "registering");
-        let (deleted, count) = walks(|| {
-            owner().delete_user("reader@example.com", crate::UserDeleteOptions::default())
-        });
-        deleted.unwrap();
-        assert_eq!(count, 1, "deleting");
-        let (refused, count) = walks(register);
-        let error = refused.expect_err("a deleted user's ID was reused");
-        assert!(format!("{error:#}").contains("deleted"), "{error:#}");
-        assert_eq!(count, 1, "refusing a deleted ID");
+            let (registered, count) = walks(register);
+            registered.unwrap();
+            assert_eq!(count, expected, "{which}: registering");
+            let (deleted, count) = walks(|| {
+                owner().delete_user("reader@example.com", crate::UserDeleteOptions::default())
+            });
+            deleted.unwrap();
+            assert_eq!(count, expected, "{which}: deleting");
+            let (refused, count) = walks(register);
+            let error = refused.expect_err("a deleted user's ID was reused");
+            assert!(
+                format!("{error:#}").contains("deleted"),
+                "{which}: {error:#}"
+            );
+            assert_eq!(count, expected, "{which}: refusing a deleted ID");
+        }
     }
 
     /// An event creating `items/{id}`, prepared on `audit`, with its bytes and
@@ -4850,7 +5090,9 @@ mod tests {
             ] {
                 let which = format!("{case}, cached: {cached}");
                 let root = tempfile::tempdir().unwrap();
-                let cache = JournalCache::persistent(JournalVerification::Resume);
+                // Every write starts from the first event, so this is about
+                // the check at the append alone.
+                let cache = JournalCache::persistent(JournalVerification::Resume, 1);
                 let log = |actor: &'static str| {
                     AuditLog::new(
                         root.path(),

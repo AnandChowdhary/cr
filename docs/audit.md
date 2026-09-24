@@ -57,7 +57,7 @@ The audit journal is tamper-evident, not magically tamper-proof if an attacker c
 cr audit verify --expected-head 'sha256:YOUR_SAVED_HASH'
 ```
 
-### Reads and the saved walk
+### Reads, writes, and the saved walk
 
 Commands other than `audit verify` and `check` need the journal too: reading
 or listing a collection without encryption checks that no record once owned
@@ -74,25 +74,35 @@ verified. Anything that does not match, and a missing, damaged, or
 other-release file, sends the command back to the first event. Reads never
 write the file, and `.cr/cache/` can be deleted at any time.
 
-Nothing that verifies the journal uses it: `audit verify`, `check`, and the
-walk every write makes before it appends start from the first event every time.
-A write makes that walk once, while it holds the audit lock. When it appends,
-it checks that the journal on disk is still what the walk verified, older
-segments by their file identity, size, and times and the newest byte for byte,
-rather than walking it again, and anything that no longer matches is walked
-again from the first event. To have any other command start from the first
-event too, pass the global `--verify-audit`:
+Writes resume it too. A write verifies the events appended since the saved
+walk while it holds the audit lock, and when it appends, it checks that the
+journal on disk is still what it verified — older segments by their file
+identity, size, and times and the newest byte for byte — rather than walking it
+again. Once 64 events have been appended since a write last verified every
+event from the first, the next write does that instead, so one write in 64 pays
+for a full walk and the rest pay for the events since. Change the interval in
+`.cr/config.yaml`; `1` makes every write walk from the first event:
+
+```yaml
+audit:
+  full_walk_after_events: 1
+```
+
+Nothing that verifies the journal uses the saved walk: `audit verify` and
+`check` start from the first event every time. To have any other command, write
+or read, start from the first event too, pass the global `--verify-audit`:
 
 ```sh
 cr --verify-audit get deals acme-renewal
 ```
 
 The saved walk is as writable as the journal. Someone who can rewrite `.cr/`
-can make a read believe a different replayed state until the next write
-replaces the file with one it verified from the first event. It does not hide
-an altered segment, short of a rewrite that also restores the segment's change
-time ([the trade](architecture.md#the-verified-journal) the server has always
-made), and `audit verify` does not consult it.
+can make a command believe a different replayed state, and a write build on
+it, until the next write that walks from the first event. That write, like
+`audit verify`, then refuses the journal at the first event that was built on
+the forgery. The saved walk does not hide an altered segment, short of a
+rewrite that also restores the segment's change time
+([the trade](architecture.md#the-verified-journal) the server has always made).
 
 ## Anchor the head in Git
 
