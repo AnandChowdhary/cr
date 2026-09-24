@@ -1613,6 +1613,43 @@ async fn long_record_ids_are_capped_and_shortened_in_the_middle_of_the_table() {
 }
 
 #[tokio::test]
+async fn the_records_table_scrolls_in_its_own_box_with_its_heading_and_edges_pinned() {
+    let (_temporary, database) = test_database("views-pinned-edges");
+    database
+        .create(
+            "tasks",
+            "alpha",
+            &[Assignment::from_str("status=done").unwrap()],
+            "",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.text().contains(
+            r#"<div class="cr-table-scroll"><table class="min-w-full text-left text-sm">"#
+        )
+    );
+    // The box is bounded, so the heading can stick to its top edge.
+    for rule in [
+        "max-height: max(20rem, calc(100dvh - 12.5rem));",
+        ".cr-table-scroll thead th { position: sticky; top: 0;",
+        ".cr-table-scroll tbody td:last-child:not([colspan]) { position: sticky; right: 0;",
+        ".cr-table-scroll tbody td:first-child:not([colspan]) { position: sticky; left: 0;",
+        "animation-timeline: --cr-table-x;",
+    ] {
+        assert!(page.text().contains(rule), "missing `{rule}`");
+    }
+
+    // The empty state spans every column and is not pinned to either edge.
+    let empty = request(&app, Method::GET, "/tasks?q=nothing-matches", None, &[]).await;
+    assert!(empty.text().contains("No records match this view."));
+    assert!(empty.text().contains(r#"<td colspan=""#));
+}
+
+#[tokio::test]
 async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     let (_temporary, database) = test_database("views-index");
     for (id, status) in [("alpha", "open"), ("beta", "open"), ("gamma", "won")] {
