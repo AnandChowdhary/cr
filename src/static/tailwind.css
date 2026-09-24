@@ -372,14 +372,14 @@
     width: calc(var(--spacing) * 6);
     height: calc(var(--spacing) * 6);
   }
+  .h-8 {
+    height: calc(var(--spacing) * 8);
+  }
   .h-full {
     height: 100%;
   }
   .max-h-64 {
     max-height: calc(var(--spacing) * 64);
-  }
-  .min-h-0 {
-    min-height: 0px;
   }
   .min-h-20 {
     min-height: calc(var(--spacing) * 20);
@@ -765,6 +765,9 @@
   .text-xs {
     font-size: var(--text-xs);
     line-height: var(--tw-leading, var(--text-xs--line-height));
+  }
+  .text-\[0\.8rem\] {
+    font-size: 0.8rem;
   }
   .text-\[0\.65rem\] {
     font-size: 0.65rem;

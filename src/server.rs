@@ -6551,7 +6551,7 @@ fn render_view_records(
                             // `⌕` is a tiny glyph on macOS and a missing one in
                             // fonts without it. The button stays the submit
                             // control, so its accessible name is its label.
-                            input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Search records" placeholder="Search records…" autocomplete="off" data-view-search="true" class="w-full border bg-white py-2 pl-9 pr-3 text-sm outline-none placeholder:text-gray-400 sm:w-56";
+                            input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Search records" placeholder="Search records…" autocomplete="off" data-view-search="true" class="h-8 w-full border bg-white pl-9 pr-3 text-[0.8rem] outline-none placeholder:text-gray-400 sm:w-56";
                             button type="submit" aria-label="Submit search" title="Search" class="absolute inset-y-1 left-1 inline-flex w-7 items-center justify-center rounded-md text-gray-400 hover:bg-gray-100 hover:text-blue-700" {
                                 (PreEscaped(SEARCH_ICON))
                             }
@@ -7698,7 +7698,7 @@ fn render_kanban_board(
                                                         }
                                                     }
                                                 }
-                                                button type="submit" class="cr-button cr-button-primary min-h-0 px-2.5 py-1.5 text-xs" { "Move" }
+                                                button type="submit" class="cr-button cr-button-primary cr-button-small" { "Move" }
                                             }
                                         }
                                     }
@@ -10193,16 +10193,21 @@ html {
   text-wrap: pretty;
 }
 
+/* Every button is one height, and so is the search box that sits among them
+   (`h-8` in its markup), so a row of controls lines up top and bottom
+   whatever each one holds. A height rather than a minimum, because a badge
+   inside a button, such as the Filter count, must not make it taller than its
+   neighbours; its text never wraps, so nothing else needs the room. */
 .cr-button {
   display: inline-flex;
-  min-height: 32px;
+  height: 32px;
   align-items: center;
   justify-content: center;
   border: 1px solid var(--cr-gray-300);
   border-radius: 7px;
   background: var(--cr-gray-0);
   color: var(--cr-gray-700);
-  padding: 6px 10px;
+  padding: 0 12px;
   font-size: 0.77rem;
   font-weight: 600;
   line-height: 1;
@@ -10210,6 +10215,9 @@ html {
 }
 
 .cr-button > span[aria-hidden="true"] { margin-left: 0.2em; }
+.cr-button .cr-pill { padding: 1px 6px; }
+/* A button inside a card, such as a Kanban card's Move. */
+.cr-button-small { height: 28px; padding: 0 10px; font-size: 0.72rem; }
 
 .cr-button:hover { border-color: var(--cr-gray-400); background: var(--cr-gray-50); color: var(--cr-gray-900); }
 .cr-button:active { transform: translateY(1px); }
