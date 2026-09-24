@@ -210,7 +210,7 @@ fn assert_nothing_was_lost(html: &str) {
         "a text field was not preserved:\n{html}"
     );
     assert!(
-        html.contains(r#"value="discovery" selected"#),
+        html.contains(r#"value="discovery" checked"#),
         "the chosen option was not preserved:\n{html}"
     );
     assert!(
@@ -237,7 +237,7 @@ fn assert_nothing_was_lost(html: &str) {
     // The box that holds the YAML is open, because a collapsed disclosure would
     // hide both the text and anything said about it.
     assert!(
-        html.contains(r#"bg-gray-50" open>"#),
+        html.contains(r#"class="cr-form-more" open>"#),
         "the additional-attributes box came back collapsed:\n{html}"
     );
 }
@@ -722,4 +722,283 @@ async fn a_body_that_is_not_the_rendered_form_still_gets_the_error_page() {
     .await;
     assert_eq!(wrong_token.status, StatusCode::FORBIDDEN);
     assert_nothing_was_written(&database, "deals", "acme-pilot");
+}
+
+/// A record in a collection with no schema, holding one value of every kind the
+/// fields form tells apart, plus a Markdown body that starts with a blank line.
+fn schemaless_database(name: &str) -> (TempDir, Database) {
+    let (temporary, database) = test_database(name);
+    let assignments = [
+        "name=Jane Doe",
+        "postcode=\"02139\"",
+        "bio=\"line one\\nline two\"",
+        "ranking=3",
+        "reviewed=false",
+        "missing=null",
+        "tags=[a, b]",
+        "joined=2026-09-02",
+        "website=https://example.com/jane",
+        "homepage=javascript:alert(1)",
+    ]
+    .map(|assignment| Assignment::from_str(assignment).unwrap());
+    database
+        .create(
+            "people",
+            "jane",
+            &assignments,
+            "\nNotes after a blank line.\n",
+        )
+        .unwrap();
+    (temporary, database)
+}
+
+/// The fields form for [`schemaless_database`]'s record as a browser submits
+/// it untouched: every control in document order, with each `<textarea>`'s
+/// line breaks sent as CRLF.
+fn untouched_fields_form(token: &str, version: &str) -> Vec<(String, String)> {
+    [
+        ("_csrf", token),
+        ("_expected_record_hash", version),
+        ("_form_mode", "fields"),
+        ("_field.name", "text"),
+        ("attribute.name", "Jane Doe"),
+        ("_field.postcode", "text"),
+        ("attribute.postcode", "02139"),
+        ("_field.bio", "text"),
+        ("attribute.bio", "line one\r\nline two"),
+        ("_field.ranking", "number"),
+        ("attribute.ranking", "3"),
+        ("_field.reviewed", "boolean"),
+        ("attribute.reviewed", "false"),
+        ("_field.missing", "empty"),
+        ("attribute.missing", ""),
+        ("_field.tags", "yaml"),
+        ("attribute.tags", "- a\r\n- b"),
+        ("_field.joined", "text"),
+        ("attribute.joined", "2026-09-02"),
+        ("_field.website", "text"),
+        ("attribute.website", "https://example.com/jane"),
+        ("_field.homepage", "text"),
+        ("attribute.homepage", "javascript:alert(1)"),
+        ("markdown", "\r\nNotes after a blank line.\r\n"),
+    ]
+    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+    .to_vec()
+}
+
+fn with_values(mut fields: Vec<(String, String)>, changes: &[(&str, &str)]) -> String {
+    for (name, value) in changes {
+        let field = fields
+            .iter_mut()
+            .find(|(field, _)| field == name)
+            .unwrap_or_else(|| panic!("no form field {name}"));
+        field.1 = (*value).to_owned();
+    }
+    let pairs = fields
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    form(&pairs)
+}
+
+#[tokio::test]
+async fn a_record_without_a_schema_is_edited_one_field_at_a_time() {
+    let (_temporary, database) = schemaless_database("fields-render");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/people/records/jane", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    let html = &page.body;
+
+    assert!(html.contains(r#"name="_form_mode" value="fields""#));
+    assert!(!html.contains(r#"name="front_matter""#));
+    // One control per field, labelled readably, each saying how it is read back.
+    for (key, kind) in [
+        ("name", "text"),
+        ("postcode", "text"),
+        ("bio", "text"),
+        ("ranking", "number"),
+        ("reviewed", "boolean"),
+        ("missing", "empty"),
+        ("tags", "yaml"),
+        ("joined", "text"),
+    ] {
+        assert!(
+            html.contains(&format!(r#"name="_field.{key}" value="{kind}""#)),
+            "{key} is not a {kind} field:\n{html}"
+        );
+    }
+    assert!(
+        html.contains(r#"<label for="field-postcode" class="cr-field-label">Postcode</label>"#)
+    );
+    assert!(html.contains(r#"type="text" name="attribute.postcode" value="02139""#));
+    assert!(html.contains(r#"type="number" step="any" name="attribute.ranking" value="3""#));
+    // True or false is a pair of buttons. The record's value made it a
+    // boolean, so there is no "Not set" to fall back to.
+    assert!(html.contains(r#"type="radio" name="attribute.reviewed" value="false" checked"#));
+    assert!(!html.contains(r#"name="attribute.reviewed" value="""#));
+    // A calendar date gets a date picker.
+    assert!(html.contains(r#"type="date" name="attribute.joined" value="2026-09-02""#));
+    // A web address can be opened from the form; nothing else becomes a link.
+    assert!(html.contains(
+        r#"<a href="https://example.com/jane" target="_blank" rel="noopener noreferrer""#
+    ));
+    assert!(!html.contains(r#"href="javascript:"#));
+    // A string with a line break is edited in a box that keeps it.
+    assert!(html.contains(r#"<textarea id="field-bio" name="attribute.bio""#));
+    assert!(html.contains(">line one\nline two</textarea>"));
+    // The parser drops the first line feed of a `<textarea>`, so a body that
+    // starts with one is given a second for it to drop.
+    assert!(html.contains(">\n\nNotes after a blank line.\n</textarea>"));
+    assert!(html.contains(r#"href="/people/records/jane?editor=yaml""#));
+
+    let yaml = request(
+        &app,
+        Method::GET,
+        "/people/records/jane?editor=yaml",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(yaml.status, StatusCode::OK);
+    assert!(yaml.body.contains(r#"name="front_matter""#));
+    assert!(!yaml.body.contains(r#"name="_form_mode""#));
+    assert!(
+        yaml.body
+            .contains(r#"href="/people/records/jane" class="cr-form-link">Edit as form</a>"#)
+    );
+}
+
+#[tokio::test]
+async fn saving_the_fields_form_untouched_changes_nothing() {
+    let (_temporary, database) = schemaless_database("fields-untouched");
+    let before = database.get("people", "jane").unwrap();
+    let file = database.root().join("records/people/jane.md");
+    let bytes = fs::read(&file).unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/people/records/jane", None, &[]).await;
+
+    let saved = request(
+        &app,
+        Method::POST,
+        "/people/records/jane",
+        Some(with_values(
+            untouched_fields_form(csrf(&page.body), expected_record_hash(&page.body)),
+            &[],
+        )),
+        &[],
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.body);
+    let after = database.get("people", "jane").unwrap();
+    assert_eq!(after.attributes, before.attributes);
+    assert_eq!(after.body, before.body);
+    assert_eq!(fs::read(&file).unwrap(), bytes);
+    database.audit_verify(None).unwrap();
+}
+
+#[tokio::test]
+async fn an_edited_field_keeps_the_type_it_had() {
+    let (_temporary, database) = schemaless_database("fields-typed");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/people/records/jane", None, &[]).await;
+
+    let saved = request(
+        &app,
+        Method::POST,
+        "/people/records/jane",
+        Some(with_values(
+            untouched_fields_form(csrf(&page.body), expected_record_hash(&page.body)),
+            &[
+                // Digits typed into a text field are still text,
+                ("attribute.postcode", "02140"),
+                // a number field takes any number,
+                ("attribute.ranking", "4.5"),
+                // "Not set" is null rather than a missing field,
+                ("attribute.reviewed", ""),
+                // an empty text field is an empty string,
+                ("attribute.name", ""),
+                // and anything typed into an empty field is text.
+                ("attribute.missing", "true"),
+                ("attribute.tags", "[c]"),
+            ],
+        )),
+        &[],
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.body);
+    let record = database.get("people", "jane").unwrap();
+    assert_eq!(record.attributes["postcode"], "02140");
+    assert_eq!(record.attributes["ranking"], 4.5);
+    assert!(record.attributes["reviewed"].is_null());
+    assert_eq!(record.attributes["name"], "");
+    assert_eq!(record.attributes["missing"], "true");
+    assert_eq!(record.attributes["tags"][0], "c");
+    assert_eq!(record.attributes["tags"].as_sequence().unwrap().len(), 1);
+    assert_eq!(record.attributes["bio"], "line one\nline two");
+    // The order the record kept its fields in is the order it still keeps them.
+    let keys = record
+        .attributes
+        .keys()
+        .map(|key| key.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        [
+            "name", "postcode", "bio", "ranking", "reviewed", "missing", "tags", "joined",
+            "website", "homepage"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_refused_fields_form_comes_back_as_the_fields_form() {
+    let (_temporary, database) = schemaless_database("fields-refused");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/people/records/jane", None, &[]).await;
+
+    let refused = request(
+        &app,
+        Method::POST,
+        "/people/records/jane",
+        Some(with_values(
+            untouched_fields_form(csrf(&page.body), expected_record_hash(&page.body)),
+            &[("attribute.ranking", "high"), ("attribute.name", "Janet")],
+        )),
+        &[],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    let html = &refused.body;
+    assert!(html.contains("This record was not saved."));
+    assert!(html.contains(r#"name="_form_mode" value="fields""#));
+    let before_control = html
+        .split_once(r#"id="field-ranking""#)
+        .expect("the ranking control is rendered")
+        .0;
+    assert!(
+        before_control.contains("attribute 'ranking' must be a number"),
+        "the message is not beside the control it is about:\n{html}"
+    );
+    assert!(html.contains(r#"name="attribute.name" value="Janet""#));
+    assert!(html.contains(r#"name="_field.tags" value="yaml""#));
+    assert_eq!(
+        database.get("people", "jane").unwrap().attributes["name"],
+        "Jane Doe"
+    );
+
+    // A field type the form never renders is a broken client, not a typo.
+    let tampered = request(
+        &app,
+        Method::POST,
+        "/people/records/jane",
+        Some(with_values(
+            untouched_fields_form(csrf(&page.body), expected_record_hash(&page.body)),
+            &[("_field.ranking", "integer")],
+        )),
+        &[],
+    )
+    .await;
+    assert_eq!(tampered.status, StatusCode::BAD_REQUEST);
+    assert!(!tampered.body.contains(r#"id="cr-record-form""#));
+    database.audit_verify(None).unwrap();
 }

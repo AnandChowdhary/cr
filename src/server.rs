@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::{self, Read, Write},
@@ -37,10 +38,10 @@ use yaml_serde::{Mapping, Value as YamlValue};
 
 use crate::{
     AccessAction, AccessIdentity, AccessResource, AgentEvidence, Aggregation, Assignment,
-    Attribution, AttributionOverrides, AuditAgent, AuditAuthorization, AuditEntry, AuditFilter,
-    AuditIntent, AuditIntentPart, AuditSource, Backlink, COLLECTION_ACCESS_EXTENSION, CheckScope,
-    CheckSummary, CollectionModel, CollectionPresentation, Database, DomainError, Filter,
-    FilterExpression, FilterOperator, Finding, MAX_TRAVERSAL_DEPTH, Projection,
+    Attribution, AttributionOverrides, AuditAction, AuditAgent, AuditAuthorization, AuditEntry,
+    AuditFilter, AuditIntent, AuditIntentPart, AuditSource, Backlink, COLLECTION_ACCESS_EXTENSION,
+    CheckScope, CheckSummary, CollectionModel, CollectionPresentation, Database, DomainError,
+    Filter, FilterExpression, FilterOperator, Finding, MAX_TRAVERSAL_DEPTH, Projection,
     RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SchemaReview, SchemaViolation,
     SearchQuery, SearchTarget, SortDirection, USERS_COLLECTION, User, UserKind, UserStatus,
     ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch, audit::AuditChange,
@@ -961,9 +962,177 @@ struct HtmlDocumentForm {
     id: Option<String>,
     front_matter: Option<String>,
     markdown: String,
-    structured: bool,
+    mode: DocumentFormMode,
     additional_attributes: String,
     fields: BTreeMap<String, Vec<String>>,
+    /// The fields a `Fields` form listed, in its order, each with how its text
+    /// is read back. Empty for the other two editors.
+    field_kinds: Vec<(String, InferredFieldKind)>,
+}
+
+/// Which of the record form's three editors a submission came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentFormMode {
+    /// The whole front matter as one YAML mapping.
+    Yaml,
+    /// One control per property the collection's JSON Schema declares.
+    Structured,
+    /// One control per field the record already has, for a collection whose
+    /// schema declares no properties.
+    Fields,
+}
+
+/// How a field is edited on a record whose collection declares no properties.
+///
+/// There is no schema to ask, so the value the record holds decides, and saving
+/// gives back a value of the same type: `ranking: 3` does not come back as the
+/// string `"3"`, and a postcode stored as text does not come back as a number.
+/// Leaving a box empty never removes the field; it stores the empty value of
+/// its kind. Adding, renaming and removing fields is what the YAML editor is
+/// for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InferredFieldKind {
+    /// A string, saved exactly as typed.
+    Text,
+    /// A number; an empty box is `null`.
+    Number,
+    /// `true` or `false`; "Not set" is `null`.
+    Boolean,
+    /// `null`; anything typed is a string.
+    Empty,
+    /// Anything else — a list, a mapping, a tagged value, or a string a text
+    /// control cannot carry intact — as typed YAML; an empty box is `null`.
+    Yaml,
+}
+
+impl InferredFieldKind {
+    fn of(value: &YamlValue) -> Self {
+        match value {
+            // A text control can only give back line feeds and tabs: an
+            // `<input>` drops carriage returns and a `<textarea>` turns every
+            // line break into CRLF, so any other control character would not
+            // survive a save untouched.
+            YamlValue::String(text)
+                if text.chars().all(|character| {
+                    !character.is_control() || matches!(character, '\n' | '\t')
+                }) =>
+            {
+                Self::Text
+            }
+            // `.inf` and `.nan` are numbers a number input cannot hold.
+            YamlValue::Number(number) if number.as_f64().is_some_and(f64::is_finite) => {
+                Self::Number
+            }
+            YamlValue::Bool(_) => Self::Boolean,
+            YamlValue::Null => Self::Empty,
+            _ => Self::Yaml,
+        }
+    }
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::Empty => "empty",
+            Self::Yaml => "yaml",
+        }
+    }
+
+    fn from_token(token: &str) -> Option<Self> {
+        [
+            Self::Text,
+            Self::Number,
+            Self::Boolean,
+            Self::Empty,
+            Self::Yaml,
+        ]
+        .into_iter()
+        .find(|kind| kind.token() == token)
+    }
+
+    /// The control that edits a field of this kind holding `text`. Text that
+    /// is a calendar date gets a date picker, which gives back exactly the
+    /// `YYYY-MM-DD` it was given.
+    fn control(self, text: Option<&str>) -> SchemaFieldKind {
+        match self {
+            Self::Text | Self::Empty => SchemaFieldKind::String {
+                input_type: if self == Self::Text && text.is_some_and(is_calendar_date) {
+                    "date"
+                } else {
+                    "text"
+                },
+                min_length: None,
+                max_length: None,
+            },
+            Self::Number => SchemaFieldKind::Number {
+                minimum: None,
+                maximum: None,
+            },
+            Self::Boolean => SchemaFieldKind::Boolean,
+            Self::Yaml => SchemaFieldKind::Yaml,
+        }
+    }
+
+    fn parse(self, key: &str, raw: &str) -> ApiResult<YamlValue> {
+        match self {
+            Self::Text => Ok(YamlValue::String(form_text(raw))),
+            Self::Empty if raw.is_empty() => Ok(YamlValue::Null),
+            Self::Empty => Ok(YamlValue::String(form_text(raw))),
+            Self::Number if raw.trim().is_empty() => Ok(YamlValue::Null),
+            Self::Number => match parse_form_yaml_value(key, raw.trim())? {
+                number @ YamlValue::Number(_) => Ok(number),
+                _ => Err(ApiError::bad_request(
+                    "invalid_form",
+                    format!("attribute '{key}' must be a number"),
+                )),
+            },
+            Self::Boolean => match raw {
+                "" => Ok(YamlValue::Null),
+                "true" => Ok(YamlValue::Bool(true)),
+                "false" => Ok(YamlValue::Bool(false)),
+                _ => Err(ApiError::bad_request(
+                    "invalid_form",
+                    format!("attribute '{key}' must be true or false"),
+                )),
+            },
+            Self::Yaml if raw.trim().is_empty() => Ok(YamlValue::Null),
+            Self::Yaml => parse_form_yaml_value(key, raw),
+        }
+    }
+}
+
+/// Whether `text` is a real `YYYY-MM-DD` date a date input can hold. Anything
+/// else — `2026-02-30`, year zero — a browser would silently empty.
+fn is_calendar_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        text[0..4].parse::<i32>(),
+        text[5..7].parse::<u8>(),
+        text[8..10].parse::<u8>(),
+    ) else {
+        return false;
+    };
+    year >= 1
+        && time::Month::try_from(month)
+            .and_then(|month| time::Date::from_calendar_date(year, month, day))
+            .is_ok()
+}
+
+/// Text as a form control submitted it, with the CRLF a `<textarea>` sends for
+/// every line break read back as the line feed it was.
+fn form_text(raw: &str) -> String {
+    raw.replace("\r\n", "\n")
 }
 
 #[derive(Clone, Debug)]
@@ -981,6 +1150,11 @@ struct SchemaFormField {
     /// would silently undo what the user did.
     submitted: Option<Vec<String>>,
     kind: SchemaFieldKind,
+    /// How the field's type was decided when there is no schema to declare
+    /// it, which the form sends back so the server reads the text the same way.
+    inferred: Option<InferredFieldKind>,
+    /// The unit a number is in, from its `x-cr-unit`, shown beside the box.
+    unit: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2815,6 +2989,7 @@ async fn new_record_form(
             },
             None,
             None,
+            None,
         ))
     }
     .await;
@@ -2827,6 +3002,8 @@ async fn new_record_form(
 struct RecordPageQuery {
     /// The outcome of the relation change that redirected here.
     notice: Option<String>,
+    /// The editor asked for instead of the one the collection gives the form.
+    editor: Option<RecordEditor>,
 }
 
 async fn edit_record_form(
@@ -2880,6 +3057,7 @@ async fn edit_record_form(
             permissions,
             Some(&relations),
             query.notice.as_deref(),
+            query.editor,
         ))
     }
     .await;
@@ -3177,6 +3355,7 @@ async fn reject_record_form(
         context.ui.as_ref(),
         context.permissions,
         context.relations.as_ref(),
+        None,
         None,
     );
     rejected_form_response(status, markup)
@@ -5912,29 +6091,37 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
                             summary class="cursor-pointer text-sm font-semibold text-blue-700 hover:text-blue-900" {
                                 (entry.payload.changes.len()) " field-level " @if entry.payload.changes.len() == 1 { "change" } @else { "changes" }
                             }
-                            div class="mt-3 space-y-3" {
-                                @for change in &entry.payload.changes {
-                                    div class="rounded-lg border border-gray-200 bg-gray-50 p-3" {
-                                        div class="flex flex-wrap items-center gap-2" {
-                                            span class="rounded bg-gray-200 px-2 py-0.5 text-xs font-bold uppercase text-gray-700" { (audit_change_operation(change)) }
-                                            code class="text-xs text-gray-700" { (audit_change_path(change)) }
-                                        }
-                                        div class="mt-3 grid gap-3 lg:grid-cols-2" {
-                                            @if let Some(before) = audit_change_before(change) {
-                                                div {
-                                                    p class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500" { "Before" }
-                                                    pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-red-100 bg-red-50 p-3 text-xs leading-5 text-red-950" { (json_preview(before)) }
-                                                }
-                                            }
-                                            @if let Some(after) = audit_change_after(change) {
-                                                div {
-                                                    p class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500" { "After" }
-                                                    pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-xs leading-5 text-emerald-950" { (json_preview(after)) }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                            (render_audit_changes(&entry.payload.changes, false))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An event's changes, each with the value before and after it. `narrow` is
+/// for a sidebar, where before and after are stacked rather than side by side.
+fn render_audit_changes(changes: &[AuditChange], narrow: bool) -> Markup {
+    html! {
+        div class=(if narrow { "mt-2 space-y-2" } else { "mt-3 space-y-3" }) {
+            @for change in changes {
+                div class=(if narrow { "rounded-lg border border-gray-200 bg-gray-50 p-2" } else { "rounded-lg border border-gray-200 bg-gray-50 p-3" }) {
+                    div class="flex flex-wrap items-center gap-2" {
+                        span class="rounded bg-gray-200 px-2 py-0.5 text-xs font-bold uppercase text-gray-700" { (audit_change_operation(change)) }
+                        code class="text-xs text-gray-700" { (audit_change_path(change)) }
+                    }
+                    div class=(if narrow { "mt-2 grid gap-2" } else { "mt-3 grid gap-3 lg:grid-cols-2" }) {
+                        @if let Some(before) = audit_change_before(change) {
+                            div {
+                                p class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500" { "Before" }
+                                pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-red-100 bg-red-50 p-3 text-xs leading-5 text-red-950" { (json_preview(before)) }
+                            }
+                        }
+                        @if let Some(after) = audit_change_after(change) {
+                            div {
+                                p class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500" { "After" }
+                                pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-xs leading-5 text-emerald-950" { (json_preview(after)) }
                             }
                         }
                     }
@@ -7084,6 +7271,10 @@ fn schema_form_fields(schema: &JsonValue, attributes: &Mapping) -> Option<Vec<Sc
             value: attributes.get(YamlValue::String(key.clone())).cloned(),
             submitted: None,
             kind: schema_field_kind(definition),
+            inferred: None,
+            unit: definition
+                .get("x-cr-unit")
+                .and_then(|unit| amount_unit(unit, Some(attributes))),
         })
         .collect::<Vec<_>>();
     fields.sort_by(|left, right| {
@@ -7331,30 +7522,24 @@ fn record_name(attributes: &Mapping) -> Option<&str> {
     })
 }
 
-fn schema_field_type_label(kind: &SchemaFieldKind) -> &'static str {
-    match kind {
-        SchemaFieldKind::Select(_) => "Single select",
-        SchemaFieldKind::MultiSelect(_) => "Multi-select",
-        SchemaFieldKind::String { input_type, .. } => match *input_type {
-            "email" => "Email",
-            "url" => "URL",
-            "date" => "Date",
-            "time" => "Time",
-            "datetime-local" => "Date & time",
-            _ => "Text",
-        },
-        SchemaFieldKind::Integer { .. } => "Integer",
-        SchemaFieldKind::Number { .. } => "Number",
-        SchemaFieldKind::Boolean => "Boolean",
-        SchemaFieldKind::Yaml => "Structured YAML",
-    }
-}
-
 fn schema_field_is_wide(kind: &SchemaFieldKind) -> bool {
     matches!(
         kind,
         SchemaFieldKind::MultiSelect(_) | SchemaFieldKind::Yaml
     )
+}
+
+/// The text a `<textarea>` should be given to show `text`.
+///
+/// The HTML parser drops one line feed straight after `<textarea>`, so a value
+/// that starts with a blank line would lose it on every save unless a line feed
+/// is there for the parser to drop.
+fn textarea_text(text: &str) -> Cow<'_, str> {
+    if text.starts_with('\n') || text.starts_with("\r\n") {
+        Cow::Owned(format!("\n{text}"))
+    } else {
+        Cow::Borrowed(text)
+    }
 }
 
 fn field_text_value(value: Option<&YamlValue>) -> String {
@@ -7418,84 +7603,177 @@ fn field_is_unset(field: &SchemaFormField) -> bool {
     }
 }
 
+/// The most options a single choice offers as a row of buttons rather than a
+/// dropdown, and the most characters their labels may add up to: past either,
+/// the row stops fitting beside another field and a `<select>` reads better.
+const CHOICE_ROW_MAX_OPTIONS: usize = 3;
+const CHOICE_ROW_MAX_LABEL_CHARS: usize = 36;
+
+/// A single choice's options as a row of buttons, each `(value, label,
+/// chosen)`, or `None` when there are too many to sit in one row. A field that
+/// may be left empty ends with "Not set"; a field of a record with no schema
+/// does not, because the value it holds is what made it a choice.
+fn choice_row(field: &SchemaFormField) -> Option<Vec<(String, String, bool)>> {
+    let mut choices = match &field.kind {
+        SchemaFieldKind::Select(options) if options.len() <= CHOICE_ROW_MAX_OPTIONS => options
+            .iter()
+            .map(|option| {
+                (
+                    serialize_yaml_value(option),
+                    schema_value_label(option),
+                    option_is_chosen(field, option),
+                )
+            })
+            .collect::<Vec<_>>(),
+        SchemaFieldKind::Boolean => [(true, "True"), (false, "False")]
+            .into_iter()
+            .map(|(value, label)| {
+                (
+                    value.to_string(),
+                    label.to_owned(),
+                    option_is_chosen(field, &YamlValue::Bool(value)),
+                )
+            })
+            .collect(),
+        _ => return None,
+    };
+    if !field.required && field.inferred.is_none() {
+        choices.push((String::new(), "Not set".to_owned(), field_is_unset(field)));
+    }
+    let label_chars: usize = choices
+        .iter()
+        .map(|(_, label, _)| label.chars().count())
+        .sum();
+    (label_chars <= CHOICE_ROW_MAX_LABEL_CHARS).then_some(choices)
+}
+
+/// The address a text field holds when it is a web page worth opening from
+/// the form. Only `http` and `https`: this becomes a link's `href`.
+fn field_web_address(field: &SchemaFormField, text: &str) -> Option<String> {
+    if !matches!(field.kind, SchemaFieldKind::String { .. }) {
+        return None;
+    }
+    let text = text.trim();
+    let rest = text
+        .strip_prefix("https://")
+        .or_else(|| text.strip_prefix("http://"))?;
+    (!rest.is_empty() && !text.chars().any(char::is_whitespace)).then(|| text.to_owned())
+}
+
 fn render_schema_field(field: &SchemaFormField, diagnostics: &[String]) -> Markup {
     let name = format!("attribute.{}", field.key);
-    let wide = schema_field_is_wide(&field.kind);
+    let id = format!("field-{}", field.key);
+    let label_id = format!("{id}-label");
+    let help = field.description.as_ref().map(|_| format!("{id}-help"));
+    let text = field_control_text(field);
+    // A one-line `<input>` silently drops every line break in what it is
+    // given, so a string that has one is edited in a box that keeps it.
+    let multiline = matches!(&field.kind, SchemaFieldKind::String { input_type, .. } if *input_type == "text")
+        && text.contains('\n');
+    let choices = choice_row(field);
+    // A group of buttons is named by its heading rather than by a `<label>`,
+    // which can only name one control.
+    let group = choices.is_some() || matches!(field.kind, SchemaFieldKind::MultiSelect(_));
+    let web_address = field_web_address(field, &text);
+    let wide = schema_field_is_wide(&field.kind) || multiline;
     let unset = field_is_unset(field);
     // Maud writes an attribute with a `[…]` value only when the option is
     // `Some`, so a field nothing was said about carries no `aria-invalid` at all
     // rather than carrying `aria-invalid="false"`.
     let invalid = (!diagnostics.is_empty()).then_some("true");
-    let field_class = if diagnostics.is_empty() {
-        if wide {
-            "cr-field p-4 sm:col-span-2"
-        } else {
-            "cr-field p-4"
+    let field_class = match (wide, diagnostics.is_empty()) {
+        (false, true) => "cr-field",
+        (true, true) => "cr-field cr-field-wide",
+        (false, false) => "cr-field cr-field-invalid",
+        (true, false) => "cr-field cr-field-wide cr-field-invalid",
+    };
+    let label = html! {
+        (&field.label)
+        @if field.required {
+            span class="cr-required" aria-hidden="true" { "*" }
         }
-    } else if wide {
-        "cr-field cr-field-invalid p-4 sm:col-span-2"
-    } else {
-        "cr-field cr-field-invalid p-4"
+    };
+    let number = |step: &str, minimum: &Option<String>, maximum: &Option<String>| {
+        html! {
+            input id=(&id) type="number" step=(step) name=(&name) value=(&text) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] aria-invalid=[invalid] aria-describedby=[help.as_deref()] class="cr-input";
+        }
     };
     html! {
         div class=(field_class) {
-            div class="mb-2 flex items-start justify-between gap-3" {
-                label for=(format!("field-{}", field.key)) class="text-sm font-semibold text-gray-900" {
-                    (&field.label)
-                    @if field.required {
-                        span class="ml-1 text-red-500" aria-hidden="true" { "*" }
-                    }
-                }
-                span class="shrink-0 rounded-md bg-white px-2 py-0.5 text-[0.65rem] font-bold uppercase tracking-wide text-gray-500 shadow-sm" {
-                    (schema_field_type_label(&field.kind))
-                }
+            @if let Some(kind) = field.inferred {
+                input type="hidden" name=(format!("_field.{}", field.key)) value=(kind.token());
             }
-            @if let Some(description) = &field.description {
-                p class="mb-3 text-xs leading-5 text-gray-500" { (description) }
+            div class="cr-field-head" {
+                @if group {
+                    span id=(&label_id) class="cr-field-label" { (label) }
+                } @else {
+                    label for=(&id) class="cr-field-label" { (label) }
+                }
+                @if matches!(field.kind, SchemaFieldKind::Yaml) {
+                    span class="cr-field-hint" { "YAML" }
+                }
+                @if let Some(address) = &web_address {
+                    a href=(address) target="_blank" rel="noopener noreferrer" hx-boost=(UNBOOSTED) class="cr-field-hint cr-field-open" { "Open" span aria-hidden="true" { " ↗" } }
+                }
             }
             (render_field_diagnostics(diagnostics))
-            @match &field.kind {
-                SchemaFieldKind::Select(options) => {
-                    select id=(format!("field-{}", field.key)) name=(name) required[field.required] aria-invalid=[invalid] class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" {
-                        option value="" selected[unset] disabled[field.required] {
-                            @if field.required { "Select a value…" } @else { "Not set" }
-                        }
-                        @for option in options {
-                            option value=(serialize_yaml_value(option)) selected[option_is_chosen(field, option)] { (schema_value_label(option)) }
+            @if let Some(choices) = &choices {
+                div id=(&id) role="radiogroup" aria-labelledby=(&label_id) aria-describedby=[help.as_deref()] aria-invalid=[invalid] class="cr-choice-row" {
+                    @for (value, choice, chosen) in choices {
+                        label class="cr-choice-option" {
+                            input type="radio" name=(&name) value=(value) checked[*chosen] required[field.required];
+                            span { (choice) }
                         }
                     }
                 }
-                SchemaFieldKind::MultiSelect(options) => {
-                    div id=(format!("field-{}", field.key)) class="flex flex-wrap gap-2" {
-                        @for option in options {
-                            label class="inline-flex cursor-pointer items-center gap-2 rounded-full border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 has-checked:border-indigo-500 has-checked:bg-indigo-50 has-checked:text-indigo-800" {
-                                input type="checkbox" name=(name.clone()) value=(serialize_yaml_value(option)) checked[option_is_chosen(field, option)] aria-invalid=[invalid] class="size-4 accent-indigo-600";
-                                (schema_value_label(option))
+            } @else {
+                @match &field.kind {
+                    SchemaFieldKind::Select(options) => {
+                        select id=(&id) name=(&name) required[field.required] aria-invalid=[invalid] aria-describedby=[help.as_deref()] class="cr-input" {
+                            option value="" selected[unset] disabled[field.required] {
+                                @if field.required { "Select a value…" } @else { "Not set" }
+                            }
+                            @for option in options {
+                                option value=(serialize_yaml_value(option)) selected[option_is_chosen(field, option)] { (schema_value_label(option)) }
                             }
                         }
                     }
-                }
-                SchemaFieldKind::String { input_type, min_length, max_length } => {
-                    input id=(format!("field-{}", field.key)) type=(input_type) name=(name) value=(field_control_text(field)) required[field.required] minlength=[*min_length] maxlength=[*max_length] aria-invalid=[invalid] autocomplete=(if *input_type == "email" { "email" } else { "off" }) class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
-                }
-                SchemaFieldKind::Integer { minimum, maximum } => {
-                    input id=(format!("field-{}", field.key)) type="number" step="1" name=(name) value=(field_control_text(field)) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] aria-invalid=[invalid] class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
-                }
-                SchemaFieldKind::Number { minimum, maximum } => {
-                    input id=(format!("field-{}", field.key)) type="number" step="any" name=(name) value=(field_control_text(field)) required[field.required] min=[minimum.as_deref()] max=[maximum.as_deref()] aria-invalid=[invalid] class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2";
-                }
-                SchemaFieldKind::Boolean => {
-                    select id=(format!("field-{}", field.key)) name=(name) required[field.required] aria-invalid=[invalid] class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" {
-                        option value="" selected[unset] disabled[field.required] {
-                            @if field.required { "Choose true or false…" } @else { "Not set" }
+                    SchemaFieldKind::MultiSelect(options) => {
+                        div id=(&id) role="group" aria-labelledby=(&label_id) aria-describedby=[help.as_deref()] class="cr-checkbox-row" {
+                            @for option in options {
+                                label class="cr-checkbox-option" {
+                                    input type="checkbox" name=(&name) value=(serialize_yaml_value(option)) checked[option_is_chosen(field, option)] aria-invalid=[invalid];
+                                    span { (schema_value_label(option)) }
+                                }
+                            }
                         }
-                        option value="true" selected[option_is_chosen(field, &YamlValue::Bool(true))] { "True" }
-                        option value="false" selected[option_is_chosen(field, &YamlValue::Bool(false))] { "False" }
+                    }
+                    SchemaFieldKind::String { min_length, max_length, .. } if multiline => {
+                        textarea id=(&id) name=(&name) rows="4" required[field.required] minlength=[*min_length] maxlength=[*max_length] aria-invalid=[invalid] aria-describedby=[help.as_deref()] class="cr-input" { (textarea_text(&text)) }
+                    }
+                    SchemaFieldKind::String { input_type, min_length, max_length } => {
+                        input id=(&id) type=(input_type) name=(&name) value=(&text) required[field.required] minlength=[*min_length] maxlength=[*max_length] aria-invalid=[invalid] autocomplete=(if *input_type == "email" { "email" } else { "off" }) aria-describedby=[help.as_deref()] placeholder=[(field.inferred == Some(InferredFieldKind::Empty)).then_some("Empty")] class="cr-input";
+                    }
+                    SchemaFieldKind::Integer { minimum, maximum } | SchemaFieldKind::Number { minimum, maximum } => {
+                        @let step = if matches!(field.kind, SchemaFieldKind::Integer { .. }) { "1" } else { "any" };
+                        @if let Some(unit) = &field.unit {
+                            div class="cr-input-group" {
+                                (number(step, minimum, maximum))
+                                span class="cr-input-unit" aria-hidden="true" { (unit) }
+                            }
+                        } @else {
+                            (number(step, minimum, maximum))
+                        }
+                    }
+                    // Always a row of buttons, above.
+                    SchemaFieldKind::Boolean => {}
+                    SchemaFieldKind::Yaml => {
+                        textarea id=(&id) name=(&name) rows="5" spellcheck="false" required[field.required] aria-invalid=[invalid] aria-describedby=[help.as_deref()] class="cr-input cr-input-code" { (field_yaml_text(field)) }
                     }
                 }
-                SchemaFieldKind::Yaml => {
-                    textarea id=(format!("field-{}", field.key)) name=(name) rows="5" spellcheck="false" required[field.required] aria-invalid=[invalid] placeholder="{}" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (field_yaml_text(field)) }
-                }
+            }
+            @if let (Some(help), Some(description)) = (&help, &field.description) {
+                p id=(help) class="cr-field-help" { (description) }
             }
         }
     }
@@ -7595,13 +7873,14 @@ fn rejected_form_headline(editing: bool) -> &'static str {
 ///
 /// A diagnostic is worth more beside the control the value was typed into than
 /// at the top of a long form, but only if it lands on the right one. The mapping
-/// is therefore explicit: a violation about a property the structured form
-/// renders goes to that property's control; one about `profile.team` goes to the
-/// `profile` control, keeping the full path in its text, because that is the box
-/// the value was typed into; and anything the form does not render a control for
-/// — an attribute the schema does not declare, or a schema-shaped name on a form
-/// that has no schema — goes to whichever free-text box carries it, which is the
-/// whole point of that box existing.
+/// is therefore explicit: a violation about a field the structured or fields
+/// form renders goes to that field's control; one about `profile.team` goes to
+/// the `profile` control, keeping the full path in its text, because that is the
+/// box the value was typed into; and anything the form does not render a control
+/// for — an attribute the schema does not declare, or a schema-shaped name on a
+/// form that has no schema — goes to whichever free-text box carries it, which is
+/// the whole point of that box existing. A fields form has no such box, so there
+/// it stays in the message at the top.
 ///
 /// A violation the schema locates in the record as a whole is deliberately left
 /// where it is: it is already in the message at the top of the form, and putting
@@ -7613,29 +7892,39 @@ fn record_form_diagnostics(
     error_field: Option<&str>,
     violations: &[SchemaViolation],
 ) -> BTreeMap<String, Vec<String>> {
-    let declared = schema
-        .and_then(|schema| schema.get("properties"))
-        .and_then(JsonValue::as_object)
-        .map(|properties| properties.keys().cloned().collect::<BTreeSet<_>>())
-        .unwrap_or_default();
-    // Where anything the form renders no control for ends up.
-    let overflow = if submitted.structured {
-        ADDITIONAL_ATTRIBUTES_CONTROL
-    } else {
-        FRONT_MATTER_CONTROL
+    // The fields the form rendered a control of their own for.
+    let rendered = match submitted.mode {
+        DocumentFormMode::Structured => schema
+            .and_then(|schema| schema.get("properties"))
+            .and_then(JsonValue::as_object)
+            .map(|properties| properties.keys().cloned().collect::<BTreeSet<_>>())
+            .unwrap_or_default(),
+        DocumentFormMode::Fields => submitted
+            .field_kinds
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect(),
+        DocumentFormMode::Yaml => BTreeSet::new(),
     };
-    let control_for = |field: &str| -> String {
+    // Where anything the form renders no control for ends up. A fields form
+    // has no such box, so that stays in the message at the top.
+    let overflow = match submitted.mode {
+        DocumentFormMode::Structured => Some(ADDITIONAL_ATTRIBUTES_CONTROL),
+        DocumentFormMode::Yaml => Some(FRONT_MATTER_CONTROL),
+        DocumentFormMode::Fields => None,
+    };
+    let control_for = |field: &str| -> Option<String> {
         let root = field.split('.').next().unwrap_or(field);
-        if submitted.structured && declared.contains(root) {
-            return root.to_owned();
+        if rendered.contains(root) {
+            return Some(root.to_owned());
         }
         if matches!(
             root,
             ID_CONTROL | FRONT_MATTER_CONTROL | ADDITIONAL_ATTRIBUTES_CONTROL
         ) {
-            return root.to_owned();
+            return Some(root.to_owned());
         }
-        overflow.to_owned()
+        overflow.map(str::to_owned)
     };
 
     let mut diagnostics: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -7643,7 +7932,9 @@ fn record_form_diagnostics(
         let Some(field) = &violation.field else {
             continue;
         };
-        let control = control_for(field);
+        let Some(control) = control_for(field) else {
+            continue;
+        };
         let message = if control == *field {
             violation.message.clone()
         } else {
@@ -7653,9 +7944,9 @@ fn record_form_diagnostics(
         };
         diagnostics.entry(control).or_default().push(message);
     }
-    if let Some(field) = error_field {
+    if let Some(control) = error_field.and_then(control_for) {
         diagnostics
-            .entry(control_for(field))
+            .entry(control)
             .or_default()
             .push(error.message.clone());
     }
@@ -7847,7 +8138,7 @@ fn render_record_relations(
     };
     html! {
         section id="relations" class="cr-relations" aria-labelledby="relations-heading" {
-            h2 id="relations-heading" class="text-base font-bold text-gray-900" { "Relations" }
+            h2 id="relations-heading" class="cr-aside-heading" { "Relations" }
             @if relations.outgoing.is_empty() && relations.incoming.is_empty() {
                 p class="mt-1 text-xs text-gray-500" { "No linked records yet." }
             }
@@ -7930,6 +8221,80 @@ fn render_record_relations(
     }
 }
 
+/// The form for a record whose collection declares no properties: one control
+/// per field it has, in the order it has them, each typed by its value. `None`
+/// for a record with no fields, or with a key no form control can be named by,
+/// which leaves the YAML editor as the way to edit it.
+fn inferred_form_fields(attributes: &Mapping) -> Option<Vec<SchemaFormField>> {
+    if attributes.is_empty() {
+        return None;
+    }
+    attributes
+        .iter()
+        .map(|(key, value)| {
+            let YamlValue::String(key) = key else {
+                return None;
+            };
+            if key.is_empty() {
+                return None;
+            }
+            let kind = InferredFieldKind::of(value);
+            Some(SchemaFormField {
+                key: key.clone(),
+                label: inferred_field_label(key),
+                description: None,
+                required: false,
+                value: Some(value.clone()),
+                submitted: None,
+                kind: kind.control(value.as_str()),
+                inferred: Some(kind),
+                unit: None,
+            })
+        })
+        .collect()
+}
+
+/// The fields a refused `Fields` form listed, holding what was typed into them.
+fn submitted_inferred_fields(submitted: &HtmlDocumentForm) -> Vec<SchemaFormField> {
+    submitted
+        .field_kinds
+        .iter()
+        .map(|(key, kind)| {
+            let values = submitted.fields.get(key).cloned().unwrap_or_default();
+            SchemaFormField {
+                key: key.clone(),
+                label: inferred_field_label(key),
+                description: None,
+                required: false,
+                value: None,
+                kind: kind.control(values.first().map(String::as_str)),
+                submitted: Some(values),
+                inferred: Some(*kind),
+                unit: None,
+            }
+        })
+        .collect()
+}
+
+/// A key made readable, or the key itself when it is nothing but separators.
+fn inferred_field_label(key: &str) -> String {
+    let label = humanize_field_name(key);
+    if label.is_empty() {
+        key.to_owned()
+    } else {
+        label
+    }
+}
+
+/// Which editor a record page asks for in its URL.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum RecordEditor {
+    /// The whole front matter as one YAML mapping, whatever the collection's
+    /// schema would otherwise give the form.
+    Yaml,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_record_form(
     representation: &Representation,
@@ -7944,13 +8309,14 @@ fn render_record_form(
     permissions: RecordPermissions,
     relations: Option<&RecordRelations>,
     notice: Option<&str>,
+    editor: Option<RecordEditor>,
 ) -> Markup {
     let editing = record.is_some();
     let submitted = rejection.map(|rejection| &rejection.submitted);
     // A record is called by its name, with the ID beside it as the stable
     // identifier it is, rather than by the ID alone: "Acme annual renewal", not
-    // "Edit acme-renewal". Whether the page can edit is said by the lede and by
-    // the form itself, so the title no longer carries a verb for it.
+    // "Edit acme-renewal". Whether the page can edit is said by the form
+    // itself, so the title carries no verb for it.
     let name = record.map(|record| record_name(&record.attributes).unwrap_or(&record.id));
     let title = name
         .map(str::to_owned)
@@ -7972,8 +8338,28 @@ fn render_record_form(
         .map(|record| &record.attributes)
         .unwrap_or(&empty_attributes);
     let schema_fields = schema.and_then(|schema| schema_form_fields(schema, attributes));
-    let structured = schema_fields.is_some();
-    let mut schema_fields = schema_fields.unwrap_or_default();
+    let inferred_fields = if schema_fields.is_none() {
+        inferred_form_fields(attributes)
+    } else {
+        None
+    };
+    // The editor the form offers when nothing asks for another: the schema's
+    // fields when it declares any, and otherwise the fields the record has.
+    // YAML is the fallback for a record neither can describe.
+    let fields_mode = if schema_fields.is_some() {
+        Some(DocumentFormMode::Structured)
+    } else if inferred_fields.is_some() {
+        Some(DocumentFormMode::Fields)
+    } else {
+        None
+    };
+    // A refused submission comes back in the editor it was typed into.
+    let mode = match submitted.map(|submitted| submitted.mode) {
+        Some(DocumentFormMode::Structured) if schema_fields.is_none() => DocumentFormMode::Yaml,
+        Some(mode) => mode,
+        None if editor == Some(RecordEditor::Yaml) => DocumentFormMode::Yaml,
+        None => fields_mode.unwrap_or(DocumentFormMode::Yaml),
+    };
     // Every value below is the submitted text when there is one, and the stored
     // record's otherwise. The two are overlaid here rather than inside each
     // control so that "show what was typed" is one decision per field group
@@ -7981,17 +8367,30 @@ fn render_record_form(
     // that the text is the submitted string throughout: re-serializing what the
     // server parsed would answer a rejected `1.50` with `1.5` and a rejected
     // YAML mapping with its keys reordered.
-    if let Some(submitted) = submitted.filter(|submitted| submitted.structured) {
-        for field in &mut schema_fields {
-            field.submitted = Some(
-                submitted
-                    .fields
-                    .get(&field.key)
-                    .cloned()
-                    .unwrap_or_default(),
-            );
+    let form_fields = match mode {
+        DocumentFormMode::Structured => {
+            let mut fields = schema_fields.unwrap_or_default();
+            if let Some(submitted) =
+                submitted.filter(|submitted| submitted.mode == DocumentFormMode::Structured)
+            {
+                for field in &mut fields {
+                    field.submitted = Some(
+                        submitted
+                            .fields
+                            .get(&field.key)
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            fields
         }
-    }
+        DocumentFormMode::Fields => match submitted {
+            Some(submitted) => submitted_inferred_fields(submitted),
+            None => inferred_fields.unwrap_or_default(),
+        },
+        DocumentFormMode::Yaml => Vec::new(),
+    };
     let front_matter = submitted
         .and_then(|submitted| submitted.front_matter.clone())
         .unwrap_or_else(|| yaml_serde::to_string(attributes).unwrap_or_else(|_| "{}\n".to_owned()));
@@ -7999,17 +8398,17 @@ fn render_record_form(
         .map(|schema| additional_attributes(attributes, schema))
         .unwrap_or_default();
     let additional_yaml = submitted
-        .filter(|submitted| submitted.structured)
+        .filter(|submitted| submitted.mode == DocumentFormMode::Structured)
         .map(|submitted| submitted.additional_attributes.clone())
         .unwrap_or_else(|| {
             yaml_serde::to_string(&additional).unwrap_or_else(|_| "{}\n".to_owned())
         });
     let additional_diagnostics = form_diagnostics(rejection, ADDITIONAL_ATTRIBUTES_CONTROL);
     let allows_additional = schema.is_some_and(schema_allows_additional_attributes);
+    let has_additional = !additional_yaml.trim().is_empty() && additional_yaml.trim() != "{}";
     // A collapsed disclosure would hide a diagnostic about what is inside it, and
     // hide the YAML the reader is being asked to correct.
-    let additional_open = (!additional_yaml.trim().is_empty() && additional_yaml.trim() != "{}")
-        || !additional_diagnostics.is_empty();
+    let additional_open = has_additional || !additional_diagnostics.is_empty();
     let markdown = submitted
         .map(|submitted| submitted.markdown.as_str())
         .unwrap_or_else(|| record.map(|record| record.body.as_str()).unwrap_or(""));
@@ -8025,6 +8424,17 @@ fn render_record_form(
         .and_then(|submitted| submitted.expected_record_hash.clone())
         .or_else(|| record.map(|record| record.version.clone()));
     let back = format!("/{}", encode_segment(&view.name));
+    // The other editor, on a record page where there is one to switch to. A
+    // new record has no page to switch on, and its form is the one the
+    // collection gives it.
+    let editor_switch = match (editing, mode, fields_mode) {
+        (true, DocumentFormMode::Yaml, Some(_)) => Some((action.clone(), "Edit as form")),
+        (true, DocumentFormMode::Structured | DocumentFormMode::Fields, _) => {
+            Some((format!("{action}?editor=yaml"), "Edit as YAML"))
+        }
+        _ => None,
+    };
+    let front_matter_diagnostics = form_diagnostics(rejection, FRONT_MATTER_CONTROL);
     // The form is rendered on its own first because it is a region in its own
     // right: a refused submission is answered with exactly this element, rooted
     // at the `id` the request named, and the document below embeds the very same
@@ -8042,17 +8452,22 @@ fn render_record_form(
             // outside the `Idempotency-Key` contract the JSON API offers, so two
             // submissions really are two writes, and disabling the button for
             // the life of the request is what stops the second one.
-            hx-target="this" hx-swap="outerHTML" hx-disabled-elt="find button[type=submit]"
-            class="space-y-4" {
+            hx-target="this" hx-swap="outerHTML" hx-disabled-elt="find button[type=submit]" {
             input type="hidden" name="_csrf" value=(csrf_token);
             @if let Some(version) = &expected_version {
                 input type="hidden" name="_expected_record_hash" value=(version);
             }
-            @if structured {
-                input type="hidden" name="_form_mode" value="structured";
+            @match mode {
+                DocumentFormMode::Structured => {
+                    input type="hidden" name="_form_mode" value="structured";
+                }
+                DocumentFormMode::Fields => {
+                    input type="hidden" name="_form_mode" value="fields";
+                }
+                DocumentFormMode::Yaml => {}
             }
             @if let Some(rejection) = rejection {
-                div role="alert" class="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" {
+                div role="alert" class="cr-form-alert rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" {
                     p class="font-semibold" { (rejected_form_headline(editing)) }
                     p class="mt-1 whitespace-pre-line" { (&rejection.error.message) }
                     p class="mt-2 text-xs text-red-700" {
@@ -8060,98 +8475,105 @@ fn render_record_form(
                     }
                 }
             }
-            fieldset disabled[!permissions.update] class="contents disabled:opacity-80" {
-            section class="cr-form-section p-4 sm:p-5" {
-                div class="mb-4 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" {
-                    div {
-                        h2 class="text-lg font-bold text-gray-900" { "Record details" }
-                        p class="mt-1 text-sm text-gray-500" {
-                            @if structured { "Fields and controls follow this collection’s JSON Schema." } @else { "Front matter accepts any YAML mapping." }
-                        }
-                    }
-                    @if structured {
-                        span class="rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700" { "Schema-powered" }
-                    }
-                }
-                @if !editing {
-                    div class="mb-4 rounded-xl border border-indigo-100 bg-indigo-50/60 p-4" {
-                        label for="record-id" class="mb-1.5 block text-sm font-semibold text-gray-900" { "Record ID " span class="text-red-500" aria-hidden="true" { "*" } }
-                        (render_field_diagnostics(form_diagnostics(rejection, ID_CONTROL)))
-                        // Both characters are escaped, so the rendered attribute
-                        // is `[^\/\\]+`. `pattern` is compiled with the
-                        // Unicode-sets semantics current browsers apply, which
-                        // require `/` inside a character class to be escaped;
-                        // the previous `[^/\]+` failed to compile, so the
-                        // browser logged a syntax error on every submission and
-                        // ignored an attribute whose whole purpose is to refuse
-                        // `/` and `\` in a record ID. The server refuses those
-                        // characters regardless — this is the hint, not the rule.
-                        input id="record-id" type="text" name="id" value=(record_id) required pattern="[^\\/\\\\]+" placeholder="acme-renewal" aria-describedby="record-id-help" aria-invalid=[(!form_diagnostics(rejection, ID_CONTROL).is_empty()).then_some("true")] class="w-full rounded-lg border border-indigo-200 bg-white px-3 py-2.5 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
-                        span id="record-id-help" class="mt-1.5 block text-xs text-gray-500" { "Stable URL and filename identifier. It cannot be changed later." }
-                    }
-                }
-                @if structured {
-                    div class="grid gap-3 sm:grid-cols-2" {
-                        @for field in &schema_fields {
-                            // Relations are edited in the relations panel beside
-                            // the form, one audited link at a time, so the form
-                            // carries the stored value through unchanged rather
-                            // than offering it as YAML to retype. The record's
-                            // version is what keeps that safe: a link made after
-                            // this page was rendered changes it, and the save is
-                            // refused instead of writing the old relations back.
-                            // A value the panel could not have produced — not a
-                            // mapping — or one the save was refused over stays an
-                            // editable field.
-                            @if relations.is_some()
-                                && field.key == RELATIONS_FIELD
-                                && matches!(field.kind, SchemaFieldKind::Yaml)
-                                && matches!(field.value, None | Some(YamlValue::Mapping(_)))
-                                && form_diagnostics(rejection, &field.key).is_empty()
-                            {
-                                input type="hidden" name=(format!("attribute.{}", field.key)) value=(field_yaml_text(field));
-                            } @else {
-                                (render_schema_field(field, form_diagnostics(rejection, &field.key)))
+            fieldset disabled[!permissions.update] class="contents" {
+            div class="cr-form-section" {
+                div class="cr-form-grid" {
+                    @if !editing {
+                        div class=(if form_diagnostics(rejection, ID_CONTROL).is_empty() { "cr-field cr-field-wide" } else { "cr-field cr-field-wide cr-field-invalid" }) {
+                            div class="cr-field-head" {
+                                label for="record-id" class="cr-field-label" { "Record ID" span class="cr-required" aria-hidden="true" { "*" } }
                             }
+                            (render_field_diagnostics(form_diagnostics(rejection, ID_CONTROL)))
+                            // Both characters are escaped, so the rendered attribute
+                            // is `[^\/\\]+`. `pattern` is compiled with the
+                            // Unicode-sets semantics current browsers apply, which
+                            // require `/` inside a character class to be escaped;
+                            // the previous `[^/\]+` failed to compile, so the
+                            // browser logged a syntax error on every submission and
+                            // ignored an attribute whose whole purpose is to refuse
+                            // `/` and `\` in a record ID. The server refuses those
+                            // characters regardless — this is the hint, not the rule.
+                            input id="record-id" type="text" name="id" value=(record_id) required pattern="[^\\/\\\\]+" placeholder="acme-renewal" aria-describedby="record-id-help" aria-invalid=[(!form_diagnostics(rejection, ID_CONTROL).is_empty()).then_some("true")] class="cr-input cr-input-code";
+                            p id="record-id-help" class="cr-field-help" { "Used in the record’s URL and filename. It cannot be changed later." }
                         }
                     }
-                    @if allows_additional {
-                        details class="mt-5 rounded-xl border border-dashed border-gray-300 bg-gray-50" open[additional_open] {
-                            summary class="cursor-pointer px-4 py-3 text-sm font-semibold text-gray-700 hover:text-indigo-700" { "+ Additional attributes" }
-                            div class="border-t border-gray-200 p-4" {
-                                p class="mb-2 text-xs leading-5 text-gray-500" { "Optional front matter not declared in the schema. Declared fields above cannot be overridden here." }
-                                (render_field_diagnostics(additional_diagnostics))
-                                textarea name="_additional_attributes" rows="5" spellcheck="false" aria-invalid=[(!additional_diagnostics.is_empty()).then_some("true")] class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (additional_yaml) }
+                    @for field in &form_fields {
+                        // Relations are edited in the relations panel beside
+                        // the form, one audited link at a time, so the form
+                        // carries the stored value through unchanged rather
+                        // than offering it as YAML to retype. The record's
+                        // version is what keeps that safe: a link made after
+                        // this page was rendered changes it, and the save is
+                        // refused instead of writing the old relations back.
+                        // A value the panel could not have produced — not a
+                        // mapping — or one the save was refused over stays an
+                        // editable field.
+                        @if relations.is_some()
+                            && field.key == RELATIONS_FIELD
+                            && matches!(field.kind, SchemaFieldKind::Yaml)
+                            && matches!(field.value, None | Some(YamlValue::Mapping(_)))
+                            && form_diagnostics(rejection, &field.key).is_empty()
+                        {
+                            @if let Some(kind) = field.inferred {
+                                input type="hidden" name=(format!("_field.{}", field.key)) value=(kind.token());
                             }
+                            input type="hidden" name=(format!("attribute.{}", field.key)) value=(field_yaml_text(field));
+                        } @else {
+                            (render_schema_field(field, form_diagnostics(rejection, &field.key)))
                         }
                     }
-                } @else {
-                    label class="block" {
-                        span class="mb-1.5 block text-sm font-semibold text-gray-900" { "Front matter" }
-                        (render_field_diagnostics(form_diagnostics(rejection, FRONT_MATTER_CONTROL)))
-                        textarea name="front_matter" rows="14" spellcheck="false" aria-invalid=[(!form_diagnostics(rejection, FRONT_MATTER_CONTROL).is_empty()).then_some("true")] class="w-full rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (front_matter) }
+                    @if mode == DocumentFormMode::Yaml {
+                        div class=(if front_matter_diagnostics.is_empty() { "cr-field cr-field-wide" } else { "cr-field cr-field-wide cr-field-invalid" }) {
+                            div class="cr-field-head" {
+                                label for="front-matter" class="cr-field-label" { "Fields" }
+                                span class="cr-field-hint" { "YAML" }
+                            }
+                            (render_field_diagnostics(front_matter_diagnostics))
+                            textarea id="front-matter" name="front_matter" rows="12" spellcheck="false" aria-invalid=[(!front_matter_diagnostics.is_empty()).then_some("true")] class="cr-input cr-input-code cr-input-tall" { (front_matter) }
+                        }
+                    }
+                }
+                // Front matter the schema does not declare. A record page
+                // only shows the box when there is some, because "Edit as
+                // YAML" is the way to add it there; a new record has no such
+                // switch.
+                @if mode == DocumentFormMode::Structured && allows_additional && (!editing || additional_open) {
+                    details class="cr-form-more" open[additional_open] {
+                        summary {
+                            "Other fields"
+                            @if has_additional { " (" (additional.len()) ")" }
+                        }
+                        div class="cr-field" {
+                            p class="cr-field-help" { "Front matter this collection’s schema does not declare, as YAML. It cannot override the fields above." }
+                            (render_field_diagnostics(additional_diagnostics))
+                            textarea name="_additional_attributes" rows="5" spellcheck="false" aria-label="Other fields" aria-invalid=[(!additional_diagnostics.is_empty()).then_some("true")] class="cr-input cr-input-code" { (additional_yaml) }
+                        }
                     }
                 }
             }
-            section class="cr-form-section p-4 sm:p-5" {
-                div class="mb-3 flex items-center justify-between gap-3" {
-                    div {
-                        h2 class="text-lg font-bold text-gray-900" { "Notes" }
-                        p class="mt-1 text-sm text-gray-500" { "Long-form context stored as the Markdown body." }
+            div class="cr-form-section" {
+                div class="cr-field" {
+                    div class="cr-field-head" {
+                        label for="record-markdown" class="cr-field-label" { "Notes" }
+                        span class="cr-field-hint" { "Markdown" }
                     }
-                    span class="rounded-md bg-gray-100 px-2 py-1 font-mono text-xs font-semibold text-gray-500" { "Markdown" }
+                    textarea id="record-markdown" name="markdown" rows="10" class="cr-input cr-input-tall" { (textarea_text(markdown)) }
                 }
-                textarea name="markdown" aria-label="Markdown notes" rows="12" class="w-full rounded-lg border border-gray-300 px-3 py-2.5 font-mono text-sm leading-6 outline-none ring-indigo-500 focus:ring-2" { (markdown) }
             }
             }
-            div class="cr-surface flex flex-wrap items-center justify-between gap-3 p-3" {
-                a href=(back.clone()) class="cr-button" { "Cancel" }
-                @if permissions.update {
-                    button type="submit" class="cr-button cr-button-primary" {
-                        @if editing { "Save changes" } @else { "Create record" }
+            div class="cr-form-footer" {
+                @if let Some((href, label)) = &editor_switch {
+                    a href=(href) class="cr-form-link" { (label) }
+                }
+                div class="cr-form-actions" {
+                    a href=(back.clone()) class="cr-button" { "Cancel" }
+                    @if permissions.update {
+                        button type="submit" class="cr-button cr-button-primary" {
+                            @if editing { "Save changes" } @else { "Create record" }
+                        }
+                    } @else {
+                        span class="cr-pill" { "Read-only perspective" }
                     }
-                } @else {
-                    span class="cr-pill" { "Read-only perspective" }
                 }
             }
         }
@@ -8185,29 +8607,34 @@ fn render_record_form(
                 div data-notice="true" class="mx-auto mb-5 max-w-7xl rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800" { (notice) }
             }
             div class="mx-auto max-w-7xl" {
-                div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
+                div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between" {
                     div class="min-w-0" {
                         h1 class="cr-title" { (&title) }
                         @if let Some(id) = shown_id {
                             p class="cr-path mt-1" { (id) }
                         }
                     }
-                    @if editing {
-                        a href="#audit-history" class="cr-button cr-activity-jump" {
-                            (audit_entries.len()) " audit " @if audit_entries.len() == 1 { "event" } @else { "events" } " ↓"
+                    @if let Some(record) = record {
+                        div class="flex shrink-0 items-center gap-2" {
+                            a href="#audit-history" class="cr-button cr-activity-jump" {
+                                "Activity" span aria-hidden="true" { "↓" }
+                            }
+                            // A link to the confirmation page, not a form that
+                            // deletes. See `delete_confirmation_url` for why the
+                            // confirmation is a page rather than a dialog; the
+                            // consequence here is that this element cannot write
+                            // anything, so it needs no CSRF token, no version,
+                            // and no handler to guard it.
+                            @if permissions.delete {
+                                a href=(delete_confirmation_url(view, record)) class="cr-button cr-button-danger" { "Delete record…" }
+                            }
                         }
                     }
                 }
-                p class="cr-lede mt-1" {
-                    @if editing && !permissions.update {
-                        "This perspective has read-only access to the record."
-                    } @else if structured {
-                        "Edit typed fields generated from the collection schema. Saving validates the complete record and writes normal Markdown with YAML front matter."
-                    } @else {
-                        "This collection has no field schema yet, so front matter remains available as typed YAML."
-                    }
+                @if editing && !permissions.update {
+                    p class="cr-lede mt-1" { "This perspective has read-only access to the record." }
                 }
-                div class=(if editing { "cr-record-layout mt-5" } else { "mx-auto mt-5 max-w-5xl" }) {
+                div class=(if editing { "cr-record-layout mt-5" } else { "mt-5 max-w-3xl" }) {
                 div class="cr-record-primary min-w-0" {
                 (form_region)
                 }
@@ -8216,30 +8643,13 @@ fn render_record_form(
                         @if let Some(relations) = relations {
                             (render_record_relations(view, record, relations, permissions, csrf_token))
                         }
-                        div class="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between" {
-                            div {
-                                h2 class="text-base font-bold text-gray-900" { "Activity" }
-                                p class="mt-0.5 text-xs text-gray-500" { "Newest accepted changes" }
+                        section aria-labelledby="activity-heading" {
+                            div class="flex items-baseline justify-between gap-2" {
+                                h2 id="activity-heading" class="cr-aside-heading" { "Activity" }
+                                a href=(audit_filter_url(&view.collection, &record.id)) class="cr-aside-link" { "All activity" span aria-hidden="true" { " →" } }
                             }
-                            a href=(audit_filter_url(&view.collection, &record.id)) class="text-xs font-semibold text-indigo-700 hover:text-indigo-900" { "All activity" span aria-hidden="true" { " →" } }
+                            (render_record_activity(audit_entries))
                         }
-                        (render_audit_entries(audit_entries))
-                    // A link to the confirmation page, not a form that deletes.
-                    // See `delete_confirmation_url` for why the confirmation is
-                    // a page rather than a dialog; the consequence here is that
-                    // this element cannot write anything, so it needs no CSRF
-                    // token, no version, and no handler to guard it.
-                    @if permissions.delete {
-                        div class="cr-record-danger rounded-lg border border-red-200 bg-red-50 p-4" {
-                            div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
-                                div {
-                                    h2 class="font-semibold text-red-900" { "Delete this record" }
-                                    p class="mt-1 text-sm text-red-700" { "You will be asked to confirm. The previous document remains represented in the tamper-evident audit log." }
-                                }
-                                a href=(delete_confirmation_url(view, record)) class="rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-semibold text-red-700 hover:bg-red-100" { "Delete record…" }
-                            }
-                        }
-                    }
                     }
                 }
                 }
@@ -8248,6 +8658,109 @@ fn render_record_form(
         ui,
         csrf_token,
     )
+}
+
+/// A record's recent history as its page shows it beside the form: what
+/// happened, who did it, when, and which fields it touched, with the change
+/// itself one click away. Everything else an event records — its hash, the
+/// agent's session and delegation chain, the authorization, the intent — is
+/// on the audit log, which "All activity" opens filtered to this record.
+fn render_record_activity(entries: &[AuditEntry]) -> Markup {
+    html! {
+        @if entries.is_empty() {
+            p class="cr-activity-empty" { "No recorded changes yet." }
+        } @else {
+            ol class="cr-activity" {
+                @for entry in entries {
+                    @let payload = &entry.payload;
+                    @let fields = audit_changed_fields(&payload.changes);
+                    li id=(format!("event-{}", payload.sequence)) class="cr-activity-item scroll-mt-20" {
+                        p class="cr-activity-title" {
+                            (audit_action_label(&payload.action))
+                            @if !fields.is_empty() && payload.action != AuditAction::Create {
+                                " "
+                                span class="cr-activity-fields" { (fields.join(", ")) }
+                            }
+                        }
+                        p class="cr-activity-meta" {
+                            span title=(&payload.actor) { (identity_name(&payload.actor)) }
+                            @if let Some(operator) = payload
+                                .access
+                                .as_ref()
+                                .and_then(|access| access.impersonated_by.as_ref())
+                            {
+                                " · impersonated by " span title=(&operator.display) { (identity_name(&operator.display)) }
+                            }
+                            @if let Some(agent) = &payload.agent {
+                                " · via " a href=(audit_agent_url(&agent.id)) class="hover:text-blue-700" { (&agent.id) }
+                            }
+                            " · " (render_timestamp(Some(&payload.timestamp)))
+                        }
+                        @if let Some(message) = &payload.message {
+                            p class="cr-activity-message" { (message) }
+                        }
+                        @if !payload.changes.is_empty() {
+                            details class="cr-activity-changes" {
+                                summary { "Show changes" }
+                                (render_audit_changes(&payload.changes, true))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What an audit action is called in a record's activity.
+fn audit_action_label(action: &AuditAction) -> &'static str {
+    match action {
+        AuditAction::Baseline => "Recorded",
+        AuditAction::Create => "Created",
+        AuditAction::Update => "Updated",
+        AuditAction::Link => "Linked",
+        AuditAction::Delete => "Deleted",
+    }
+}
+
+/// The fields an event changed, named as the record names them: the first
+/// segment under `/attributes`, and "notes" for the Markdown body. At most
+/// three, then how many more, so a sweeping change stays one line.
+fn audit_changed_fields(changes: &[AuditChange]) -> Vec<String> {
+    let mut fields: Vec<String> = Vec::new();
+    for change in changes {
+        let path = change.path();
+        let field = match path.strip_prefix("/attributes/") {
+            Some(rest) => rest
+                .split('/')
+                .next()
+                .unwrap_or(rest)
+                .replace("~1", "/")
+                .replace("~0", "~"),
+            None if path == "/body" => "notes".to_owned(),
+            None if path.is_empty() => continue,
+            None => path.trim_start_matches('/').to_owned(),
+        };
+        if !fields.contains(&field) {
+            fields.push(field);
+        }
+    }
+    if fields.len() > 3 {
+        let more = fields.len() - 3;
+        fields.truncate(3);
+        fields.push(format!("+{more} more"));
+    }
+    fields
+}
+
+/// `Jane Doe <jane@example.com>` as `Jane Doe`: the name a reader knows them
+/// by, with the full identity left in the tooltip. An identity with no name in
+/// front of its address is shown whole.
+fn identity_name(identity: &str) -> &str {
+    match identity.split_once('<') {
+        Some((name, _)) if !name.trim().is_empty() => name.trim(),
+        _ => identity,
+    }
 }
 
 /// The URL of a record's delete confirmation, which is the same path its
@@ -9031,33 +9544,182 @@ html {
 .cr-kanban-move summary { color: var(--cr-gray-500); font-size: 0.72rem; font-weight: 620; }
 .cr-kanban-move[open] summary { margin-bottom: 8px; }
 
-.cr-form-section,
-.cr-field {
-  border: 1px solid var(--cr-gray-200);
-  border-radius: var(--cr-radius);
-  background: var(--cr-gray-0);
-  box-shadow: none;
+/* The record form: fields straight on the page with a label above each
+   control, the notes under them, and the actions held at the bottom edge of
+   the window while a long form scrolls beneath them. */
+.cr-form-alert { margin-bottom: 20px; }
+.cr-form-section + .cr-form-section { margin-top: 18px; }
+.cr-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 16px; }
+
+.cr-field { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
+.cr-field-wide { grid-column: 1 / -1; }
+
+.cr-field-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.cr-field-label { color: var(--cr-gray-700); font-size: 0.78rem; font-weight: 600; line-height: 1.3; }
+.cr-field-hint { color: var(--cr-gray-400); font-size: 0.66rem; font-weight: 550; }
+a.cr-field-open { color: var(--cr-gray-500); font-weight: 600; }
+a.cr-field-open:hover { color: var(--cr-accent); }
+.cr-required { margin-left: 3px; color: var(--cr-danger); }
+.cr-field-help { color: var(--cr-gray-500); font-size: 0.72rem; line-height: 1.45; }
+
+.cr-app .cr-input {
+  display: block;
+  width: 100%;
+  min-height: 34px;
+  border-width: 1px;
+  border-style: solid;
+  padding: 6px 10px;
+  font-size: 0.84rem;
+  line-height: 1.45;
+  outline: none;
 }
 
-.cr-field { background: var(--cr-gray-50); }
+/* A text box grows with what is in it where the browser can size it that way,
+   and keeps its `rows` where it cannot. */
+.cr-app textarea.cr-input { min-height: 3.6rem; max-height: 30rem; field-sizing: content; resize: vertical; }
+.cr-app textarea.cr-input-tall { min-height: 9rem; max-height: none; }
+.cr-app .cr-input-code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.78rem; line-height: 1.6; }
+
+/* A number with a unit: the unit sits in the box's right edge. */
+.cr-input-group { display: flex; min-width: 0; }
+.cr-app .cr-input-group > input.cr-input:not([type="radio"]) { min-width: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.cr-input-unit {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  border: 1px solid var(--cr-gray-300);
+  border-left: 0;
+  border-radius: 0 7px 7px 0;
+  background: var(--cr-gray-50);
+  color: var(--cr-gray-500);
+  padding: 0 10px;
+  font-size: 0.78rem;
+  font-weight: 550;
+}
+
+/* A choice among two or three options: a row of buttons, one pressed. The
+   radio itself is hidden but still takes focus and arrow keys, and the
+   button it is in shows both. */
+.cr-choice-row {
+  display: inline-flex;
+  max-width: 100%;
+  min-height: 34px;
+  align-self: flex-start;
+  gap: 2px;
+  overflow-x: auto;
+  border: 1px solid var(--cr-gray-300);
+  border-radius: 7px;
+  background: var(--cr-gray-50);
+  padding: 2px;
+}
+.cr-choice-option {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  color: var(--cr-gray-600);
+  padding: 3px 12px;
+  font-size: 0.8rem;
+  font-weight: 550;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.cr-choice-option input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.cr-choice-option:hover { color: var(--cr-gray-900); }
+.cr-choice-option:has(:checked) { background: var(--cr-gray-0); color: var(--cr-gray-900); box-shadow: 0 0 0 1px var(--cr-gray-200), 0 1px 2px rgb(0 0 0 / 0.08); }
+.cr-choice-option:has(:focus-visible) { outline: 2px solid var(--cr-accent); outline-offset: 1px; }
+.cr-choice-option:has(:disabled) { cursor: default; }
+.cr-choice-row[aria-invalid=true] { border-color: var(--cr-danger); }
+
+/* Several options, any of them: a checkbox in each chip. */
+.cr-checkbox-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.cr-checkbox-option {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--cr-gray-300);
+  border-radius: 7px;
+  background: var(--cr-gray-0);
+  color: var(--cr-gray-700);
+  padding: 4px 11px 4px 9px;
+  font-size: 0.8rem;
+  font-weight: 550;
+  cursor: pointer;
+}
+.cr-checkbox-option input { width: 14px; height: 14px; accent-color: var(--cr-accent); }
+.cr-checkbox-option:hover { border-color: var(--cr-gray-400); }
+.cr-checkbox-option:has(:checked) { border-color: var(--cr-accent); background: var(--cr-accent-soft); color: var(--cr-gray-900); }
+.cr-checkbox-option:has(:focus-visible) { outline: 2px solid var(--cr-accent); outline-offset: 1px; }
 
 /* A field a refused submission had something to say about. Colour alone never
    carries the message: the reason is rendered above the control as text, and the
    control itself is marked `aria-invalid`. */
-.cr-field-invalid {
-  border-color: var(--cr-invalid-line);
-  background: var(--cr-invalid-soft);
+.cr-field-invalid .cr-field-label { color: var(--cr-danger); }
+.cr-app .cr-field .cr-input[aria-invalid=true] { border-color: var(--cr-danger); background-color: var(--cr-invalid-soft); }
+
+.cr-form-more { margin-top: 18px; }
+.cr-form-more summary { width: fit-content; cursor: pointer; color: var(--cr-gray-600); font-size: 0.75rem; font-weight: 600; }
+.cr-form-more summary:hover { color: var(--cr-gray-900); }
+.cr-form-more[open] summary { margin-bottom: 10px; }
+
+.cr-form-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 24px;
+  border-top: 1px solid var(--cr-gray-200);
+  background: color-mix(in srgb, var(--cr-gray-0) 92%, transparent);
+  backdrop-filter: blur(10px);
+  padding: 12px 0;
 }
 
-.cr-record-layout { display: grid; grid-template-columns: minmax(0, 1fr) 350px; align-items: start; gap: 18px; }
-.cr-record-layout .cr-field { padding: 14px !important; }
+.cr-form-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.cr-form-link { color: var(--cr-gray-500); font-size: 0.75rem; font-weight: 600; }
+.cr-form-link:hover { color: var(--cr-gray-900); text-decoration: underline; }
+
+.cr-button-danger { color: var(--cr-danger); }
+.cr-button-danger:hover { border-color: var(--cr-invalid-line); background: var(--cr-invalid-soft); color: var(--cr-danger); }
+
+.cr-record-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; align-items: start; gap: 32px; }
 .cr-record-activity { position: sticky; top: 20px; min-width: 0; max-height: calc(100vh - 40px); overflow-y: auto; padding: 2px; scrollbar-width: thin; }
-.cr-record-activity .cr-audit-entry { padding: 11px; }
-.cr-record-activity .cr-audit-entry > div { gap: 8px; }
-.cr-record-danger { margin-top: 12px; }
+
+.cr-aside-heading { color: var(--cr-gray-900); font-size: 0.8rem; font-weight: 650; }
+.cr-aside-link { color: var(--cr-gray-500); font-size: 0.72rem; font-weight: 600; white-space: nowrap; }
+.cr-aside-link:hover { color: var(--cr-gray-900); }
+
+/* A record's recent history, as a timeline down the side of the page. */
+.cr-activity { margin: 12px 0 0 3px; border-left: 1px solid var(--cr-gray-200); }
+.cr-activity-empty { margin-top: 6px; color: var(--cr-gray-500); font-size: 0.75rem; }
+.cr-activity-item { position: relative; padding: 0 0 16px 16px; }
+.cr-activity-item:last-child { padding-bottom: 2px; }
+.cr-activity-item::before {
+  content: "";
+  position: absolute;
+  top: 5px;
+  left: -4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--cr-gray-300);
+  box-shadow: 0 0 0 3px var(--cr-gray-0);
+}
+.cr-activity-item:first-child::before { background: var(--cr-gray-500); }
+.cr-activity-item:target::before { background: var(--cr-accent); }
+.cr-activity-title { color: var(--cr-gray-900); font-size: 0.78rem; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+.cr-activity-fields { color: var(--cr-gray-600); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.72rem; font-weight: 500; }
+.cr-activity-meta { margin-top: 2px; color: var(--cr-gray-500); font-size: 0.72rem; line-height: 1.45; overflow-wrap: anywhere; }
+.cr-activity-message { margin-top: 4px; color: var(--cr-gray-700); font-size: 0.75rem; line-height: 1.45; }
+.cr-activity-changes summary { width: fit-content; margin-top: 3px; cursor: pointer; color: var(--cr-gray-500); font-size: 0.72rem; font-weight: 600; }
+.cr-activity-changes summary:hover { color: var(--cr-gray-900); }
 
 /* The record page's relations panel, above its activity. */
-.cr-relations { margin-bottom: 22px; }
+.cr-relations { margin-bottom: 28px; }
 .cr-relations-label { display: block; margin: 12px 0 5px; color: var(--cr-gray-500); font-size: 0.66rem; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
 .cr-relations-list { overflow: hidden; border: 1px solid var(--cr-gray-200); border-radius: var(--cr-radius); background: var(--cr-gray-0); }
 .cr-relation { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--cr-gray-200); padding: 8px 10px; }
@@ -9074,7 +9736,6 @@ a.cr-relation-target:hover { color: var(--cr-accent); text-decoration: underline
 .cr-relation-add summary:hover { color: var(--cr-gray-900); }
 .cr-relation-form { display: grid; gap: 8px; margin-top: 8px; border: 1px dashed var(--cr-gray-300); border-radius: var(--cr-radius); padding: 10px; }
 .cr-relation-form .cr-relations-label { margin-top: 0; }
-.cr-record-danger p { font-size: 0.75rem !important; line-height: 1.4; }
 
 @media (min-width: 1200px) {
   .cr-activity-jump { display: none; }
@@ -9083,6 +9744,10 @@ a.cr-relation-target:hover { color: var(--cr-accent); text-decoration: underline
 @media (max-width: 1199px) {
   .cr-record-layout { display: block; }
   .cr-record-activity { position: static; max-height: none; margin-top: 28px; overflow: visible; }
+}
+
+@media (max-width: 640px) {
+  .cr-form-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 899px) {
@@ -10395,6 +11060,7 @@ fn parse_document_form(raw: &[u8]) -> ApiResult<HtmlDocumentForm> {
     let mut mode = None;
     let mut additional_attributes = None;
     let mut fields: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut field_kinds: Vec<(String, InferredFieldKind)> = Vec::new();
 
     for (name, value) in form_urlencoded::parse(raw) {
         let name = name.into_owned();
@@ -10410,6 +11076,22 @@ fn parse_document_form(raw: &[u8]) -> ApiResult<HtmlDocumentForm> {
             "_form_mode" => set_form_value(&mut mode, value, "_form_mode")?,
             "_additional_attributes" => {
                 set_form_value(&mut additional_attributes, value, "_additional_attributes")?
+            }
+            _ if name.starts_with("_field.") => {
+                let field = &name["_field.".len()..];
+                let kind = InferredFieldKind::from_token(&value).ok_or_else(|| {
+                    ApiError::bad_request(
+                        "invalid_form",
+                        format!("unsupported field type '{value}' for attribute '{field}'"),
+                    )
+                })?;
+                if field.is_empty() || field_kinds.iter().any(|(key, _)| key == field) {
+                    return Err(ApiError::bad_request(
+                        "invalid_form",
+                        format!("form field '{name}' cannot be empty or repeated"),
+                    ));
+                }
+                field_kinds.push((field.to_owned(), kind));
             }
             _ => {
                 let Some(field) = name.strip_prefix("attribute.") else {
@@ -10429,26 +11111,41 @@ fn parse_document_form(raw: &[u8]) -> ApiResult<HtmlDocumentForm> {
         }
     }
 
-    let structured = match mode.as_deref() {
-        Some("structured") => true,
+    let mode = match mode.as_deref() {
+        Some("structured") => DocumentFormMode::Structured,
+        Some("fields") => DocumentFormMode::Fields,
         Some(other) => {
             return Err(ApiError::bad_request(
                 "invalid_form",
                 format!("unsupported form mode '{other}'"),
             ));
         }
-        None => false,
+        None => DocumentFormMode::Yaml,
     };
-    if structured && front_matter.is_some() {
+    if mode != DocumentFormMode::Yaml && front_matter.is_some() {
         return Err(ApiError::bad_request(
             "invalid_form",
             "structured fields and raw front matter cannot be submitted together",
         ));
     }
-    if !structured && front_matter.is_none() {
+    if mode == DocumentFormMode::Yaml && front_matter.is_none() {
         return Err(ApiError::bad_request(
             "invalid_form",
             "front_matter is required when structured fields are not used",
+        ));
+    }
+    if mode != DocumentFormMode::Fields && !field_kinds.is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_form",
+            "field types are only submitted by the fields form",
+        ));
+    }
+    if let Some(field) = fields.keys().find(|field| {
+        mode == DocumentFormMode::Fields && !field_kinds.iter().any(|(key, _)| key == *field)
+    }) {
+        return Err(ApiError::bad_request(
+            "invalid_form",
+            format!("attribute '{field}' was submitted without a field type"),
         ));
     }
 
@@ -10457,11 +11154,15 @@ fn parse_document_form(raw: &[u8]) -> ApiResult<HtmlDocumentForm> {
         expected_record_hash,
         id,
         front_matter,
+        // Read back as the line feeds it was shown with, so saving a record
+        // from a browser does not rewrite every line of its body as CRLF.
         markdown: markdown
+            .map(|markdown| form_text(&markdown))
             .ok_or_else(|| ApiError::bad_request("invalid_form", "markdown is required"))?,
-        structured,
+        mode,
         additional_attributes: additional_attributes.unwrap_or_else(|| "{}".to_owned()),
         fields,
+        field_kinds,
     })
 }
 
@@ -10480,13 +11181,17 @@ fn document_form_attributes(
     form: &HtmlDocumentForm,
     schema: Option<&JsonValue>,
 ) -> ApiResult<Mapping> {
-    if !form.structured {
-        return parse_front_matter(
-            form.front_matter
-                .as_deref()
-                .expect("raw forms have front matter"),
-        )
-        .map_err(|error| error.with_field(FRONT_MATTER_CONTROL));
+    match form.mode {
+        DocumentFormMode::Yaml => {
+            return parse_front_matter(
+                form.front_matter
+                    .as_deref()
+                    .expect("raw forms have front matter"),
+            )
+            .map_err(|error| error.with_field(FRONT_MATTER_CONTROL));
+        }
+        DocumentFormMode::Fields => return parse_inferred_attributes(form),
+        DocumentFormMode::Structured => {}
     }
     let schema = schema.ok_or_else(|| {
         ApiError::bad_request(
@@ -10562,6 +11267,32 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
     Ok(attributes)
 }
 
+/// The front matter a `Fields` form describes: each listed field, in the order
+/// the form listed it, read back as the kind it was rendered as. The collection
+/// schema, whatever it says, is applied afterwards by the write itself, exactly
+/// as it is to YAML typed into the raw editor.
+fn parse_inferred_attributes(form: &HtmlDocumentForm) -> ApiResult<Mapping> {
+    let mut attributes = Mapping::new();
+    for (key, kind) in &form.field_kinds {
+        let values = form.fields.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        let raw = single_schema_form_value(key, values)
+            .and_then(|raw| {
+                raw.ok_or_else(|| {
+                    ApiError::bad_request(
+                        "invalid_form",
+                        format!("attribute '{key}' is missing from the form"),
+                    )
+                })
+            })
+            .map_err(|error| error.with_field(key))?;
+        let value = kind
+            .parse(key, raw)
+            .map_err(|error| error.with_field(key))?;
+        attributes.insert(YamlValue::String(key.clone()), value);
+    }
+    Ok(attributes)
+}
+
 fn parse_schema_form_value(
     key: &str,
     definition: &JsonValue,
@@ -10613,7 +11344,7 @@ fn parse_schema_form_value(
             if raw.is_empty() && !required {
                 Ok(None)
             } else {
-                Ok(Some(YamlValue::String(raw.to_owned())))
+                Ok(Some(YamlValue::String(form_text(raw))))
             }
         }
         SchemaFieldKind::Integer { .. }

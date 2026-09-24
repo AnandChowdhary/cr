@@ -249,7 +249,7 @@ async fn internal_user_records_are_readable_without_any_web_mutation() {
     assert!(owner.text().contains("read-only"));
     assert!(!owner.text().contains("New record"));
     assert!(!owner.text().contains("Save changes"));
-    assert!(!owner.text().contains("Delete this record"));
+    assert!(!owner.text().contains("Delete record…"));
     assert!(!owner.text().contains("href=\"/users/records"));
     let owner_files = request(&app, Method::GET, "/browse", None, None, &[]).await;
     assert_eq!(owner_files.status, StatusCode::OK, "{}", owner_files.text());
@@ -493,7 +493,7 @@ async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
     );
     assert!(reader_record.text().contains("Read-only perspective"));
     assert!(!reader_record.text().contains("Save changes"));
-    assert!(!reader_record.text().contains("Delete this record"));
+    assert!(!reader_record.text().contains("Delete record…"));
 
     let secret = request(
         &app,
@@ -566,7 +566,7 @@ async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
             .contains(r#"<h1 class="cr-title">public</h1>"#)
     );
     assert!(editor_record.text().contains("Save changes"));
-    assert!(!editor_record.text().contains("Delete this record"));
+    assert!(!editor_record.text().contains("Delete record…"));
 
     let updated = request(
         &app,
