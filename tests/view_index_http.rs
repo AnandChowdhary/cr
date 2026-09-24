@@ -146,7 +146,7 @@ async fn the_document_names_every_view_and_leaves_the_counting_to_the_page() {
     // Without a script nothing will ask, so the document offers the page that
     // has the numbers in it.
     assert!(body.contains(&format!(
-        "<noscript><a href=\"{SUMMARY_URL}\" class=\"cr-pill\">Count records</a></noscript>"
+        "<noscript><span class=\"mx-1.5 text-gray-300\" aria-hidden=\"true\">·</span><a href=\"{SUMMARY_URL}\" class=\"underline hover:text-gray-900\">Count records</a></noscript>"
     )));
 
     // Asking for the default explicitly is the same document.

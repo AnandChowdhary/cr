@@ -5273,26 +5273,26 @@ fn render_views_home(
         "/",
         views,
         html! {
-            div class="cr-page-heading mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between" {
-                div {
-                    p class="cr-eyebrow" { "Workspace" }
-                    h1 class="cr-title mt-1" { "Database views" }
-                    p class="cr-lede mt-1 max-w-2xl" {
-                        "Every collection and saved view. Changes use the same validated, audited operations as the CLI and REST API."
-                    }
-                }
-                div class="flex flex-wrap gap-1.5" {
-                    span class="cr-pill" { (views.len()) " views" }
-                    (view_index_total(views, index, OutOfBand::No))
-                    @if deferred {
-                        // Nothing will ask for the region without a script, so
-                        // offer the document that has the numbers in it.
-                        noscript {
-                            a href=(VIEW_INDEX_SUMMARY_URL) class="cr-pill" { "Count records" }
+            (page_bar(
+                &[],
+                Some(HOME_ICON),
+                "All views",
+                html! {
+                    span class="cr-page-meta" {
+                        (count_noun(views.len(), "view", "views"))
+                        (view_index_total(views, index, OutOfBand::No))
+                        @if deferred {
+                            // Nothing will ask for the region without a script, so
+                            // offer the document that has the numbers in it.
+                            noscript {
+                                span class="mx-1.5 text-gray-300" aria-hidden="true" { "·" }
+                                a href=(VIEW_INDEX_SUMMARY_URL) class="underline hover:text-gray-900" { "Count records" }
+                            }
                         }
                     }
-                }
-            }
+                },
+                html! {},
+            ))
             @if views.is_empty() {
                 div class="cr-empty-state" {
                     h2 class="text-lg font-semibold text-gray-900" { "No collections yet" }
@@ -5428,10 +5428,10 @@ fn view_index_total(views: &[ViewDefinition], index: &ViewIndex, out_of_band: Ou
         .filter(|_| !views.is_empty());
     html! {
         @match total {
-            Some(total) => span id=(VIEW_INDEX_TOTAL_ID) class="cr-pill" hx-swap-oob=[out_of_band.attribute()] {
+            Some(total) => span id=(VIEW_INDEX_TOTAL_ID) hx-swap-oob=[out_of_band.attribute()] {
+                span class="mx-1.5 text-gray-300" aria-hidden="true" { "·" }
                 (count_noun(total, "record", "records"))
             },
-            // No `cr-pill`: its `display` would override `hidden`.
             None => span id=(VIEW_INDEX_TOTAL_ID) hidden hx-swap-oob=[out_of_band.attribute()] {},
         }
     }
@@ -5549,28 +5549,27 @@ fn render_users_view(
         "/users",
         views,
         html! {
-            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-gray-500" {
-                a href="/" class="font-medium hover:text-blue-700" { "Views" }
-                span aria-hidden="true" { "/" }
-                span class="text-gray-900" { "Users" }
-            }
-            div class="cr-page-heading mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
-                div {
-                    p class="cr-eyebrow" { "Internal record" }
-                    h1 class="cr-title mt-1" { "Users" }
-                    p class="cr-lede mt-1 max-w-2xl" {
-                        "Every principal registered in the reserved "
-                        code class="rounded bg-gray-100 px-1.5 py-0.5 text-xs" { "users" }
-                        " collection. CR owns this collection's schema and history, so the web UI keeps it read-only: register a principal, change a role, or disable an identity with "
-                        code class="rounded bg-gray-100 px-1.5 py-0.5 text-xs" { "cr access" }
-                        " or the REST API."
+            (page_bar(
+                &[("/".to_owned(), None, "Views")],
+                Some(USERS_ICON),
+                "Users",
+                html! {
+                    span class="cr-page-meta" {
+                        (count_noun(users.len(), "principal", "principals"))
+                        span class="mx-1.5 text-gray-300" aria-hidden="true" { "·" }
+                        "read-only"
                     }
-                }
-                div class="flex flex-wrap items-center gap-2" {
-                    span class="cr-pill" { (users.len()) " principals" }
-                    span class="cr-pill cr-pill-warn" { "read-only" }
+                },
+                html! {
                     a href="/api/v1/collections/users/records" hx-boost=(UNBOOSTED) class="cr-button" { "JSON API" span aria-hidden="true" { " ↗" } }
-                }
+                },
+            ))
+            p class="cr-page-note max-w-3xl" {
+                "Every principal registered in the reserved "
+                code class="rounded bg-gray-100 px-1.5 py-0.5 text-xs" { "users" }
+                " collection. CR owns its schema and history, so it is read-only here: register a principal, change a role, or disable an identity with "
+                code class="rounded bg-gray-100 px-1.5 py-0.5 text-xs" { "cr access" }
+                " or the REST API."
             }
             div class="cr-table-shell" {
                 div class="overflow-x-auto" {
@@ -5682,28 +5681,18 @@ fn render_browse_view(
         &current_path,
         views,
         html! {
-            nav aria-label="Breadcrumb" class="mb-3 flex min-w-0 flex-wrap items-center gap-2 text-xs text-gray-500" {
-                a href="/" class="font-medium hover:text-blue-700" { "Views" }
-                span aria-hidden="true" { "/" }
-                a href=(sort.carry("/browse")) class="font-medium hover:text-blue-700" { "Browse" }
-                @for crumb in &page.crumbs {
-                    span aria-hidden="true" { "/" }
-                    a href=(sort.carry(&crumb.href)) class="max-w-48 truncate font-mono hover:text-blue-700" { (&crumb.label) }
-                }
-            }
-            div class="cr-page-heading mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between" {
-                div class="min-w-0" {
-                    p class="cr-eyebrow" { "Internal · owner only" }
-                    h1 class="cr-title mt-1" { "Filesystem browser" }
-                    p class="cr-lede mt-1 max-w-3xl" {
-                        "Read-only access to files visible to the CR server process. Browsing starts at the database root; use "
-                        code class="rounded bg-gray-100 px-1.5 py-0.5 text-xs" { ".." }
-                        " to move toward the filesystem root."
+            (page_bar(
+                &[("/".to_owned(), None, "Views")],
+                Some(ALL_FILES_ICON),
+                "All files",
+                html! {
+                    span class="cr-page-meta" {
+                        "owner only"
+                        span class="mx-1.5 text-gray-300" aria-hidden="true" { "·" }
+                        "read-only"
                     }
-                    p class="cr-path mt-3 break-all" { (&location) }
-                }
-                div class="flex shrink-0 flex-wrap items-center gap-2" {
-                    span class="cr-pill cr-pill-warn" { "read-only" }
+                },
+                html! {
                     @if let Some(here) = page.location.to_str() {
                         (render_pin_control(here, pinned, csrf_token))
                     }
@@ -5711,6 +5700,15 @@ fn render_browse_view(
                     @if let Some(parent) = &page.parent {
                         a href=(sort.carry(&browse_url(parent.to_string_lossy().as_ref()))) class="cr-button" { "Up" }
                     }
+                },
+            ))
+            // Where this is, as the path's own steps, each one a way back up.
+            nav aria-label="Location" class="cr-page-note flex min-w-0 flex-wrap items-center gap-x-1 font-mono text-xs" title=(&location) {
+                @for (index, crumb) in page.crumbs.iter().enumerate() {
+                    @if index > 0 {
+                        span class="text-gray-300" aria-hidden="true" { "/" }
+                    }
+                    a href=(sort.carry(&crumb.href)) class="max-w-48 truncate hover:text-gray-900" { (&crumb.label) }
                 }
             }
             @match &page.item {
@@ -5995,21 +5993,15 @@ fn render_audit_view(
         "/audit",
         views,
         html! {
-            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-gray-500" {
-                a href="/" class="font-medium hover:text-blue-700" { "Views" }
-                span aria-hidden="true" { "/" }
-                span class="text-gray-900" { "Audit log" }
-            }
-            div class="cr-page-heading mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" {
-                div {
-                    p class="cr-eyebrow" { "Tamper-evident journal" }
-                    h1 class="cr-title mt-1" { "Global audit log" }
-                    p class="cr-lede mt-1 max-w-2xl" {
-                        "Every accepted record mutation, newest first. Expand an event to inspect its field-level changes."
-                    }
-                }
-                a href="/api/v1/audit/log" hx-boost=(UNBOOSTED) class="cr-button" { "JSON API" span aria-hidden="true" { " ↗" } }
-            }
+            (page_bar(
+                &[("/".to_owned(), None, "Views")],
+                Some(AUDIT_ICON),
+                "Audit log",
+                html! { span class="cr-page-meta" { "every accepted change, newest first" } },
+                html! {
+                    a href="/api/v1/audit/log" hx-boost=(UNBOOSTED) class="cr-button" { "JSON API" span aria-hidden="true" { " ↗" } }
+                },
+            ))
             form method="get" action=(reset_url) class="cr-surface mb-4 grid gap-3 p-3 sm:grid-cols-[1fr_1fr_1fr_1fr_auto]" {
                 label class="block" {
                     span class="mb-1 block text-xs font-semibold text-gray-600" { "Collection" }
@@ -6474,57 +6466,26 @@ fn render_view_records(
         &format!("/{}", encode_segment(&view.name)),
         navigation,
         html! {
-            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-gray-500" {
-                a href="/" class="font-medium hover:text-blue-700" { "Views" }
-                span aria-hidden="true" { "/" }
-                span class="text-gray-900" { (&view.title) }
-            }
-            div class="cr-page-heading mb-4 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between" {
-                div {
-                    div class="flex flex-wrap items-center gap-2" {
-                        span class="cr-title-icon" aria-hidden="true" { (view_icon(view)) }
-                        h1 class="cr-title" { (&view.title) }
-                    }
-                    // What the page is, in one quiet line under its title
-                    // rather than a row of badges beside it: what kind of view,
-                    // of which collection, and how many records it shows.
-                    p class="cr-lede mt-1" data-view-summary="true" {
-                        (match (view.saved, view.layout) {
-                            (false, _) => "Automatic view",
-                            (true, ViewLayout::Table) => "Saved view",
-                            (true, ViewLayout::Kanban) => "Saved Kanban view",
-                        })
-                        " of the " code class="font-mono text-gray-700" { (&view.collection) } " collection"
-                        span class="mx-1.5 text-gray-300" aria-hidden="true" { "·" }
+            (page_bar(
+                &[("/".to_owned(), None, "Views")],
+                Some(view_icon(view)),
+                &view.title,
+                // What the page holds: how many records, and for a saved view
+                // which collection they come from.
+                html! {
+                    span class="cr-page-meta" data-view-summary="true" {
+                        @if view.saved {
+                            (match view.layout {
+                                ViewLayout::Table => "Saved view",
+                                ViewLayout::Kanban => "Saved Kanban view",
+                            })
+                            " of " code class="font-mono text-gray-700" { (&view.collection) }
+                            span class="mx-1.5 text-gray-300" aria-hidden="true" { "·" }
+                        }
                         (view_record_count(page.total, OutOfBand::No))
                     }
-                    @if !view.filters.is_empty() || !view.where_expr.is_empty() || !view.filter_groups.is_empty() {
-                        div class="mt-2 flex flex-wrap gap-1.5" {
-                            @for filter in &view.filters {
-                                code class="cr-filter-tag" { (filter) }
-                            }
-                            @for expression in &view.where_expr {
-                                code class="cr-filter-tag" { (expression) }
-                            }
-                            @for group in &view.filter_groups {
-                                code class="cr-filter-tag" {
-                                    (match group.match_mode { ViewPredicateMatch::All => "All: ", ViewPredicateMatch::Any => "Any: " })
-                                    (group.expressions.join(" · "))
-                                }
-                            }
-                        }
-                    }
-                }
-                div class="flex flex-wrap items-center gap-2" {
-                    @if can_manage_views {
-                        (render_save_view_control(
-                            view,
-                            query,
-                            columns,
-                            available_columns,
-                            csrf_token,
-                        ))
-                    }
+                },
+                html! {
                     // One form, two submit buttons, and both of them only change
                     // which records are listed: the magnifying glass beside the
                     // search box and "Apply view" at the bottom of the filter
@@ -6656,9 +6617,35 @@ fn render_view_records(
                             }
                         }
                     }
+                    @if can_manage_views {
+                        (render_save_view_control(
+                            view,
+                            query,
+                            columns,
+                            available_columns,
+                            csrf_token,
+                        ))
+                    }
                     @if can_create {
                         a href=(new_url) class="cr-button cr-button-primary" {
                             "New record"
+                        }
+                    }
+                },
+            ))
+            // A saved view's own filters: what the view is, so not removable.
+            @if !view.filters.is_empty() || !view.where_expr.is_empty() || !view.filter_groups.is_empty() {
+                div class="mb-3 flex flex-wrap items-center gap-1.5" data-view-filters="true" {
+                    @for filter in &view.filters {
+                        code class="cr-filter-tag" { (filter) }
+                    }
+                    @for expression in &view.where_expr {
+                        code class="cr-filter-tag" { (expression) }
+                    }
+                    @for group in &view.filter_groups {
+                        code class="cr-filter-tag" {
+                            (match group.match_mode { ViewPredicateMatch::All => "All: ", ViewPredicateMatch::Any => "Any: " })
+                            (group.expressions.join(" · "))
                         }
                     }
                 }
@@ -9426,47 +9413,45 @@ fn render_record_form(
         &back,
         navigation,
         html! {
-            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-gray-500" {
-                a href="/" class="font-medium hover:text-blue-700" { "Views" }
-                span aria-hidden="true" { "/" }
-                a href=(back.clone()) class="font-medium hover:text-blue-700" { (&view.title) }
-                span aria-hidden="true" { "/" }
-                span class="text-gray-900" { (&title) }
-            }
+            (page_bar(
+                &[
+                    ("/".to_owned(), None, "Views"),
+                    (back.clone(), Some(view_icon(view)), &view.title),
+                ],
+                None,
+                &title,
+                html! {
+                    @if let Some(id) = shown_id {
+                        span class="cr-page-meta font-mono" { (id) }
+                    }
+                },
+                html! {
+                    @if let Some(record) = record {
+                        a href="#audit-history" class="cr-button cr-activity-jump" {
+                            "Activity" span aria-hidden="true" { "↓" }
+                        }
+                        // A link to the confirmation page, not a form that
+                        // deletes. See `delete_confirmation_url` for why the
+                        // confirmation is a page rather than a dialog; the
+                        // consequence here is that this element cannot write
+                        // anything, so it needs no CSRF token, no version,
+                        // and no handler to guard it.
+                        @if permissions.delete {
+                            a href=(delete_confirmation_url(view, record)) class="cr-button cr-button-danger" { "Delete record…" }
+                        }
+                    }
+                },
+            ))
             // The outcome of a link or unlink, which redirects back here. See
             // the same banner on view pages for how it reaches a screen reader.
             @if let Some(notice) = notice {
                 div data-notice="true" class="mx-auto mb-5 max-w-7xl rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800" { (notice) }
             }
             div class="mx-auto max-w-7xl" {
-                div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between" {
-                    div class="min-w-0" {
-                        h1 class="cr-title" { (&title) }
-                        @if let Some(id) = shown_id {
-                            p class="cr-path mt-1" { (id) }
-                        }
-                    }
-                    @if let Some(record) = record {
-                        div class="flex shrink-0 items-center gap-2" {
-                            a href="#audit-history" class="cr-button cr-activity-jump" {
-                                "Activity" span aria-hidden="true" { "↓" }
-                            }
-                            // A link to the confirmation page, not a form that
-                            // deletes. See `delete_confirmation_url` for why the
-                            // confirmation is a page rather than a dialog; the
-                            // consequence here is that this element cannot write
-                            // anything, so it needs no CSRF token, no version,
-                            // and no handler to guard it.
-                            @if permissions.delete {
-                                a href=(delete_confirmation_url(view, record)) class="cr-button cr-button-danger" { "Delete record…" }
-                            }
-                        }
-                    }
-                }
                 @if editing && !permissions.update {
-                    p class="cr-lede mt-1" { "This perspective has read-only access to the record." }
+                    p class="cr-page-note" { "This perspective has read-only access to the record." }
                 }
-                div class=(if editing { "cr-record-layout mt-5" } else { "mt-5 max-w-3xl" }) {
+                div class=(if editing { "cr-record-layout" } else { "max-w-3xl" }) {
                 div class="cr-record-primary min-w-0" {
                 (form_region)
                 }
@@ -9661,18 +9646,20 @@ fn render_delete_confirmation(
         &back,
         navigation,
         html! {
-            nav aria-label="Breadcrumb" class="mb-3 flex items-center gap-2 text-xs text-gray-500" {
-                a href="/" class="font-medium hover:text-blue-700" { "Views" }
-                span aria-hidden="true" { "/" }
-                a href=(&back) class="font-medium hover:text-blue-700" { (&view.title) }
-                span aria-hidden="true" { "/" }
-                a href=(&record_url) class="font-medium hover:text-blue-700" { (name) }
-                span aria-hidden="true" { "/" }
-                span class="text-gray-900" { "Delete" }
-            }
+            (page_bar(
+                &[
+                    ("/".to_owned(), None, "Views"),
+                    (back.clone(), Some(view_icon(view)), &view.title),
+                    (record_url.clone(), None, name),
+                ],
+                None,
+                "Delete",
+                html! {},
+                html! {},
+            ))
             div class="mx-auto max-w-2xl" {
                 div class="cr-record-danger rounded-xl border border-red-200 bg-red-50 p-6" {
-                    h1 class="cr-title text-red-900" { "Delete this record?" }
+                    h2 class="text-lg font-semibold text-red-900" { "Delete this record?" }
                     p class="mt-2 text-sm text-red-800" {
                         "You are about to delete "
                         @if name != record.id {
@@ -10116,7 +10103,6 @@ html {
 .cr-sidebar-notice { margin: 4px 8px; color: var(--cr-warn-ink); font-size: 0.68rem; line-height: 1.35; overflow-wrap: anywhere; }
 
 .cr-mobile-icon { margin-right: 4px; font-family: var(--cr-emoji); }
-.cr-title-icon { font-family: var(--cr-emoji); font-size: 1.35rem; line-height: 1; }
 .cr-file-icon { display: inline-block; width: 1.4em; font-family: var(--cr-emoji); }
 
 .cr-external { margin-left: auto; color: var(--cr-gray-400); font-size: 0.7rem; }
@@ -10167,31 +10153,69 @@ html {
   color: var(--cr-info-ink);
 }
 
-.cr-main { min-height: 100vh; }
-
-.cr-eyebrow {
-  color: var(--cr-accent);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.72rem;
-  font-weight: 650;
-  letter-spacing: 0.04em;
+/* The content area's padding is named, so the page bar can reach past it to
+   the area's edges. */
+.cr-main {
+  --cr-main-x: 16px;
+  --cr-main-y: 20px;
+  min-height: 100vh;
+  padding: var(--cr-main-y) var(--cr-main-x);
 }
+@media (min-width: 640px) { .cr-main { --cr-main-x: 24px; --cr-main-y: 24px; } }
+@media (min-width: 1280px) { .cr-main { --cr-main-x: 32px; } }
 
-.cr-title {
+/* The bar at the top of every page: a breadcrumb that ends in the page's
+   title, at the size of the text around it, a quiet word about what the page
+   holds, and the page's actions on the right, all on one line that spans the
+   content area and stays at its top while the page scrolls on a desktop. */
+.cr-page-bar {
+  display: flex;
+  min-height: 52px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin: calc(-1 * var(--cr-main-y)) calc(-1 * var(--cr-main-x)) 16px;
+  border-bottom: 1px solid var(--cr-gray-200);
+  background: var(--cr-gray-0);
+  padding: 9px var(--cr-main-x);
+}
+@media (min-width: 900px) { .cr-page-bar { position: sticky; top: 0; z-index: 25; } }
+.cr-page-bar-title { display: flex; min-width: 0; flex: 1 1 auto; align-items: center; gap: 8px; }
+.cr-page-path { display: flex; min-width: 0; flex: 0 1 auto; align-items: center; gap: 6px; }
+.cr-crumbs { display: flex; min-width: 0; flex: 0 1 auto; align-items: center; gap: 6px; color: var(--cr-gray-500); font-size: 0.84rem; font-weight: 520; }
+/* On a narrow screen each step gives way to an ellipsis rather than
+   running under the title, and the separators between them never do. */
+.cr-crumbs a { display: inline-flex; min-width: 0; align-items: center; gap: 6px; }
+.cr-crumbs a:hover { color: var(--cr-gray-900); }
+.cr-crumb-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cr-crumb-separator { flex: 0 0 auto; color: var(--cr-gray-300); }
+.cr-page-title {
+  display: flex;
+  min-width: 0;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 6px;
   color: var(--cr-gray-900);
-  font-size: clamp(1.5rem, 2vw, 1.8rem);
-  font-weight: 670;
-  letter-spacing: -0.028em;
-  line-height: 1.12;
-  text-wrap: balance;
+  font-size: 0.84rem;
+  font-weight: 620;
+  line-height: 1.3;
 }
-
-.cr-lede {
-  color: var(--cr-gray-600);
-  font-size: 0.82rem;
-  line-height: 1.45;
-  text-wrap: pretty;
+.cr-page-title > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cr-page-icon { flex: 0 0 auto; font-family: var(--cr-emoji); font-size: 0.95rem; line-height: 1; }
+/* The meta gives way before the title does. */
+.cr-page-meta { min-width: 0; flex: 0 4 auto; overflow: hidden; color: var(--cr-gray-500); font-size: 0.78rem; text-overflow: ellipsis; white-space: nowrap; }
+.cr-page-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* On a phone the bar keeps only the nearest step back, since the view strip
+   above it reaches everything else, and the meta takes a line of its own
+   rather than squeezing the title. */
+@media (max-width: 639px) {
+  .cr-page-bar-title { flex-wrap: wrap; row-gap: 2px; }
+  .cr-page-meta { flex-basis: 100%; }
+  .cr-crumbs > :nth-last-child(n+3) { display: none; }
 }
+/* What a page needs said before it is used, one quiet line under the bar. */
+.cr-page-note { margin-bottom: 16px; color: var(--cr-gray-600); font-size: 0.8rem; line-height: 1.45; }
 
 /* Every button is one height, and so is the search box that sits among them
    (`h-8` in its markup), so a row of controls lines up top and bottom
@@ -10305,7 +10329,6 @@ html {
 
 .cr-time { color: var(--cr-gray-500); white-space: nowrap; font-variant-numeric: tabular-nums; }
 
-.cr-path,
 .cr-data {
   color: var(--cr-gray-500);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -10810,7 +10833,6 @@ a.cr-relation-target:hover { color: var(--cr-accent); text-decoration: underline
   .cr-view-kind { grid-column: 1 / span 2; grid-row: 2; }
   .cr-view-arrow { grid-column: 3; grid-row: 1 / span 2; }
   .cr-view-unit { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
-  .cr-title { font-size: 1.45rem; }
   .cr-mobile-header .cr-perspective select { max-width: 155px; }
 }
 
@@ -11247,6 +11269,56 @@ impl Representation {
 /// and so that adding a page needs no thought about the seam at all — a
 /// renderer that never sees a matching `HX-Target` simply keeps rendering
 /// documents.
+/// One step of a page bar's breadcrumb: where it goes, an icon, and a label.
+type Crumb<'a> = (String, Option<&'a str>, &'a str);
+
+/// The bar at the top of every page, after Linear's and GitHub's.
+///
+/// Pages used to open with a breadcrumb, an eyebrow, a display-sized title, a
+/// sentence of description, and buttons beside the lot, which was five lines
+/// before the first record and a heading far larger than anything it
+/// introduced. The bar says the same in one line: the breadcrumb, which ends in
+/// the page's `<h1>` at the size of the text around it; `meta`, a quiet word
+/// about what the page holds; and `actions` on the right. What a page must say
+/// before it is used goes under the bar in a `cr-page-note`.
+fn page_bar(
+    crumbs: &[Crumb<'_>],
+    icon: Option<&str>,
+    title: &str,
+    meta: Markup,
+    actions: Markup,
+) -> Markup {
+    html! {
+        header class="cr-page-bar" {
+            div class="cr-page-bar-title" {
+                div class="cr-page-path" {
+                    @if !crumbs.is_empty() {
+                        nav aria-label="Breadcrumb" class="cr-crumbs" {
+                            @for (href, icon, label) in crumbs {
+                                a href=(href) {
+                                    @if let Some(icon) = icon {
+                                        span class="cr-page-icon" aria-hidden="true" { (icon) }
+                                    }
+                                    span class="cr-crumb-label" { (label) }
+                                }
+                                span class="cr-crumb-separator" aria-hidden="true" { "›" }
+                            }
+                        }
+                    }
+                    h1 class="cr-page-title" {
+                        @if let Some(icon) = icon {
+                            span class="cr-page-icon" aria-hidden="true" { (icon) }
+                        }
+                        span { (title) }
+                    }
+                }
+                (meta)
+            }
+            div class="cr-page-actions" { (actions) }
+        }
+    }
+}
+
 fn page_or_content(
     representation: &Representation,
     title: &str,
@@ -11400,7 +11472,7 @@ fn page_layout(
                         // The one element whose contents a content fragment
                         // replaces, which is why its id is a constant: the
                         // shell and the seam have to agree on the name.
-                        main id=(CONTENT_REGION) class="cr-main w-full px-4 py-5 sm:px-6 sm:py-6 xl:px-8" tabindex="-1" { (content) }
+                        main id=(CONTENT_REGION) class="cr-main w-full" tabindex="-1" { (content) }
                     }
                 }
             }

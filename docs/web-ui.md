@@ -93,13 +93,21 @@ does the same sideways. Every entry is marked by an emoji—a collection's own w
 each section is ordered by the name a reader sees;
 the active route remains highlighted on list, board, and record pages. Narrow
 screens collapse the same hierarchy into a sticky top bar and horizontally
-scrollable view strip. The main workspace uses short breadcrumbs, one-line
-context, restrained borders, and compact controls so records begin near the top
-of the viewport without losing labels or accessible fallbacks. Under a view's
-title, one quiet line says what the page is — **Automatic view of the `deals`
-collection · 3 records**, or **Saved view** and **Saved Kanban view** — and the
-count follows every search and filter. A saved view's own filters are listed
-below that line.
+scrollable view strip.
+
+Every page opens with one bar across the top of the workspace, in the manner
+of Linear and GitHub, so records begin near the top of the window. The bar
+holds a breadcrumb that ends in the page's title, at the size of the text
+around it — **Views › Deals** — then a quiet word about what the page holds,
+and the page's controls on the right, every one of them the same 32-pixel
+height. On a view that word is its record count, which follows every search
+and filter, and a saved view adds the collection it reads (**Saved view of
+`deals` · 3 records**) and lists its own filters under the bar. A record's bar
+reads **Views › Deals › Acme renewal** with the record ID after it, and a page
+that needs something said before it is used, such as the read-only Users page,
+says it in one line under the bar. On a desktop the bar stays at the top while
+the page scrolls. On a phone it keeps only the nearest step back, since the
+view strip reaches the rest, and puts the count on a line of its own.
 
 Every table opens with two columns the database derives rather than stores:
 **Created** and **Updated**, read from the audit journal and shown right after

@@ -1113,7 +1113,7 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
     assert_eq!(audit[0].payload.actor, "sales@example.com");
 
     let edit_page = request(&app, Method::GET, "/open-deals/records/acme", None, &[]).await;
-    assert!(edit_page.text().contains("class=\"cr-record-layout mt-5\""));
+    assert!(edit_page.text().contains("class=\"cr-record-layout\""));
     assert!(
         edit_page
             .text()
@@ -1477,7 +1477,7 @@ async fn global_audit_view_renders_filters_and_paginates_field_changes() {
 
     let global = request(&app, Method::GET, "/audit", None, &[]).await;
     assert_eq!(global.status, StatusCode::OK);
-    assert!(global.text().contains("Global audit log"));
+    assert!(global.text().contains("<span>Audit log</span></h1>"));
     assert!(global.text().contains("contacts/beta"));
     assert!(global.text().contains("deals/alpha"));
     assert!(global.text().contains("sales@example.com"));
@@ -2787,13 +2787,16 @@ async fn a_row_has_one_link_to_its_record_and_opens_it_from_anywhere() {
 }
 
 #[tokio::test]
-async fn a_views_heading_says_what_it_is_in_one_line() {
+async fn every_page_opens_with_one_compact_bar() {
     let (_temporary, database) = test_database("views-heading");
     database
         .create(
             "deals",
             "alpha",
-            &[Assignment::from_str("stage=won").unwrap()],
+            &[
+                Assignment::from_str("name=Acme renewal").unwrap(),
+                Assignment::from_str("stage=won").unwrap(),
+            ],
             "",
         )
         .unwrap();
@@ -2809,33 +2812,75 @@ async fn a_views_heading_says_what_it_is_in_one_line() {
         .unwrap();
     let app = router(database.clone(), ServerConfig::default()).unwrap();
 
+    // A view: the way back, then its title at the size of the text around it,
+    // then how many records it shows, with its controls in the same bar.
     let automatic = request(&app, Method::GET, "/deals", None, &[]).await;
     assert!(automatic.text().contains(
-        r#"<p class="cr-lede mt-1" data-view-summary="true">Automatic view of the <code class="font-mono text-gray-700">deals</code> collection<span class="mx-1.5 text-gray-300" aria-hidden="true">·</span><span id="cr-view-count">1 record</span></p>"#
+        r#"<header class="cr-page-bar"><div class="cr-page-bar-title"><div class="cr-page-path"><nav aria-label="Breadcrumb" class="cr-crumbs"><a href="/"><span class="cr-crumb-label">Views</span></a><span class="cr-crumb-separator" aria-hidden="true">›</span></nav><h1 class="cr-page-title"><span class="cr-page-icon" aria-hidden="true">🗃️</span><span>Deals</span></h1></div><span class="cr-page-meta" data-view-summary="true"><span id="cr-view-count">1 record</span></span></div><div class="cr-page-actions">"#
     ));
-    // No badges beside the title.
-    assert!(
-        !automatic
-            .text()
-            .contains(r#"<span class="cr-pill">automatic view</span>"#)
-    );
-    assert!(
-        !automatic
-            .text()
-            .contains(r#"class="cr-pill" id="cr-view-count""#)
-    );
+    let bar = automatic
+        .text()
+        .split(r#"<header class="cr-page-bar">"#)
+        .nth(1)
+        .unwrap();
+    let bar = &bar[..bar.find("</header>").unwrap()];
+    for control in [
+        r#"data-view-search="true""#,
+        r#"id="cr-view-filter-summary""#,
+        "Save as view",
+        ">New record<",
+    ] {
+        assert!(bar.contains(control), "the bar lacks {control}");
+    }
+    // One heading per page, and none of the old display-sized furniture.
+    assert_eq!(automatic.text().matches("<h1").count(), 1);
+    for gone in ["cr-title", "cr-eyebrow", "cr-lede", "cr-page-heading"] {
+        assert!(!automatic.text().contains(gone), "{gone} is still rendered");
+    }
 
+    // A saved view says which collection it reads, and lists its own filters
+    // under the bar.
     let saved = request(&app, Method::GET, "/won", None, &[]).await;
+    assert!(saved.text().contains(
+        r#"data-view-summary="true">Saved view of <code class="font-mono text-gray-700">deals</code><span class="mx-1.5 text-gray-300" aria-hidden="true">·</span><span id="cr-view-count">1 record</span>"#
+    ));
+    assert!(saved.text().contains(
+        r#"<div class="mb-3 flex flex-wrap items-center gap-1.5" data-view-filters="true"><code class="cr-filter-tag">stage=won</code>"#
+    ));
+
+    // A record: its view is a step back, its ID the quiet word after its name.
+    let record = request(&app, Method::GET, "/deals/records/alpha", None, &[]).await;
+    assert!(record.text().contains(
+        r#"<a href="/deals"><span class="cr-page-icon" aria-hidden="true">🗃️</span><span class="cr-crumb-label">Deals</span></a><span class="cr-crumb-separator" aria-hidden="true">›</span></nav><h1 class="cr-page-title"><span>Acme renewal</span></h1></div><span class="cr-page-meta font-mono">alpha</span>"#
+    ));
+    assert_eq!(record.text().matches("<h1").count(), 1);
+    // Its delete confirmation's question is the card's heading, not the page's.
+    let delete = request(&app, Method::GET, "/deals/records/alpha/delete", None, &[]).await;
     assert!(
-        saved
+        delete
             .text()
-            .contains(r#"data-view-summary="true">Saved view of the "#)
+            .contains(r#"<h1 class="cr-page-title"><span>Delete</span></h1>"#)
     );
-    // The saved view's own filters are still listed under it.
     assert!(
-        saved
+        delete
             .text()
-            .contains(r#"<code class="cr-filter-tag">stage=won</code>"#)
+            .contains(r#"<h2 class="text-lg font-semibold text-red-900">Delete this record?</h2>"#)
+    );
+    assert_eq!(delete.text().matches("<h1").count(), 1);
+
+    // The index and the audit log are bars too.
+    let home = request(&app, Method::GET, "/?summary=inline", None, &[]).await;
+    assert!(home.text().contains(r#"<span>All views</span></h1></div><span class="cr-page-meta">2 views<span id="cr-view-index-total"><span class="mx-1.5 text-gray-300" aria-hidden="true">·</span>1 record</span>"#));
+    let audit = request(&app, Method::GET, "/audit", None, &[]).await;
+    assert!(audit.text().contains("<span>Audit log</span></h1>"));
+    assert_eq!(audit.text().matches("<h1").count(), 1);
+
+    // On a phone only the nearest step back is kept, and the meta takes its
+    // own line.
+    assert!(
+        automatic
+            .text()
+            .contains(".cr-crumbs > :nth-last-child(n+3) { display: none; }")
     );
 }
 
@@ -2935,11 +2980,7 @@ async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     // Clearing a label returns the sentence-cased directory name.
     assert!(database.set_collection_label("zebras", None).unwrap());
     let cleared = request(&app, Method::GET, "/zebras", None, &[]).await;
-    assert!(
-        cleared
-            .text()
-            .contains("<h1 class=\"cr-title\">Zebras</h1>")
-    );
+    assert!(cleared.text().contains("<span>Zebras</span></h1>"));
 }
 
 #[tokio::test]
@@ -2966,7 +3007,7 @@ async fn owners_can_browse_and_preview_the_filesystem_without_mutating_it() {
 
     let root = request(&app, Method::GET, "/browse", None, &[]).await;
     assert_eq!(root.status, StatusCode::OK, "{}", root.text());
-    assert!(root.text().contains("Filesystem browser"));
+    assert!(root.text().contains("<span>All files</span></h1>"));
     assert!(root.text().contains("owner only"));
     assert!(root.text().contains("read-only"));
     assert!(root.text().contains("notes"));
