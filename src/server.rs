@@ -10020,12 +10020,53 @@ html {
   line-height: 1.3;
 }
 
+/* Views and collections scroll between the brand and the utility section,
+   which stay put however many there are. */
 .cr-sidebar-nav {
   min-height: 0;
   flex: 1 1 auto;
   overflow-y: auto;
   padding: 4px 8px 16px;
   scrollbar-width: thin;
+  scroll-timeline: --cr-sidebar-y block;
+}
+
+/* The list's edges say whether it goes on, as a table's do: a fade above the
+   utility section while entries are hidden below it, which clears at the
+   last one, and a fade under the brand once entries have scrolled up past
+   it. Each is a pinned pseudo-element that takes no room in the list, and
+   starts hidden, because a list that fits has an inactive timeline and an
+   animation on one has no effect. */
+@supports (animation-timeline: scroll()) {
+  .cr-sidebar-nav::before,
+  .cr-sidebar-nav::after {
+    position: sticky;
+    z-index: 1;
+    display: block;
+    height: 32px;
+    margin-right: -8px;
+    margin-left: -8px;
+    content: "";
+    opacity: 0;
+    pointer-events: none;
+  }
+  /* Sticky offsets are measured inside the list's padding, so these reach
+     past it to the list's edges. The timeline follows the `animation`
+     shorthand, which resets it. */
+  .cr-sidebar-nav::before {
+    top: -4px;
+    margin-bottom: -32px;
+    background: linear-gradient(var(--cr-gray-50), transparent);
+    animation: cr-more-behind linear both;
+    animation-timeline: --cr-sidebar-y;
+  }
+  .cr-sidebar-nav::after {
+    bottom: -16px;
+    margin-top: -32px;
+    background: linear-gradient(transparent, var(--cr-gray-50));
+    animation: cr-more-ahead linear both;
+    animation-timeline: --cr-sidebar-y;
+  }
 }
 
 .cr-sidebar-label {
@@ -10451,7 +10492,7 @@ html {
        an inactive timeline, and an animation on one has no effect at all. */
     opacity: 0;
     pointer-events: none;
-    animation: cr-table-more linear both;
+    animation: cr-more-ahead linear both;
     animation-timeline: --cr-table-x;
   }
   @media (min-width: 900px) {
@@ -10466,13 +10507,16 @@ html {
       content: "";
       opacity: 0;
       pointer-events: none;
-      animation: cr-table-scrolled linear both;
+      animation: cr-more-behind linear both;
       animation-timeline: --cr-table-x;
     }
   }
 }
-@keyframes cr-table-more { 0%, 96% { opacity: 1; } 100% { opacity: 0; } }
-@keyframes cr-table-scrolled { 0% { opacity: 0; } 4%, 100% { opacity: 1; } }
+/* A scroll hint's opacity across its scroller's range: one that says there is
+   more ahead clears as the reader reaches the end, and one that says content
+   has scrolled past appears as soon as they leave the start. */
+@keyframes cr-more-ahead { 0%, 96% { opacity: 1; } 100% { opacity: 0; } }
+@keyframes cr-more-behind { 0% { opacity: 0; } 4%, 100% { opacity: 1; } }
 
 .cr-popover {
   border: 1px solid var(--cr-gray-200);

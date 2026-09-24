@@ -82,9 +82,12 @@ and index. Give it a better name or its own emoji with
 The default UI uses a compact workspace shell rather than a documentation-style
 page frame. On desktop, saved views, then collections, then internal records
 stay visible in a persistent sidebar with audit, OpenAPI, and the RBAC
-perspective control anchored below. Every entry is marked by an emoji—a
-collection's own when its schema names one—and each section is ordered by the
-name a reader sees;
+perspective control anchored below. Once the list is longer than the window it
+scrolls between the brand and that anchored section, which stay put, and a
+fade above the section and under the brand shows while entries are hidden
+beyond either edge, where the browser supports scroll-driven animations. Every
+entry is marked by an emoji—a collection's own when its schema names one—and
+each section is ordered by the name a reader sees;
 the active route remains highlighted on list, board, and record pages. Narrow
 screens collapse the same hierarchy into a sticky top bar and horizontally
 scrollable view strip. The main workspace uses short breadcrumbs, one-line
