@@ -620,6 +620,10 @@ pub(crate) struct PreparedEntry {
     parsed: AuditPayload,
     /// Digest of this event's change set, computed from the bytes above.
     change_digest: String,
+    /// The walk this event was prepared against, which [`AuditLog::commit`]
+    /// appends it to. `None` for an event a bulk save prepared against its
+    /// own snapshot, or recovered from a pending file; dropped with a preview.
+    admission: Option<Admission>,
 }
 
 impl PreparedEntry {
@@ -662,7 +666,7 @@ struct ChainState {
 /// [`JournalCache`] keeps one between walks and feeds it only the lines
 /// appended since, so an event verified late is held to exactly the rules an
 /// event verified by a fresh walk is: there is one implementation of them.
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct ChainWalk {
     expected_sequence: u64,
     previous_hash: Option<String>,
@@ -822,7 +826,7 @@ pub enum JournalVerification {
 /// bounds it:
 ///
 /// * A walk is only ever saved if it began at the first event in the saving
-///   process, which every append makes anyway, so one saved walk is never
+///   process, which every write makes anyway, so one saved walk is never
 ///   built on another and the next write replaces a forged one with a
 ///   verified one.
 /// * A saved walk that is unreadable, from another release of `cr`, or no
@@ -832,10 +836,12 @@ pub enum JournalVerification {
 ///   command skip work, never fail.
 /// * Nothing that decides whether the journal is intact uses it: `cr audit
 ///   verify`, `cr check`, and their API routes walk the whole chain every
-///   time. Neither does any write: `append` verifies the whole chain before it
-///   extends it, so a mutation never builds on a journal only the cache
+///   time. Neither does any write: each walks the whole chain from its first
+///   event under the audit lock before it extends it, once, and checks at the
+///   append that the journal on disk is still what that walk verified (see
+///   [`Admission`]), so a mutation never builds on a journal only the cache
 ///   believed. [`JournalVerification::Full`] (`--verify-audit`) makes any
-///   other command do the same.
+///   other command start from the first event too.
 #[derive(Default)]
 pub(crate) struct JournalCache {
     verified: Mutex<Option<VerifiedJournal>>,
@@ -882,6 +888,11 @@ impl JournalCache {
 }
 
 /// What a walk of the journal established, and where it stopped.
+///
+/// A clone shares the replayed maps with the original until either is
+/// extended, and copies only what is small beside them: the newest segment's
+/// verified bytes, the idempotency identities, and a stamp per sealed segment.
+#[derive(Clone)]
 struct VerifiedJournal {
     walk: ChainWalk,
     states: Arc<AuditedRecordStates>,
@@ -1030,6 +1041,7 @@ impl VerifiedJournal {
 }
 
 /// The part of the newest segment a walk has verified.
+#[derive(Clone)]
 enum VerifiedPrefix {
     /// The bytes themselves, as this process verified them.
     Bytes(Vec<u8>),
@@ -1132,7 +1144,7 @@ struct JournalSnapshot {
 /// time no ordinary interface sets it back. A segment replaced rather than
 /// rewritten has a different inode. Elsewhere only the length and
 /// modification time are available, which is a weaker promise.
-#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct SegmentStamp {
     length: u64,
     modified: Option<SystemTime>,
@@ -1259,6 +1271,34 @@ impl ReconciliationSnapshot {
     }
 }
 
+/// The walk from the first event that one single-record write makes, under
+/// the audit lock, before it extends the chain.
+///
+/// [`AuditLog::admit`] makes it. The write may read the audited state it
+/// needs from it, then prepares its event against it, and [`AuditLog::commit`]
+/// appends the event to it after checking that the journal on disk is still
+/// what it verified, rather than walking the journal a second time. That is
+/// the one walk the write makes, whatever cache is attached, and it is never
+/// taken from a cache: a cache can hold a walk resumed from a saved one, and
+/// in `cr serve` other requests move it along.
+pub(crate) struct Admission {
+    journal: VerifiedJournal,
+}
+
+impl Admission {
+    /// Every record's audited state, as the walk replayed it.
+    pub(crate) fn states(&self) -> &AuditedRecordStates {
+        &self.journal.states
+    }
+
+    /// Whether the latest audited state for this record is a deletion.
+    pub(crate) fn is_tombstoned(&self, collection: &str, id: &str) -> bool {
+        self.states()
+            .get(&(collection.to_owned(), id.to_owned()))
+            .is_some_and(|state| state.hash.is_none())
+    }
+}
+
 impl<'a> AuditLog<'a> {
     pub fn new(
         root: &'a Path,
@@ -1302,9 +1342,38 @@ impl<'a> AuditLog<'a> {
         Ok(lock)
     }
 
+    /// Verify the whole journal from its first event for a write that is
+    /// about to extend it, and keep the walk for [`Self::prepare_admitted`].
+    ///
+    /// Call it while holding [`Self::lock`], and hold the lock until the
+    /// event is committed: the append trusts the lock to have kept every
+    /// cooperating writer out, and checks the rest. With a cache attached, a
+    /// copy of the walk is left there for the readers after it, and a walk
+    /// that fails leaves nothing cached.
+    pub(crate) fn admit(&self) -> Result<Admission> {
+        let journal = self.walk_fresh()?;
+        self.verify_legacy_representation_heads(&journal.states)?;
+        Ok(Admission { journal })
+    }
+
+    /// Prepare one event against a walk of the whole journal made here.
     pub fn prepare(&self, mutation: AuditMutation<'_>) -> Result<PreparedEntry> {
+        let admission = self.admit()?;
+        self.prepare_admitted(mutation, admission)
+    }
+
+    /// Prepare one event against `admission`, which the event carries to
+    /// [`Self::commit`].
+    pub(crate) fn prepare_admitted(
+        &self,
+        mutation: AuditMutation<'_>,
+        admission: Admission,
+    ) -> Result<PreparedEntry> {
         let before_hash = mutation.before_bytes.map(record_hash);
-        let (audited_state, chain) = self.record_state(mutation.collection, mutation.id)?;
+        let audited_state = admission
+            .states()
+            .get(&(mutation.collection.to_owned(), mutation.id.to_owned()))
+            .map(|state| state.hash.clone());
         if mutation.action == AuditAction::Baseline {
             if audited_state.is_some() {
                 return Err(conflict(format!(
@@ -1325,7 +1394,7 @@ impl<'a> AuditLog<'a> {
             }
         }
 
-        self.prepare_payload(PayloadMutation {
+        let mut entry = self.prepare_payload(PayloadMutation {
             action: mutation.action,
             collection: mutation.collection,
             id: mutation.id,
@@ -1334,12 +1403,14 @@ impl<'a> AuditLog<'a> {
             before_hash,
             after_hash: mutation.after_bytes.map(record_hash),
             after_bytes: mutation.after_bytes,
-            chain,
+            chain: admission.journal.walk.state(),
             source: mutation.source,
             message: mutation.message,
             access: mutation.access,
             idempotency: mutation.idempotency,
-        })
+        })?;
+        entry.admission = Some(admission);
+        Ok(entry)
     }
 
     /// Capture one verified generation for a locked multi-record filesystem
@@ -1452,6 +1523,7 @@ impl<'a> AuditLog<'a> {
             payload: serialized,
             parsed: payload,
             change_digest,
+            admission: None,
         })
     }
 
@@ -1475,10 +1547,13 @@ impl<'a> AuditLog<'a> {
         }
     }
 
-    pub fn commit<F>(&self, entry: PreparedEntry, target: &Path, apply: F) -> Result<()>
+    /// Apply one prepared mutation and append its event, which must still
+    /// extend the chain exactly as the walk it was prepared against left it.
+    pub fn commit<F>(&self, mut entry: PreparedEntry, target: &Path, apply: F) -> Result<()>
     where
         F: FnOnce() -> Result<()>,
     {
+        let admission = entry.admission.take();
         let target = target.to_path_buf();
         validate_relative_target(&target)?;
         let expected_target = self
@@ -1512,7 +1587,7 @@ impl<'a> AuditLog<'a> {
         )?;
 
         if current_hash == pending.after_hash {
-            self.append(&entry)?;
+            self.append(&entry, admission)?;
             self.clear_pending()?;
             return result;
         }
@@ -1647,12 +1722,20 @@ impl<'a> AuditLog<'a> {
                 },
             )?;
             let change_digest = change_set_hash(&pending.payload)?;
-            self.append(&PreparedEntry {
-                hash: pending.hash,
-                payload: pending.payload,
-                parsed: payload,
-                change_digest,
-            })?;
+            // Walked again rather than handed the walk above: recovery runs
+            // once after a crash, so sharing would save nothing that matters,
+            // and the one path that appends an event some other process
+            // prepared stays exactly as it was.
+            self.append(
+                &PreparedEntry {
+                    hash: pending.hash,
+                    payload: pending.payload,
+                    parsed: payload,
+                    change_digest,
+                    admission: None,
+                },
+                None,
+            )?;
             self.clear_pending()?;
             return Ok(());
         }
@@ -2212,26 +2295,49 @@ impl<'a> AuditLog<'a> {
     }
 
     /// Replay the whole journal from its first event, trusting nothing a cache
-    /// holds, and leave the walk in `journal` for the readers after it.
+    /// holds, and leave a copy of the walk in the attached cache for the
+    /// readers after it. A walk that fails leaves nothing cached.
     ///
     /// This is the walk a write makes before it extends the chain, so every
     /// walk [`Self::save_journal_cache`] saves descends from one.
-    fn walk_into(&self, journal: &JournalCache) -> Result<(AuditedRecordStates, ChainState)> {
+    fn walk_fresh(&self) -> Result<VerifiedJournal> {
         let walked = self
             .segment_paths()
             .and_then(|paths| self.walk_journal(&paths));
-        let mut verified = journal.lock();
-        match walked {
-            Ok(walked) => {
-                let result = ((*walked.states).clone(), walked.walk.state());
-                *verified = Some(walked);
-                Ok(result)
-            }
-            Err(error) => {
-                *verified = None;
-                Err(error)
-            }
+        if let Some(journal) = self.journal {
+            *journal.lock() = walked.as_ref().ok().cloned();
         }
+        walked
+    }
+
+    /// Bring the admission walk up to date with the journal on disk before
+    /// an event is appended to it.
+    ///
+    /// The audit lock has been held since the walk began, so no cooperating
+    /// writer has appended since; this is the check for everything else.
+    /// Every sealed segment must still be at its path with the identity,
+    /// length, and times it had when the walk read it, the newest segment must
+    /// still begin with exactly the bytes the walk verified, and anything
+    /// after them is verified by the rules the walk applies. That is what
+    /// [`JournalCache`] checks before trusting a walk, with the newest segment
+    /// compared byte for byte rather than by digest. Anything already
+    /// verified that has changed is judged by a walk from the first event
+    /// instead, and a failure leaves nothing cached.
+    fn recheck(&self, admission: Admission) -> Result<VerifiedJournal> {
+        let mut journal = admission.journal;
+        let checked = self.segment_paths().and_then(|paths| {
+            if self.extend_journal(&mut journal, &paths)? {
+                Ok(journal)
+            } else {
+                self.walk_journal(&paths)
+            }
+        });
+        if checked.is_err()
+            && let Some(journal) = self.journal
+        {
+            *journal.lock() = None;
+        }
+        checked
     }
 
     /// Verify every segment from the first, keeping what a later
@@ -2396,12 +2502,6 @@ impl<'a> AuditLog<'a> {
         Ok(states)
     }
 
-    /// Whether the latest audited state for this record is a deletion.
-    pub(crate) fn record_is_tombstoned(&self, collection: &str, id: &str) -> Result<bool> {
-        self.record_state(collection, id)
-            .map(|(state, _)| state == Some(None))
-    }
-
     /// Whether this principal participated in an event outside its own user
     /// lifecycle. The complete verified chain is examined; a page or recent
     /// history limit can never make an identity appear unused.
@@ -2443,8 +2543,9 @@ impl<'a> AuditLog<'a> {
     /// With a journal cache attached, the unchecked replay is also left in the
     /// cache for the readers that follow, but it never starts from the cache.
     fn states(&self, check_approvals: bool) -> Result<(AuditedRecordStates, ChainState)> {
-        if !check_approvals && let Some(journal) = self.journal {
-            return self.walk_into(journal);
+        if !check_approvals && self.journal.is_some() {
+            let walked = self.walk_fresh()?;
+            return Ok((Arc::unwrap_or_clone(walked.states), walked.walk.finish()));
         }
         let mut latest = AuditedRecordStates::new();
         let chain = self.verify_chain(|entry, payload| {
@@ -2483,13 +2584,48 @@ impl<'a> AuditLog<'a> {
         Ok(chain)
     }
 
-    fn append(&self, entry: &PreparedEntry) -> Result<()> {
-        // Recheck the complete journal immediately before publishing. Normal
-        // mutation preparation already refuses a reused identity, but append
-        // is also reached by pending recovery and must be safe on its own.
-        let (states, chain) = self.states(false)?;
-        let mut snapshot = ReconciliationSnapshot { states, chain };
+    /// Publish `entry` on a journal verified from its first event in this
+    /// process: `admission`, the walk it was prepared against, once
+    /// [`Self::recheck`] has found the journal on disk still to be what it
+    /// verified, or without one a walk made here.
+    ///
+    /// Either way, [`Self::append_in_snapshot`] then compares the head on disk
+    /// with the verified one, registers the event's idempotency identity, and
+    /// replays the event before a byte is written, so a reused identity or a
+    /// change set that does not apply is refused here even though preparation
+    /// refuses them too.
+    fn append(&self, entry: &PreparedEntry, admission: Option<Admission>) -> Result<()> {
+        let Some(admission) = admission else {
+            let (states, chain) = self.states(false)?;
+            let mut snapshot = ReconciliationSnapshot { states, chain };
+            self.append_in_snapshot(entry, &mut snapshot)?;
+            self.save_journal_cache();
+            return Ok(());
+        };
+        let journal = self.recheck(admission)?;
+        // Replaying one event reads and writes only its own record's state,
+        // so that state is all the check needs, rather than a copy of every
+        // record's.
+        let record = (
+            entry.parsed.record.collection.clone(),
+            entry.parsed.record.id.clone(),
+        );
+        let states = journal
+            .states
+            .get(&record)
+            .map(|state| (record, state.clone()))
+            .into_iter()
+            .collect();
+        let mut snapshot = ReconciliationSnapshot {
+            states,
+            chain: journal.walk.state(),
+        };
         self.append_in_snapshot(entry, &mut snapshot)?;
+        if let Some(cache) = self.journal {
+            // The cache holds a copy of this walk, or whatever another request
+            // left since. Either way, this is the walk to extend and save.
+            *cache.lock() = Some(journal);
+        }
         self.save_journal_cache();
         Ok(())
     }
@@ -2622,19 +2758,6 @@ impl<'a> AuditLog<'a> {
             }
         }
         Ok(walk.finish())
-    }
-
-    fn record_state(
-        &self,
-        collection: &str,
-        id: &str,
-    ) -> Result<(Option<Option<String>>, ChainState)> {
-        let (states, chain) = self.states(false)?;
-        let state = states
-            .get(&(collection.to_owned(), id.to_owned()))
-            .map(|state| state.hash.clone());
-        self.verify_legacy_representation_heads(&states)?;
-        Ok((state, chain))
     }
 
     /// Close a legacy exact-representation gap with the materialized record
@@ -3544,12 +3667,12 @@ mod tests {
         AuditAction, AuditChange, AuditEntry, AuditFilter, AuditIdempotency,
         AuditIdempotencyResult, AuditLog, AuditMutation, AuditPayload, AuditRecord, AuditSource,
         CACHE_IGNORE_PATH, CHANGE_SET_HASH_DOMAIN, CollectionsActivity, JOURNAL_CACHE_HASH_DOMAIN,
-        JOURNAL_CACHE_PATH, JournalVerification, PENDING_PATH, PendingMutation, PreparedEntry,
-        ReconciledMutation, VERIFY_CHAIN_CALLS, apply_changes, change_set_hash, diff_documents,
-        digest, event_hash, parse_line, record_hash, stored_line,
+        JOURNAL_CACHE_PATH, JournalCache, JournalVerification, PENDING_PATH, PendingMutation,
+        PreparedEntry, ReconciledMutation, VERIFY_CHAIN_CALLS, apply_changes, change_set_hash,
+        diff_documents, digest, event_hash, parse_line, record_hash, stored_line,
     };
     use crate::{
-        Assignment, Database,
+        Assignment, Database, Record,
         attribution::{
             AgentEvidence, Attribution, AuditAgent, AuditAuthorization, AuditIntent,
             AuditIntentPart, AuthorizationMode, IntentAuthor,
@@ -4560,6 +4683,274 @@ mod tests {
     }
 
     #[test]
+    fn a_single_record_write_walks_the_journal_once() {
+        let root = tempfile::tempdir().unwrap();
+        let (served, uncached) = cached_and_uncached(root.path(), 2);
+        create_items(&uncached, 0..3);
+
+        // As a library calls it, with no cache; as `cr serve` does, one cache
+        // for every request; and as the CLI does, a new process per command,
+        // with `--verify-audit` and without.
+        type Open<'a> = Box<dyn Fn() -> Database + 'a>;
+        let modes: [(&str, Open<'_>, bool); 4] = [
+            ("no cache", Box::new(|| uncached.clone()), false),
+            ("a server's cache", Box::new(|| served.clone()), false),
+            (
+                "full verification",
+                Box::new(|| process(root.path(), JournalVerification::Full)),
+                true,
+            ),
+            (
+                "a saved walk",
+                Box::new(|| process(root.path(), JournalVerification::Resume)),
+                true,
+            ),
+        ];
+        for (index, (mode, open, saves)) in modes.into_iter().enumerate() {
+            let id = format!("written-{index}");
+            let changed: Assignment = "value=changed".parse().unwrap();
+            type Write<'a> = Box<dyn Fn(&Database) -> anyhow::Result<Record> + 'a>;
+            let writes: [(&str, Write<'_>); 5] = [
+                (
+                    "create",
+                    Box::new(|database| database.create("items", &id, &[], "")),
+                ),
+                (
+                    "update",
+                    Box::new(|database| {
+                        database.update("items", &id, std::slice::from_ref(&changed), None)
+                    }),
+                ),
+                (
+                    "link",
+                    Box::new(|database| database.link("items", &id, "related", "items", "item-0")),
+                ),
+                (
+                    "unlink",
+                    Box::new(|database| {
+                        database.unlink("items", &id, "related", "items", "item-0")
+                    }),
+                ),
+                ("delete", Box::new(|database| database.delete("items", &id))),
+            ];
+            for (write, run) in writes {
+                let database = open();
+                let (written, count) = walks(|| run(&database));
+                written.unwrap();
+                assert_eq!(count, 1, "{mode}: {write}");
+
+                // And what it leaves for the next reader is the journal with
+                // its own event on the end, verified.
+                let expected = replayed(&uncached);
+                if saves {
+                    let reader = process(root.path(), JournalVerification::Resume);
+                    let (states, count) = walks(|| replayed(&reader));
+                    assert_eq!(count, 0, "{mode}: {write} saved no walk");
+                    assert_eq!(states, expected, "{mode}: {write}");
+                }
+                if mode == "a server's cache" {
+                    let (states, count) = walks(|| replayed(&served));
+                    assert_eq!(count, 0, "{mode}: {write} left no walk");
+                    assert_eq!(states, expected, "{mode}: {write}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn registering_a_user_checks_for_a_deleted_id_on_the_write_s_one_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::init(root.path())
+            .unwrap()
+            .with_actor("owner@example.com")
+            .unwrap();
+        // A new process per command, as the CLI runs them, each resuming the
+        // walk the command before it saved.
+        let owner = || {
+            database
+                .clone()
+                .with_journal_verification(JournalVerification::Resume)
+        };
+        owner()
+            .initialize_access(Some("Owner"), Some("owner@example.com"))
+            .unwrap();
+        let register = || {
+            owner().add_user(
+                "reader@example.com",
+                "Reader",
+                Some("reader@example.com"),
+                crate::UserKind::Human,
+            )
+        };
+
+        let (registered, count) = walks(register);
+        registered.unwrap();
+        assert_eq!(count, 1, "registering");
+        let (deleted, count) = walks(|| {
+            owner().delete_user("reader@example.com", crate::UserDeleteOptions::default())
+        });
+        deleted.unwrap();
+        assert_eq!(count, 1, "deleting");
+        let (refused, count) = walks(register);
+        let error = refused.expect_err("a deleted user's ID was reused");
+        assert!(format!("{error:#}").contains("deleted"), "{error:#}");
+        assert_eq!(count, 1, "refusing a deleted ID");
+    }
+
+    /// An event creating `items/{id}`, prepared on `audit`, with its bytes and
+    /// where they go.
+    fn prepare_item(audit: &AuditLog<'_>, id: &str) -> (PreparedEntry, String, PathBuf) {
+        let document = Document {
+            attributes: Mapping::new(),
+            body: format!("{id}\n"),
+        };
+        let rendered = document.render().unwrap();
+        let entry = audit
+            .prepare(AuditMutation {
+                action: AuditAction::Create,
+                collection: "items",
+                id,
+                before_document: None,
+                after_document: Some(&document),
+                before_bytes: None,
+                after_bytes: Some(rendered.as_bytes()),
+                source: AuditSource::Cli,
+                message: None,
+                access: None,
+                idempotency: None,
+            })
+            .unwrap();
+        (
+            entry,
+            rendered,
+            PathBuf::from(format!("records/items/{id}.md")),
+        )
+    }
+
+    fn commit_item(
+        audit: &AuditLog<'_>,
+        (entry, rendered, target): (PreparedEntry, String, PathBuf),
+    ) -> anyhow::Result<()> {
+        audit.commit(entry, &target, || {
+            paths::write_new(audit.root, &target, rendered.as_bytes(), "the record")
+        })
+    }
+
+    #[test]
+    fn an_event_is_not_appended_to_a_journal_changed_since_it_was_prepared() {
+        use std::io::Write;
+
+        let attribution = Attribution::default();
+        for cached in [false, true] {
+            for case in [
+                "nothing",
+                "a sealed segment",
+                "the newest segment",
+                "another writer",
+            ] {
+                let which = format!("{case}, cached: {cached}");
+                let root = tempfile::tempdir().unwrap();
+                let cache = JournalCache::persistent(JournalVerification::Resume);
+                let log = |actor: &'static str| {
+                    AuditLog::new(
+                        root.path(),
+                        Path::new("records"),
+                        2,
+                        1024 * 1024,
+                        actor,
+                        &attribution,
+                    )
+                };
+                let audit = log("tester").with_journal_cache(cached.then_some(&cache));
+                let _lock = audit.lock().unwrap();
+                // Segments 1, 3, and 5. Appending reads the newest two to find
+                // the head, and never reads the first.
+                for index in 0..5 {
+                    commit_item(&audit, prepare_item(&audit, &format!("item-{index}"))).unwrap();
+                }
+                let (prepared, count) = walks(|| prepare_item(&audit, "prepared"));
+                assert_eq!(count, 1, "{which}");
+                let _ = std::fs::remove_file(saved_walk(root.path()));
+
+                let segments = root.path().join(".cr/audit/segments");
+                let mut restore = None;
+                match case {
+                    "a sealed segment" | "the newest segment" => {
+                        let path = segments.join(if case == "a sealed segment" {
+                            "00000000000000000001.jsonl"
+                        } else {
+                            "00000000000000000005.jsonl"
+                        });
+                        let original = std::fs::read(&path).unwrap();
+                        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                        let forged = String::from_utf8(original.clone())
+                            .unwrap()
+                            .replacen("tester", "forger", 1);
+                        assert_eq!(forged.len(), original.len());
+                        // So that the change time moves on a coarse clock; see
+                        // `a_rewritten_segment_is_verified_again_from_the_first_event`.
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        let rewrite = move |contents: &[u8]| {
+                            let mut file =
+                                std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                            file.write_all(contents).unwrap();
+                            file.set_modified(modified).unwrap();
+                        };
+                        rewrite(forged.as_bytes());
+                        restore = Some(move || rewrite(&original));
+                    }
+                    // Something that does not take the lock, such as a copy of
+                    // `cr` that predates it or a hand-rolled script.
+                    "another writer" => {
+                        let other = log("other");
+                        commit_item(&other, prepare_item(&other, "interloper")).unwrap();
+                    }
+                    _ => {}
+                }
+
+                let (committed, count) = walks(|| commit_item(&audit, prepared));
+                let head = match case {
+                    "nothing" => {
+                        committed.unwrap();
+                        assert_eq!(count, 0, "{which}: appending walked the journal");
+                        assert_eq!(cached, saved_walk(root.path()).is_file(), "{which}");
+                        ("prepared", 6)
+                    }
+                    "another writer" => {
+                        let error = committed.expect_err(&which);
+                        assert!(
+                            format!("{error:#}").contains("does not extend the current chain head"),
+                            "{which}: {error:#}"
+                        );
+                        assert_eq!(count, 0, "{which}");
+                        ("interloper", 6)
+                    }
+                    _ => {
+                        let error = committed.expect_err(&which);
+                        assert!(
+                            format!("{error:#}").contains("audit event hash mismatch"),
+                            "{which}: {error:#}"
+                        );
+                        // Judged by a walk from the first event, which failed.
+                        assert_eq!(count, 1, "{which}");
+                        restore.take().unwrap()();
+                        ("item-4", 5)
+                    }
+                };
+                let newest = audit.recent(1, AuditFilter::all()).unwrap();
+                assert_eq!(
+                    (
+                        newest[0].payload.record.id.as_str(),
+                        newest[0].payload.sequence
+                    ),
+                    head,
+                    "{which}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bulk_save_preview_and_apply_share_one_verified_replay() {
         let root = tempfile::tempdir().unwrap();
         let database = Database::init(root.path().join("database"))
@@ -4793,12 +5184,19 @@ mod tests {
         forged.payload = serde_json::to_string(&forged.parsed).unwrap();
         forged.hash = event_hash(forged.payload.as_bytes());
         forged.change_digest = change_set_hash(&forged.payload).unwrap();
-        let error = audit.append(&forged).unwrap_err();
-        assert_eq!(
-            DomainError::of(&error).map(DomainError::code),
-            Some("audit_integrity_failed")
-        );
-        assert_eq!(audit.head().unwrap().sequence, 2);
+        // Both on the walk the event was prepared against, as `commit`
+        // appends, and on a fresh one, as pending recovery does.
+        let admission = forged.admission.take();
+        assert!(admission.is_some());
+        for (which, admission) in [("prepared", admission), ("recovered", None)] {
+            let error = audit.append(&forged, admission).unwrap_err();
+            assert_eq!(
+                DomainError::of(&error).map(DomainError::code),
+                Some("audit_integrity_failed"),
+                "{which}"
+            );
+            assert_eq!(audit.head().unwrap().sequence, 2, "{which}");
+        }
     }
 
     fn store_pending(audit: &AuditLog<'_>, entry: &PreparedEntry, target: PathBuf) {
