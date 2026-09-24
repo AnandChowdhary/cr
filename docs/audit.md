@@ -76,7 +76,12 @@ write the file, and `.cr/cache/` can be deleted at any time.
 
 Nothing that verifies the journal uses it: `audit verify`, `check`, and the
 walk every write makes before it appends start from the first event every time.
-To have any other command do the same, pass the global `--verify-audit`:
+A write makes that walk once, while it holds the audit lock. When it appends,
+it checks that the journal on disk is still what the walk verified, older
+segments by their file identity, size, and times and the newest byte for byte,
+rather than walking it again, and anything that no longer matches is walked
+again from the first event. To have any other command start from the first
+event too, pass the global `--verify-audit`:
 
 ```sh
 cr --verify-audit get deals acme-renewal

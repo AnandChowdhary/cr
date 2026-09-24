@@ -1507,7 +1507,9 @@ impl Database {
                 "user '{id}' exists but does not match the requested definition"
             )));
         }
-        if audit.record_is_tombstoned(USERS_COLLECTION, id)? {
+        // The one walk of the journal this write makes.
+        let admission = audit.admit()?;
+        if admission.is_tombstoned(USERS_COLLECTION, id) {
             if !options.reuse_deleted_id {
                 return Err(user_id_tombstoned(id));
             }
@@ -1519,19 +1521,22 @@ impl Database {
             body: String::new(),
         };
         let rendered = document.render()?;
-        let event = audit.prepare(AuditMutation {
-            action: AuditAction::Create,
-            collection: USERS_COLLECTION,
-            id,
-            before_document: None,
-            after_document: Some(&document),
-            before_bytes: None,
-            after_bytes: Some(rendered.as_bytes()),
-            source: self.source.clone(),
-            message: self.audit_message.as_deref(),
-            access: decision.as_ref(),
-            idempotency: None,
-        })?;
+        let event = audit.prepare_admitted(
+            AuditMutation {
+                action: AuditAction::Create,
+                collection: USERS_COLLECTION,
+                id,
+                before_document: None,
+                after_document: Some(&document),
+                before_bytes: None,
+                after_bytes: Some(rendered.as_bytes()),
+                source: self.source.clone(),
+                message: self.audit_message.as_deref(),
+                access: decision.as_ref(),
+                idempotency: None,
+            },
+            admission,
+        )?;
         audit.commit(event, &path, || {
             paths::write_new(&self.root, &path, rendered.as_bytes(), &label).map_err(|error| {
                 if is_already_exists(&error) {
@@ -2101,9 +2106,15 @@ impl Database {
         if paths::entry_kind(&self.root, &path, &label)?.is_some() {
             return Err(DomainError::record_exists(collection, id).into());
         }
-        let tombstoned =
-            collection == USERS_COLLECTION && audit.record_is_tombstoned(collection, id)?;
-        if tombstoned {
+        // Only a user's ID needs the journal this early, to refuse reusing a
+        // deleted one. The walk made here is the one the event is prepared
+        // against below, and any other create makes it there instead.
+        let mut admission = None;
+        if collection == USERS_COLLECTION
+            && admission
+                .insert(audit.admit()?)
+                .is_tombstoned(collection, id)
+        {
             if !reuse_deleted_user_id {
                 return Err(user_id_tombstoned(id));
             }
@@ -2137,19 +2148,26 @@ impl Database {
             record_hash(rendered.as_bytes()),
         );
         let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
-        let event = audit.prepare(AuditMutation {
-            action: AuditAction::Create,
-            collection,
-            id,
-            before_document: None,
-            after_document: Some(&stored),
-            before_bytes: None,
-            after_bytes: Some(rendered.as_bytes()),
-            source: self.source.clone(),
-            message: self.audit_message.as_deref(),
-            access: decision.as_ref(),
-            idempotency: idempotency.as_ref(),
-        })?;
+        let admission = match admission {
+            Some(admission) => admission,
+            None => audit.admit()?,
+        };
+        let event = audit.prepare_admitted(
+            AuditMutation {
+                action: AuditAction::Create,
+                collection,
+                id,
+                before_document: None,
+                after_document: Some(&stored),
+                before_bytes: None,
+                after_bytes: Some(rendered.as_bytes()),
+                source: self.source.clone(),
+                message: self.audit_message.as_deref(),
+                access: decision.as_ref(),
+                idempotency: idempotency.as_ref(),
+            },
+            admission,
+        )?;
         if mode == MutationMode::Preview {
             return Ok(MutationOutcome::Previewed(
                 self.reveal_preview(event.into_preview())?,
@@ -3486,7 +3504,16 @@ impl Database {
             precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
         }
         let before_stored = parse_record(collection, id, &before_raw)?;
-        let before = self.reveal_document(collection, id, &before_stored)?;
+        // The one walk of the journal this write makes. What it reads of the
+        // audited state from here on, and the event it prepares, all come
+        // from it.
+        let admission = audit.admit()?;
+        let before = self.reveal_document_with_audited_states(
+            collection,
+            id,
+            &before_stored,
+            Some(admission.states()),
+        )?;
         let mut document = before.clone();
         mutate(&mut document)?;
         if self.record_access_policy(collection)?.is_some() {
@@ -3527,19 +3554,22 @@ impl Database {
             record_hash(rendered.as_bytes()),
         );
         let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
-        let event = audit.prepare(AuditMutation {
-            action: AuditAction::Update,
-            collection,
-            id,
-            before_document: Some(&before_stored),
-            after_document: Some(&after_stored),
-            before_bytes: Some(before_raw.as_bytes()),
-            after_bytes: Some(rendered.as_bytes()),
-            source: self.source.clone(),
-            message: self.audit_message.as_deref(),
-            access: decision.as_ref(),
-            idempotency: idempotency.as_ref(),
-        })?;
+        let event = audit.prepare_admitted(
+            AuditMutation {
+                action: AuditAction::Update,
+                collection,
+                id,
+                before_document: Some(&before_stored),
+                after_document: Some(&after_stored),
+                before_bytes: Some(before_raw.as_bytes()),
+                after_bytes: Some(rendered.as_bytes()),
+                source: self.source.clone(),
+                message: self.audit_message.as_deref(),
+                access: decision.as_ref(),
+                idempotency: idempotency.as_ref(),
+            },
+            admission,
+        )?;
         if mode == MutationMode::Preview {
             return Ok(MutationOutcome::Previewed(
                 self.reveal_preview(event.into_preview())?,
@@ -3682,6 +3712,10 @@ impl Database {
         if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
             return Ok(MutationOutcome::Applied(record));
         }
+        // The one walk of the journal this write makes, taken where it first
+        // needs audited state. The target's check, the source's, and the
+        // event all come from it.
+        let mut admission = None;
         if change == RelationChange::Add {
             let target_path = self.record_path(target_collection, target_id)?;
             let target_raw = self
@@ -3695,8 +3729,20 @@ impl Database {
                         error
                     }
                 })?;
-            self.parse_logical_record(target_collection, target_id, &target_raw)?;
-            audit.assert_current(target_collection, target_id, target_raw.as_bytes())?;
+            let states = admission.insert(audit.admit()?).states();
+            let target = parse_record(target_collection, target_id, &target_raw)?;
+            self.reveal_document_with_audited_states(
+                target_collection,
+                target_id,
+                &target,
+                Some(states),
+            )?;
+            AuditLog::assert_current_in(
+                states,
+                target_collection,
+                target_id,
+                target_raw.as_bytes(),
+            )?;
         }
 
         let path = self.record_path(collection, id)?;
@@ -3706,7 +3752,16 @@ impl Database {
             precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
         }
         let before_stored = parse_record(collection, id, &before_raw)?;
-        let before = self.reveal_document(collection, id, &before_stored)?;
+        let admission = match admission {
+            Some(admission) => admission,
+            None => audit.admit()?,
+        };
+        let before = self.reveal_document_with_audited_states(
+            collection,
+            id,
+            &before_stored,
+            Some(admission.states()),
+        )?;
         let mut document = before.clone();
         match change {
             RelationChange::Add => {
@@ -3737,19 +3792,22 @@ impl Database {
             record_hash(rendered.as_bytes()),
         );
         let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
-        let event = audit.prepare(AuditMutation {
-            action: AuditAction::Link,
-            collection,
-            id,
-            before_document: Some(&before_stored),
-            after_document: Some(&after_stored),
-            before_bytes: Some(before_raw.as_bytes()),
-            after_bytes: Some(rendered.as_bytes()),
-            source: self.source.clone(),
-            message: self.audit_message.as_deref(),
-            access: decision.as_ref(),
-            idempotency: idempotency.as_ref(),
-        })?;
+        let event = audit.prepare_admitted(
+            AuditMutation {
+                action: AuditAction::Link,
+                collection,
+                id,
+                before_document: Some(&before_stored),
+                after_document: Some(&after_stored),
+                before_bytes: Some(before_raw.as_bytes()),
+                after_bytes: Some(rendered.as_bytes()),
+                source: self.source.clone(),
+                message: self.audit_message.as_deref(),
+                access: decision.as_ref(),
+                idempotency: idempotency.as_ref(),
+            },
+            admission,
+        )?;
         if mode == MutationMode::Preview {
             return Ok(MutationOutcome::Previewed(
                 self.reveal_preview(event.into_preview())?,
@@ -3972,9 +4030,18 @@ impl Database {
             precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
         }
         let stored_document = parse_record(collection, id, &before_raw)?;
-        let document = self.reveal_document(collection, id, &stored_document)?;
+        // The one walk of the journal this write makes. What it reads of the
+        // audited state from here on, and the event it prepares, all come
+        // from it.
+        let admission = audit.admit()?;
+        let document = self.reveal_document_with_audited_states(
+            collection,
+            id,
+            &stored_document,
+            Some(admission.states()),
+        )?;
         if collection == USERS_COLLECTION {
-            audit.assert_current(collection, id, before_raw.as_bytes())?;
+            AuditLog::assert_current_in(admission.states(), collection, id, before_raw.as_bytes())?;
             let user = User::from_attributes(&document.attributes)?;
             if user.status == UserStatus::Active
                 && user.is_database_owner()
@@ -3996,19 +4063,22 @@ impl Database {
             record_hash(before_raw.as_bytes()),
         );
         let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &before_raw)?;
-        let event = audit.prepare(AuditMutation {
-            action: AuditAction::Delete,
-            collection,
-            id,
-            before_document: Some(&stored_document),
-            after_document: None,
-            before_bytes: Some(before_raw.as_bytes()),
-            after_bytes: None,
-            source: self.source.clone(),
-            message: self.audit_message.as_deref(),
-            access: decision.as_ref(),
-            idempotency: idempotency.as_ref(),
-        })?;
+        let event = audit.prepare_admitted(
+            AuditMutation {
+                action: AuditAction::Delete,
+                collection,
+                id,
+                before_document: Some(&stored_document),
+                after_document: None,
+                before_bytes: Some(before_raw.as_bytes()),
+                after_bytes: None,
+                source: self.source.clone(),
+                message: self.audit_message.as_deref(),
+                access: decision.as_ref(),
+                idempotency: idempotency.as_ref(),
+            },
+            admission,
+        )?;
         if mode == MutationMode::Preview {
             return Ok(MutationOutcome::Previewed(
                 self.reveal_preview(event.into_preview())?,
