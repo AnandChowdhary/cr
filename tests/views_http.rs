@@ -1662,8 +1662,17 @@ async fn the_records_table_scrolls_in_its_own_box_with_its_heading_and_edges_pin
     // Both hints start hidden. A table that fits has an inactive timeline,
     // and an animation on one has no effect, so without this they showed on
     // every table that did not scroll.
-    for hint in ["animation: cr-table-more", "animation: cr-table-scrolled"] {
-        let rule = page.text().split(hint).next().unwrap();
+    for hint in ["animation: cr-more-ahead", "animation: cr-more-behind"] {
+        // The table's rule, not the sidebar's, which shares the keyframes.
+        let (at, _) = page
+            .text()
+            .match_indices(hint)
+            .find(|(at, _)| {
+                let rest = &page.text()[*at..];
+                rest[..rest.find('}').unwrap()].contains("--cr-table-x")
+            })
+            .unwrap_or_else(|| panic!("no table rule animates `{hint}`"));
+        let rule = &page.text()[..at];
         let rule = &rule[rule.rfind('{').unwrap()..];
         assert!(rule.contains("opacity: 0;"), "`{hint}` starts visible");
     }
@@ -1672,6 +1681,47 @@ async fn the_records_table_scrolls_in_its_own_box_with_its_heading_and_edges_pin
     let empty = request(&app, Method::GET, "/tasks?q=nothing-matches", None, &[]).await;
     assert!(empty.text().contains("No records match this view."));
     assert!(empty.text().contains(r#"<td colspan=""#));
+}
+
+#[tokio::test]
+async fn the_sidebar_list_scrolls_under_a_pinned_footer_with_faded_edges() {
+    let (_temporary, database) = test_database("views-sidebar-fades");
+    database
+        .create(
+            "tasks",
+            "alpha",
+            &[Assignment::from_str("status=done").unwrap()],
+            "",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    let sheet = page.text();
+    let rule = |selector: &str| {
+        let start = sheet
+            .find(&format!("{selector} {{"))
+            .unwrap_or_else(|| panic!("no rule for `{selector}`"));
+        &sheet[start..start + sheet[start..].find('}').unwrap()]
+    };
+    // The list scrolls on its own, and the footer below it does not.
+    assert!(rule(".cr-sidebar-nav").contains("overflow-y: auto;"));
+    assert!(rule(".cr-sidebar-nav").contains("scroll-timeline: --cr-sidebar-y block;"));
+    assert!(rule(".cr-sidebar-utility").contains("flex: 0 0 auto;"));
+    // Both fades are pinned to the list's edges, start hidden, and are shown
+    // by where the list is scrolled to.
+    let shared = rule("  .cr-sidebar-nav::before,\n  .cr-sidebar-nav::after");
+    assert!(shared.contains("position: sticky;") && shared.contains("opacity: 0;"));
+    assert!(rule("  .cr-sidebar-nav::before").contains(
+        "animation: cr-more-behind linear both;\n    animation-timeline: --cr-sidebar-y;"
+    ));
+    // The last rule for `::after`: the first is the one it shares with `::before`.
+    let after = &sheet[sheet.rfind("  .cr-sidebar-nav::after {").unwrap()..];
+    let after = &after[..after.find('}').unwrap()];
+    assert!(after.contains(
+        "animation: cr-more-ahead linear both;\n    animation-timeline: --cr-sidebar-y;"
+    ));
 }
 
 #[tokio::test]
