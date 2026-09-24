@@ -7436,7 +7436,10 @@ fn view_results(
             }
             div class="cr-table-shell" {
                 div class="cr-table-scroll" {
-                    table class="min-w-full text-left text-sm" data-date-groups=[date_groups(query)] {
+                    // Every row opens its record: the first cell's link is
+                    // its one link, and `cr.js` follows it from a click
+                    // anywhere else on the row.
+                    table class="min-w-full text-left text-sm" data-date-groups=[date_groups(query)] data-row-links="true" {
                         thead {
                             tr {
                                 // One loop over the three kinds of sortable
@@ -7480,7 +7483,7 @@ fn view_results(
                                         @for column in &shown_columns {
                                             @let value = display_field(record, column, schema);
                                             td class="px-4 py-3 text-gray-700" {
-                                                a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) title=[cell_title(&value)] class="block max-w-xs truncate hover:text-indigo-700 hover:underline" { (render_field_value(record, column, schema, &value)) }
+                                                span title=[cell_title(&value)] class="block max-w-xs truncate" { (render_field_value(record, column, schema, &value)) }
                                             }
                                         }
                                         td class="whitespace-nowrap px-4 py-3 text-right" {
@@ -10378,6 +10381,8 @@ html {
 .cr-table-shell th { padding: 8px 12px !important; color: var(--cr-gray-600) !important; font-size: 0.72rem; font-weight: 620 !important; }
 .cr-table-shell td { padding: 8px 12px !important; font-size: 0.79rem; }
 .cr-table-shell tbody tr:hover { background: var(--cr-gray-50); }
+/* Set by cr.js once a click anywhere on a row opens its record. */
+.cr-rows-open tbody tr:has(td a[href]) { cursor: pointer; }
 
 /* A records table scrolls inside its own box rather than with the page, in
    both directions. That is what lets the heading row stay put: the box has to
