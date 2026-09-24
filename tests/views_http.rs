@@ -1651,6 +1651,14 @@ async fn the_records_table_scrolls_in_its_own_box_with_its_heading_and_edges_pin
     ] {
         assert!(page.text().contains(rule), "missing `{rule}`");
     }
+    // Both hints start hidden. A table that fits has an inactive timeline,
+    // and an animation on one has no effect, so without this they showed on
+    // every table that did not scroll.
+    for hint in ["animation: cr-table-more", "animation: cr-table-scrolled"] {
+        let rule = page.text().split(hint).next().unwrap();
+        let rule = &rule[rule.rfind('{').unwrap()..];
+        assert!(rule.contains("opacity: 0;"), "`{hint}` starts visible");
+    }
 
     // The empty state spans every column and is not pinned to either edge.
     let empty = request(&app, Method::GET, "/tasks?q=nothing-matches", None, &[]).await;

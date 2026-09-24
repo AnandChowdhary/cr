@@ -9874,7 +9874,8 @@ html {
    whether there is more table beyond them: a fade before the open action
    while columns are hidden to the right, which clears once the reader reaches
    the last one, and a darker edge after the ID once columns have scrolled
-   under it. A table that fits has no scroll range, so neither ever appears.
+   under it. A table that fits has no scroll range, so its timeline is
+   inactive and both keep the opacity they are given here, which is none.
    Browsers without scroll-driven animations get the pinned edges alone. */
 @supports (animation-timeline: scroll()) {
   .cr-table-scroll thead th:last-child::before,
@@ -9886,6 +9887,9 @@ html {
     width: 2rem;
     background: linear-gradient(to right, transparent, var(--cr-row-bg, var(--cr-gray-50)));
     content: "";
+    /* Hidden unless the scroll position says otherwise: a table that fits has
+       an inactive timeline, and an animation on one has no effect at all. */
+    opacity: 0;
     pointer-events: none;
     animation: cr-table-more linear both;
     animation-timeline: --cr-table-x;
@@ -9900,6 +9904,7 @@ html {
       width: 0.75rem;
       box-shadow: inset 8px 0 8px -8px rgb(0 0 0 / 0.18);
       content: "";
+      opacity: 0;
       pointer-events: none;
       animation: cr-table-scrolled linear both;
       animation-timeline: --cr-table-x;
