@@ -7388,23 +7388,10 @@ fn can_create_in_collection(database: &Database, collection: &str) -> Result<boo
 
 fn schema_form_fields(schema: &JsonValue, attributes: &Mapping) -> Option<Vec<SchemaFormField>> {
     let properties = schema.get("properties")?.as_object()?;
-    let required = schema
-        .get("required")
-        .and_then(JsonValue::as_array)
+    let required = schema_required_fields(schema)
         .into_iter()
-        .flatten()
-        .filter_map(JsonValue::as_str)
         .collect::<BTreeSet<_>>();
-    let configured_order = schema
-        .get("x-cr-ui")
-        .and_then(|ui| ui.get("order"))
-        .and_then(JsonValue::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(JsonValue::as_str)
-        .enumerate()
-        .map(|(index, key)| (key.to_owned(), index))
-        .collect::<BTreeMap<_, _>>();
+    let configured_order = schema_ui_order(schema);
     let mut fields = properties
         .iter()
         .map(|(key, definition)| SchemaFormField {
@@ -10601,6 +10588,20 @@ fn page_layout(
     }
 }
 
+/// Every column a view can show: its own, then every other field the schema
+/// declares or a record has.
+///
+/// The others are ordered the way the people who wrote them ordered them,
+/// rather than alphabetically, which put `asked_by` and `attempts` in front of
+/// `title` and `status` and let the default twelve columns miss the fields a
+/// reader came for. First the schema's `x-cr-ui.order`, the order the record
+/// form already follows; then its `required` fields, in the order it lists
+/// them; then the rest by where they sit in the front matter of the records
+/// that have them. A position is averaged over those records, so one file
+/// written in an unusual order cannot move a column on its own, and the
+/// ordering does not depend on which records sort first. A field only the
+/// schema knows, which no record has yet, comes last, and the name settles
+/// any tie.
 fn view_available_columns(
     view: &ViewDefinition,
     records: &[Record],
@@ -10628,20 +10629,80 @@ fn view_available_columns(
                 .cloned(),
         );
     }
+    // The sum of a field's positions and the number of records it is in.
+    let mut positions = BTreeMap::<String, (usize, usize)>::new();
     for record in records {
-        additional.extend(record.attributes.keys().filter_map(|key| match key {
-            YamlValue::String(key) if !record_owned || key != RECORD_ACCESS_FIELD => {
-                Some(key.clone())
-            }
-            _ => None,
-        }));
+        for (position, key) in record
+            .attributes
+            .keys()
+            .filter_map(|key| match key {
+                YamlValue::String(key) if !record_owned || key != RECORD_ACCESS_FIELD => Some(key),
+                _ => None,
+            })
+            .enumerate()
+        {
+            let (sum, count) = positions.entry(key.clone()).or_default();
+            *sum += position;
+            *count += 1;
+            additional.insert(key.clone());
+        }
     }
-    columns.extend(
-        additional
-            .into_iter()
-            .filter(|column| known.insert(column.clone())),
-    );
+    let configured = schema.map(schema_ui_order).unwrap_or_default();
+    let required = schema.map(schema_required_fields).unwrap_or_default();
+    let rank = |key: &str| {
+        (
+            configured.get(key).copied().unwrap_or(usize::MAX),
+            required
+                .iter()
+                .position(|field| *field == key)
+                .unwrap_or(usize::MAX),
+        )
+    };
+    let mut additional = additional
+        .into_iter()
+        .filter(|column| known.insert(column.clone()))
+        .collect::<Vec<_>>();
+    additional.sort_by(|left, right| {
+        rank(left).cmp(&rank(right)).then_with(|| {
+            match (positions.get(left), positions.get(right)) {
+                // The two averages compared without dividing either.
+                (Some((left_sum, left_count)), Some((right_sum, right_count))) => {
+                    (left_sum * right_count).cmp(&(right_sum * left_count))
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+            .then_with(|| left.cmp(right))
+        })
+    });
+    columns.extend(additional);
     columns
+}
+
+/// Each field `x-cr-ui.order` names, with its place in that list.
+fn schema_ui_order(schema: &JsonValue) -> BTreeMap<String, usize> {
+    schema
+        .get("x-cr-ui")
+        .and_then(|ui| ui.get("order"))
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .enumerate()
+        .map(|(index, key)| (key.to_owned(), index))
+        .collect()
+}
+
+/// The schema's `required` fields, in the order it lists them.
+fn schema_required_fields(schema: &JsonValue) -> Vec<&str> {
+    schema
+        .get("required")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .collect()
 }
 
 fn selected_view_columns(

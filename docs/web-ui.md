@@ -106,7 +106,12 @@ definition's own `sort_by` still wins, and any column heading or the sorting
 panel overrides both for the current URL.
 
 The table infers other columns from the collection schema and current front
-matter. Its dense header keeps search and its submit action immediately
+matter. A saved view's own columns come first. The rest follow the schema's
+`x-cr-ui.order`, the order the record form uses, then its `required` fields in
+the order it lists them, then every other field by where it sits in the front
+matter of the records that have it, averaged over those records so one file
+written in an unusual order does not move a column. Fields only the schema
+declares come last, and the name breaks ties. Its dense header keeps search and its submit action immediately
 available.
 **Filter** opens the complete schema-aware condition, column, and sorting panel
 only when needed, and shows the number of active ad hoc conditions. Rows use the

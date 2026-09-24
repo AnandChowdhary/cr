@@ -1781,6 +1781,88 @@ async fn the_pager_shows_the_page_number_and_offers_other_page_sizes() {
 }
 
 #[tokio::test]
+async fn automatic_columns_follow_the_schema_then_the_order_records_are_written_in() {
+    let (_temporary, database) = test_database("views-column-order");
+    fs::create_dir_all(database.root().join(".cr/schemas")).unwrap();
+    fs::write(
+        database.root().join(".cr/schemas/tasks.json"),
+        r#"{
+          "type": "object",
+          "x-cr-ui": { "order": ["title"] },
+          "required": ["title", "status"],
+          "properties": {
+            "asked_by": { "type": "string" },
+            "attempts": { "type": "integer" },
+            "status": { "enum": ["queued", "done"] },
+            "title": { "type": "string" },
+            "zeta": { "type": "string" }
+          }
+        }"#,
+    )
+    .unwrap();
+    // Written the way an agent writes them: the schema's fields in their own
+    // order, then undeclared ones.
+    for id in ["one", "two", "three", "four", "five"] {
+        database
+            .create(
+                "tasks",
+                id,
+                &[
+                    Assignment::from_str("status=queued").unwrap(),
+                    Assignment::from_str("title=Rate an applicant").unwrap(),
+                    Assignment::from_str("prompt=Rate them").unwrap(),
+                    Assignment::from_str("attempts=0").unwrap(),
+                    Assignment::from_str("asked_by=anand").unwrap(),
+                ],
+                "",
+            )
+            .unwrap();
+    }
+    // One file written in another order does not move a column by itself.
+    fs::write(
+        database.root().join("records/tasks/odd.md"),
+        "---\nasked_by: anand\ntitle: Odd\nstatus: done\nattempts: 1\nprompt: Rate\n---\n",
+    )
+    .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    let at = |label: &str| {
+        page.text()
+            .find(&format!("aria-label=\"Sort by {label} ascending\""))
+            .unwrap_or_else(|| panic!("no {label} column"))
+    };
+    // `x-cr-ui.order`, then `required` in its own order, then where the
+    // records put the rest, then what only the schema declares.
+    let order = ["Title", "Status", "Prompt", "Attempts", "Asked By", "Zeta"];
+    for pair in order.windows(2) {
+        assert!(at(pair[0]) < at(pair[1]), "{} before {}", pair[0], pair[1]);
+    }
+
+    // Without a schema the records' own order is the whole answer.
+    for id in ["alpha", "beta"] {
+        database
+            .create(
+                "notes",
+                id,
+                &[
+                    Assignment::from_str("name=Note").unwrap(),
+                    Assignment::from_str("stage=draft").unwrap(),
+                    Assignment::from_str("author=anand").unwrap(),
+                ],
+                "",
+            )
+            .unwrap();
+    }
+    let notes = request(&app, Method::GET, "/notes", None, &[]).await;
+    let name = notes.text().find("Sort by Name ascending").unwrap();
+    let stage = notes.text().find("Sort by Stage ascending").unwrap();
+    let author = notes.text().find("Sort by Author ascending").unwrap();
+    assert!(name < stage && stage < author);
+}
+
+#[tokio::test]
 async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     let (_temporary, database) = test_database("views-index");
     for (id, status) in [("alpha", "open"), ("beta", "open"), ("gamma", "won")] {
