@@ -1650,6 +1650,43 @@ async fn the_records_table_scrolls_in_its_own_box_with_its_heading_and_edges_pin
 }
 
 #[tokio::test]
+async fn table_rows_keep_to_one_line_and_long_values_show_in_full_on_hover() {
+    let (_temporary, database) = test_database("views-one-line");
+    let prompt = "Rate the inbound applicant against the rubric and draft a note.";
+    database
+        .create(
+            "tasks",
+            "alpha",
+            &[
+                Assignment::from_str("asked_by=anand-chowdhary").unwrap(),
+                Assignment::from_str(&format!("prompt={prompt:?}")).unwrap(),
+                Assignment::from_str("claim.pid=0").unwrap(),
+                Assignment::from_str("claim.owner=worker-with-a-rather-long-name-v1").unwrap(),
+            ],
+            "",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    let cell = r#"class="block max-w-xs truncate hover:text-indigo-700 hover:underline""#;
+    // A short value is one line with nothing to reveal.
+    assert!(page.text().contains(&format!(
+        r#"<a href="/tasks/records/alpha" {cell}>anand-chowdhary</a>"#
+    )));
+    // A long one may be cut at the cell's width, so hovering shows all of it.
+    assert!(page.text().contains(&format!(
+        r#"<a href="/tasks/records/alpha" title="{prompt}" {cell}>{prompt}</a>"#
+    )));
+    // A nested value runs together in the cell and keeps its lines on hover.
+    assert!(page.text().contains(&format!(
+        "<a href=\"/tasks/records/alpha\" title=\"pid: 0\nowner: worker-with-a-rather-long-name-v1\" {cell}>"
+    )));
+    assert!(!page.text().contains("line-clamp-2"));
+}
+
+#[tokio::test]
 async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     let (_temporary, database) = test_database("views-index");
     for (id, status) in [("alpha", "open"), ("beta", "open"), ("gamma", "won")] {

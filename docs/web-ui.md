@@ -115,7 +115,9 @@ small open action visible without a separate oversized action column. A long
 record ID, such as a slug followed by a hash, is capped at a fixed width so it
 cannot push the other columns off screen: its start and its last ten characters
 stay visible with an ellipsis between them, and hovering shows the whole ID.
-The table scrolls inside its own box, sized to the window, so the heading row
+Every row is one line: a value too long for its column, which is at most 20rem
+wide, ends in an ellipsis, and hovering a value of 40 characters or more shows
+all of it, with a nested value on its own lines. The table scrolls inside its own box, sized to the window, so the heading row
 stays in view as rows scroll past and the horizontal scrollbar stays on screen.
 The open action stays at the right edge, and on screens at least 900 pixels
 wide the record ID stays at the left edge, so a row scrolled sideways still

@@ -6880,6 +6880,25 @@ fn render_record_id_link(href: &str, id: &str) -> Markup {
     }
 }
 
+/// Values at least this long may not fit a table cell, so they carry their
+/// full text as a tooltip.
+const CELL_TITLE_MIN_CHARS: usize = 40;
+
+/// The tooltip for a table cell showing `value`, if it needs one.
+///
+/// A row is one line. A cell used to wrap to a second line and clamp there, so
+/// a name with a hyphen in it broke at the hyphen and a table of short values
+/// was twice as tall as it needed to be. Now a value keeps to one line and a
+/// long one ends in an ellipsis at the cell's width, which leaves the whole of
+/// it for hovering. Whether a value is cut depends on the font and the
+/// characters in it, which the server cannot measure, so the tooltip goes on
+/// every value long enough that it might be; a short one never is, and a
+/// tooltip repeating the visible text is noise. It also shows a nested value
+/// on its own lines, where the cell has run them together.
+fn cell_title(value: &str) -> Option<&str> {
+    (value.chars().count() >= CELL_TITLE_MIN_CHARS).then_some(value)
+}
+
 /// The region of a view page that a page turn, a re-sort, a filter or a search
 /// replaces, and the only part of the page any of them change.
 ///
@@ -6953,8 +6972,9 @@ fn view_results(
                                             (render_timestamp(record_activity.map(|activity| activity.updated_at.as_str())))
                                         }
                                         @for column in columns {
-                                            td class="max-w-sm px-4 py-3 text-gray-700" {
-                                                a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="line-clamp-2 hover:text-indigo-700 hover:underline" { (display_field(record, column, schema)) }
+                                            @let value = display_field(record, column, schema);
+                                            td class="px-4 py-3 text-gray-700" {
+                                                a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) title=[cell_title(&value)] class="block max-w-xs truncate hover:text-indigo-700 hover:underline" { (value) }
                                             }
                                         }
                                         td class="whitespace-nowrap px-4 py-3 text-right" {
