@@ -409,11 +409,12 @@ document.addEventListener('htmx:beforeSwap', (event) => {
 // request htmx makes — a boosted link or form, a targeted swap, the navigation
 // that follows a save — and cancels it when prevented. The form's own
 // submission is let through, because it is how the changes get saved; so is
-// anything once the reader has chosen to discard them.
+// anything once the reader has chosen to discard them. A link inside the form,
+// such as Cancel or "Edit as YAML", is a navigation like any other and asks.
 document.addEventListener('htmx:confirm', (event) => {
   if (!hasUnsavedChanges()) return;
-  const form = event.detail.elt?.closest?.('form');
-  if (form && unsavedForms.has(form)) return;
+  const source = event.detail.elt;
+  if (source instanceof HTMLFormElement && unsavedForms.has(source)) return;
   if (window.confirm('You have unsaved changes. Leave without saving them?')) {
     unsavedForms.clear();
   } else {

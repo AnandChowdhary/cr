@@ -1096,21 +1096,26 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
     assert!(
         edit_page
             .text()
-            .contains("<h2 class=\"text-base font-bold text-gray-900\">Activity</h2>")
+            .contains("<h2 id=\"activity-heading\" class=\"cr-aside-heading\">Activity</h2>")
     );
     assert_eq!(edit_page.status, StatusCode::OK);
-    assert!(edit_page.text().contains("Schema-powered"));
-    assert!(edit_page.text().contains("name=\"attribute.status\""));
     assert!(
         edit_page
             .text()
-            .contains("value=\"open\" selected>Open</option>")
+            .contains("name=\"_form_mode\" value=\"structured\"")
+    );
+    assert!(edit_page.text().contains("name=\"attribute.status\""));
+    // Two options are a row of buttons rather than a dropdown.
+    assert!(
+        edit_page
+            .text()
+            .contains("type=\"radio\" name=\"attribute.status\" value=\"open\" checked")
     );
     assert!(edit_page.text().contains("name=\"attribute.value\""));
     assert!(edit_page.text().contains("value=\"12500\""));
     assert!(edit_page.text().contains("All activity"));
     assert!(edit_page.text().contains("sales@example.com"));
-    assert!(edit_page.text().contains("create"));
+    assert!(edit_page.text().contains("Created"));
     assert!(
         edit_page
             .text()
@@ -1186,6 +1191,9 @@ async fn html_forms_create_update_and_delete_through_validated_audited_database_
     assert!(!filtered.text().contains("acme"));
 
     let delete_page = request(&app, Method::GET, "/open-deals/records/acme", None, &[]).await;
+    assert!(delete_page.text().contains(
+        "href=\"/open-deals/records/acme/delete\" class=\"cr-button cr-button-danger\">Delete record…</a>"
+    ));
     let delete_token = csrf(delete_page.text()).to_owned();
     let delete_version = expected_record_hash(delete_page.text()).to_owned();
     let deleted = request(
@@ -1228,7 +1236,8 @@ async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
     },
     "email": { "type": "string", "format": "email", "description": "Primary email address" },
     "stage": { "enum": ["applied", "interview", "offer"] },
-    "budget": { "type": "number", "minimum": 0, "maximum": 1000000 },
+    "seniority": { "enum": ["junior", "mid", "senior", "staff"] },
+    "budget": { "type": "number", "minimum": 0, "maximum": 1000000, "x-cr-unit": "USD" },
     "active": { "type": "boolean" },
     "tags": { "type": "array", "items": { "enum": ["rust", "remote", "referred"] } },
     "profile": { "type": "object" }
@@ -1241,7 +1250,6 @@ async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
 
     let new_page = request(&app, Method::GET, "/candidates/new", None, &[]).await;
     assert_eq!(new_page.status, StatusCode::OK);
-    assert!(new_page.text().contains("Schema-powered"));
     assert!(
         new_page
             .text()
@@ -1264,20 +1272,38 @@ async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
             .text()
             .contains("type=\"number\" step=\"any\" name=\"attribute.budget\"")
     );
+    // Three options are a row of buttons; more than three are a dropdown.
     assert!(
         new_page
             .text()
-            .contains("select id=\"field-stage\" name=\"attribute.stage\"")
+            .contains("type=\"radio\" name=\"attribute.stage\" value=\"applied\" required")
     );
-    assert!(new_page.text().contains("Single select"));
-    assert!(new_page.text().contains("Multi-select"));
+    assert!(
+        new_page
+            .text()
+            .contains("select id=\"field-seniority\" name=\"attribute.seniority\"")
+    );
+    // A number's unit sits at the edge of its box.
+    assert!(
+        new_page
+            .text()
+            .contains("<span class=\"cr-input-unit\" aria-hidden=\"true\">USD</span>")
+    );
     assert!(
         new_page
             .text()
             .contains("type=\"checkbox\" name=\"attribute.tags\"")
     );
-    assert!(new_page.text().contains("Structured YAML"));
-    assert!(new_page.text().contains("+ Additional attributes"));
+    // A value with no control of its own is typed YAML, and says so.
+    assert!(
+        new_page
+            .text()
+            .contains("<span class=\"cr-field-hint\">YAML</span>")
+    );
+    // A new record has no "Edit as YAML" switch, so front matter the schema
+    // does not declare has its own box.
+    assert!(new_page.text().contains("name=\"_additional_attributes\""));
+    assert!(new_page.text().contains("Other fields"));
     assert!(
         new_page.text().find("Candidate &lt;name&gt;").unwrap()
             < new_page.text().find("Primary email address").unwrap()
@@ -1330,7 +1356,7 @@ async fn schema_driven_forms_render_typed_controls_and_preserve_typed_values() {
     assert!(
         edit_page
             .text()
-            .contains("value=\"interview\" selected>Interview</option>")
+            .contains("name=\"attribute.stage\" value=\"interview\" checked")
     );
     assert!(
         edit_page

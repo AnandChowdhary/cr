@@ -246,14 +246,18 @@ weaken the host, reverse-proxy, or bearer-token boundary.
 
 When a collection has a JSON Schema, create and edit pages generate one control per declared top-level attribute:
 
-- string formats become text, email, URL, date, time, or date-time inputs;
-- integers and numbers become constrained numeric inputs;
-- enums become single-select dropdowns;
-- arrays whose items have an enum become multi-select checkbox chips;
-- booleans become true/false selectors;
+- string formats become text, email, URL, date, time, or date-time inputs, and a field holding an `http` or `https` address gets an **Open** link;
+- integers and numbers become constrained numeric inputs, with their `x-cr-unit` shown at the edge of the box;
+- enums with two or three short options become a row of buttons, and longer enums become a dropdown;
+- arrays whose items have an enum become checkbox chips;
+- booleans become a **True** / **False** row of buttons, with **Not set** when the field is optional;
 - objects and other complex values retain a focused typed-YAML editor.
 
-Required fields, titles, descriptions, length limits, and numeric bounds come from the schema. Schema-permitted undeclared front matter remains available under **Additional attributes** and cannot override a declared field. Collections without schema properties retain the complete raw-YAML editor. Both modes preserve typed YAML values and use the same atomic, audited database mutations.
+Required fields, titles, descriptions, length limits, and numeric bounds come from the schema. A string value that contains a line break is edited in a multi-line box, so saving keeps its line breaks. Schema-permitted undeclared front matter is available under **Other fields** and cannot override a declared field; on an existing record that box appears only when the record has such front matter, and **Edit as YAML** is the way to add some.
+
+A collection without schema properties gets the same kind of form, built from the record itself: one field per front matter key, in the record's order, typed by the value it holds. Text stays text even when you type digits into it, and text that is a `YYYY-MM-DD` date gets a date picker; a number field takes any number, a boolean is a **True** / **False** row of buttons, and a list, mapping, or other complex value is a small typed-YAML box. Clearing a field keeps the key with an empty value (an empty string for text, `null` otherwise); it never removes the key. A record with no front matter, or a key a form field cannot name, opens in the YAML editor instead.
+
+**Edit as YAML**, at the bottom of any record form, opens the whole front matter as one YAML mapping (`?editor=yaml`), which is how you add, rename, or remove keys; **Edit as form** switches back. Every editor preserves typed YAML values and uses the same atomic, audited database mutations.
 
 Use the optional `x-cr-ui.order` schema extension to control field order without changing validation semantics:
 
@@ -317,8 +321,8 @@ one fit but a word does not. Neither changes what a record may contain.
 
 The commands refuse a value that does not fit, need collection ownership when
 RBAC is enabled, and create `.cr/schemas/<collection>.json` when the collection
-has none—without `properties`, so the record form stays the complete raw-YAML
-editor. Like `cr schema encrypt`, they rewrite an existing schema file in
+has none—without `properties`, so the record form stays one built from each
+record's own fields. Like `cr schema encrypt`, they rewrite an existing schema file in
 canonical JSON formatting. A hand-written value that does not fit is ignored,
 the same as a malformed `order`, so a typo in a hint never takes a page down.
 The built-in `users` collection keeps its fixed name.
@@ -327,7 +331,7 @@ The built-in `users` collection keeps its fixed name.
 
 Open [http://127.0.0.1:3000/audit](http://127.0.0.1:3000/audit) for the global audit journal, newest first. Filter it by collection and record ID, page through older events, and expand an event to inspect its add/remove/replace operations with before and after values.
 
-Every existing record page embeds its newest audit history with actor, source, timestamp, optional sync/save message, and field-level changes. The **View complete history** link opens `/audit` with that collection and ID already selected. Historical values are escaped before rendering and long values are preview-limited in the page; the complete event remains available from the JSON API and CLI.
+Every existing record page shows its newest activity beside the form as a short timeline: what happened and which fields it touched, who did it and through which agent, when, any save message, and the before and after values under **Show changes**. Hashes, sources, sessions, authorization, and intent are left to the audit log; **All activity** opens `/audit` with that collection and ID already selected. Historical values are escaped before rendering and long values are preview-limited in the page; the complete event remains available from the JSON API and CLI.
 
 On wide screens, record fields and their newest activity share a two-column
 workspace so policy and provenance stay visible while editing. At smaller
