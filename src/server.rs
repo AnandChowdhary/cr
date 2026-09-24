@@ -6840,6 +6840,46 @@ fn view_filter_summary(active: usize, out_of_band: OutOfBand) -> Markup {
     }
 }
 
+/// How many characters at the end of a long record ID stay visible when its
+/// table cell is too narrow for the whole ID.
+const RECORD_ID_KEPT_TAIL_CHARS: usize = 10;
+
+/// A record ID in the first cell of a table row, linking to the record.
+///
+/// IDs are often generated — a kind, a name, then a hash — and a hundred and
+/// fifty characters of that in a column that could not wrap left no room for
+/// any other column. The link is capped instead, and a long ID is shortened in
+/// the middle rather than at the end: the start says what sort of record it is
+/// and the end is usually what tells two of them apart, which is exactly what
+/// an ellipsis at the end would hide. The two halves are adjacent spans with
+/// nothing between them, so the text a screen reader reads, find-in-page
+/// matches and a copy takes is still the whole ID, and `title` shows it on
+/// hover. An ID short enough never to be cut is one span and has no `title`,
+/// because a tooltip repeating the visible text is noise.
+fn render_record_id_link(href: &str, id: &str) -> Markup {
+    let tail_start = id
+        .char_indices()
+        .rev()
+        .nth(RECORD_ID_KEPT_TAIL_CHARS - 1)
+        .map(|(index, _)| index)
+        .filter(|_| id.chars().count() > 2 * RECORD_ID_KEPT_TAIL_CHARS);
+    html! {
+        @match tail_start {
+            Some(tail_start) => {
+                a href=(href) title=(id) class="flex max-w-80 text-gray-600 hover:text-indigo-700 hover:underline" {
+                    span class="truncate" { (&id[..tail_start]) }
+                    span class="shrink-0" { (&id[tail_start..]) }
+                }
+            }
+            None => {
+                a href=(href) class="flex max-w-80 text-gray-600 hover:text-indigo-700 hover:underline" {
+                    span class="truncate" { (id) }
+                }
+            }
+        }
+    }
+}
+
 /// The region of a view page that a page turn, a re-sort, a filter or a search
 /// replaces, and the only part of the page any of them change.
 ///
@@ -6903,8 +6943,8 @@ fn view_results(
                                 @for record in &page.records {
                                     @let record_activity = activity.get(&record.id);
                                     tr {
-                                        td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold" {
-                                            a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="text-gray-900 hover:text-indigo-700 hover:underline" { (&record.id) }
+                                        td class="px-4 py-3 font-mono text-xs" {
+                                            (render_record_id_link(&format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id)), &record.id))
                                         }
                                         td class="whitespace-nowrap px-4 py-3" {
                                             (render_timestamp(record_activity.map(|activity| activity.created_at.as_str())))

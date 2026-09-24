@@ -1582,6 +1582,37 @@ async fn tables_show_audited_creation_and_update_times_and_open_newest_first() {
 }
 
 #[tokio::test]
+async fn long_record_ids_are_capped_and_shortened_in_the_middle_of_the_table() {
+    let (_temporary, database) = test_database("views-long-ids");
+    let long = "triggered-inbound-rating-on-create-quiet-anik-majumdar-member-of-technical-staff-intern-4de0aaa0bd9f-3de67c9eb27d08b42c6feb79";
+    for id in [long, "acme-renewal"] {
+        database
+            .create(
+                "tasks",
+                id,
+                &[Assignment::from_str("status=done").unwrap()],
+                "",
+            )
+            .unwrap();
+    }
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    // The link is capped, keeps the last ten characters whole, and carries the
+    // complete ID for hover. The halves are adjacent, so the text is the ID.
+    let (head, tail) = long.split_at(long.len() - 10);
+    assert!(page.text().contains(&format!(
+        r#"<a href="/tasks/records/{long}" title="{long}" class="flex max-w-80 text-gray-600 hover:text-indigo-700 hover:underline"><span class="truncate">{head}</span><span class="shrink-0">{tail}</span></a>"#
+    )));
+    assert_eq!(tail, "b42c6feb79");
+    // A short ID is never cut, so it is one span and needs no tooltip.
+    assert!(page.text().contains(
+        r#"<a href="/tasks/records/acme-renewal" class="flex max-w-80 text-gray-600 hover:text-indigo-700 hover:underline"><span class="truncate">acme-renewal</span></a>"#
+    ));
+}
+
+#[tokio::test]
 async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     let (_temporary, database) = test_database("views-index");
     for (id, status) in [("alpha", "open"), ("beta", "open"), ("gamma", "won")] {

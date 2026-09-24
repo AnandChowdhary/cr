@@ -408,6 +408,9 @@
   .max-w-48 {
     max-width: calc(var(--spacing) * 48);
   }
+  .max-w-80 {
+    max-width: calc(var(--spacing) * 80);
+  }
   .max-w-sm {
     max-width: var(--container-sm);
   }

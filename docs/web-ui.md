@@ -111,8 +111,11 @@ available.
 **Filter** opens the complete schema-aware condition, column, and sorting panel
 only when needed, and shows the number of active ad hoc conditions. Rows use the
 entire available workspace and keep the stable ID, every selected value, and a
-small open action visible without a separate oversized action column. The view
-also includes cursor pagination, create and edit forms, and audited deletion.
+small open action visible without a separate oversized action column. A long
+record ID, such as a slug followed by a hash, is capped at a fixed width so it
+cannot push the other columns off screen: its start and its last ten characters
+stay visible with an ellipsis between them, and hovering shows the whole ID. The
+view also includes cursor pagination, create and edit forms, and audited deletion.
 Click a record ID, field value, or its row action to open the record editor.
 Saved views can switch the same query to a Kanban layout. Every mutation is
 schema-validated and recorded with `source: api`.
