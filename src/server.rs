@@ -6169,10 +6169,14 @@ fn view_filter_fields(schema: Option<&JsonValue>, columns: &[String]) -> Vec<Vie
         .collect::<BTreeSet<_>>();
     for column in columns {
         if known.insert(column.clone()) {
+            // A nested field the schema describes filters with its own
+            // control, an enum's dropdown included.
             fields.push(ViewFilterField {
                 key: column.clone(),
-                label: humanize_field_name(column),
-                kind: SchemaFieldKind::Yaml,
+                label: field_label(schema, column),
+                kind: property_definition(schema, column)
+                    .map(schema_field_kind)
+                    .unwrap_or(SchemaFieldKind::Yaml),
             });
         }
     }
@@ -7565,7 +7569,17 @@ fn schema_value_label(value: &YamlValue) -> String {
 
 /// A top-level field's schema definition, when the schema declares one.
 fn property_definition<'a>(schema: Option<&'a JsonValue>, key: &str) -> Option<&'a JsonValue> {
-    schema?.get("properties")?.get(key)
+    let properties = schema?.get("properties")?;
+    if let Some(definition) = properties.get(key) {
+        return Some(definition);
+    }
+    // A nested column, `learning.status`, is described inside its parent.
+    let mut segments = key.split('.');
+    let mut definition = properties.get(segments.next()?)?;
+    for segment in segments {
+        definition = definition.get("properties")?.get(segment)?;
+    }
+    Some(definition)
 }
 
 /// What a field is called on screen: its schema `title`, or else its key made
@@ -10852,21 +10866,93 @@ fn view_available_columns(
         .filter(|column| known.insert(column.clone()))
         .collect::<Vec<_>>();
     additional.sort_by(|left, right| {
-        rank(left).cmp(&rank(right)).then_with(|| {
-            match (positions.get(left), positions.get(right)) {
-                // The two averages compared without dividing either.
-                (Some((left_sum, left_count)), Some((right_sum, right_count))) => {
-                    (left_sum * right_count).cmp(&(right_sum * left_count))
-                }
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            }
-            .then_with(|| left.cmp(right))
-        })
+        rank(left)
+            .cmp(&rank(right))
+            .then_with(|| compare_average_positions(&positions, left, right))
     });
-    columns.extend(additional);
+    for column in additional {
+        let nested = nested_columns(&column, schema, records);
+        columns.push(column);
+        columns.extend(nested.into_iter().filter(|path| known.insert(path.clone())));
+    }
     columns
+}
+
+/// Order two fields by their average position in the records that have them,
+/// then fields no record has, then by name. `positions` holds each field's
+/// summed positions and the number of records it is in.
+fn compare_average_positions(
+    positions: &BTreeMap<String, (usize, usize)>,
+    left: &str,
+    right: &str,
+) -> std::cmp::Ordering {
+    match (positions.get(left), positions.get(right)) {
+        // The two averages compared without dividing either.
+        (Some((left_sum, left_count)), Some((right_sum, right_count))) => {
+            (left_sum * right_count).cmp(&(right_sum * left_count))
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| left.cmp(right))
+}
+
+/// The columns inside an object field: `learning.status` for `learning`.
+///
+/// A whole object is too much for one cell, and its summary shows only one
+/// part of it, so each field inside that holds a plain value, or a list of
+/// them, can be a column of its own. The dotted path is already what sorting,
+/// filtering and `Record::field` read. One level deep: a field inside those
+/// that is itself an object stays in its parent's tooltip. They are ordered
+/// like top-level fields, by where the records put them, then the ones only
+/// the schema declares, and they follow their parent wherever it is listed.
+fn nested_columns(parent: &str, schema: Option<&JsonValue>, records: &[Record]) -> Vec<String> {
+    let is_plain = |value: &YamlValue| match value {
+        YamlValue::Mapping(_) => false,
+        YamlValue::Sequence(items) => items
+            .iter()
+            .all(|item| !matches!(item, YamlValue::Mapping(_) | YamlValue::Sequence(_))),
+        _ => true,
+    };
+    let mut keys = BTreeSet::new();
+    let mut positions = BTreeMap::<String, (usize, usize)>::new();
+    for record in records {
+        let Some(YamlValue::Mapping(object)) =
+            record.attributes.get(YamlValue::String(parent.to_owned()))
+        else {
+            continue;
+        };
+        for (position, (key, value)) in object.iter().enumerate() {
+            if let YamlValue::String(key) = key
+                && is_plain(value)
+            {
+                let (sum, count) = positions.entry(key.clone()).or_default();
+                *sum += position;
+                *count += 1;
+                keys.insert(key.clone());
+            }
+        }
+    }
+    if let Some(properties) = property_definition(schema, parent)
+        .and_then(|definition| definition.get("properties"))
+        .and_then(JsonValue::as_object)
+    {
+        keys.extend(
+            properties
+                .iter()
+                .filter(|(_, definition)| !declares_objects(definition))
+                .map(|(key, _)| key.clone()),
+        );
+    }
+    let mut keys = keys
+        .into_iter()
+        .filter(|key| !key.is_empty() && !key.contains('.'))
+        .collect::<Vec<_>>();
+    keys.sort_by(|left, right| compare_average_positions(&positions, left, right));
+    keys.into_iter()
+        .map(|key| format!("{parent}.{key}"))
+        .collect()
 }
 
 /// Each field `x-cr-ui.order` names, with its place in that list.
@@ -10966,6 +11052,8 @@ fn default_view_columns(
     available
         .iter()
         .filter(|column| Some(column.as_str()) != title)
+        // A field inside an object is offered, never chosen for the reader.
+        .filter(|column| !column.contains('.'))
         .filter(|column| !field_holds_objects(column, schema, records))
         .take(DEFAULT_VIEW_COLUMNS)
         .cloned()
@@ -10975,19 +11063,7 @@ fn default_view_columns(
 /// Whether the schema declares `field` an object or a list of objects, or a
 /// record holds one there.
 fn field_holds_objects(field: &str, schema: Option<&JsonValue>, records: &[Record]) -> bool {
-    let declares_object = |definition: Option<&JsonValue>| {
-        definition
-            .and_then(|definition| definition.get("type"))
-            .is_some_and(|kind| match kind {
-                JsonValue::String(kind) => kind == "object",
-                JsonValue::Array(kinds) => kinds.iter().any(|kind| kind == "object"),
-                _ => false,
-            })
-    };
-    let definition = property_definition(schema, field);
-    if declares_object(definition)
-        || declares_object(definition.and_then(|definition| definition.get("items")))
-    {
+    if property_definition(schema, field).is_some_and(declares_objects) {
         return true;
     }
     records.iter().any(
@@ -10999,6 +11075,20 @@ fn field_holds_objects(field: &str, schema: Option<&JsonValue>, records: &[Recor
             _ => false,
         },
     )
+}
+
+/// Whether a schema definition is of an object, or of a list of objects.
+fn declares_objects(definition: &JsonValue) -> bool {
+    let is_object = |definition: Option<&JsonValue>| {
+        definition
+            .and_then(|definition| definition.get("type"))
+            .is_some_and(|kind| match kind {
+                JsonValue::String(kind) => kind == "object",
+                JsonValue::Array(kinds) => kinds.iter().any(|kind| kind == "object"),
+                _ => false,
+            })
+    };
+    is_object(Some(definition)) || is_object(definition.get("items"))
 }
 
 fn query_columns_custom(query: &ViewQuery) -> bool {

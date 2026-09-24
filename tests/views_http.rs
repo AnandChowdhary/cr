@@ -2115,6 +2115,90 @@ async fn object_values_are_summarised_as_a_badge_or_chips_rather_than_yaml() {
 }
 
 #[tokio::test]
+async fn fields_inside_objects_can_be_chosen_as_columns_of_their_own() {
+    let (_temporary, database) = test_database("views-nested-columns");
+    fs::create_dir_all(database.root().join(".cr/schemas")).unwrap();
+    fs::write(
+        database.root().join(".cr/schemas/tasks.json"),
+        r#"{ "type": "object",
+             "properties": { "learning": { "type": "object", "properties": {
+                 "status": { "enum": ["in_progress", "done"], "title": "Learning state" },
+                 "notes": { "type": "string" } } } } }"#,
+    )
+    .unwrap();
+    for (id, status, session) in [
+        ("alpha", "done", "b-session"),
+        ("beta", "in_progress", "a-session"),
+    ] {
+        database
+            .create(
+                "tasks",
+                id,
+                &[
+                    Assignment::from_str("kind=triggered").unwrap(),
+                    Assignment::from_str(&format!("learning.status={status}")).unwrap(),
+                    Assignment::from_str(&format!("learning.session={session}")).unwrap(),
+                    Assignment::from_str("learning.retry.at=never").unwrap(),
+                ],
+                "",
+            )
+            .unwrap();
+    }
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    // Offered right after their object, in the records' order, then what only
+    // the schema declares; a nested object is not.
+    let offered = |field: &str| {
+        page.text()
+            .find(&format!(r#"name="column" value="{field}""#))
+            .unwrap_or_else(|| panic!("{field} is not offered"))
+    };
+    assert!(offered("learning") < offered("learning.status"));
+    assert!(offered("learning.status") < offered("learning.session"));
+    assert!(offered("learning.session") < offered("learning.notes"));
+    assert!(!page.text().contains(r#"value="learning.retry""#));
+    assert!(!page.text().contains(r#"value="learning.retry.at""#));
+    // Never a default column.
+    assert!(!page.text().contains("Sort by Learning state"));
+
+    // Chosen, it is a column like any other: labelled and read through the
+    // schema, and sortable by its path.
+    let chosen = request(
+        &app,
+        Method::GET,
+        "/tasks?columns=custom&column=learning.status&column=learning.session&sort_field=learning.session&sort_direction=asc",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(chosen.status, StatusCode::OK);
+    assert!(chosen.text().contains("Sort by Learning state ascending"));
+    assert!(chosen.text().contains(">In Progress</a>"));
+    assert!(
+        chosen.text().find("/tasks/records/beta").unwrap()
+            < chosen.text().find("/tasks/records/alpha").unwrap()
+    );
+    // And filterable, with the schema's own control.
+    assert!(
+        chosen
+            .text()
+            .contains(r#"<option value="learning.status" data-filter-kind="select""#)
+    );
+    let filtered = request(
+        &app,
+        Method::GET,
+        "/tasks?filter_field=learning.status&filter_operator=eq&filter_value=done",
+        None,
+        &[],
+    )
+    .await;
+    assert!(filtered.text().contains("/tasks/records/alpha"));
+    assert!(!filtered.text().contains("/tasks/records/beta"));
+}
+
+#[tokio::test]
 async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     let (_temporary, database) = test_database("views-index");
     for (id, status) in [("alpha", "open"), ("beta", "open"), ("gamma", "won")] {
