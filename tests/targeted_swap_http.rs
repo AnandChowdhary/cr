@@ -5,7 +5,7 @@
 //! whole document or the `cr-view-table` region depending on what the request
 //! asked for — and shipped it with nothing asking. Phase 4 is the first caller:
 //! the cursor links, the column sort links, the search box and the filter panel's
-//! "Apply view" all name that region, so a page turn, a re-sort, a search and an
+//! "Apply" all name that region, so a page turn, a re-sort, a search and an
 //! apply leave the sidebar, the heading and — the visible win — an open filter
 //! panel exactly where they were.
 //!
@@ -296,7 +296,7 @@ async fn every_control_that_only_changes_the_results_targets_the_results_region(
     let app = router(database, ServerConfig::default()).unwrap();
     let page = get(&app, "/deals?limit=2", &[]).await.body;
 
-    // The search box and "Apply view" are two submit buttons on one `<form>`, so
+    // The search box and "Apply" are two submit buttons on one `<form>`, so
     // one set of attributes covers both — and it is the form that must not scroll,
     // because the panel the reader applied from hangs below it.
     assert!(page.contains(&format!(
@@ -327,11 +327,11 @@ async fn every_control_that_only_changes_the_results_targets_the_results_region(
         "a control targets the region without saying how to swap it"
     );
 
-    // Deliberate exclusions. "Clear all" empties the panel, and swapping only the
+    // Deliberate exclusions. "Reset" empties the panel, and swapping only the
     // results would leave the discarded conditions on screen above rows that no
     // longer reflect them, so it stays a whole page. A record link leaves the view
     // entirely, which is what `hx-boost` on `<body>` already handles.
-    assert!(page.contains("<a href=\"/deals\" class=\"cr-button\">Clear all</a>"));
+    assert!(page.contains("<a href=\"/deals\" class=\"cr-button\">Reset</a>"));
     let rows = between(&page, "<tbody", "</tbody>");
     assert!(rows.contains("/deals/records/"));
     assert!(

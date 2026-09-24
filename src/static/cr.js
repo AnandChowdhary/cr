@@ -51,7 +51,6 @@ const enhanceFilterBuilder = () => {
   const list = builder.querySelector('[data-filter-list]');
   const template = builder.querySelector('template[data-filter-template]');
   const addButton = builder.querySelector('[data-add-filter]');
-  const closeButton = builder.querySelector('[data-close-filter]');
   const maximum = Number(builder.dataset.maxFilters || '20');
 
   const closeDisclosure = () => {
@@ -60,9 +59,21 @@ const enhanceFilterBuilder = () => {
     disclosure.querySelector('summary')?.focus();
   };
 
-  closeButton?.addEventListener('click', closeDisclosure);
   builder.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && disclosure?.open) closeDisclosure();
+  });
+
+  // A row whose field is not chosen yet, which Add filter goes to rather than
+  // adding a second one beside it.
+  const blankRow = () => [...list.querySelectorAll('[data-filter-row]')]
+    .find((row) => row.querySelector('[data-filter-field]').value === '');
+
+  // Opening the panel with nothing filtered puts the reader on the field to
+  // filter by.
+  disclosure?.addEventListener('toggle', () => {
+    if (!disclosure.open) return;
+    const rows = list.querySelectorAll('[data-filter-row]');
+    if (rows.length === 1 && blankRow()) rows[0].querySelector('[data-filter-field]').focus();
   });
 
   const reindex = () => {
@@ -83,23 +94,21 @@ const enhanceFilterBuilder = () => {
     const slot = row.querySelector('[data-filter-value-slot]');
     const kind = option.dataset.filterKind || 'input';
     let control;
+    // "Owner is empty" is the whole condition, so the slot stays blank.
     if (operator === 'is-empty' || operator === 'is-not-empty') {
       control = document.createElement('input');
       control.type = 'hidden';
       control.value = '';
-      const hint = document.createElement('span');
-      hint.className = 'block px-3 py-2 text-sm text-gray-400';
-      hint.textContent = 'No value needed';
       control.name = 'filter_value';
       control.dataset.filterValue = 'true';
-      slot.replaceChildren(control, hint);
+      slot.replaceChildren(control);
       reindex();
       return;
     } else if (kind === 'select') {
       control = document.createElement('select');
       const blank = document.createElement('option');
       blank.value = '';
-      blank.textContent = 'Select a value…';
+      blank.textContent = 'Choose a value…';
       control.appendChild(blank);
       JSON.parse(option.dataset.filterOptions || '[]').forEach((item) => {
         const choice = document.createElement('option');
@@ -111,11 +120,11 @@ const enhanceFilterBuilder = () => {
       control = document.createElement('input');
       control.type = option.dataset.filterInputType || 'text';
       if (control.type === 'number') control.step = 'any';
-      control.placeholder = control.type === 'number' ? 'Exact number' : 'Exact value';
+      control.placeholder = control.type === 'number' ? 'Number' : 'Value';
     }
     control.name = 'filter_value';
     control.dataset.filterValue = 'true';
-    control.className = 'w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2';
+    control.className = 'cr-input';
     slot.replaceChildren(control);
     reindex();
   };
@@ -141,19 +150,28 @@ const enhanceFilterBuilder = () => {
     row.querySelector('[data-filter-operator]').addEventListener('change', () => replaceValueControl(row));
     row.querySelector('[data-remove-filter]').addEventListener('click', () => {
       const rows = list.querySelectorAll('[data-filter-row]');
+      // The button goes with its row, or out of sight when the last row is
+      // emptied instead, so focus moves to where the next filter starts.
       if (rows.length === 1) {
         row.querySelector('[data-filter-field]').value = '';
         row.querySelector('[data-filter-operator]').value = 'eq';
         replaceOperatorControl(row);
+        row.querySelector('[data-filter-field]').focus();
       } else {
         row.remove();
         reindex();
+        addButton.focus();
       }
     });
   };
 
   list.querySelectorAll('[data-filter-row]').forEach(bindRow);
   addButton.addEventListener('click', () => {
+    const blank = blankRow();
+    if (blank) {
+      blank.querySelector('[data-filter-field]').focus();
+      return;
+    }
     if (list.querySelectorAll('[data-filter-row]').length >= maximum) return;
     const row = template.content.firstElementChild.cloneNode(true);
     list.appendChild(row);
@@ -533,6 +551,18 @@ document.addEventListener('htmx:beforeSwap', (event) => {
   }
 });
 
+// A click outside an open filter panel closes it, as a click outside any
+// popover does. Closing keeps what was typed in it, so reopening shows the
+// same conditions. One listener for the document rather than one per panel,
+// because a navigation brings a new panel and this would otherwise pile up a
+// listener for every one the tab had shown. The event's path rather than its
+// target, because a row's remove button has left the document by the time the
+// click reaches this listener, and a detached node is inside nothing.
+document.addEventListener('click', (event) => {
+  const disclosure = document.querySelector('[data-filter-disclosure][open]');
+  if (disclosure && !event.composedPath().includes(disclosure)) disclosure.open = false;
+});
+
 // The unsaved-edits guard's two prompts. `htmx:confirm` fires before every
 // request htmx makes — a boosted link or form, a targeted swap, the navigation
 // that follows a save — and cancels it when prevented. The form's own
@@ -562,7 +592,7 @@ window.addEventListener('beforeunload', (event) => {
 // page load follows that redirect and comes back signed in; an htmx request
 // cannot, because to XMLHttpRequest a cross-origin redirect is a network error,
 // and htmx answers a network error by doing nothing at all: no swap, no new
-// URL, no message. "Apply view", a re-sort, a page turn, even a sidebar link
+// URL, no message. "Apply", a re-sort, a page turn, even a sidebar link
 // looked dead until the page was reloaded by hand.
 //
 // So a GET htmx could not complete becomes the page load it stands in for.

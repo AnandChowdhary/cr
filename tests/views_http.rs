@@ -247,11 +247,24 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
         .unwrap();
     let new_record_position = automatic.text().find("href=\"/deals/new\"").unwrap();
     assert!(search_position < filter_position && filter_position < new_record_position);
-    assert!(automatic.text().contains("+ Add condition"));
-    assert!(automatic.text().contains("data-close-filter=\"true\""));
-    assert!(automatic.text().contains("All conditions match"));
-    assert!(automatic.text().contains("name=\"filter_match\""));
-    assert!(automatic.text().contains("Any condition matches"));
+    assert!(automatic.text().contains("+ Add filter"));
+    // Each condition reads as a sentence, led by "Where" and joined by "and"
+    // or "or"; the stylesheet shows the one word that fits.
+    assert!(
+        automatic
+            .text()
+            .contains(r#"<span class="cr-filter-join"><span class="cr-filter-join-where">Where</span><span class="cr-filter-join-all">and</span><span class="cr-filter-join-any">or</span></span>"#)
+    );
+    assert!(
+        automatic
+            .text()
+            .contains(r#"name="filter_match" value="all" checked"#)
+    );
+    assert!(
+        automatic
+            .text()
+            .contains(r#"name="filter_match" value="any">"#)
+    );
     assert!(automatic.text().contains("aria-label=\"Sort by\""));
     assert!(automatic.text().contains("aria-label=\"Sort direction\""));
     assert!(automatic.text().contains("aria-label=\"Visible columns\""));
@@ -270,12 +283,14 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     );
     assert!(automatic.text().contains("Missing values stay last"));
     assert!(automatic.text().contains("Sort by Value ascending"));
-    assert!(automatic.text().contains("md:grid-cols-2 xl:grid-cols-12"));
-    assert!(
-        automatic
-            .text()
-            .contains("md:col-span-2 xl:col-span-1 xl:justify-self-end")
-    );
+    // A row lays out by the panel's width, not the window's, so the remove
+    // control has its own column and cannot overlap the value.
+    assert!(automatic.text().contains(r#"class="cr-filter-row""#));
+    assert!(automatic.text().contains(
+        r#"aria-label="Remove filter 1" title="Remove filter" class="cr-filter-remove""#
+    ));
+    assert!(automatic.text().contains(r#">Reset</a>"#));
+    assert!(automatic.text().contains(r#">Apply</button>"#));
     assert!(
         automatic
             .text()
@@ -473,7 +488,11 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     .await;
     assert_eq!(sorted.status, StatusCode::OK);
     assert!(sorted.text().contains("value=\"value\" selected"));
-    assert!(sorted.text().contains("value=\"asc\" selected"));
+    assert!(
+        sorted
+            .text()
+            .contains("name=\"sort_direction\" value=\"asc\" checked")
+    );
     assert!(sorted.text().contains("aria-sort=\"ascending\""));
     assert!(sorted.text().contains("Sort by Value descending"));
     assert!(
@@ -643,7 +662,11 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     )
     .await;
     assert_eq!(empty.status, StatusCode::OK);
-    assert!(empty.text().contains("No value needed"));
+    // "Owner is empty" needs no value, so the slot holds only the empty one
+    // the form submits.
+    assert!(empty.text().contains(
+        r#"class="cr-filter-value"><input type="hidden" name="filter_value" data-filter-value="true" value=""></div>"#
+    ));
     assert!(empty.text().contains("alpha"));
     assert!(empty.text().contains("beta"));
 
@@ -656,7 +679,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     )
     .await;
     assert_eq!(any.status, StatusCode::OK);
-    assert!(any.text().contains("value=\"any\" selected"));
+    assert!(any.text().contains("value=\"any\" checked"));
     assert!(any.text().contains("alpha"));
     assert!(any.text().contains("beta"));
 
@@ -838,7 +861,11 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     assert!(board.text().contains("score&gt;=40"));
     assert!(!board.text().contains("/pipeline/records/excluded"));
     assert!(board.text().contains("value=\"score\" selected"));
-    assert!(board.text().contains("value=\"asc\" selected"));
+    assert!(
+        board
+            .text()
+            .contains("name=\"sort_direction\" value=\"asc\" checked")
+    );
     assert!(board.text().contains("Unassigned"));
     assert!(
         board
@@ -1370,6 +1397,26 @@ async fn a_kanban_board_fits_the_window_with_lanes_that_scroll_on_their_own() {
     // scroll inside it under its heading.
     assert!(rule(".cr-kanban-lane").contains("max-height: max(22rem, calc(100dvh - 10.5rem));"));
     assert!(rule(".cr-lane-cards").contains("overflow-y: auto;"));
+    // Each lane's cards fade at its edges while there are more past them, on
+    // the lane's own timeline, so a lane that fits shows no fade.
+    assert!(rule(".cr-lane-cards").contains("scroll-timeline: --cr-lane-y block;"));
+    let lane_fades = rule("  .cr-lane-cards::before,\n  .cr-lane-cards::after");
+    assert!(
+        lane_fades.contains("position: sticky;")
+            && lane_fades.contains("opacity: 0;")
+            && lane_fades.contains("flex: 0 0 auto;")
+    );
+    assert!(
+        rule("  .cr-lane-cards::before").contains(
+            "animation: cr-more-behind linear both;\n    animation-timeline: --cr-lane-y;"
+        )
+    );
+    let lane_after = &sheet[sheet.rfind("  .cr-lane-cards::after {").unwrap()..];
+    assert!(
+        lane_after[..lane_after.find('}').unwrap()].contains(
+            "animation: cr-more-ahead linear both;\n    animation-timeline: --cr-lane-y;"
+        )
+    );
     // The board scrolls sideways on its own timeline, and its edges fade only
     // while there is more board past them.
     assert!(rule(".cr-board-scroll").contains("scroll-timeline: --cr-board-x inline;"));
@@ -2528,7 +2575,7 @@ async fn automatic_tables_show_six_fields_and_leave_objects_to_the_picker() {
     for field in ["capability", "reviews", "delivery", "draft"] {
         assert!(
             page.text()
-                .contains(&format!(r#"name="column" value="{field}" class="#)),
+                .contains(&format!(r#"name="column" value="{field}">"#)),
             "{field} is offered unchecked"
         );
     }
