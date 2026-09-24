@@ -891,7 +891,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     assert!(
         projected_board
             .text()
-            .contains(r#"class="text-sm font-semibold text-gray-900 hover:text-indigo-700 hover:underline">Beta</a>"#)
+            .contains(r#"class="cr-card-title">Beta</a>"#)
     );
     assert!(!projected_board.text().contains(">Owner</dt>"));
     assert!(!projected_board.text().contains(">Score</dt>"));
@@ -1047,6 +1047,84 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     .await;
     assert_eq!(table_move.status, StatusCode::UNPROCESSABLE_ENTITY);
     database.audit_verify(None).unwrap();
+}
+
+#[tokio::test]
+async fn kanban_cards_show_their_values_as_chips_without_labels_or_blanks() {
+    let (_temporary, database) = test_database("views-kanban-cards");
+    fs::create_dir_all(database.root().join(".cr/schemas")).unwrap();
+    fs::write(
+        database.root().join(".cr/schemas/tasks.json"),
+        r#"{ "type": "object", "properties": {
+             "status": { "enum": ["queued", "done"] },
+             "kind": { "enum": ["scheduled", "triggered"] },
+             "owner": { "type": "string", "title": "Assignee" } } }"#,
+    )
+    .unwrap();
+    let long = "triggered-inbound-rating-on-create-quiet-anik-majumdar-member-of-technical-staff-intern-4de0aaa0bd9f-3de67c9eb27d08b42c6feb79";
+    database
+        .create(
+            "tasks",
+            long,
+            &[
+                Assignment::from_str("title=Rate an applicant").unwrap(),
+                Assignment::from_str("status=queued").unwrap(),
+                Assignment::from_str("kind=triggered").unwrap(),
+                Assignment::from_str("owner=anand").unwrap(),
+            ],
+            "",
+        )
+        .unwrap();
+    database
+        .create(
+            "tasks",
+            "untitled",
+            &[Assignment::from_str("status=done").unwrap()],
+            "",
+        )
+        .unwrap();
+    database
+        .create_view_with_layout(
+            "board",
+            Some("Board"),
+            "tasks",
+            vec![],
+            vec!["kind".into(), "owner".into()],
+            25,
+            ViewLayout::Kanban,
+            Some("status".into()),
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let board = request(&app, Method::GET, "/board", None, &[]).await;
+    assert_eq!(board.status, StatusCode::OK);
+    // The title, then the ID in one line, shortened in the middle.
+    let (head, tail) = long.split_at(long.len() - 10);
+    assert!(board.text().contains(&format!(
+        r#"class="cr-card-title">Rate an applicant</a><p class="cr-card-id" title="{long}"><span class="truncate">{head}</span><span class="shrink-0">{tail}</span></p>"#
+    )));
+    // Values without labels: a state is its badge, anything else a chip, and
+    // each says what it is to a screen reader and in its tooltip.
+    assert!(board.text().contains(
+        r#"<div class="cr-card-props"><span class="cr-card-prop-badge" title="Kind: Triggered"><span class="sr-only">Kind: </span><span class="cr-pill">Triggered</span></span><span class="cr-card-prop" title="Assignee: anand"><span class="sr-only">Assignee: </span>anand</span></div>"#
+    ));
+    assert!(!board.text().contains("<dt"));
+    // A card without a title leads with its ID; one without values has no row
+    // of empty ones.
+    assert!(board.text().contains(r#"<a href="/board/records/untitled" class="cr-card-title cr-card-title-id"><span class="truncate">untitled</span></a>"#));
+    let untitled = &board.text()[board.text().find("/board/records/untitled").unwrap()..];
+    let untitled = &untitled[..untitled.find("</article>").unwrap()];
+    assert!(!untitled.contains("cr-card-props"));
+    assert!(!untitled.contains("—"));
+    // The move control is there for the keyboard and touch, and quiet for a
+    // pointer until the card is pointed at.
+    assert!(
+        board
+            .text()
+            .contains(r#"<details class="cr-kanban-move"><summary>Move…</summary>"#)
+    );
+    assert!(board.text().contains(".cr-kanban-card:not(:hover):not(:focus-within) .cr-kanban-move:not([open]) summary { opacity: 0; }"));
 }
 
 #[tokio::test]

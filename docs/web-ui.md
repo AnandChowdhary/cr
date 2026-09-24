@@ -529,6 +529,8 @@ cr view create hiring-pipeline \
 
 If the grouping field has an `enum` in the collection's JSON Schema, lanes follow that declared order and empty stages remain visible. Other observed values are added deterministically; records without the field appear under **Unassigned**. `--sort-by` controls the default card order inside every lane; the page controls can override or clear it for the current URL. Drag a card to another lane, or use its move selector and button. Both interactions submit the same CSRF-protected form, set or remove the chosen front matter field, validate the complete record, and append the normal field-level audit event.
 
+A card is compact: its title in at most two lines, its record ID shortened in the middle on one quiet line under it (or the ID alone, as the title, for a record without one), then a row of the values it holds. A state is its coloured badge and any other value a small chip; an empty value is left out rather than shown as a dash. Values carry no labels, which would repeat down every card in a lane: each chip names its field in its tooltip and to a screen reader. **Move…**, the move control for the keyboard and for touch screens, which cannot drag, stays out of sight on a screen with a pointer until the card is pointed at or has focus.
+
 ## Manage saved views
 
 Inspect all routes or one definition:
