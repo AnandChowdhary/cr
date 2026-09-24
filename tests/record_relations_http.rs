@@ -466,9 +466,12 @@ async fn records_are_named_and_tables_read_like_the_form() {
     );
     assert!(
         deal.body
-            .contains(r#"<h1 class="cr-title">Acme annual renewal</h1>"#)
+            .contains(r#"<h1 class="cr-page-title"><span>Acme annual renewal</span></h1>"#)
     );
-    assert!(deal.body.contains(r#"<p class="cr-path mt-1">renewal</p>"#));
+    assert!(
+        deal.body
+            .contains(r#"<span class="cr-page-meta font-mono">renewal</span>"#)
+    );
     // A record with no name keeps its ID, once.
     let table = request(&app, Method::GET, "/deals", None, None).await;
     assert_eq!(table.status, StatusCode::OK);

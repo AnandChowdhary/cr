@@ -161,7 +161,9 @@ fn assert_is_a_fragment(uri: &str, body: &str) {
     for shell in [
         "<!DOCTYPE",
         "<html",
-        "<head",
+        // `<head>` rather than `<head`, which every page bar's `<header>`
+        // would match.
+        "<head>",
         "<title",
         "<body",
         "<script",

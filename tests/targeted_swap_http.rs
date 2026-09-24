@@ -449,7 +449,7 @@ async fn the_same_urls_answer_a_browser_with_a_whole_page_and_no_patches() {
         // same URL is navigated to rather than swapped into.
         for shell in [
             "cr-sidebar",
-            "cr-page-heading",
+            "cr-page-bar",
             "data-filter-builder=\"true\"",
             "data-filter-panel=\"true\"",
             "hx-boost=\"true\"",
