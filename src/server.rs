@@ -3158,6 +3158,9 @@ async fn update_record_form(
         })
         .await?;
         let attributes = document_form_attributes(&form, schema.as_ref())?;
+        // The YAML editor and the fields form already submit the record's
+        // own order; the structured form submits the schema's.
+        let keep_stored_order = form.mode == DocumentFormMode::Structured;
         let collection = view.collection;
         let markdown = form.markdown;
         let expected = form.expected_record_hash.ok_or_else(|| {
@@ -3165,6 +3168,14 @@ async fn update_record_form(
         })?;
         let precondition = RecordPrecondition::version(expected).map_err(ApiError::from_domain)?;
         run_database(&state, &headers, move |database| {
+            // Read in the same call as the write, and the version checked by
+            // the write is what makes the two agree: if the record changed in
+            // between, the write is refused whatever order this produced.
+            let attributes = if keep_stored_order {
+                in_stored_order(attributes, &database.get(&collection, &id)?.attributes)
+            } else {
+                attributes
+            };
             database.replace_conditionally(
                 &collection,
                 &id,
@@ -11225,9 +11236,9 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
     // Every refusal below is about text somebody typed into the
     // additional-attributes box, so each one says so and the re-rendered form
     // opens that box with the message inside it.
-    let mut attributes = parse_front_matter(&form.additional_attributes)
+    let additional = parse_front_matter(&form.additional_attributes)
         .map_err(|error| error.with_field(ADDITIONAL_ATTRIBUTES_CONTROL))?;
-    for key in attributes.keys() {
+    for key in additional.keys() {
         if let YamlValue::String(key) = key
             && properties.contains_key(key)
         {
@@ -11238,7 +11249,7 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
             .with_field(ADDITIONAL_ATTRIBUTES_CONTROL));
         }
     }
-    if !schema_allows_additional_attributes(schema) && !attributes.is_empty() {
+    if !schema_allows_additional_attributes(schema) && !additional.is_empty() {
         return Err(ApiError::bad_request(
             "invalid_form",
             "this collection schema does not allow additional attributes",
@@ -11253,18 +11264,47 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
         .flatten()
         .filter_map(JsonValue::as_str)
         .collect::<BTreeSet<_>>();
-    for (key, definition) in properties {
-        let values = form.fields.get(key).map(Vec::as_slice).unwrap_or(&[]);
+    // Declared fields in the order the form shows them, then the rest, so a
+    // new record's file reads in the same order as its form. Saving an
+    // existing record puts its own order back; see `in_stored_order`.
+    let mut attributes = Mapping::new();
+    for field in schema_form_fields(schema, &Mapping::new()).unwrap_or_default() {
+        let key = field.key;
+        let values = form.fields.get(&key).map(Vec::as_slice).unwrap_or(&[]);
         // Every refusal from here names the property it is about, so a
         // re-rendered form can put it beside that property's control.
-        if let Some(value) =
-            parse_schema_form_value(key, definition, required.contains(key.as_str()), values)
-                .map_err(|error| error.with_field(key))?
+        if let Some(value) = parse_schema_form_value(
+            &key,
+            &properties[&key],
+            required.contains(key.as_str()),
+            values,
+        )
+        .map_err(|error| error.with_field(&key))?
         {
-            attributes.insert(YamlValue::String(key.clone()), value);
+            attributes.insert(YamlValue::String(key), value);
         }
     }
+    attributes.extend(additional);
     Ok(attributes)
+}
+
+/// `attributes` with the keys `stored` has in the order it has them, and any
+/// others after those in the order they came.
+///
+/// The structured form lists fields in the schema's order, which is rarely the
+/// order a record's file keeps them in: a record written by the CLI, an agent
+/// or by hand has its own. Writing the form's order back moved the front
+/// matter's lines around on every save, so a one-field change showed up in the
+/// file's diff as a reshuffle of all of them.
+fn in_stored_order(mut attributes: Mapping, stored: &Mapping) -> Mapping {
+    let mut ordered = Mapping::with_capacity(attributes.len());
+    for key in stored.keys() {
+        if let Some(value) = attributes.shift_remove(key) {
+            ordered.insert(key.clone(), value);
+        }
+    }
+    ordered.extend(attributes);
+    ordered
 }
 
 /// The front matter a `Fields` form describes: each listed field, in the order
