@@ -441,6 +441,14 @@ async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
             .contains("<span class=\"cr-view-count\">1<")
     );
     assert!(!reader_home.text().contains("cr-view-count\">2<"));
+    // The owner is told how to fill an empty Saved views section; a reader,
+    // who cannot save views, is not offered what they cannot do.
+    assert!(home.text().contains(r#"<p class="cr-sidebar-hint">"#));
+    assert!(
+        !reader_home
+            .text()
+            .contains(r#"<p class="cr-sidebar-hint">"#)
+    );
 
     let reader_view = request(
         &app,

@@ -2094,19 +2094,29 @@ async fn navigation_lists_mark_the_current_page_and_keep_it_in_view() {
             )
             .unwrap();
     }
+    database
+        .create_view(
+            "done",
+            Some("Done tasks"),
+            "tasks",
+            vec!["status=done".into()],
+            vec![],
+            25,
+        )
+        .unwrap();
     let app = router(database.clone(), ServerConfig::default()).unwrap();
 
-    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    let page = request(&app, Method::GET, "/done", None, &[]).await;
     assert_eq!(page.status, StatusCode::OK);
     // Both lists say which entry is this page, the narrow screens' strip as
     // the sidebar already did, and only that one.
     assert!(
         page.text()
-            .contains(r#"<a href="/tasks" class="is-active" aria-current="page">"#)
+            .contains(r#"<a href="/done" class="is-active" aria-current="page">"#)
     );
     assert!(
         page.text()
-            .contains(r#"<a href="/tasks" class="cr-sidebar-link is-active" aria-current="page""#)
+            .contains(r#"<a href="/done" class="cr-sidebar-link is-active" aria-current="page""#)
     );
     assert_eq!(page.text().matches(r#"aria-current="page""#).count(), 2);
     // The browser keeps that entry in sight as the lists are re-rendered.
@@ -3238,6 +3248,28 @@ async fn every_page_opens_with_one_compact_bar() {
 }
 
 #[tokio::test]
+async fn an_empty_saved_views_section_says_how_to_fill_it() {
+    let (_temporary, database) = test_database("views-nav-empty");
+    database
+        .create(
+            "tasks",
+            "one",
+            &[Assignment::from_str("status=done").unwrap()],
+            "",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert!(page.text().contains(
+        r#"<p class="cr-sidebar-label">Saved views</p><p class="cr-sidebar-hint">Use <strong>Save as view</strong> on any collection to keep it here.</p>"#
+    ));
+    // No collection is listed in either navigation list.
+    let (navigation, _) = page.text().split_once("<main").unwrap();
+    assert!(!navigation.contains(r#"href="/tasks""#));
+}
+
+#[tokio::test]
 async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     let (_temporary, database) = test_database("views-index");
     for (id, status) in [("alpha", "open"), ("beta", "open"), ("gamma", "won")] {
@@ -3278,8 +3310,16 @@ async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     assert_eq!(home.status, StatusCode::OK);
     let (sidebar, index) = home
         .text()
-        .split_once("aria-label=\"Available database views\"")
+        .split_once(r#"<section class="cr-view-index mb-5" aria-label="Saved views">"#)
         .unwrap();
+    // Saved views first, then every collection, each under its own heading.
+    let (saved, collections) = index
+        .split_once(r#"<section class="cr-view-index mb-5" aria-label="Collections">"#)
+        .unwrap();
+    assert!(saved.contains(">Open deals</h2>") && !saved.contains(">Deals</h2>"));
+    assert!(collections.contains(">Deals</h2>") && !collections.contains(">Open deals</h2>"));
+    assert!(!index.contains(r#"<span class="cr-pill">automatic</span>"#));
+    assert!(!index.contains(r#"<span class="cr-pill">saved</span>"#));
     // The index names collections rather than their storage paths.
     assert!(!index.contains("records/deals"));
     assert!(index.contains("<h2 class=\"truncate\">Inbound ratings</h2>"));
@@ -3302,14 +3342,49 @@ async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     assert!(row("Open deals").contains(">💼<"));
     assert!(row("Inbound ratings").contains(">🗃️<"));
     assert!(index.find(">Animals</h2>").unwrap() < index.find(">Deals</h2>").unwrap());
-    // The sidebar uses the same names and icons, in the same order.
-    assert!(sidebar.contains("aria-hidden=\"true\">💼</span><span class=\"truncate\">Deals<"));
-    assert!(
-        sidebar.contains("aria-hidden=\"true\">🗃️</span><span class=\"truncate\">Inbound ratings<")
-    );
-    assert!(sidebar.find(">Animals<").unwrap() < sidebar.find(">Deals<").unwrap());
+    // The sidebar holds the saved views, with their names and icons, and
+    // leaves the collections to the index rather than repeating it.
+    assert!(sidebar.contains("aria-hidden=\"true\">💼</span><span class=\"truncate\">Open deals<"));
+    for collection in ["Deals", "Inbound ratings", "Animals"] {
+        assert!(
+            !sidebar.contains(&format!(">{collection}<")),
+            "{collection} is in the sidebar"
+        );
+    }
+    assert!(!sidebar.contains("cr-sidebar-label\">Collections<"));
     assert!(sidebar.contains(">🏠</span><span>All views<"));
     assert!(sidebar.contains(">📜</span><span>Audit log<"));
+
+    // A collection's page is reached through the index, so the index's entry
+    // is the one lit, without claiming to be the page.
+    let collection = request(&app, Method::GET, "/deals", None, &[]).await;
+    assert!(
+        collection
+            .text()
+            .contains(r#"<a href="/" class="cr-sidebar-link is-active">"#)
+    );
+    assert!(
+        collection
+            .text()
+            .contains(r#"<a href="/" class="is-active">"#)
+    );
+    assert!(!collection.text().contains(r#"aria-current="page""#));
+    let record = request(&app, Method::GET, "/deals/records/alpha", None, &[]).await;
+    assert!(
+        record
+            .text()
+            .contains(r#"<a href="/" class="cr-sidebar-link is-active">"#)
+    );
+    // A saved view's own page lights its own entry instead.
+    let saved_page = request(&app, Method::GET, "/open-deals", None, &[]).await;
+    assert!(
+        saved_page
+            .text()
+            .contains(r#"<a href="/" class="cr-sidebar-link">"#)
+    );
+    assert!(saved_page.text().contains(
+        r#"<a href="/open-deals" class="cr-sidebar-link is-active" aria-current="page""#
+    ));
 
     // A collection that cannot be read leaves a dash rather than an error
     // page: the index is how a reader reaches the view that explains it.
@@ -3322,7 +3397,7 @@ async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     assert_eq!(degraded.status, StatusCode::OK);
     let degraded_index = degraded
         .text()
-        .split_once("Available database views")
+        .split_once(r#"aria-label="Collections""#)
         .unwrap()
         .1;
     let start = degraded_index.find(">Inbound ratings</h2>").unwrap();

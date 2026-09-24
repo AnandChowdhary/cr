@@ -176,6 +176,9 @@ struct UiContext {
     /// only a database owner may use the browser, and the route is absent when
     /// RBAC is disabled because there is then no authenticated administrator.
     can_browse_files: bool,
+    /// Whether this perspective may save views, and so whether an empty Saved
+    /// views section in the sidebar says how to fill it.
+    can_save_views: bool,
     /// Pinned filesystem locations, loaded only for a perspective that may
     /// browse files.
     pins: Vec<UiPin>,
@@ -5339,51 +5342,52 @@ fn view_index_region(
             hx-swap=[deferred.then_some("outerHTML")]
         {
             @if !views.is_empty() {
-                section class="cr-view-index" aria-label="Available database views" {
-                    (view_index_header("View"))
-                    @for (view, summary) in navigation_order_with(views, &summaries) {
-                        a href=(format!("/{}", encode_segment(&view.name))) class="cr-view-row group" {
-                            div class="cr-view-name" {
-                                span class="cr-view-icon" aria-hidden="true" { (view_icon(view)) }
-                                h2 class="truncate" { (&view.title) }
-                                @if view.saved {
-                                    span class="cr-view-source" {
-                                        (index.collection_titles.get(&view.collection).map_or(view.collection.as_str(), String::as_str))
-                                    }
-                                }
-                            }
-                            (view_index_numbers(*summary))
-                            div class="cr-view-kind" {
-                                span class="cr-pill" {
-                                    @if view.saved { "saved" } @else { "automatic" }
-                                }
-                                @if view.layout == ViewLayout::Kanban {
-                                    span class="cr-pill cr-pill-accent" { "kanban" }
-                                }
-                                @if view.filters.is_empty() && view.where_expr.is_empty() && view.filter_groups.is_empty() {
-                                    span class="text-xs text-gray-500" { "All records" }
-                                } @else {
-                                    @for filter in &view.filters {
-                                        code class="cr-filter-tag" { (filter) }
-                                    }
-                                    @for expression in &view.where_expr {
-                                        code class="cr-filter-tag" { (expression) }
-                                    }
-                                    @for group in &view.filter_groups {
-                                        code class="cr-filter-tag" {
-                                            (match group.match_mode { ViewPredicateMatch::All => "All: ", ViewPredicateMatch::Any => "Any: " })
-                                            (group.expressions.join(" · "))
+                @for (label, saved) in [("Saved views", true), ("Collections", false)] {
+                    @if views.iter().any(|view| view.saved == saved) {
+                        section class="cr-view-index mb-5" aria-label=(label) {
+                            (view_index_header(label))
+                            @for (view, summary) in navigation_order_with(views, &summaries).filter(|(view, _)| view.saved == saved) {
+                                a href=(format!("/{}", encode_segment(&view.name))) class="cr-view-row group" {
+                                    div class="cr-view-name" {
+                                        span class="cr-view-icon" aria-hidden="true" { (view_icon(view)) }
+                                        h2 class="truncate" { (&view.title) }
+                                        @if view.saved {
+                                            span class="cr-view-source" {
+                                                (index.collection_titles.get(&view.collection).map_or(view.collection.as_str(), String::as_str))
+                                            }
                                         }
                                     }
+                                    (view_index_numbers(*summary))
+                                    div class="cr-view-kind" {
+                                        @if view.layout == ViewLayout::Kanban {
+                                            span class="cr-pill cr-pill-accent" { "kanban" }
+                                        }
+                                        @if view.filters.is_empty() && view.where_expr.is_empty() && view.filter_groups.is_empty() {
+                                            span class="text-xs text-gray-500" { "All records" }
+                                        } @else {
+                                            @for filter in &view.filters {
+                                                code class="cr-filter-tag" { (filter) }
+                                            }
+                                            @for expression in &view.where_expr {
+                                                code class="cr-filter-tag" { (expression) }
+                                            }
+                                            @for group in &view.filter_groups {
+                                                code class="cr-filter-tag" {
+                                                    (match group.match_mode { ViewPredicateMatch::All => "All: ", ViewPredicateMatch::Any => "Any: " })
+                                                    (group.expressions.join(" · "))
+                                                }
+                                            }
+                                        }
+                                    }
+                                    span class="cr-view-arrow" aria-hidden="true" { "→" }
                                 }
                             }
-                            span class="cr-view-arrow" aria-hidden="true" { "→" }
                         }
                     }
                 }
             }
             @if ui.is_some_and(|ui| ui.can_read_users) {
-                section class="cr-view-index mt-5" aria-label="Internal records" {
+                section class="cr-view-index" aria-label="Internal records" {
                     (view_index_header("Internal"))
                     a href="/users" class="cr-view-row group" {
                         div class="cr-view-name" {
@@ -10206,6 +10210,8 @@ html {
 }
 
 .cr-nav-note { margin-left: auto; color: var(--cr-gray-400); font-size: 0.62rem; font-weight: 550; }
+.cr-sidebar-hint { margin: 2px 8px; color: var(--cr-gray-400); font-size: 0.7rem; line-height: 1.4; }
+.cr-sidebar-hint strong { color: var(--cr-gray-500); font-weight: 600; }
 .cr-sidebar-notice { margin: 4px 8px; color: var(--cr-warn-ink); font-size: 0.68rem; line-height: 1.35; overflow-wrap: anywhere; }
 
 .cr-mobile-icon { margin-right: 4px; font-family: var(--cr-emoji); }
@@ -11092,6 +11098,27 @@ fn perspective_control(ui: &UiContext, csrf_token: &str, id: &str) -> Markup {
     }
 }
 
+/// Whether `current_path` is somewhere the sidebar reaches only through **All
+/// views**: the index itself, or a collection's automatic view and the records
+/// opened from it. Collections are listed on the index rather than in the
+/// sidebar, so on their pages it is **All views** that shows where the reader
+/// is, as the breadcrumb does.
+fn under_all_views(current_path: &str, views: &[ViewDefinition]) -> bool {
+    current_path == "/"
+        || views
+            .iter()
+            .any(|view| !view.saved && format!("/{}", encode_segment(&view.name)) == current_path)
+}
+
+/// The sidebar lists saved views and not collections.
+///
+/// It used to list every collection under the saved views, which repeated the
+/// **All views** index beside it and grew with every collection an agent made,
+/// until the views someone had chosen to keep were a few entries lost among
+/// dozens they had not. Now the sidebar holds what the reader chose: saving a
+/// view is how a collection, or a filtered, sorted, or Kanban way of reading
+/// one, gets a place in it. Every collection is still one click away on the
+/// index.
 fn sidebar_navigation(
     current_path: &str,
     views: &[ViewDefinition],
@@ -11108,7 +11135,7 @@ fn sidebar_navigation(
                 span class="cr-local-badge" { "local" }
             }
             nav aria-label="Primary" class="cr-sidebar-nav" {
-                a href="/" class=(if current_path == "/" { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == "/").then_some("page")] {
+                a href="/" class=(if under_all_views(current_path, views) { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == "/").then_some("page")] {
                     span class="cr-nav-glyph" aria-hidden="true" { (HOME_ICON) }
                     span { "All views" }
                 }
@@ -11121,16 +11148,9 @@ fn sidebar_navigation(
                             span class="truncate" { (&view.title) }
                         }
                     }
-                }
-                @if views.iter().any(|view| !view.saved) {
-                    p class="cr-sidebar-label" { "Collections" }
-                    @for view in navigation_order(views).filter(|view| !view.saved) {
-                        @let path = format!("/{}", encode_segment(&view.name));
-                        a href=(&path) class=(if current_path == path { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == path).then_some("page")] title=(&view.title) {
-                            span class="cr-nav-glyph" aria-hidden="true" { (view_icon(view)) }
-                            span class="truncate" { (&view.title) }
-                        }
-                    }
+                } @else if ui.is_none_or(|ui| ui.can_save_views) {
+                    p class="cr-sidebar-label" { "Saved views" }
+                    p class="cr-sidebar-hint" { "Use " strong { "Save as view" } " on any collection to keep it here." }
                 }
                 @if let Some(ui) = ui.filter(|ui| ui.can_browse_files) {
                     (browse_navigation(current_path, ui))
@@ -11237,10 +11257,10 @@ fn mobile_navigation(
                 }
             }
             nav aria-label="Views" class="cr-mobile-view-strip" {
-                a href="/" class=(if current_path == "/" { "is-active" } else { "" }) aria-current=[(current_path == "/").then_some("page")] { (mobile_icon(HOME_ICON)) "All views" }
-                // Same order as the desktop sidebar: saved views, then
-                // collections, then the internal registry.
-                @for view in navigation_order(views) {
+                a href="/" class=(if under_all_views(current_path, views) { "is-active" } else { "" }) aria-current=[(current_path == "/").then_some("page")] { (mobile_icon(HOME_ICON)) "All views" }
+                // The same entries as the desktop sidebar: saved views, then
+                // the internal registry, with collections on the index.
+                @for view in navigation_order(views).filter(|view| view.saved) {
                     @let path = format!("/{}", encode_segment(&view.name));
                     a href=(&path) class=(if current_path == path { "is-active" } else { "" }) aria-current=[(current_path == path).then_some("page")] { (mobile_icon(view_icon(view))) (&view.title) }
                 }
@@ -13444,6 +13464,7 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
         let can_read_users = selected_database
             .access_allowed(AccessAction::ReadAccess, &AccessResource::Database)?;
         let can_browse_files = selected_database.owner_access_allowed(&AccessResource::Database)?;
+        let can_save_views = selected_database.owner_access_allowed(&AccessResource::Database)?;
         let pins = if can_browse_files {
             selected_database
                 .pins()
@@ -13476,6 +13497,7 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
                 can_view_global_audit,
                 can_read_users,
                 can_browse_files,
+                can_save_views,
                 pins,
                 pins_error: None,
                 users,
