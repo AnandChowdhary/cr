@@ -175,7 +175,7 @@ expressions, projections, relationship traversal, and indexes—is tracked in
 
 `cr` requires Rust 1.89 or newer, declared as `rust-version` in `Cargo.toml`.
 
-Continuous integration runs these exact commands on Linux and macOS, so running them locally reproduces the pipeline:
+Continuous integration runs these exact commands on Linux, so running them locally reproduces the pipeline:
 
 ```sh
 cargo fmt --all --check
