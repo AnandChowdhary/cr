@@ -324,6 +324,15 @@ Tables and Kanban cards use the same words as the form. A column heading is the 
 
 With those, a deal shows `125,000 USD` and `80%` instead of `125000` and `80`. A number with no unit is shown exactly as stored, because it may be a year or a postcode. Like `x-cr-ui`, `x-cr-unit` changes only presentation, never what validates.
 
+An object is summarised rather than printed as YAML. One with a `status` or
+`state` field, or a field the schema gives an `enum`, shows that value as a
+badge, so `learning: {status: done, attempts: 0, …}` reads **Done**. Any other
+object shows its first two fields that hold something as `key value` chips,
+leaving out empty strings, zeroes, `false`, nulls, and nested values, and counts
+the rest (`+2`); one with nothing worth showing is `—`. A list of objects shows
+how many it holds, such as **3 items**. Hovering a table cell still shows the
+whole value.
+
 A record page is headed by the record's `name` or `title` field, with its ID beneath; a record with neither is called by its ID. Times in tables, the index, and activity feeds read as how long ago they were, such as "3 hours ago", with the exact time in the tooltip.
 
 If you start editing a record and then click a link, the page asks before discarding your changes. Reloading or closing the tab asks too, through the browser's own prompt.

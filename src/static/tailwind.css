@@ -711,6 +711,9 @@
   .py-12 {
     padding-block: calc(var(--spacing) * 12);
   }
+  .py-px {
+    padding-block: 1px;
+  }
   .pt-2 {
     padding-top: calc(var(--spacing) * 2);
   }
