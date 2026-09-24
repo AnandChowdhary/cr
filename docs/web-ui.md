@@ -324,6 +324,16 @@ Tables and Kanban cards use the same words as the form. A column heading is the 
 
 With those, a deal shows `125,000 USD` and `80%` instead of `125000` and `80`. A number with no unit is shown exactly as stored, because it may be a year or a postcode. Like `x-cr-ui`, `x-cr-unit` changes only presentation, never what validates.
 
+An enum's value is a badge, and so is a string in a field named `status` or
+`state`, which is what a collection without a schema calls its states; each
+value in a list of enum values is a badge of its own. A badge is coloured by
+the word it holds: green for one that finished well (`done`, `completed`,
+`won`, `approved`, `merged`, …), red for one that did not (`failed`, `error`,
+`lost`, `rejected`, `cancelled`, …), blue while under way (`running`,
+`in_progress`, `processing`, …), and amber while waiting (`queued`, `pending`,
+`scheduled`, `draft`, …). Spaces, hyphens, and case do not matter. Any other
+value stays grey rather than being given a colour it never claimed.
+
 An object is summarised rather than printed as YAML. One with a `status` or
 `state` field, or a field the schema gives an `enum`, shows that value as a
 badge, so `learning: {status: done, attempts: 0, …}` reads **Done**. Any other
