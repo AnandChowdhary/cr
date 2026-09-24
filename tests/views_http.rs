@@ -222,7 +222,11 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(automatic.text().contains(
         r#"class="absolute inset-y-1 left-1 inline-flex w-7 items-center justify-center rounded-md text-gray-400 hover:bg-gray-100 hover:text-blue-700"><svg aria-hidden="true" focusable="false""#
     ));
-    assert!(automatic.text().contains("py-2 pl-9 pr-3 text-sm"));
+    assert!(
+        automatic
+            .text()
+            .contains("h-8 w-full border bg-white pl-9 pr-3")
+    );
     assert!(!automatic.text().contains("⌕"));
     assert!(automatic.text().contains("data-filter-disclosure=\"true\""));
     // The applied-condition count states itself on the disclosure's `<summary>`
@@ -1772,6 +1776,30 @@ async fn navigation_lists_mark_the_current_page_and_keep_it_in_view() {
             .contains("keepCurrentEntryInView('.cr-mobile-view-strip', false);")
     );
     assert!(script.text().contains("  enhanceNavigationLists();"));
+}
+
+#[tokio::test]
+async fn header_controls_are_one_height() {
+    let (_temporary, database) = test_database("views-control-height");
+    database
+        .create(
+            "tasks",
+            "alpha",
+            &[Assignment::from_str("status=done").unwrap()],
+            "",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    let sheet = page.text();
+    let button = &sheet[sheet.find(".cr-button {").unwrap()..];
+    let button = &button[..button.find('}').unwrap()];
+    // A height, not a minimum, so a badge inside cannot stretch one button.
+    assert!(button.contains("height: 32px;") && !button.contains("min-height"));
+    assert!(sheet.contains(".cr-button .cr-pill { padding: 1px 6px; }"));
+    // The search box among them is the same 2rem.
+    assert!(sheet.contains(r#"data-view-search="true" class="h-8 w-full"#));
 }
 
 #[tokio::test]
