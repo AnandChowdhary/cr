@@ -513,13 +513,14 @@ async fn a_kanban_board_is_paged_and_filtered_by_the_same_controls() {
     let (_temporary, database) = database_with_deals("swap-kanban");
     let app = router(database, ServerConfig::default()).unwrap();
 
-    // One region id, two layouts: a board is paged, searched and filtered by the
-    // same three controls a table is, so the board has to be a valid answer to the
-    // same request. It renders no column headings, so the pager is the control it
-    // shares.
-    let page = get(&app, "/pipeline", &[]).await;
+    // One region id, two layouts: a board is searched and filtered by the same
+    // controls a table is, so the board has to be a valid answer to the same
+    // request. It is not paged; a lane holding more than it shows offers more,
+    // and that link swaps the board as the pager swaps a table's page.
+    let page = get(&app, "/pipeline?limit=1", &[]).await;
     assert!(page.body.contains("data-kanban-board"));
-    let next = attribute(&page.body, "cr-page-next", "href");
+    let next = attribute(&page.body, "cr-lane-more-1", "href");
+    assert!(next.contains("limit=2"));
     let answer = results(&next, &swap(&app, &next).await.body);
     assert!(answer.region.contains("data-kanban-lane"));
     assert!(!answer.region.contains("cr-table-shell"));
@@ -532,12 +533,15 @@ async fn a_kanban_board_is_paged_and_filtered_by_the_same_controls() {
     // `cr.js` submits with `form.submit()`, which fires no submit event and so is
     // never an htmx request. Giving the form a swap the drop cannot have is the
     // asymmetry `UNBOOSTED` exists to prevent.
-    let board = between(&page.body, "data-kanban-board", "cr-surface mt-1");
+    let board = between(&page.body, "data-kanban-board", "data-board-summary");
     assert!(board.contains("/move\" hx-boost=\"false\""));
-    assert!(
-        !board.contains("hx-target"),
-        "a card gained a targeted swap its drag-and-drop twin cannot make"
-    );
+    for card in board.split("<article").skip(1) {
+        let card = &card[..card.find("</article>").unwrap()];
+        assert!(
+            !card.contains("hx-target"),
+            "a card gained a targeted swap its drag-and-drop twin cannot make"
+        );
+    }
 }
 
 #[tokio::test]

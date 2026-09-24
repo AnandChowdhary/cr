@@ -1226,6 +1226,105 @@ async fn kanban_cards_show_the_values_that_tell_cards_apart_by_default() {
 }
 
 #[tokio::test]
+async fn kanban_lanes_count_their_whole_lane_and_offer_more_of_it() {
+    let (_temporary, database) = test_database("views-kanban-lanes");
+    fs::create_dir_all(database.root().join(".cr/schemas")).unwrap();
+    fs::write(
+        database.root().join(".cr/schemas/tasks.json"),
+        r#"{ "type": "object", "properties": { "status": { "enum": ["queued", "done", "failed"] } } }"#,
+    )
+    .unwrap();
+    // Five done, two queued, none failed, and one without a status.
+    for (index, status) in ["done", "done", "queued", "done", "done", "queued", "done"]
+        .into_iter()
+        .enumerate()
+    {
+        database
+            .create(
+                "tasks",
+                &format!("task-{index}"),
+                &[Assignment::from_str(&format!("status={status}")).unwrap()],
+                "",
+            )
+            .unwrap();
+    }
+    database.create("tasks", "loose", &[], "").unwrap();
+    database
+        .create_view_with_layout(
+            "board",
+            Some("Board"),
+            "tasks",
+            vec![],
+            vec![],
+            2,
+            ViewLayout::Kanban,
+            Some("status".into()),
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let board = request(&app, Method::GET, "/board", None, &[]).await;
+    assert_eq!(board.status, StatusCode::OK);
+    let lane = |label: &str| {
+        let at = board.text().find(&format!("<h2>{label}</h2>")).unwrap();
+        let rest = &board.text()[at..];
+        rest[..rest.find("</section>").unwrap()].to_owned()
+    };
+    // Each lane counts every record it holds and shows up to the page size of
+    // its own, rather than whatever share of one page fell into it.
+    let done = lane("Done");
+    assert!(done.contains(r#"<span class="cr-lane-count">5</span>"#));
+    assert_eq!(done.matches("<article").count(), 2);
+    let queued = lane("Queued");
+    assert!(queued.contains(r#"<span class="cr-lane-count">2</span>"#));
+    assert_eq!(queued.matches("<article").count(), 2);
+    assert!(!queued.contains("cr-lane-more"));
+    assert!(lane("Failed").contains(r#"<span class="cr-lane-count">0</span>"#));
+    assert!(lane("Unassigned").contains(r#"<span class="cr-lane-count">1</span>"#));
+    // More of every lane is one swap away.
+    assert!(done.contains(
+        r#"<a id="cr-lane-more-1" href="/board?filter_match=all&amp;sort_field=%24created_at&amp;sort_direction=desc&amp;limit=4" class="cr-lane-more""#
+    ));
+    assert!(done.contains(">Show 2 more</a>"));
+    assert!(
+        board.text().contains(
+            r#"data-board-summary="true">Showing 5 of 8 records, up to 2 in each lane</p>"#
+        )
+    );
+    // A board has no pager; its lanes are what page.
+    assert!(!board.text().contains(r#"id="cr-page-next""#));
+    let more = request(&app, Method::GET, "/board?limit=4", None, &[]).await;
+    assert_eq!(more.text().matches("<article").count(), 7);
+    // Past the most the server sends, a lane says how to reach the rest.
+    let bounded = router(
+        database.clone(),
+        ServerConfig {
+            max_page_size: 2,
+            ..ServerConfig::default()
+        },
+    )
+    .unwrap();
+    let capped = request(&bounded, Method::GET, "/board", None, &[]).await;
+    assert!(capped.text().contains(
+        r#"<p class="cr-lane-more">3 more not shown; filter the board to reach them</p>"#
+    ));
+
+    // The lane's dot takes its state's colour.
+    assert!(done.starts_with("<h2>Done</h2>"));
+    assert!(board.text().contains(
+        r#"<span class="cr-lane-dot cr-pill-positive" aria-hidden="true"></span><h2>Done</h2>"#
+    ));
+    assert!(board.text().contains(
+        r#"<span class="cr-lane-dot cr-pill-negative" aria-hidden="true"></span><h2>Failed</h2>"#
+    ));
+    assert!(
+        board
+            .text()
+            .contains(r#"<span class="cr-lane-dot" aria-hidden="true"></span><h2>Unassigned</h2>"#)
+    );
+}
+
+#[tokio::test]
 async fn html_forms_create_update_and_delete_through_validated_audited_database_methods() {
     let (_temporary, database) = test_database("views-forms");
     fs::write(
