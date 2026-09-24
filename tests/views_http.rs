@@ -1640,7 +1640,7 @@ async fn the_records_table_scrolls_in_its_own_box_with_its_heading_and_edges_pin
     assert_eq!(page.status, StatusCode::OK);
     assert!(
         page.text().contains(
-            r#"<div class="cr-table-scroll"><table class="min-w-full text-left text-sm" data-date-groups="created">"#
+            r#"<div class="cr-table-scroll"><table class="min-w-full text-left text-sm" data-date-groups="created" data-row-links="true">"#
         )
     );
     // The box is bounded, so the heading can stick to its top edge.
@@ -1697,18 +1697,20 @@ async fn table_rows_keep_to_one_line_and_long_values_show_in_full_on_hover() {
     )
     .await;
     assert_eq!(page.status, StatusCode::OK);
-    let cell = r#"class="block max-w-xs truncate hover:text-indigo-700 hover:underline""#;
+    let cell = r#"class="block max-w-xs truncate""#;
     // A short value is one line with nothing to reveal.
-    assert!(page.text().contains(&format!(
-        r#"<a href="/tasks/records/alpha" {cell}>anand-chowdhary</a>"#
-    )));
+    assert!(
+        page.text()
+            .contains(&format!(r#"<span {cell}>anand-chowdhary</span>"#))
+    );
     // A long one may be cut at the cell's width, so hovering shows all of it.
-    assert!(page.text().contains(&format!(
-        r#"<a href="/tasks/records/alpha" title="{prompt}" {cell}>{prompt}</a>"#
-    )));
+    assert!(
+        page.text()
+            .contains(&format!(r#"<span title="{prompt}" {cell}>{prompt}</span>"#))
+    );
     // A nested value runs together in the cell and keeps its lines on hover.
     assert!(page.text().contains(&format!(
-        "<a href=\"/tasks/records/alpha\" title=\"pid: 0\nowner: worker-with-a-rather-long-name-v1\" {cell}>"
+        "<span title=\"pid: 0\nowner: worker-with-a-rather-long-name-v1\" {cell}>"
     )));
     assert!(!page.text().contains("line-clamp-2"));
 }
@@ -2088,7 +2090,7 @@ async fn object_values_are_summarised_as_a_badge_or_chips_rather_than_yaml() {
     )
     .await;
     assert_eq!(page.status, StatusCode::OK);
-    let cell = |content: &str| format!(r#"hover:text-indigo-700 hover:underline">{content}</a>"#);
+    let cell = |content: &str| format!(r#"class="block max-w-xs truncate">{content}</span>"#);
     // A state is the whole summary, read like an enum.
     assert!(page.text().contains(&cell(
         r#"<span class="cr-pill cr-pill-active">In Progress</span>"#
@@ -2189,7 +2191,7 @@ async fn fields_inside_objects_can_be_chosen_as_columns_of_their_own() {
     assert!(
         chosen
             .text()
-            .contains(r#"<span class="cr-pill cr-pill-active">In Progress</span></a>"#)
+            .contains(r#"<span class="cr-pill cr-pill-active">In Progress</span></span>"#)
     );
     assert!(
         chosen.text().find("/tasks/records/beta").unwrap()
@@ -2278,11 +2280,14 @@ async fn states_are_coloured_badges_by_what_they_say() {
     // A `status` or `state` field is one even without a schema, and so is an
     // object's state; any other text stays text.
     assert!(page.text().contains(&format!(
-        r#"hover:underline">{}</a>"#,
+        r#"class="block max-w-xs truncate">{}</span>"#,
         badge("positive", "Done")
     )));
     assert!(page.text().contains(&badge("active", "Running")));
-    assert!(page.text().contains(r#"hover:underline">done</a>"#));
+    assert!(
+        page.text()
+            .contains(r#"class="block max-w-xs truncate">done</span>"#)
+    );
     // The tones have colours in both schemes.
     for tone in ["positive", "negative", "active", "warn"] {
         assert!(
@@ -2329,14 +2334,17 @@ async fn empty_values_read_as_a_quiet_dash_however_yaml_spells_them() {
     )
     .await;
     assert_eq!(page.status, StatusCode::OK);
-    let dash = r#"hover:underline"><span class="text-gray-400">—</span></a>"#;
+    let dash = r#"class="block max-w-xs truncate"><span class="text-gray-400">—</span></span>"#;
     // Six empty cells on alpha and six missing ones on beta; an empty status
     // is not an empty badge, and zero is a value.
     assert_eq!(page.text().matches(dash).count(), 12);
     assert!(!page.text().contains("''"));
     assert!(!page.text().contains(">null<"));
     assert!(!page.text().contains(r#"<span class="cr-pill"></span>"#));
-    assert!(page.text().contains(r#"hover:underline">0</a>"#));
+    assert!(
+        page.text()
+            .contains(r#"class="block max-w-xs truncate">0</span>"#)
+    );
 }
 
 #[tokio::test]
@@ -2594,6 +2602,54 @@ async fn a_table_ordered_by_time_is_marked_for_grouping_by_day() {
     let script = request(&app, Method::GET, script, None, &[]).await;
     assert!(script.text().contains("const enhanceDateGroups = () => {"));
     assert!(script.text().contains("enhanceDateGroups();"));
+}
+
+#[tokio::test]
+async fn a_row_has_one_link_to_its_record_and_opens_it_from_anywhere() {
+    let (_temporary, database) = test_database("views-row-links");
+    database
+        .create(
+            "tasks",
+            "alpha",
+            &[
+                Assignment::from_str("name=Alpha").unwrap(),
+                Assignment::from_str("status=done").unwrap(),
+                Assignment::from_str("owner=anand").unwrap(),
+                Assignment::from_str("notes=Rate the applicant").unwrap(),
+            ],
+            "",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    // The title and the open action; the cells between are text.
+    assert_eq!(
+        page.text()
+            .matches(r#"href="/tasks/records/alpha""#)
+            .count(),
+        2
+    );
+    assert!(
+        page.text()
+            .contains(r#"<span class="block max-w-xs truncate">anand</span>"#)
+    );
+    assert!(page.text().contains(r#"data-row-links="true""#));
+    assert!(
+        page.text()
+            .contains(".cr-rows-open tbody tr:has(td a[href]) { cursor: pointer; }")
+    );
+    let script = page
+        .text()
+        .split(r#"<script src=""#)
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|src| src.starts_with("/static/cr-"))
+        .expect("the page links cr.js");
+    let script = request(&app, Method::GET, script, None, &[]).await;
+    assert!(script.text().contains("const enhanceRowLinks = () => {"));
+    assert!(script.text().contains("enhanceRowLinks();"));
 }
 
 #[tokio::test]

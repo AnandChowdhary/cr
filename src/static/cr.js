@@ -224,9 +224,10 @@ const enhanceTimes = () => {
 // is headed with that day. Days are the reader's, which is why this is here:
 // the server knows each instant but not where the reader's midnight falls.
 // The rows move into one `<tbody>` per day, each headed by a row whose `<th>`
-// labels the group. A table restored from htmx's history snapshot is already
-// grouped, and grouping it again would head each group twice, so a table that
-// has a heading is left alone.
+// labels the group. This binds no listeners, so it does not `claim` the table,
+// which the row links below do; what keeps it from running twice is the DOM
+// itself. A table that has a heading is already grouped — by an earlier run,
+// or in the history snapshot htmx restored it from — and is left alone.
 const startOfDay = (date) => new Date(date.getFullYear(), date.getMonth(), date.getDate());
 
 const dayLabel = (date, now) => {
@@ -243,7 +244,7 @@ const dayLabel = (date, now) => {
 
 const enhanceDateGroups = () => {
   document.querySelectorAll('table[data-date-groups]').forEach((table) => {
-    if (!claim(table) || table.querySelector('.cr-date-group')) return;
+    if (table.querySelector('.cr-date-group')) return;
     const body = table.tBodies[0];
     const columns = table.tHead?.rows[0]?.cells.length ?? 1;
     const now = new Date();
@@ -274,6 +275,37 @@ const enhanceDateGroups = () => {
       table.insertBefore(section, body);
     }
     body.remove();
+  });
+};
+
+// Whole-row links. A records table used to make every cell its own link to
+// the row's record, which put a dozen tab stops in each row and underlined
+// whichever cell the pointer was over. Now a row's one link is in its first
+// cell, which is what the keyboard and a browser without this file use, and a
+// click anywhere else on the row follows it. A click on something that is
+// already a control does what that control does, and a click that ends a text
+// selection is left alone so a value can still be copied. A modified or
+// middle click opens the record in a new tab, as it would on a link.
+const enhanceRowLinks = () => {
+  document.querySelectorAll('table[data-row-links]').forEach((table) => {
+    if (!claim(table)) return;
+    table.classList.add('cr-rows-open');
+    const rowLink = (event) => {
+      if (event.target.closest('a, button, input, select, textarea, summary, label')) return null;
+      if (window.getSelection()?.toString()) return null;
+      return event.target.closest('tbody tr')?.querySelector('td a[href]') ?? null;
+    };
+    const openInNewTab = (link) => window.open(link.href, '_blank', 'noopener');
+    table.addEventListener('click', (event) => {
+      const link = rowLink(event);
+      if (!link) return;
+      if (event.metaKey || event.ctrlKey || event.shiftKey) openInNewTab(link);
+      else link.click();
+    });
+    table.addEventListener('auxclick', (event) => {
+      const link = event.button === 1 ? rowLink(event) : null;
+      if (link) openInNewTab(link);
+    });
   });
 };
 
@@ -530,6 +562,7 @@ const enhanceAll = () => {
   enhanceNotice();
   enhanceTimes();
   enhanceDateGroups();
+  enhanceRowLinks();
   enhanceRecordForm();
   enhanceFilterBuilder();
   enhanceViewLayout();

@@ -142,7 +142,7 @@ says which record it is. In browsers that support scroll-driven animations, a
 fade before the open action shows that more columns are hidden to the right,
 and a shadow after the ID shows that columns have scrolled under it. The
 view also includes cursor pagination, create and edit forms, and audited deletion.
-Click a record ID, field value, or its row action to open the record editor.
+Click anywhere on a row to open its record. The row's one link is its title or ID in the first cell, which is what the keyboard and a browser without JavaScript use, together with the open action at the row's end; the cells between are text, so tabbing through a table stops twice per row rather than at every cell. A click that ends a text selection is left alone so a value can still be copied, and a Ctrl-, Cmd-, Shift-, or middle-click opens the record in a new tab.
 Saved views can switch the same query to a Kanban layout. Every mutation is
 schema-validated and recorded with `source: api`.
 

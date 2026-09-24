@@ -480,17 +480,17 @@ async fn records_are_named_and_tables_read_like_the_form() {
     assert!(
         table
             .body
-            .contains(r#"<span class="cr-pill">Negotiation</span></a>"#)
+            .contains(r#"<span class="cr-pill">Negotiation</span></span>"#)
     );
     // An amount is grouped and carries its unit, read from the record when the
     // schema says so, and a number with no unit is left exactly as stored.
     assert!(
-        table.body.contains(">125,000\u{a0}USD</a>"),
+        table.body.contains(">125,000\u{a0}USD</span>"),
         "{}",
         table.body
     );
-    assert!(table.body.contains(">80%</a>"));
-    assert!(table.body.contains(">2019</a>"));
+    assert!(table.body.contains(">80%</span>"));
+    assert!(table.body.contains(">2019</span>"));
     // Times are relative, with the exact instant kept in the markup.
     assert!(table.body.contains(r#"class="cr-time">just now</time>"#));
     assert!(table.body.contains(r#" UTC" class="cr-time""#));
