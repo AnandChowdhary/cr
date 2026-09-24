@@ -817,6 +817,8 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     assert_eq!(board.status, StatusCode::OK);
     assert!(board.text().contains("Grouped by"));
     assert!(board.text().contains("data-kanban-board=\"true\""));
+    // A board's lanes already split it by state, so it has no quick filters.
+    assert!(!board.text().contains("data-quick-filter"));
     assert!(board.text().contains("draggable=\"true\""));
     // The drag-and-drop enhancement moved to the embedded asset the page
     // links; `tests/static_assets_http.rs` asserts the script it serves.
@@ -2335,6 +2337,138 @@ async fn empty_values_read_as_a_quiet_dash_however_yaml_spells_them() {
     assert!(!page.text().contains(">null<"));
     assert!(!page.text().contains(r#"<span class="cr-pill"></span>"#));
     assert!(page.text().contains(r#"hover:underline">0</a>"#));
+}
+
+#[tokio::test]
+async fn quick_filters_count_each_state_and_apply_it_in_one_click() {
+    let (_temporary, database) = test_database("views-quick-filters");
+    fs::create_dir_all(database.root().join(".cr/schemas")).unwrap();
+    fs::write(
+        database.root().join(".cr/schemas/tasks.json"),
+        r#"{ "type": "object", "properties": {
+             "status": { "enum": ["queued", "running", "done", "failed"] },
+             "kind": { "enum": ["scheduled", "triggered"] } } }"#,
+    )
+    .unwrap();
+    let tasks = [
+        ("a", Some("done"), "triggered"),
+        ("b", Some("done"), "scheduled"),
+        ("c", Some("done"), "triggered"),
+        ("d", Some("failed"), "triggered"),
+        ("e", Some("failed"), "scheduled"),
+        ("f", Some("queued"), "triggered"),
+        ("g", None, "triggered"),
+    ];
+    for (id, status, kind) in tasks {
+        let mut assignments = vec![Assignment::from_str(&format!("kind={kind}")).unwrap()];
+        if let Some(status) = status {
+            assignments.push(Assignment::from_str(&format!("status={status}")).unwrap());
+        }
+        database.create("tasks", id, &assignments, "").unwrap();
+    }
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let chip = |label: &str, count: usize, current: bool| {
+        format!(
+            r#"class="cr-quick-filter"{}>{label}<span class="cr-quick-filter-count">{count}</span></a>"#,
+            if current {
+                r#" aria-current="true""#
+            } else {
+                ""
+            }
+        )
+    };
+
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.text()
+            .contains(r#"<nav aria-label="Filter by Status" data-quick-filter="status""#)
+    );
+    // All, then the schema's order, values nothing has left out, then the
+    // records with no status.
+    let offered = [
+        chip("All", 7, true),
+        chip("Queued", 1, false),
+        chip("Done", 3, false),
+        chip("Failed", 2, false),
+        chip("Not set", 1, false),
+    ];
+    let positions = offered
+        .iter()
+        .map(|chip| {
+            page.text()
+                .find(chip.as_str())
+                .unwrap_or_else(|| panic!("missing {chip}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(!page.text().contains(">Running<"));
+    // A chip is the URL the filter panel would build.
+    assert!(page.text().contains(
+        "filter_match=all&amp;filter_field=status&amp;filter_operator=eq&amp;filter_value=failed&amp;sort_field"
+    ));
+    assert!(
+        page.text()
+            .contains("filter_field=status&amp;filter_operator=is-empty&amp;filter_value=&amp;")
+    );
+
+    // Applied, it is marked, and the other counts are still what each chip
+    // would show, because a chip replaces the condition on its field.
+    let failed = request(
+        &app,
+        Method::GET,
+        "/tasks?filter_field=status&filter_operator=eq&filter_value=failed",
+        None,
+        &[],
+    )
+    .await;
+    assert!(failed.text().contains(&chip("Failed", 2, true)));
+    assert!(failed.text().contains(&chip("All", 7, false)));
+    assert!(failed.text().contains(&chip("Done", 3, false)));
+    assert!(failed.text().contains("Showing 1\u{2013}2 of 2"));
+    // Its All chip clears the condition and nothing else.
+    assert!(failed.text().contains(r#"<a href="/tasks?filter_match=all&amp;sort_field=%24created_at&amp;sort_direction=desc&amp;limit=25" class="cr-quick-filter">All"#));
+
+    // Conditions on other fields narrow every count.
+    let triggered = request(
+        &app,
+        Method::GET,
+        "/tasks?filter_field=kind&filter_operator=eq&filter_value=triggered",
+        None,
+        &[],
+    )
+    .await;
+    assert!(triggered.text().contains(&chip("All", 5, true)));
+    assert!(triggered.text().contains(&chip("Done", 2, false)));
+    assert!(triggered.text().contains(&chip("Failed", 1, false)));
+
+    // Any-of matching with another field's condition has no honest count.
+    let any = request(
+        &app,
+        Method::GET,
+        "/tasks?filter_match=any&filter_field=kind&filter_operator=eq&filter_value=triggered",
+        None,
+        &[],
+    )
+    .await;
+    assert!(!any.text().contains("data-quick-filter"));
+
+    // A schemaless `status` gets them too, most frequent first.
+    for (id, status) in [("x", "open"), ("y", "closed"), ("z", "closed")] {
+        database
+            .create(
+                "issues",
+                id,
+                &[Assignment::from_str(&format!("status={status}")).unwrap()],
+                "",
+            )
+            .unwrap();
+    }
+    let issues = request(&app, Method::GET, "/issues", None, &[]).await;
+    assert!(
+        issues.text().find(&chip("Closed", 2, false)).unwrap()
+            < issues.text().find(&chip("Open", 1, false)).unwrap()
+    );
 }
 
 #[tokio::test]

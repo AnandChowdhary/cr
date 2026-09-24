@@ -138,6 +138,21 @@ Click a record ID, field value, or its row action to open the record editor.
 Saved views can switch the same query to a Kanban layout. Every mutation is
 schema-validated and recorded with `source: api`.
 
+Above a table, a row of quick filters splits the view by state in one click.
+It is on the collection's `status` or `state` field when it has one of plain
+text or an enum, or else on its first enum field in column order, and it is
+left out when the field has only one value, when that field is the title, and
+on Kanban boards, whose lanes already do this. **All** comes first, then up to
+eight values — an enum's in the schema's order, anything else most frequent
+first — then **Not set** for records without one. Each chip says how many
+records it would show: the count honours the search and every other filter in
+the URL, but not the conditions on its own field, because clicking a chip
+replaces those with its own (`is` the value, or `is empty` for **Not set**).
+Each chip is a link to the same URL the filter panel would build, so the panel
+shows the condition when opened. With **any** matching and a condition on
+another field, a chip would widen the result rather than narrow it, so the row
+is left out.
+
 The filter builder combines up to 20 conditions with either **all** (AND) or **any** (OR) matching. Each row has schema-aware operators: equality and inequality for every type; numeric and ISO string/date comparisons; string and array containment; starts/ends-with; and explicit empty/not-empty checks. Enum, boolean, and multi-select values use constrained dropdowns, numeric fields use numeric inputs, formatted strings use their matching input type, and other values accept typed YAML. Add or remove rows in the browser; the match mode and filters stay in the URL as `filter_match` plus repeated `filter_field`, `filter_operator`, and `filter_value` triples, including through pagination. Saved-view predicates always remain required, so choosing **any** cannot escape the view's underlying scope. Missing values match `is empty`, but do not silently match negative operators such as `is not` or `does not contain`.
 
 Every generated page also has schema-aware sorting. Choose a field and direction in the query panel, or click a table column heading to toggle ascending and descending order. Numbers sort numerically, strings and normalized ISO dates sort lexicographically, missing values stay last in both directions, and record ID is the deterministic tie-breaker. The audit-derived `$created_at` and `$updated_at` sort by journal sequence rather than by formatted instant, so two events in the same second still order exactly as they happened, and records with no history stay last. Sorting happens before pagination and remains in pagination URLs; Kanban uses the same order for cards inside each lane.

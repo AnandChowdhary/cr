@@ -2758,6 +2758,7 @@ async fn view_records(
             mut records,
             activity,
             schema,
+            quick_filter,
             navigation,
             can_create,
             can_manage_views,
@@ -2772,21 +2773,25 @@ async fn view_records(
                 }
                 None => database.list(&view.collection, &predicates.assignments)?,
             };
-            records.retain(|record| {
-                predicates.matches(&record.attributes)
-                    && query_for_database
-                        .filter_match
-                        .matches(&ad_hoc_filters, &record.attributes)
-            });
-            // One verified journal walk per page: the created and updated
-            // columns are derived from history, and the sort default reads
-            // them, so this is not optional work the renderer can skip.
-            let activity = database.record_activity(&view.collection)?;
+            records.retain(|record| predicates.matches(&record.attributes));
             let schema = database
                 .collection_models()?
                 .into_iter()
                 .find(|model| model.name == view.collection)
                 .and_then(|model| model.schema);
+            // Counted before the ad hoc filters narrow the records, because a
+            // chip's count is what the view would show with the chip's
+            // condition in place of any on its field.
+            let quick_filter = quick_filter(&view, schema.as_ref(), &records, &query_for_database);
+            records.retain(|record| {
+                query_for_database
+                    .filter_match
+                    .matches(&ad_hoc_filters, &record.attributes)
+            });
+            // One verified journal walk per page: the created and updated
+            // columns are derived from history, and the sort default reads
+            // them, so this is not optional work the renderer can skip.
+            let activity = database.record_activity(&view.collection)?;
             let navigation = database.views()?;
             let can_create = can_create_in_collection(database, &view.collection)?;
             let can_manage_views = database.owner_access_allowed(&AccessResource::Database)?;
@@ -2804,6 +2809,7 @@ async fn view_records(
                 records,
                 activity,
                 schema,
+                quick_filter,
                 navigation,
                 can_create,
                 can_manage_views,
@@ -2864,6 +2870,7 @@ async fn view_records(
             can_create,
             can_manage_views,
             &updatable,
+            quick_filter.as_ref(),
         ))
     }
     .await;
@@ -6391,6 +6398,7 @@ fn render_view_records(
     can_create: bool,
     can_manage_views: bool,
     updatable: &BTreeSet<String>,
+    quick_filter: Option<&QuickFilter>,
 ) -> Markup {
     let new_url = format!("/{}/new", encode_segment(&view.name));
     let reset_url = format!("/{}", encode_segment(&view.name));
@@ -6421,7 +6429,15 @@ fn render_view_records(
         .filter(|(field, _, value)| !field.is_empty() || !value.is_empty())
         .count();
     let results = view_results(
-        view, columns, page, activity, query, schema, csrf_token, updatable,
+        view,
+        columns,
+        page,
+        activity,
+        query,
+        schema,
+        csrf_token,
+        updatable,
+        quick_filter,
     );
     // The one route that can answer with something smaller than its content.
     // It comes first because it is the narrower answer: everything below builds
@@ -7003,6 +7019,282 @@ fn cell_title(value: &str) -> Option<&str> {
     (value.chars().count() >= CELL_TITLE_MIN_CHARS).then_some(value)
 }
 
+/// How many values a row of quick filters offers besides **All**.
+const QUICK_FILTER_VALUES: usize = 8;
+
+/// One-click filters on the field that says what state a view's records are
+/// in, with how many records each would show.
+///
+/// A collection of a few hundred tasks is mostly read one state at a time —
+/// what failed, what is still queued — and that took opening the filter panel,
+/// choosing the field, the operator and the value, and applying it. The row
+/// above the table does it in one click and says beforehand how many records
+/// the click will leave. Each chip is an ordinary link to the URL the filter
+/// panel would have built, so it is shareable, and the panel shows the
+/// condition when opened.
+struct QuickFilter {
+    field: String,
+    /// How many records the view shows with no condition on `field`.
+    total: usize,
+    /// The values offered, each with how many records it would show, in the
+    /// order they are offered. `None` stands for records with no value.
+    values: Vec<(Option<YamlValue>, usize)>,
+}
+
+/// The field a view's quick filters are on, if it has one worth offering: a
+/// top-level `status` or `state` field of plain text or an enum, which is what
+/// collections call their states, or else the first enum field in column
+/// order. Never the title field, and never on a Kanban board, whose lanes are
+/// already this.
+fn quick_filter_field(
+    view: &ViewDefinition,
+    schema: Option<&JsonValue>,
+    records: &[Record],
+) -> Option<String> {
+    if view.layout == ViewLayout::Kanban {
+        return None;
+    }
+    let title = view_title_field(schema, records);
+    let is_enum = |field: &str| {
+        property_definition(schema, field)
+            .is_some_and(|definition| definition.get("enum").is_some())
+    };
+    let holds_text = |field: &str| {
+        let key = YamlValue::String(field.to_owned());
+        records
+            .iter()
+            .any(|record| matches!(record.attributes.get(&key), Some(YamlValue::String(_))))
+            && !records.iter().any(|record| {
+                matches!(
+                    record.attributes.get(&key),
+                    Some(YamlValue::Mapping(_) | YamlValue::Sequence(_))
+                )
+            })
+    };
+    ["status", "state"]
+        .into_iter()
+        .find(|field| Some(*field) != title && (is_enum(field) || holds_text(field)))
+        .map(str::to_owned)
+        .or_else(|| {
+            view_available_columns(view, records, schema)
+                .into_iter()
+                .find(|column| {
+                    !column.contains('.') && Some(column.as_str()) != title && is_enum(column)
+                })
+        })
+}
+
+/// Count what each quick filter would show.
+///
+/// `records` are the view's records before the URL's ad hoc filters, which
+/// are applied here without any on the quick filter's own field: clicking a
+/// chip replaces those, so the count beside it is the count the reader will
+/// get. Any-of matching with a condition on another field is left without
+/// quick filters, because there a chip's condition would widen the result
+/// rather than narrow it, and no count per value would say what clicking does.
+fn quick_filter(
+    view: &ViewDefinition,
+    schema: Option<&JsonValue>,
+    records: &[Record],
+    query: &ViewQuery,
+) -> Option<QuickFilter> {
+    let field = quick_filter_field(view, schema, records)?;
+    let others = query_without_field(query, &field);
+    if query.filter_match == ViewFilterMatch::Any && !others.filter_field.is_empty() {
+        return None;
+    }
+    // A subset of the conditions the page has already parsed, so this does
+    // not fail where the page did not.
+    let others = view_filter_expressions(&others).ok()?;
+    let key = YamlValue::String(field.clone());
+    let mut total = 0;
+    let mut unset = 0;
+    let mut counts = BTreeMap::<String, (YamlValue, usize)>::new();
+    for record in records
+        .iter()
+        .filter(|record| ViewFilterMatch::All.matches(&others, &record.attributes))
+    {
+        total += 1;
+        match record.attributes.get(&key) {
+            None => unset += 1,
+            Some(value) if is_empty_value(value) => unset += 1,
+            Some(value @ (YamlValue::String(_) | YamlValue::Number(_) | YamlValue::Bool(_))) => {
+                counts
+                    .entry(serialize_yaml_value(value))
+                    .or_insert_with(|| (value.clone(), 0))
+                    .1 += 1;
+            }
+            Some(_) => {}
+        }
+    }
+    let active = quick_filter_selection(query, &field);
+    // An enum's values in the schema's order, so a chip stays where it was as
+    // the counts change; anything else most frequent first.
+    let order = property_definition(schema, &field)
+        .and_then(|definition| definition.get("enum"))
+        .and_then(JsonValue::as_array)
+        .map(|values| json_values_as_yaml(values))
+        .unwrap_or_default();
+    let mut values = counts.into_values().collect::<Vec<_>>();
+    values.sort_by(|(left, left_count), (right, right_count)| {
+        let rank = |value: &YamlValue| {
+            order
+                .iter()
+                .position(|known| known == value)
+                .unwrap_or(usize::MAX)
+        };
+        rank(left)
+            .cmp(&rank(right))
+            .then_with(|| right_count.cmp(left_count))
+            .then_with(|| serialize_yaml_value(left).cmp(&serialize_yaml_value(right)))
+    });
+    let mut offered = values
+        .into_iter()
+        .enumerate()
+        .filter(|(index, (value, _))| {
+            *index < QUICK_FILTER_VALUES
+                || matches!(&active, QuickFilterSelection::Value(chosen) if chosen == value)
+        })
+        .map(|(_, (value, count))| (Some(value), count))
+        .collect::<Vec<_>>();
+    if unset > 0 || active == QuickFilterSelection::Unset {
+        offered.push((None, unset));
+    }
+    // One value is no choice, unless the reader has already made it.
+    if offered.len() < 2 && active == QuickFilterSelection::None {
+        return None;
+    }
+    Some(QuickFilter {
+        field,
+        total,
+        values: offered,
+    })
+}
+
+/// `query` without its conditions on `field`, operators kept beside their
+/// fields.
+fn query_without_field(query: &ViewQuery, field: &str) -> ViewQuery {
+    let kept = query_filter_conditions(query)
+        .into_iter()
+        .filter(|(condition, _, _)| condition != field)
+        .collect::<Vec<_>>();
+    ViewQuery {
+        filter_field: kept.iter().map(|(field, _, _)| field.clone()).collect(),
+        filter_operator: kept.iter().map(|(_, operator, _)| *operator).collect(),
+        filter_value: kept.into_iter().map(|(_, _, value)| value).collect(),
+        ..query.clone()
+    }
+}
+
+/// The URL's filter conditions as triples, with the operator a condition
+/// written without one defaults to.
+fn query_filter_conditions(query: &ViewQuery) -> Vec<(String, ViewFilterOperator, String)> {
+    query
+        .filter_field
+        .iter()
+        .zip(&query.filter_value)
+        .enumerate()
+        .map(|(index, (field, value))| {
+            (
+                field.clone(),
+                query
+                    .filter_operator
+                    .get(index)
+                    .copied()
+                    .unwrap_or_default(),
+                value.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Which quick filter the URL has applied.
+#[derive(Debug, PartialEq)]
+enum QuickFilterSelection {
+    /// No condition on the field: **All**.
+    None,
+    /// Exactly the condition a value's chip applies.
+    Value(YamlValue),
+    /// Exactly the condition the chip for records with no value applies.
+    Unset,
+    /// Conditions on the field no chip applies, which any chip replaces.
+    Other,
+}
+
+fn quick_filter_selection(query: &ViewQuery, field: &str) -> QuickFilterSelection {
+    let conditions = query_filter_conditions(query)
+        .into_iter()
+        .filter(|(condition, _, _)| condition == field)
+        .collect::<Vec<_>>();
+    match conditions.as_slice() {
+        [] => QuickFilterSelection::None,
+        [(_, ViewFilterOperator::IsEmpty, _)] => QuickFilterSelection::Unset,
+        [(_, ViewFilterOperator::Eq, value)] => yaml_serde::from_str::<YamlValue>(value)
+            .map(QuickFilterSelection::Value)
+            .unwrap_or(QuickFilterSelection::Other),
+        _ => QuickFilterSelection::Other,
+    }
+}
+
+/// The row of quick filters above a table.
+///
+/// It is inside the results region, so a search or a page turn that swaps the
+/// region brings its counts up to date. The chips themselves navigate the
+/// whole page, boosted, rather than swapping the region: a chip changes the
+/// URL's conditions, and the filter panel and its badge, which are outside the
+/// region, have to show them.
+fn render_quick_filter(
+    view: &ViewDefinition,
+    query: &ViewQuery,
+    page: &ViewPage,
+    quick_filter: &QuickFilter,
+    schema: Option<&JsonValue>,
+) -> Markup {
+    let field = quick_filter.field.as_str();
+    let definition = property_definition(schema, field);
+    let label = field_label(schema, field);
+    let selection = quick_filter_selection(query, field);
+    let url = |condition: Option<(ViewFilterOperator, String)>| {
+        let mut next = query_without_field(query, field);
+        if let Some((operator, value)) = condition {
+            next.filter_field.push(field.to_owned());
+            next.filter_operator.push(operator);
+            next.filter_value.push(value);
+        }
+        view_page_url(view, &next, page.limit, ViewPosition::Start)
+    };
+    html! {
+        nav aria-label=(format!("Filter by {label}")) data-quick-filter=(field) class="mb-3 flex flex-wrap items-center gap-1.5" {
+            span class="mr-1 text-xs font-semibold text-gray-500" { (label) }
+            a href=(url(None)) class="cr-quick-filter" aria-current=[(selection == QuickFilterSelection::None).then_some("true")] {
+                "All" span class="cr-quick-filter-count" { (quick_filter.total) }
+            }
+            @for (value, count) in &quick_filter.values {
+                @match value {
+                    Some(value) => {
+                        a href=(url(Some((ViewFilterOperator::Eq, serialize_yaml_value(value)))))
+                            class="cr-quick-filter"
+                            aria-current=[matches!(&selection, QuickFilterSelection::Value(chosen) if chosen == value).then_some("true")] {
+                            (match value {
+                                YamlValue::String(text) if shows_as_badge(field, definition) => humanize_field_name(text),
+                                value => display_value(value, definition, None),
+                            })
+                            span class="cr-quick-filter-count" { (count) }
+                        }
+                    }
+                    None => {
+                        a href=(url(Some((ViewFilterOperator::IsEmpty, String::new()))))
+                            class="cr-quick-filter"
+                            aria-current=[(selection == QuickFilterSelection::Unset).then_some("true")] {
+                            "Not set" span class="cr-quick-filter-count" { (count) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The region of a view page that a page turn, a re-sort, a filter or a search
 /// replaces, and the only part of the page any of them change.
 ///
@@ -7029,6 +7321,7 @@ fn view_results(
     schema: Option<&JsonValue>,
     csrf_token: &str,
     updatable: &BTreeSet<String>,
+    quick_filter: Option<&QuickFilter>,
 ) -> Markup {
     let (first, last) = page_range(page);
     // The title field is the first column, so it is not repeated among the
@@ -7043,6 +7336,9 @@ fn view_results(
             @if view.layout == ViewLayout::Kanban {
                 (render_kanban_board(view, columns, page, query, schema, csrf_token, updatable))
             } @else {
+            @if let Some(quick_filter) = quick_filter {
+                (render_quick_filter(view, query, page, quick_filter, schema))
+            }
             div class="cr-table-shell" {
                 div class="cr-table-scroll" {
                     table class="min-w-full text-left text-sm" {
@@ -7598,6 +7894,17 @@ fn field_label(schema: Option<&JsonValue>, key: &str) -> String {
 /// string, or an empty list or mapping.
 const EMPTY_VALUE: &str = "—";
 
+/// Whether `value` is one of the ways YAML writes nothing.
+fn is_empty_value(value: &YamlValue) -> bool {
+    match value {
+        YamlValue::Null => true,
+        YamlValue::String(text) => text.trim().is_empty(),
+        YamlValue::Sequence(items) => items.is_empty(),
+        YamlValue::Mapping(entries) => entries.is_empty(),
+        _ => false,
+    }
+}
+
 /// A record's field as a table cell or Kanban card shows it.
 fn display_field(record: &Record, column: &str, schema: Option<&JsonValue>) -> String {
     match record.field(column).ok().flatten() {
@@ -7778,14 +8085,7 @@ fn display_value(
 ) -> String {
     // Nothing, however it is written, reads as a missing field does: `''` and
     // `null` are how YAML spells an empty value, not what a reader should see.
-    let empty = match value {
-        YamlValue::Null => true,
-        YamlValue::String(text) => text.trim().is_empty(),
-        YamlValue::Sequence(items) => items.is_empty(),
-        YamlValue::Mapping(entries) => entries.is_empty(),
-        _ => false,
-    };
-    if empty {
+    if is_empty_value(value) {
         return EMPTY_VALUE.to_owned();
     }
     match value {
@@ -9872,6 +10172,24 @@ html {
 .cr-pill-positive { border-color: var(--color-emerald-200); background: var(--color-emerald-50); color: var(--color-emerald-700); }
 .cr-pill-negative { border-color: var(--cr-invalid-line); background: var(--cr-invalid-soft); color: var(--cr-danger); }
 .cr-pill-active { border-color: var(--cr-info-line); background: var(--cr-info-soft); color: var(--cr-info-ink); }
+
+/* A quick filter above a table, and the one applied. */
+.cr-quick-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--cr-gray-200);
+  border-radius: 999px;
+  background: var(--cr-gray-0);
+  color: var(--cr-gray-700);
+  padding: 3px 10px;
+  font-size: 0.75rem;
+  font-weight: 550;
+}
+.cr-quick-filter:hover { border-color: var(--cr-gray-400); color: var(--cr-gray-900); }
+.cr-quick-filter-count { color: var(--cr-gray-500); font-variant-numeric: tabular-nums; }
+.cr-quick-filter[aria-current="true"] { border-color: var(--cr-gray-900); background: var(--cr-gray-900); color: var(--cr-gray-0); }
+.cr-quick-filter[aria-current="true"] .cr-quick-filter-count { color: var(--cr-gray-300); }
 
 .cr-filter-tag {
   border-radius: 5px;
