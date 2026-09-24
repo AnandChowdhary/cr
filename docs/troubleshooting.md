@@ -64,6 +64,6 @@ Prefer changing the adapter to emit `upsert` or `delete` messages so future runs
 
 ## Backups and sensitive data
 
-Back up the whole database directory, not only `records/`. The `.cr/audit/` directory is necessary to verify history and reconcile direct edits, `.cr/encryption.json` is necessary to decrypt protected data, and `.cr/syncs/` plus `.cr/sync/state/` are needed to resume configured incremental imports. Include `.cr-audit-head.json`, and prefer a backup that keeps history—a Git remote rather than a mirror of the current directory—because a backup taken after a tamper is a copy of the tamper, while a history is a record of when it appeared.
+Back up the whole database directory, not only `records/`; only `.cr/cache/` is safe to leave out, because `cr` rebuilds it. The `.cr/audit/` directory is necessary to verify history and reconcile direct edits, `.cr/encryption.json` is necessary to decrypt protected data, and `.cr/syncs/` plus `.cr/sync/state/` are needed to resume configured incremental imports. Include `.cr-audit-head.json`, and prefer a backup that keeps history—a Git remote rather than a mirror of the current directory—because a backup taken after a tamper is a copy of the tamper, while a history is a record of when it appeared.
 
 CRM and ATS records often contain personal or confidential information. Apply appropriate filesystem permissions, disk encryption, backup retention, and access controls.

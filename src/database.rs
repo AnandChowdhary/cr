@@ -28,7 +28,7 @@ use crate::{
     audit::{
         AuditEncryptionTransition, AuditFilter, AuditHistory, AuditIdempotency,
         AuditIdempotencyResult, AuditLog, AuditMutation, AuditedRecordStates, ChangePreview,
-        JournalCache, ReconciledMutation, RecordActivity, record_hash,
+        JournalCache, JournalVerification, ReconciledMutation, RecordActivity, record_hash,
     },
     check::{CheckReport, CheckScope},
     encryption::{
@@ -256,7 +256,8 @@ pub struct Database {
     attribution: Attribution,
     idempotency_key: Option<String>,
     /// Shared by every clone, and so by every request a server derives from
-    /// one database; see [`Self::with_journal_cache`].
+    /// one database and by `--as` and the command it delegates; see
+    /// [`Self::with_journal_cache`] and [`Self::with_journal_verification`].
     journal: Option<Arc<JournalCache>>,
 }
 
@@ -4262,6 +4263,9 @@ impl Database {
             entry.payload.changes = changes;
             entries.push(entry);
         }
+        if !entries.is_empty() {
+            audit.save_journal_cache();
+        }
         Ok((entries, previews))
     }
 
@@ -5175,6 +5179,20 @@ impl Database {
     /// trusted in place of re-hashing, and what is not.
     pub(crate) fn with_journal_cache(mut self) -> Self {
         self.journal.get_or_insert_with(Arc::default);
+        self
+    }
+
+    /// Keep one verified walk of the journal for this process, save it on
+    /// disk after every append, and, when `verification` is
+    /// [`JournalVerification::Resume`], start from the walk the last write
+    /// saved rather than from the first event.
+    ///
+    /// For the CLI, and the server it launches. Without it every command that
+    /// needs audited state replays the whole journal, so reads cost more with
+    /// every write ever made. `JournalCache` in `src/audit.rs` states what a
+    /// saved walk is trusted with, and what never uses one.
+    pub fn with_journal_verification(mut self, verification: JournalVerification) -> Self {
+        self.journal = Some(Arc::new(JournalCache::persistent(verification)));
         self
     }
 

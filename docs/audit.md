@@ -57,6 +57,38 @@ The audit journal is tamper-evident, not magically tamper-proof if an attacker c
 cr audit verify --expected-head 'sha256:YOUR_SAVED_HASH'
 ```
 
+### Reads and the saved walk
+
+Commands other than `audit verify` and `check` need the journal too: reading
+or listing a collection without encryption checks that no record once owned
+encrypted storage, `--as` checks the operator's and the target's audited
+policy, and every write checks the record it changes. Replaying every event for
+each of those would make every command slower with every change ever recorded.
+
+So each command that appends an event saves its verified walk of the journal in
+`.cr/cache/verified-journal.json`, and the next command resumes from it,
+verifying only the events appended since. Whether an older segment still is
+what was verified is judged from its file identity, size, and modification and
+change times; the newest segment is compared with the digest of what was
+verified. Anything that does not match, and a missing, damaged, or
+other-release file, sends the command back to the first event. Reads never
+write the file, and `.cr/cache/` can be deleted at any time.
+
+Nothing that verifies the journal uses it: `audit verify`, `check`, and the
+walk every write makes before it appends start from the first event every time.
+To have any other command do the same, pass the global `--verify-audit`:
+
+```sh
+cr --verify-audit get deals acme-renewal
+```
+
+The saved walk is as writable as the journal. Someone who can rewrite `.cr/`
+can make a read believe a different replayed state until the next write
+replaces the file with one it verified from the first event. It does not hide
+an altered segment, short of a rewrite that also restores the segment's change
+time ([the trade](architecture.md#the-verified-journal) the server has always
+made), and `audit verify` does not consult it.
+
 ## Anchor the head in Git
 
 Every audit event but the newest is pinned by the hash recorded in the event
@@ -100,7 +132,7 @@ git add records .cr-audit-head.json
 git commit -m 'Move alex-smith to offer'
 ```
 
-Nothing in `cr` writes a `.gitignore`, and the anchor must never be excluded by one.
+The only `.gitignore` `cr` writes is inside `.cr/cache/`, and it ignores nothing but that directory. The anchor must never be excluded by one.
 
 When you review a commit, the anchor tells you two useful things. The hash should change in exactly the commits that also change records or `.cr/audit/`, and the sequence should only ever go **up**. An anchor that moved on its own, went backwards, or jumped is worth stopping on.
 
