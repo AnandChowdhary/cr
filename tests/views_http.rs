@@ -2107,7 +2107,10 @@ async fn object_values_are_summarised_as_a_badge_or_chips_rather_than_yaml() {
         chip("region", "eu")
     ))));
     // Nothing but zeroes and empty strings is nothing.
-    assert!(page.text().contains(&cell("—")));
+    assert!(
+        page.text()
+            .contains(&cell(r#"<span class="text-gray-400">—</span>"#))
+    );
     // A list of objects is counted.
     assert!(
         page.text()
@@ -2285,6 +2288,53 @@ async fn states_are_coloured_badges_by_what_they_say() {
                 .contains(&format!(".cr-pill-{tone} {{ border-color: var("))
         );
     }
+}
+
+#[tokio::test]
+async fn empty_values_read_as_a_quiet_dash_however_yaml_spells_them() {
+    let (_temporary, database) = test_database("views-empty-values");
+    database
+        .create(
+            "tasks",
+            "alpha",
+            &[
+                Assignment::from_str("note=''").unwrap(),
+                Assignment::from_str("owner=null").unwrap(),
+                Assignment::from_str("tags=[]").unwrap(),
+                Assignment::from_str("meta={}").unwrap(),
+                Assignment::from_str("status=''").unwrap(),
+                Assignment::from_str("count=0").unwrap(),
+            ],
+            "",
+        )
+        .unwrap();
+    database
+        .create(
+            "tasks",
+            "beta",
+            &[Assignment::from_str("extra=here").unwrap()],
+            "",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(
+        &app,
+        Method::GET,
+        "/tasks?columns=custom&column=note&column=owner&column=tags&column=meta&column=status&column=count&column=extra",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK);
+    let dash = r#"hover:underline"><span class="text-gray-400">—</span></a>"#;
+    // Six empty cells on alpha and six missing ones on beta; an empty status
+    // is not an empty badge, and zero is a value.
+    assert_eq!(page.text().matches(dash).count(), 12);
+    assert!(!page.text().contains("''"));
+    assert!(!page.text().contains(">null<"));
+    assert!(!page.text().contains(r#"<span class="cr-pill"></span>"#));
+    assert!(page.text().contains(r#"hover:underline">0</a>"#));
 }
 
 #[tokio::test]

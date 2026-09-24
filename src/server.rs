@@ -7594,6 +7594,10 @@ fn field_label(schema: Option<&JsonValue>, key: &str) -> String {
         .unwrap_or_else(|| humanize_field_name(key))
 }
 
+/// What a field with nothing in it shows: missing, `null`, an empty or blank
+/// string, or an empty list or mapping.
+const EMPTY_VALUE: &str = "—";
+
 /// A record's field as a table cell or Kanban card shows it.
 fn display_field(record: &Record, column: &str, schema: Option<&JsonValue>) -> String {
     match record.field(column).ok().flatten() {
@@ -7602,7 +7606,7 @@ fn display_field(record: &Record, column: &str, schema: Option<&JsonValue>) -> S
             property_definition(schema, column),
             Some(&record.attributes),
         ),
-        None => "—".to_owned(),
+        None => EMPTY_VALUE.to_owned(),
     }
 }
 
@@ -7628,6 +7632,9 @@ fn render_field_value(
     schema: Option<&JsonValue>,
     text: &str,
 ) -> Markup {
+    if text == EMPTY_VALUE {
+        return render_empty_value();
+    }
     let definition = property_definition(schema, column);
     match record.field(column).ok().flatten() {
         Some(YamlValue::Mapping(object)) => render_object_summary(object, definition),
@@ -7658,6 +7665,12 @@ fn render_field_value(
         }
         _ => html! { (text) },
     }
+}
+
+/// The dash an empty value shows, quieter than a value, so a column of them
+/// reads as the absence it is rather than as a column of data.
+fn render_empty_value() -> Markup {
+    html! { span class="text-gray-400" { (EMPTY_VALUE) } }
 }
 
 /// Whether a field's string values are badges: an enum's, whose values are a
@@ -7733,7 +7746,7 @@ fn render_object_summary(object: &Mapping, definition: Option<&JsonValue>) -> Ma
         .collect::<Vec<_>>();
     html! {
         @if fields.is_empty() {
-            "—"
+            (render_empty_value())
         }
         @for (key, value) in fields.iter().take(OBJECT_SUMMARY_FIELDS) {
             span class="mr-1 inline-flex items-baseline gap-1 rounded bg-gray-100 px-1.5 py-px text-xs" {
@@ -7763,6 +7776,18 @@ fn display_value(
     definition: Option<&JsonValue>,
     unit_source: Option<&Mapping>,
 ) -> String {
+    // Nothing, however it is written, reads as a missing field does: `''` and
+    // `null` are how YAML spells an empty value, not what a reader should see.
+    let empty = match value {
+        YamlValue::Null => true,
+        YamlValue::String(text) => text.trim().is_empty(),
+        YamlValue::Sequence(items) => items.is_empty(),
+        YamlValue::Mapping(entries) => entries.is_empty(),
+        _ => false,
+    };
+    if empty {
+        return EMPTY_VALUE.to_owned();
+    }
     match value {
         YamlValue::String(text)
             if definition.is_some_and(|definition| definition.get("enum").is_some()) =>
@@ -13200,6 +13225,12 @@ mod tests {
             "Key Account, Renewal"
         );
         assert_eq!(display_value(&Value::Bool(true), None, None), "True");
+        // However YAML spells nothing, it reads as a missing field does.
+        for empty in ["''", "'  '", "null", "~", "[]", "{}"] {
+            assert_eq!(display_value(&number(empty), None, None), "—", "{empty}");
+        }
+        assert_eq!(display_value(&number("0"), None, None), "0");
+        assert_eq!(display_value(&Value::Bool(false), None, None), "False");
     }
 
     #[test]
