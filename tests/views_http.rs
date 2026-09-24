@@ -1325,6 +1325,84 @@ async fn kanban_lanes_count_their_whole_lane_and_offer_more_of_it() {
 }
 
 #[tokio::test]
+async fn a_kanban_board_fits_the_window_with_lanes_that_scroll_on_their_own() {
+    let (_temporary, database) = test_database("views-kanban-layout");
+    database
+        .create(
+            "tasks",
+            "alpha",
+            &[Assignment::from_str("status=done").unwrap()],
+            "",
+        )
+        .unwrap();
+    database
+        .create_view_with_layout(
+            "board",
+            Some("Board"),
+            "tasks",
+            vec![],
+            vec![],
+            25,
+            ViewLayout::Kanban,
+            Some("status".into()),
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let board = request(&app, Method::GET, "/board", None, &[]).await;
+    assert_eq!(board.status, StatusCode::OK);
+    assert!(board.text().contains(
+        r#"<div class="cr-board-scroll"><div data-kanban-board="true" class="cr-board">"#
+    ));
+    assert!(
+        board
+            .text()
+            .contains(r#"class="cr-kanban-lane"><div class="cr-lane-head">"#)
+    );
+    let sheet = board.text();
+    let rule = |selector: &str| {
+        let start = sheet
+            .find(&format!("{selector} {{"))
+            .unwrap_or_else(|| panic!("no {selector}"));
+        &sheet[start..start + sheet[start..].find('}').unwrap()]
+    };
+    // A lane is no taller than the window leaves room for, and its cards
+    // scroll inside it under its heading.
+    assert!(rule(".cr-kanban-lane").contains("max-height: max(22rem, calc(100dvh - 10.5rem));"));
+    assert!(rule(".cr-lane-cards").contains("overflow-y: auto;"));
+    // The board scrolls sideways on its own timeline, and its edges fade only
+    // while there is more board past them.
+    assert!(rule(".cr-board-scroll").contains("scroll-timeline: --cr-board-x inline;"));
+    let shared = rule("  .cr-board::before,\n  .cr-board::after");
+    assert!(shared.contains("position: sticky;") && shared.contains("opacity: 0;"));
+    assert!(
+        rule("  .cr-board::before").contains(
+            "animation: cr-more-behind linear both;\n    animation-timeline: --cr-board-x;"
+        )
+    );
+    let after = &sheet[sheet.rfind("  .cr-board::after {").unwrap()..];
+    assert!(
+        after[..after.find('}').unwrap()].contains(
+            "animation: cr-more-ahead linear both;\n    animation-timeline: --cr-board-x;"
+        )
+    );
+    // The lane a dragged card would drop into is outlined, by an attribute the
+    // sheet styles rather than a ring utility its lane rule would override.
+    assert!(sheet.contains(
+        ".cr-kanban-lane[data-drop-target] { outline: 2px solid var(--cr-accent); outline-offset: -1px; }"
+    ));
+    let script = sheet
+        .split(r#"<script src=""#)
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|src| src.starts_with("/static/cr-"))
+        .expect("the page links cr.js");
+    let script = request(&app, Method::GET, script, None, &[]).await;
+    assert!(script.text().contains("lane.dataset.dropTarget = 'true';"));
+    assert!(!script.text().contains("ring-blue-400"));
+}
+
+#[tokio::test]
 async fn html_forms_create_update_and_delete_through_validated_audited_database_methods() {
     let (_temporary, database) = test_database("views-forms");
     fs::write(

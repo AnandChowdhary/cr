@@ -212,12 +212,16 @@ async fn every_colour_a_utility_reads_has_a_dark_value() {
         .captures_iter(&css)
         .map(|captures| captures.get(1).unwrap().as_str())
         .collect();
-    // A grey, and a hue only `cr.js` asks for — the lane a card is dragged
-    // over — so the stylesheet is known to have been compiled from both files
-    // that write markup.
+    // A grey, so the stylesheet is known to read the palette at all, and a
+    // utility only `cr.js` asks for — the card being dragged — so it is known
+    // to have been compiled from both files that write markup.
     assert!(
-        properties.contains("--cr-gray-500") && properties.contains("--color-blue-400"),
+        properties.contains("--cr-gray-500"),
         "the stylesheet reads none of the expected colours: {properties:?}"
+    );
+    assert!(
+        css.contains(".opacity-50 {"),
+        "the stylesheet was not compiled from cr.js"
     );
 
     for property in properties {
