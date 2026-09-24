@@ -6914,8 +6914,8 @@ fn view_results(
                 (render_kanban_board(view, columns, page, query, schema, csrf_token, updatable))
             } @else {
             div class="cr-table-shell" {
-                div class="overflow-x-auto" {
-                    table class="min-w-full divide-y divide-gray-200 text-left text-sm" {
+                div class="cr-table-scroll" {
+                    table class="min-w-full text-left text-sm" {
                         thead {
                             tr {
                                 // One loop over the three kinds of sortable
@@ -9551,6 +9551,76 @@ html {
 .cr-table-shell th { padding: 8px 12px !important; color: var(--cr-gray-600) !important; font-size: 0.72rem; font-weight: 620 !important; }
 .cr-table-shell td { padding: 8px 12px !important; font-size: 0.79rem; }
 .cr-table-shell tbody tr:hover { background: var(--cr-gray-50); }
+
+/* A records table scrolls inside its own box rather than with the page, in
+   both directions. That is what lets the heading row stay put: the box has to
+   scroll horizontally once there are more columns than fit, and a box that
+   scrolls one way is a scroll container both ways, so a pinned heading could
+   only ever stick to the table's own top edge unless the table's height is
+   bounded. The bound leaves room for the page heading above and the pager
+   below. It also keeps the horizontal scrollbar on screen instead of at the
+   foot of a long table. */
+.cr-table-scroll {
+  max-height: max(20rem, calc(100dvh - 12.5rem));
+  overflow: auto;
+  overscroll-behavior-x: contain;
+  scroll-timeline: --cr-table-x x;
+}
+.cr-table-scroll tbody tr { --cr-row-bg: var(--cr-gray-0); }
+.cr-table-scroll tbody tr:hover { --cr-row-bg: var(--cr-gray-50); }
+/* A line under the heading drawn with box-shadow, because a collapsed table's
+   borders belong to the table and would scroll away from a pinned cell. */
+.cr-table-scroll thead th { position: sticky; top: 0; z-index: 2; background: var(--cr-gray-50); box-shadow: inset 0 -1px 0 var(--cr-gray-200); }
+/* The open action stays at the right edge, so every row keeps a way into its
+   record however far the reader has scrolled. */
+.cr-table-scroll thead th:last-child { right: 0; z-index: 3; }
+.cr-table-scroll tbody td:last-child:not([colspan]) { position: sticky; right: 0; z-index: 1; background: var(--cr-row-bg); }
+
+/* The record ID stays at the left edge on screens wide enough to spare it the
+   width, so a row scrolled sideways still says which record it is. */
+@media (min-width: 900px) {
+  .cr-table-scroll thead th:first-child { left: 0; z-index: 3; }
+  .cr-table-scroll tbody td:first-child:not([colspan]) { position: sticky; left: 0; z-index: 1; background: var(--cr-row-bg); }
+}
+
+/* Where the browser can tie an animation to a scroll position, the edges say
+   whether there is more table beyond them: a fade before the open action
+   while columns are hidden to the right, which clears once the reader reaches
+   the last one, and a darker edge after the ID once columns have scrolled
+   under it. A table that fits has no scroll range, so neither ever appears.
+   Browsers without scroll-driven animations get the pinned edges alone. */
+@supports (animation-timeline: scroll()) {
+  .cr-table-scroll thead th:last-child::before,
+  .cr-table-scroll tbody td:last-child:not([colspan])::before {
+    position: absolute;
+    top: 0;
+    right: 100%;
+    bottom: 0;
+    width: 2rem;
+    background: linear-gradient(to right, transparent, var(--cr-row-bg, var(--cr-gray-50)));
+    content: "";
+    pointer-events: none;
+    animation: cr-table-more linear both;
+    animation-timeline: --cr-table-x;
+  }
+  @media (min-width: 900px) {
+    .cr-table-scroll thead th:first-child::after,
+    .cr-table-scroll tbody td:first-child:not([colspan])::after {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 100%;
+      width: 0.75rem;
+      box-shadow: inset 8px 0 8px -8px rgb(0 0 0 / 0.18);
+      content: "";
+      pointer-events: none;
+      animation: cr-table-scrolled linear both;
+      animation-timeline: --cr-table-x;
+    }
+  }
+}
+@keyframes cr-table-more { 0%, 96% { opacity: 1; } 100% { opacity: 0; } }
+@keyframes cr-table-scrolled { 0% { opacity: 0; } 4%, 100% { opacity: 1; } }
 
 .cr-popover {
   border: 1px solid var(--cr-gray-200);

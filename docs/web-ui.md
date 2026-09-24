@@ -114,7 +114,14 @@ entire available workspace and keep the stable ID, every selected value, and a
 small open action visible without a separate oversized action column. A long
 record ID, such as a slug followed by a hash, is capped at a fixed width so it
 cannot push the other columns off screen: its start and its last ten characters
-stay visible with an ellipsis between them, and hovering shows the whole ID. The
+stay visible with an ellipsis between them, and hovering shows the whole ID.
+The table scrolls inside its own box, sized to the window, so the heading row
+stays in view as rows scroll past and the horizontal scrollbar stays on screen.
+The open action stays at the right edge, and on screens at least 900 pixels
+wide the record ID stays at the left edge, so a row scrolled sideways still
+says which record it is. In browsers that support scroll-driven animations, a
+fade before the open action shows that more columns are hidden to the right,
+and a shadow after the ID shows that columns have scrolled under it. The
 view also includes cursor pagination, create and edit forms, and audited deletion.
 Click a record ID, field value, or its row action to open the record editor.
 Saved views can switch the same query to a Kanban layout. Every mutation is
