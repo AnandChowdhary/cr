@@ -11,9 +11,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
     AccessAction, AccessResource, AgentEvidence, Aggregation, Assignment, AttributionOverrides,
     AuditFilter, CheckReport, CheckScope, CollectionAccessPolicy, CollectionPresentation,
-    DEFAULT_VIEW_PAGE_SIZE, Database, DomainError, Filter, FilterExpression, Projection, Record,
-    RecordPrecondition, RecordVisibility, Role, SchemaReview, SearchQuery, SearchTarget,
-    SortDirection, SyncAttribution, UserDeleteOptions, UserEnsureOutcome, UserKind,
+    DEFAULT_VIEW_PAGE_SIZE, Database, DomainError, Filter, FilterExpression, JournalVerification,
+    Projection, Record, RecordPrecondition, RecordVisibility, Role, SchemaReview, SearchQuery,
+    SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions, UserEnsureOutcome, UserKind,
     UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout, parse_threshold,
     sort_by_record_field, sort_records_by_field,
 };
@@ -227,6 +227,10 @@ struct Cli {
     /// Evaluate this command as a registered principal. Requires database ownership.
     #[arg(long = "as", global = true, value_name = "PRINCIPAL")]
     as_principal: Option<String>,
+
+    /// Verify the audit journal from its first event instead of resuming the walk the last write saved.
+    #[arg(long, global = true)]
+    verify_audit: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -1465,7 +1469,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let database = Database::discover(cli.database.as_deref())?;
+    // Before `--as`, so the delegation check and the command it delegates
+    // share one verified walk of the journal.
+    let database = Database::discover(cli.database.as_deref())?.with_journal_verification(
+        if cli.verify_audit {
+            JournalVerification::Full
+        } else {
+            JournalVerification::Resume
+        },
+    );
     let database = match cli.actor {
         Some(actor) => database.with_actor(actor)?,
         None => database,

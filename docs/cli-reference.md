@@ -1,13 +1,16 @@
 # Command reference
 
 Global `--as PRINCIPAL` delegates one command from an audited database owner.
+Global `--verify-audit` makes the command verify the audit journal from its
+first event instead of resuming the walk the last write saved under
+`.cr/cache/`; see [Reads and the saved walk](audit.md#reads-and-the-saved-walk).
 Global `--json-errors` writes failures to stderr as
 `{"error":{"code":"...","message":"..."}}`; command-line syntax failures use
 `usage_error`, classified domain failures retain their stable code, and an
 unclassified failure uses `internal_error`.
 
 ```text
-cr [--database PATH] [--actor IDENTITY] [--as PRINCIPAL] [--json-errors] COMMAND
+cr [--database PATH] [--actor IDENTITY] [--as PRINCIPAL] [--verify-audit] [--json-errors] COMMAND
 
 cr init PATH
 cr identity [--json] [ATTRIBUTION]

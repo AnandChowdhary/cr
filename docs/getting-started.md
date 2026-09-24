@@ -28,6 +28,8 @@ my-database/
 
 - `records/` contains your Markdown records.
 - `.cr/audit/` contains the audit journal.
+- `.cr/cache/` appears after the first change. It holds derived state that
+  makes reads fast, keeps itself out of Git, and can be deleted at any time.
 - `.cr/encryption.json` is a portable, non-secret database identity used to
   bind protected ciphertext to this database. Keep it with every clone and
   backup.
