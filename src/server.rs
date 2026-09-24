@@ -2832,7 +2832,8 @@ async fn view_records(
         }
 
         let available_columns = view_available_columns(&view, &records, schema.as_ref());
-        let columns = selected_view_columns(&view, &query, &available_columns)?;
+        let columns =
+            selected_view_columns(&view, &query, &available_columns, schema.as_ref(), &records)?;
         sort_view_records(&mut records, &query, &activity)?;
         let bounds = page_bounds(
             query
@@ -6390,6 +6391,7 @@ fn render_view_records(
     let new_url = format!("/{}/new", encode_segment(&view.name));
     let reset_url = format!("/{}", encode_segment(&view.name));
     let filter_fields = view_filter_fields(schema, available_columns);
+    let title_field = view_title_field(schema, &page.records);
     let mut filter_rows = query
         .filter_field
         .iter()
@@ -6561,13 +6563,16 @@ fn render_view_records(
                                         summary class="cursor-pointer list-none text-sm font-bold text-gray-900" {
                                             span class="inline-flex items-center gap-2" {
                                                 "Columns"
-                                                span class="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-semibold text-gray-600" { (columns.len()) " shown" }
+                                                span class="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-semibold text-gray-600" { (columns.iter().filter(|column| Some(column.as_str()) != title_field).count()) " shown" }
                                             }
                                         }
                                         input type="hidden" name="columns" value="custom";
                                         p class="mt-1 text-xs text-gray-500" { "Choose the fields shown in the table or on Kanban cards. Select at least one." }
                                         div role="group" aria-label="Visible columns" class="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" {
-                                            @for column in available_columns {
+                                            // The title field is the first column, or a card's
+                                            // heading, whatever is chosen here, so like the ID it
+                                            // is not offered.
+                                            @for column in available_columns.iter().filter(|column| Some(column.as_str()) != title_field) {
                                                 label class="flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-700 hover:border-indigo-300 hover:bg-indigo-50/40" {
                                                     input type="checkbox" name="column" value=(column) checked[columns.contains(column)] class="size-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500";
                                                     span class="truncate" title=(column) { (field_label(schema, column)) }
@@ -10810,10 +10815,12 @@ fn selected_view_columns(
     view: &ViewDefinition,
     query: &ViewQuery,
     available: &[String],
+    schema: Option<&JsonValue>,
+    records: &[Record],
 ) -> ApiResult<Vec<String>> {
     if !query_columns_custom(query) {
         return Ok(if view.columns.is_empty() {
-            available.iter().take(12).cloned().collect()
+            default_view_columns(available, schema, records)
         } else {
             view.columns.clone()
         });
@@ -10851,6 +10858,64 @@ fn selected_view_columns(
         }
     }
     Ok(query.column.clone())
+}
+
+/// How many fields an automatic table shows beside its title or ID and its
+/// two timestamps, before the reader picks others.
+const DEFAULT_VIEW_COLUMNS: usize = 6;
+
+/// The fields a view with no columns of its own shows.
+///
+/// The first few the column order puts forward, which is six rather than the
+/// twelve it was: with the title and both timestamps that is already nine
+/// columns, and twelve fields more pushed most of them out of sight on any
+/// screen. Two kinds of field are passed over. The one the first column
+/// already shows would only say it twice. And a field whose values are
+/// objects, or lists of them, can only be printed in a one-line cell as a run
+/// of `key: value` pairs, which fills the width a readable field could have
+/// had. Every field is still in the column picker.
+fn default_view_columns(
+    available: &[String],
+    schema: Option<&JsonValue>,
+    records: &[Record],
+) -> Vec<String> {
+    let title = view_title_field(schema, records);
+    available
+        .iter()
+        .filter(|column| Some(column.as_str()) != title)
+        .filter(|column| !field_holds_objects(column, schema, records))
+        .take(DEFAULT_VIEW_COLUMNS)
+        .cloned()
+        .collect()
+}
+
+/// Whether the schema declares `field` an object or a list of objects, or a
+/// record holds one there.
+fn field_holds_objects(field: &str, schema: Option<&JsonValue>, records: &[Record]) -> bool {
+    let declares_object = |definition: Option<&JsonValue>| {
+        definition
+            .and_then(|definition| definition.get("type"))
+            .is_some_and(|kind| match kind {
+                JsonValue::String(kind) => kind == "object",
+                JsonValue::Array(kinds) => kinds.iter().any(|kind| kind == "object"),
+                _ => false,
+            })
+    };
+    let definition = property_definition(schema, field);
+    if declares_object(definition)
+        || declares_object(definition.and_then(|definition| definition.get("items")))
+    {
+        return true;
+    }
+    records.iter().any(
+        |record| match record.attributes.get(YamlValue::String(field.to_owned())) {
+            Some(YamlValue::Mapping(_)) => true,
+            Some(YamlValue::Sequence(items)) => items
+                .iter()
+                .any(|item| matches!(item, YamlValue::Mapping(_))),
+            _ => false,
+        },
+    )
 }
 
 fn query_columns_custom(query: &ViewQuery) -> bool {

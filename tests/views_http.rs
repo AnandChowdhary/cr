@@ -251,10 +251,12 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
             .text()
             .contains("name=\"columns\" value=\"custom\"")
     );
+    // The name is the first column, so like the ID it is not a choice here.
+    assert!(!automatic.text().contains("name=\"column\" value=\"name\""));
     assert!(
         automatic
             .text()
-            .contains("name=\"column\" value=\"name\" checked")
+            .contains("name=\"column\" value=\"status\" checked")
     );
     assert!(automatic.text().contains("Missing values stay last"));
     assert!(automatic.text().contains("Sort by Value ascending"));
@@ -505,7 +507,8 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     )
     .await;
     assert_eq!(projected.status, StatusCode::OK);
-    assert!(projected.text().contains("2 shown"));
+    // The name is the first column rather than one of the chosen fields.
+    assert!(projected.text().contains("1 shown"));
     assert!(projected.text().contains("Sort by Name ascending"));
     assert!(projected.text().contains("Sort by Value ascending"));
     assert!(!projected.text().contains("Sort by Status ascending"));
@@ -870,7 +873,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     )
     .await;
     assert_eq!(projected_board.status, StatusCode::OK);
-    assert!(projected_board.text().contains("1 shown"));
+    assert!(projected_board.text().contains("0 shown"));
     // The name is each card's heading, so it is not repeated as a detail.
     assert!(!projected_board.text().contains(">Name</dt>"));
     assert!(
@@ -1674,7 +1677,15 @@ async fn table_rows_keep_to_one_line_and_long_values_show_in_full_on_hover() {
         .unwrap();
     let app = router(database.clone(), ServerConfig::default()).unwrap();
 
-    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    // An object is not a default column, so this table asks for it.
+    let page = request(
+        &app,
+        Method::GET,
+        "/tasks?columns=custom&column=asked_by&column=prompt&column=claim",
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(page.status, StatusCode::OK);
     let cell = r#"class="block max-w-xs truncate hover:text-indigo-700 hover:underline""#;
     // A short value is one line with nothing to reveal.
@@ -1957,6 +1968,71 @@ async fn a_table_leads_with_the_records_title_and_keeps_the_id_on_hover() {
     );
     let delete = request(&app, Method::GET, "/tickets/records/t-1/delete", None, &[]).await;
     assert!(delete.text().contains("Delete Printer on fire"));
+}
+
+#[tokio::test]
+async fn automatic_tables_show_six_fields_and_leave_objects_to_the_picker() {
+    let (_temporary, database) = test_database("views-default-columns");
+    fs::create_dir_all(database.root().join(".cr/schemas")).unwrap();
+    fs::write(
+        database.root().join(".cr/schemas/tasks.json"),
+        r#"{ "type": "object",
+             "properties": { "reviews": { "type": "array", "items": { "type": "object" } } } }"#,
+    )
+    .unwrap();
+    database
+        .create(
+            "tasks",
+            "alpha",
+            &[
+                Assignment::from_str("title=Rate an applicant").unwrap(),
+                Assignment::from_str("status=done").unwrap(),
+                Assignment::from_str("capability.profile=worker-v1").unwrap(),
+                Assignment::from_str("kind=triggered").unwrap(),
+                Assignment::from_str("asked_by=anand").unwrap(),
+                Assignment::from_str("attempts=0").unwrap(),
+                Assignment::from_str("tags=[a, b]").unwrap(),
+                Assignment::from_str("prompt=Rate them").unwrap(),
+                Assignment::from_str("delivery=slack").unwrap(),
+                Assignment::from_str("draft=none").unwrap(),
+            ],
+            "",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    let shown = |label: &str| page.text().contains(&format!("Sort by {label} ascending"));
+    // The title leads, then the first six fields that are not objects: a list
+    // of plain values is fine, and so is anything the schema does not call an
+    // object.
+    assert!(shown("Title"));
+    for label in ["Status", "Kind", "Asked By", "Attempts", "Tags", "Prompt"] {
+        assert!(shown(label), "{label} is a default column");
+    }
+    for label in ["Capability", "Reviews", "Delivery", "Draft"] {
+        assert!(!shown(label), "{label} is not a default column");
+    }
+    assert!(page.text().contains("6 shown"));
+    // Every field can still be chosen, objects included, the title aside.
+    for field in ["capability", "reviews", "delivery", "draft"] {
+        assert!(
+            page.text()
+                .contains(&format!(r#"name="column" value="{field}" class="#)),
+            "{field} is offered unchecked"
+        );
+    }
+    assert!(!page.text().contains(r#"name="column" value="title""#));
+    let chosen = request(
+        &app,
+        Method::GET,
+        "/tasks?columns=custom&column=capability",
+        None,
+        &[],
+    )
+    .await;
+    assert!(chosen.text().contains("Sort by Capability ascending"));
 }
 
 #[tokio::test]
