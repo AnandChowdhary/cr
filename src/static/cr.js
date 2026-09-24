@@ -278,6 +278,42 @@ const enhanceDateGroups = () => {
   });
 };
 
+// Navigation lists. The sidebar's list of views and collections, and the
+// strip that replaces it on narrow screens, scroll once there are more entries
+// than fit, and every navigation re-renders them, since a boosted navigation
+// swaps the whole body. Left alone, that put each new page's list back at its
+// start: an entry clicked further down scrolled out of sight under the reader's
+// pointer, and a page opened directly could show a list without its own entry
+// in it. So each list keeps where the reader had scrolled it to, and then, if
+// the page's own entry is out of sight or under a fade at an edge, scrolls to
+// put it in the middle. `vertical` picks the sidebar's axis or the strip's.
+const listScroll = new Map();
+
+const keepCurrentEntryInView = (selector, vertical) => {
+  const list = document.querySelector(selector);
+  if (!claim(list)) return;
+  const position = vertical ? 'scrollTop' : 'scrollLeft';
+  if (listScroll.has(selector)) list[position] = listScroll.get(selector);
+  list.addEventListener('scroll', () => listScroll.set(selector, list[position]), { passive: true });
+  const current = list.querySelector('[aria-current="page"]');
+  if (!current) return;
+  const bounds = list.getBoundingClientRect();
+  const box = current.getBoundingClientRect();
+  const [start, end, size, visible] = vertical
+    ? [box.top - bounds.top, box.bottom - bounds.top, box.height, list.clientHeight]
+    : [box.left - bounds.left, box.right - bounds.left, box.width, list.clientWidth];
+  // The height of the sidebar's fades, so an entry under one counts as hidden.
+  const margin = vertical ? 32 : 0;
+  if (visible === 0 || (start >= margin && end <= visible - margin)) return;
+  list[position] += start - (visible - size) / 2;
+  listScroll.set(selector, list[position]);
+};
+
+const enhanceNavigationLists = () => {
+  keepCurrentEntryInView('.cr-sidebar-nav', true);
+  keepCurrentEntryInView('.cr-mobile-view-strip', false);
+};
+
 // Whole-row links. A records table used to make every cell its own link to
 // the row's record, which put a dozen tab stops in each row and underlined
 // whichever cell the pointer was over. Now a row's one link is in its first
@@ -560,6 +596,7 @@ document.addEventListener('htmx:sendError', (event) => {
 // flight; it is not htmx that owns them.
 const enhanceAll = () => {
   enhanceNotice();
+  enhanceNavigationLists();
   enhanceTimes();
   enhanceDateGroups();
   enhanceRowLinks();
