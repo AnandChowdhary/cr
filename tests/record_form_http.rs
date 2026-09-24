@@ -1002,3 +1002,93 @@ async fn a_refused_fields_form_comes_back_as_the_fields_form() {
     assert!(!tampered.body.contains(r#"id="cr-record-form""#));
     database.audit_verify(None).unwrap();
 }
+
+/// The record's front matter keys, in the order its file keeps them.
+fn stored_keys(database: &Database, collection: &str, id: &str) -> Vec<String> {
+    database
+        .get(collection, id)
+        .unwrap()
+        .attributes
+        .keys()
+        .map(|key| key.as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn saving_the_structured_form_keeps_the_order_the_file_keeps_its_fields_in() {
+    let (_temporary, database) = deals_database("structured-order");
+    // Not the schema's order, and not alphabetical: the order somebody wrote.
+    let assignments = [
+        "value=12500",
+        "note=keep me",
+        "stage=discovery",
+        "name=Acme",
+    ]
+    .map(|assignment| Assignment::from_str(assignment).unwrap());
+    database
+        .create("deals", "acme", &assignments, "Body")
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/deals/records/acme", None, &[]).await;
+
+    let saved = request(
+        &app,
+        Method::POST,
+        "/deals/records/acme",
+        Some(form(&[
+            ("_csrf", csrf(&page.body)),
+            ("_expected_record_hash", expected_record_hash(&page.body)),
+            ("_form_mode", "structured"),
+            ("attribute.name", "Acme"),
+            ("attribute.stage", "won"),
+            ("attribute.value", "12500"),
+            ("attribute.relations", ""),
+            ("attribute.reviewers", "grace"),
+            ("_additional_attributes", "note: keep me\n"),
+            ("markdown", "Body"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.body);
+    let record = database.get("deals", "acme").unwrap();
+    assert_eq!(record.attributes["stage"], "won");
+    // Every field stays where it was; the one the record did not have yet
+    // comes after them.
+    assert_eq!(
+        stored_keys(&database, "deals", "acme"),
+        ["value", "note", "stage", "name", "reviewers"]
+    );
+    database.audit_verify(None).unwrap();
+}
+
+#[tokio::test]
+async fn a_record_created_from_the_structured_form_keeps_the_form_order() {
+    let (_temporary, database) = deals_database("structured-create-order");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/deals/new", None, &[]).await;
+
+    let created = request(
+        &app,
+        Method::POST,
+        "/deals/records",
+        Some(submission(csrf(&page.body), "owner: ada")),
+        &[],
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::SEE_OTHER, "{}", created.body);
+    // Declared fields as the form lists them — required first — then the
+    // ones typed into "Other fields", as they were typed.
+    assert_eq!(
+        stored_keys(&database, "deals", "acme-pilot"),
+        [
+            "name",
+            "stage",
+            "value",
+            "relations",
+            "reviewers",
+            "owner",
+            "region"
+        ]
+    );
+}
