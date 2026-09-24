@@ -10982,26 +10982,26 @@ fn mobile_navigation(
                 }
             }
             nav aria-label="Views" class="cr-mobile-view-strip" {
-                a href="/" class=(if current_path == "/" { "is-active" } else { "" }) { (mobile_icon(HOME_ICON)) "All views" }
+                a href="/" class=(if current_path == "/" { "is-active" } else { "" }) aria-current=[(current_path == "/").then_some("page")] { (mobile_icon(HOME_ICON)) "All views" }
                 // Same order as the desktop sidebar: saved views, then
                 // collections, then the internal registry.
                 @for view in navigation_order(views) {
                     @let path = format!("/{}", encode_segment(&view.name));
-                    a href=(&path) class=(if current_path == path { "is-active" } else { "" }) { (mobile_icon(view_icon(view))) (&view.title) }
+                    a href=(&path) class=(if current_path == path { "is-active" } else { "" }) aria-current=[(current_path == path).then_some("page")] { (mobile_icon(view_icon(view))) (&view.title) }
                 }
                 @if ui.is_some_and(|ui| ui.can_read_users) {
-                    a href="/users" class=(if current_path == "/users" { "is-active" } else { "" }) { (mobile_icon(USERS_ICON)) "Users" }
+                    a href="/users" class=(if current_path == "/users" { "is-active" } else { "" }) aria-current=[(current_path == "/users").then_some("page")] { (mobile_icon(USERS_ICON)) "Users" }
                 }
                 @if let Some(ui) = ui.filter(|ui| ui.can_browse_files) {
                     @let on_pin = ui.pins.iter().any(|pin| pin.href == current_path);
                     @let all_files = (current_path == "/browse" || current_path.starts_with("/browse?")) && !on_pin;
-                    a href="/browse" class=(if all_files { "is-active" } else { "" }) { (mobile_icon(ALL_FILES_ICON)) "All files" }
+                    a href="/browse" class=(if all_files { "is-active" } else { "" }) aria-current=[all_files.then_some("page")] { (mobile_icon(ALL_FILES_ICON)) "All files" }
                     @for pin in &ui.pins {
-                        a href=(&pin.href) class=(if pin.href == current_path { "is-active" } else { "" }) title=(&pin.location) { (mobile_icon(pin_icon(pin.kind))) (&pin.label) }
+                        a href=(&pin.href) class=(if pin.href == current_path { "is-active" } else { "" }) aria-current=[(pin.href == current_path).then_some("page")] title=(&pin.location) { (mobile_icon(pin_icon(pin.kind))) (&pin.label) }
                     }
                 }
                 @if ui.is_none_or(|ui| ui.can_view_global_audit) {
-                    a href="/audit" class=(if current_path == "/audit" { "is-active" } else { "" }) { (mobile_icon(AUDIT_ICON)) "Audit" }
+                    a href="/audit" class=(if current_path == "/audit" { "is-active" } else { "" }) aria-current=[(current_path == "/audit").then_some("page")] { (mobile_icon(AUDIT_ICON)) "Audit" }
                 }
                 @if ui.is_some() {
                     a href="/openapi.json" hx-boost=(UNBOOSTED) { "API" }

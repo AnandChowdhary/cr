@@ -1725,6 +1725,56 @@ async fn the_sidebar_list_scrolls_under_a_pinned_footer_with_faded_edges() {
 }
 
 #[tokio::test]
+async fn navigation_lists_mark_the_current_page_and_keep_it_in_view() {
+    let (_temporary, database) = test_database("views-nav-current");
+    for collection in ["alpha", "tasks", "zeta"] {
+        database
+            .create(
+                collection,
+                "one",
+                &[Assignment::from_str("status=done").unwrap()],
+                "",
+            )
+            .unwrap();
+    }
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    // Both lists say which entry is this page, the narrow screens' strip as
+    // the sidebar already did, and only that one.
+    assert!(
+        page.text()
+            .contains(r#"<a href="/tasks" class="is-active" aria-current="page">"#)
+    );
+    assert!(
+        page.text()
+            .contains(r#"<a href="/tasks" class="cr-sidebar-link is-active" aria-current="page""#)
+    );
+    assert_eq!(page.text().matches(r#"aria-current="page""#).count(), 2);
+    // The browser keeps that entry in sight as the lists are re-rendered.
+    let script = page
+        .text()
+        .split(r#"<script src=""#)
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|src| src.starts_with("/static/cr-"))
+        .expect("the page links cr.js");
+    let script = request(&app, Method::GET, script, None, &[]).await;
+    assert!(
+        script
+            .text()
+            .contains("keepCurrentEntryInView('.cr-sidebar-nav', true);")
+    );
+    assert!(
+        script
+            .text()
+            .contains("keepCurrentEntryInView('.cr-mobile-view-strip', false);")
+    );
+    assert!(script.text().contains("  enhanceNavigationLists();"));
+}
+
+#[tokio::test]
 async fn table_rows_keep_to_one_line_and_long_values_show_in_full_on_hover() {
     let (_temporary, database) = test_database("views-one-line");
     let prompt = "Rate the inbound applicant against the rubric and draft a note.";

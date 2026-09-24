@@ -85,8 +85,11 @@ stay visible in a persistent sidebar with audit, OpenAPI, and the RBAC
 perspective control anchored below. Once the list is longer than the window it
 scrolls between the brand and that anchored section, which stay put, and a
 fade above the section and under the brand shows while entries are hidden
-beyond either edge, where the browser supports scroll-driven animations. Every
-entry is marked by an emoji—a collection's own when its schema names one—and
+beyond either edge, where the browser supports scroll-driven animations. The
+list keeps its scroll position from page to page, so an entry clicked far down
+stays under the pointer, and a page whose own entry would be out of sight, such
+as one opened from a link, scrolls the list to show it; the narrow-screen strip
+does the same sideways. Every entry is marked by an emoji—a collection's own when its schema names one—and
 each section is ordered by the name a reader sees;
 the active route remains highlighted on list, board, and record pages. Narrow
 screens collapse the same hierarchy into a sticky top bar and horizontally
