@@ -2653,6 +2653,59 @@ async fn a_row_has_one_link_to_its_record_and_opens_it_from_anywhere() {
 }
 
 #[tokio::test]
+async fn a_views_heading_says_what_it_is_in_one_line() {
+    let (_temporary, database) = test_database("views-heading");
+    database
+        .create(
+            "deals",
+            "alpha",
+            &[Assignment::from_str("stage=won").unwrap()],
+            "",
+        )
+        .unwrap();
+    database
+        .create_view(
+            "won",
+            Some("Won deals"),
+            "deals",
+            vec!["stage=won".into()],
+            vec![],
+            25,
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let automatic = request(&app, Method::GET, "/deals", None, &[]).await;
+    assert!(automatic.text().contains(
+        r#"<p class="cr-lede mt-1" data-view-summary="true">Automatic view of the <code class="font-mono text-gray-700">deals</code> collection<span class="mx-1.5 text-gray-300" aria-hidden="true">·</span><span id="cr-view-count">1 record</span></p>"#
+    ));
+    // No badges beside the title.
+    assert!(
+        !automatic
+            .text()
+            .contains(r#"<span class="cr-pill">automatic view</span>"#)
+    );
+    assert!(
+        !automatic
+            .text()
+            .contains(r#"class="cr-pill" id="cr-view-count""#)
+    );
+
+    let saved = request(&app, Method::GET, "/won", None, &[]).await;
+    assert!(
+        saved
+            .text()
+            .contains(r#"data-view-summary="true">Saved view of the "#)
+    );
+    // The saved view's own filters are still listed under it.
+    assert!(
+        saved
+            .text()
+            .contains(r#"<code class="cr-filter-tag">stage=won</code>"#)
+    );
+}
+
+#[tokio::test]
 async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     let (_temporary, database) = test_database("views-index");
     for (id, status) in [("alpha", "open"), ("beta", "open"), ("gamma", "won")] {

@@ -89,7 +89,11 @@ the active route remains highlighted on list, board, and record pages. Narrow
 screens collapse the same hierarchy into a sticky top bar and horizontally
 scrollable view strip. The main workspace uses short breadcrumbs, one-line
 context, restrained borders, and compact controls so records begin near the top
-of the viewport without losing labels or accessible fallbacks.
+of the viewport without losing labels or accessible fallbacks. Under a view's
+title, one quiet line says what the page is — **Automatic view of the `deals`
+collection · 3 records**, or **Saved view** and **Saved Kanban view** — and the
+count follows every search and filter. A saved view's own filters are listed
+below that line.
 
 Every table opens with two columns the database derives rather than stores:
 **Created** and **Updated**, read from the audit journal and shown right after

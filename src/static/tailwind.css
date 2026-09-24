@@ -286,6 +286,9 @@
       max-width: 96rem;
     }
   }
+  .mx-1\.5 {
+    margin-inline: calc(var(--spacing) * 1.5);
+  }
   .mx-auto {
     margin-inline: auto;
   }
