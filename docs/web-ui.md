@@ -138,6 +138,13 @@ Click a record ID, field value, or its row action to open the record editor.
 Saved views can switch the same query to a Kanban layout. Every mutation is
 schema-validated and recorded with `source: api`.
 
+The conditions a URL applies are listed above the results as chips, in the
+filter panel's words — **Status is Failed**, **Assignee is empty** — after
+**Filtered by**, or **Any of** when any condition may match. Each chip's **×**
+removes its condition and keeps the search, the sort, and the rest, and with
+more than one, **Clear filters** removes them all. A saved view's own filters
+are not chips, because they are what the view is; the heading lists them.
+
 Above a table, a row of quick filters splits the view by state in one click.
 It is on the collection's `status` or `state` field when it has one of plain
 text or an enum, or else on its first enum field in column order, and it is

@@ -2472,6 +2472,83 @@ async fn quick_filters_count_each_state_and_apply_it_in_one_click() {
 }
 
 #[tokio::test]
+async fn applied_filters_are_chips_that_each_remove_their_condition() {
+    let (_temporary, database) = test_database("views-filter-chips");
+    fs::create_dir_all(database.root().join(".cr/schemas")).unwrap();
+    fs::write(
+        database.root().join(".cr/schemas/tasks.json"),
+        r#"{ "type": "object", "properties": {
+             "status": { "enum": ["done", "failed"] },
+             "owner": { "type": "string", "title": "Assignee" } } }"#,
+    )
+    .unwrap();
+    database
+        .create(
+            "tasks",
+            "alpha",
+            &[Assignment::from_str("status=failed").unwrap()],
+            "",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let none = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert!(!none.text().contains("data-filter-chips"));
+
+    let page = request(
+        &app,
+        Method::GET,
+        "/tasks?q=alpha&filter_field=status&filter_operator=eq&filter_value=failed&filter_field=owner&filter_operator=is-empty&filter_value=",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.text().contains(r#"data-filter-chips="2""#));
+    assert!(page.text().contains(">Filtered by<"));
+    // In the panel's words, an enum's value as its option reads.
+    assert!(
+        page.text()
+            .contains(r#"<span class="cr-active-filter">Status is Failed<a "#)
+    );
+    assert!(
+        page.text()
+            .contains(r#"<span class="cr-active-filter">Assignee is empty<a "#)
+    );
+    // Each removes its own condition and keeps the search and the rest.
+    assert!(page.text().contains(
+        r#"href="/tasks?q=alpha&amp;filter_match=all&amp;filter_field=owner&amp;filter_operator=is-empty&amp;filter_value=&amp;sort_field=%24created_at&amp;sort_direction=desc&amp;limit=25" aria-label="Remove filter: Status is Failed""#
+    ));
+    assert!(page.text().contains(
+        r#"href="/tasks?q=alpha&amp;filter_match=all&amp;filter_field=status&amp;filter_operator=eq&amp;filter_value=failed&amp;sort_field=%24created_at&amp;sort_direction=desc&amp;limit=25" aria-label="Remove filter: Assignee is empty""#
+    ));
+    assert!(page.text().contains(
+        r#"<a href="/tasks?q=alpha&amp;filter_match=all&amp;sort_field=%24created_at&amp;sort_direction=desc&amp;limit=25" class="text-xs text-gray-500 hover:text-gray-900 hover:underline">Clear filters</a>"#
+    ));
+
+    // One condition needs no second way to remove it; any-of says so.
+    let one = request(
+        &app,
+        Method::GET,
+        "/tasks?filter_field=status&filter_operator=ne&filter_value=done",
+        None,
+        &[],
+    )
+    .await;
+    assert!(one.text().contains("Status is not Done<a "));
+    assert!(!one.text().contains("Clear filters"));
+    let any = request(
+        &app,
+        Method::GET,
+        "/tasks?filter_match=any&filter_field=status&filter_operator=eq&filter_value=done&filter_field=owner&filter_operator=is-not-empty&filter_value=",
+        None,
+        &[],
+    )
+    .await;
+    assert!(any.text().contains(">Any of<"));
+}
+
+#[tokio::test]
 async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     let (_temporary, database) = test_database("views-index");
     for (id, status) in [("alpha", "open"), ("beta", "open"), ("gamma", "won")] {

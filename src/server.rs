@@ -7236,6 +7236,83 @@ fn quick_filter_selection(query: &ViewQuery, field: &str) -> QuickFilterSelectio
     }
 }
 
+/// The URL's filter conditions as chips, each with a link that removes it.
+///
+/// The Filter button counted the conditions a page applied but did not say
+/// which, so finding out why a table was short took opening the panel and
+/// reading it, and dropping one condition took finding its row and applying
+/// again. Each chip says its condition in the panel's words and removes it in
+/// one click; with more than one, a last link removes them all. A saved view's
+/// own filters are not here, because they are what the view is and cannot be
+/// removed; the heading lists them. Like the quick filters below, the chips
+/// live in the results region, so applying the panel updates them, and their
+/// links navigate the whole page so the panel updates too.
+fn render_active_filters(
+    view: &ViewDefinition,
+    query: &ViewQuery,
+    page: &ViewPage,
+    schema: Option<&JsonValue>,
+) -> Markup {
+    let conditions = query_filter_conditions(query)
+        .into_iter()
+        .filter(|(field, _, value)| !(field.is_empty() && value.is_empty()))
+        .collect::<Vec<_>>();
+    let without = |removed: Option<usize>| {
+        let kept = conditions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| removed.is_some_and(|removed| removed != *index))
+            .map(|(_, condition)| condition.clone())
+            .collect::<Vec<_>>();
+        let next = ViewQuery {
+            filter_field: kept.iter().map(|(field, _, _)| field.clone()).collect(),
+            filter_operator: kept.iter().map(|(_, operator, _)| *operator).collect(),
+            filter_value: kept.into_iter().map(|(_, _, value)| value).collect(),
+            ..query.clone()
+        };
+        view_page_url(view, &next, page.limit, ViewPosition::Start)
+    };
+    let describe = |field: &str, operator: ViewFilterOperator, value: &str| {
+        let label = field_label(schema, field);
+        match operator {
+            ViewFilterOperator::IsEmpty | ViewFilterOperator::IsNotEmpty => {
+                format!("{label} {}", operator.label())
+            }
+            _ => {
+                let enum_option = property_definition(schema, field)
+                    .is_some_and(|definition| definition.get("enum").is_some());
+                let value = if enum_option {
+                    humanize_field_name(value)
+                } else {
+                    value.to_owned()
+                };
+                format!("{label} {} {value}", operator.label())
+            }
+        }
+    };
+    html! {
+        @if !conditions.is_empty() {
+            div data-filter-chips=(conditions.len()) class="mb-3 flex flex-wrap items-center gap-1.5" {
+                span class="mr-1 text-xs font-semibold text-gray-500" {
+                    @if query.filter_match == ViewFilterMatch::Any && conditions.len() > 1 { "Any of" } @else { "Filtered by" }
+                }
+                @for (index, (field, operator, value)) in conditions.iter().enumerate() {
+                    @let text = describe(field, *operator, value);
+                    span class="cr-active-filter" {
+                        (text)
+                        a href=(without(Some(index))) aria-label=(format!("Remove filter: {text}")) class="cr-active-filter-remove" {
+                            span aria-hidden="true" { "×" }
+                        }
+                    }
+                }
+                @if conditions.len() > 1 {
+                    a href=(without(None)) class="text-xs text-gray-500 hover:text-gray-900 hover:underline" { "Clear filters" }
+                }
+            }
+        }
+    }
+}
+
 /// The row of quick filters above a table.
 ///
 /// It is inside the results region, so a search or a page turn that swaps the
@@ -7333,6 +7410,7 @@ fn view_results(
         .collect::<Vec<_>>();
     html! {
         div id=(VIEW_TABLE_REGION) {
+            (render_active_filters(view, query, page, schema))
             @if view.layout == ViewLayout::Kanban {
                 (render_kanban_board(view, columns, page, query, schema, csrf_token, updatable))
             } @else {
@@ -10172,6 +10250,32 @@ html {
 .cr-pill-positive { border-color: var(--color-emerald-200); background: var(--color-emerald-50); color: var(--color-emerald-700); }
 .cr-pill-negative { border-color: var(--cr-invalid-line); background: var(--cr-invalid-soft); color: var(--cr-danger); }
 .cr-pill-active { border-color: var(--cr-info-line); background: var(--cr-info-soft); color: var(--cr-info-ink); }
+
+/* A condition the URL applies, with the link that removes it. */
+.cr-active-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--cr-info-line);
+  border-radius: 999px;
+  background: var(--cr-accent-soft);
+  color: var(--cr-info-strong);
+  padding: 2px 4px 2px 10px;
+  font-size: 0.75rem;
+  font-weight: 550;
+}
+.cr-active-filter-remove {
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  color: var(--cr-info-strong);
+  font-size: 0.85rem;
+  line-height: 1;
+}
+.cr-active-filter-remove:hover { background: var(--cr-info-line); }
 
 /* A quick filter above a table, and the one applied. */
 .cr-quick-filter {
