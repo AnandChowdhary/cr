@@ -7085,7 +7085,7 @@ fn view_results(
                                         @for column in &shown_columns {
                                             @let value = display_field(record, column, schema);
                                             td class="px-4 py-3 text-gray-700" {
-                                                a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) title=[cell_title(&value)] class="block max-w-xs truncate hover:text-indigo-700 hover:underline" { (value) }
+                                                a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) title=[cell_title(&value)] class="block max-w-xs truncate hover:text-indigo-700 hover:underline" { (render_field_value(record, column, schema, &value)) }
                                             }
                                         }
                                         td class="whitespace-nowrap px-4 py-3 text-right" {
@@ -7263,7 +7263,7 @@ fn render_kanban_board(
                                             @for column in &card_columns {
                                                 div {
                                                     dt class="text-[0.65rem] font-bold uppercase tracking-wide text-gray-400" { (field_label(schema, column)) }
-                                                    dd class="mt-0.5 line-clamp-2 text-sm text-gray-700" { (display_field(record, column, schema)) }
+                                                    dd class="mt-0.5 line-clamp-2 text-sm text-gray-700" { (render_field_value(record, column, schema, &display_field(record, column, schema))) }
                                                 }
                                             }
                                         }
@@ -7589,6 +7589,89 @@ fn display_field(record: &Record, column: &str, schema: Option<&JsonValue>) -> S
             Some(&record.attributes),
         ),
         None => "—".to_owned(),
+    }
+}
+
+/// How many of an object's fields a cell summarises before counting the rest.
+const OBJECT_SUMMARY_FIELDS: usize = 2;
+
+/// A record's field as a table cell or Kanban card shows it: `text`, which is
+/// [`display_field`]'s rendering of it, unless the value is an object or a
+/// list of objects, which is summarised instead.
+///
+/// Printed as text, an object was its YAML run together on one line —
+/// `status: done attempts: 0 retry: at: '' session: learning-…` — which is
+/// long, mostly noise, and hides the one part a reader wants. So an object with
+/// a state says only that: its `status` or `state`, or else the first field the
+/// schema gives an enum, as a badge. Any other object shows its first few
+/// fields that hold something, as `key value` chips, leaving out empty strings,
+/// zeroes, `false`, nulls, and nested values, and counts the rest; one with
+/// nothing worth showing is a dash. A list of objects is counted. The whole
+/// value is still in the cell's tooltip, which `text` supplies.
+fn render_field_value(
+    record: &Record,
+    column: &str,
+    schema: Option<&JsonValue>,
+    text: &str,
+) -> Markup {
+    match record.field(column).ok().flatten() {
+        Some(YamlValue::Mapping(object)) => {
+            render_object_summary(object, property_definition(schema, column))
+        }
+        Some(YamlValue::Sequence(items))
+            if items
+                .iter()
+                .any(|item| matches!(item, YamlValue::Mapping(_))) =>
+        {
+            html! {
+                span class="text-gray-500" {
+                    (items.len()) @if items.len() == 1 { " item" } @else { " items" }
+                }
+            }
+        }
+        _ => html! { (text) },
+    }
+}
+
+/// The badge or chips [`render_field_value`] shows for one object.
+fn render_object_summary(object: &Mapping, definition: Option<&JsonValue>) -> Markup {
+    let scalar = |value: &YamlValue| match value {
+        YamlValue::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        YamlValue::Number(number) if number.as_f64() != Some(0.0) => Some(number.to_string()),
+        YamlValue::Bool(true) => Some("True".to_owned()),
+        _ => None,
+    };
+    let state = ["status", "state"]
+        .into_iter()
+        .find_map(|key| object.get(YamlValue::String(key.to_owned())))
+        .or_else(|| {
+            let properties = definition?.get("properties")?.as_object()?;
+            object.iter().find_map(|(key, value)| {
+                let key = key.as_str()?;
+                properties.get(key)?.get("enum").is_some().then_some(value)
+            })
+        })
+        .and_then(scalar);
+    if let Some(state) = state {
+        return html! { span class="cr-pill" { (humanize_field_name(&state)) } };
+    }
+    let fields = object
+        .iter()
+        .filter_map(|(key, value)| Some((key.as_str()?, scalar(value)?)))
+        .collect::<Vec<_>>();
+    html! {
+        @if fields.is_empty() {
+            "—"
+        }
+        @for (key, value) in fields.iter().take(OBJECT_SUMMARY_FIELDS) {
+            span class="mr-1 inline-flex items-baseline gap-1 rounded bg-gray-100 px-1.5 py-px text-xs" {
+                span class="text-gray-500" { (key) }
+                span class="text-gray-700" { (value) }
+            }
+        }
+        @if fields.len() > OBJECT_SUMMARY_FIELDS {
+            span class="text-xs text-gray-500" { "+" (fields.len() - OBJECT_SUMMARY_FIELDS) }
+        }
     }
 }
 

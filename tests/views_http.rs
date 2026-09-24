@@ -2036,6 +2036,85 @@ async fn automatic_tables_show_six_fields_and_leave_objects_to_the_picker() {
 }
 
 #[tokio::test]
+async fn object_values_are_summarised_as_a_badge_or_chips_rather_than_yaml() {
+    let (_temporary, database) = test_database("views-object-summary");
+    fs::create_dir_all(database.root().join(".cr/schemas")).unwrap();
+    fs::write(
+        database.root().join(".cr/schemas/tasks.json"),
+        r#"{ "type": "object",
+             "properties": { "review": { "type": "object",
+                 "properties": { "verdict": { "enum": ["advance", "reject"] } } } } }"#,
+    )
+    .unwrap();
+    database
+        .create(
+            "tasks",
+            "alpha",
+            &[
+                Assignment::from_str("learning.attempts=0").unwrap(),
+                Assignment::from_str("learning.status=in_progress").unwrap(),
+                Assignment::from_str("learning.session=learning-alpha").unwrap(),
+                Assignment::from_str("review.score=4").unwrap(),
+                Assignment::from_str("review.verdict=advance").unwrap(),
+                Assignment::from_str("capability.profile=worker-v1").unwrap(),
+                Assignment::from_str("capability.region=eu").unwrap(),
+                Assignment::from_str("capability.pool=batch").unwrap(),
+                Assignment::from_str("capability.retries=0").unwrap(),
+                Assignment::from_str("claim.pid=0").unwrap(),
+                Assignment::from_str("claim.at=''").unwrap(),
+                Assignment::from_str("history=[{at: one}, {at: two}]").unwrap(),
+            ],
+            "",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(
+        &app,
+        Method::GET,
+        "/tasks?columns=custom&column=learning&column=review&column=capability&column=claim&column=history",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK);
+    let cell = |content: &str| format!(r#"hover:text-indigo-700 hover:underline">{content}</a>"#);
+    // A state is the whole summary, read like an enum.
+    assert!(
+        page.text()
+            .contains(&cell(r#"<span class="cr-pill">In Progress</span>"#))
+    );
+    // So is the field the schema gives an enum.
+    assert!(
+        page.text()
+            .contains(&cell(r#"<span class="cr-pill">Advance</span>"#))
+    );
+    // Otherwise the first fields that hold something, and a count of the rest.
+    let chip = |key: &str, value: &str| {
+        format!(
+            r#"<span class="mr-1 inline-flex items-baseline gap-1 rounded bg-gray-100 px-1.5 py-px text-xs"><span class="text-gray-500">{key}</span><span class="text-gray-700">{value}</span></span>"#
+        )
+    };
+    assert!(page.text().contains(&cell(&format!(
+        r#"{}{}<span class="text-xs text-gray-500">+1</span>"#,
+        chip("profile", "worker-v1"),
+        chip("region", "eu")
+    ))));
+    // Nothing but zeroes and empty strings is nothing.
+    assert!(page.text().contains(&cell("—")));
+    // A list of objects is counted.
+    assert!(
+        page.text()
+            .contains(&cell(r#"<span class="text-gray-500">2 items</span>"#))
+    );
+    // The YAML is still there on hover.
+    assert!(
+        page.text()
+            .contains("title=\"attempts: 0\nstatus: in_progress\nsession: learning-alpha\"")
+    );
+}
+
+#[tokio::test]
 async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     let (_temporary, database) = test_database("views-index");
     for (id, status) in [("alpha", "open"), ("beta", "open"), ("gamma", "won")] {
