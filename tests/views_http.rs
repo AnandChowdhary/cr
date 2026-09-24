@@ -871,7 +871,13 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
     .await;
     assert_eq!(projected_board.status, StatusCode::OK);
     assert!(projected_board.text().contains("1 shown"));
-    assert!(projected_board.text().contains(">Name</dt>"));
+    // The name is each card's heading, so it is not repeated as a detail.
+    assert!(!projected_board.text().contains(">Name</dt>"));
+    assert!(
+        projected_board
+            .text()
+            .contains(r#"class="text-sm font-semibold text-gray-900 hover:text-indigo-700 hover:underline">Beta</a>"#)
+    );
     assert!(!projected_board.text().contains(">Owner</dt>"));
     assert!(!projected_board.text().contains(">Score</dt>"));
 
@@ -1603,12 +1609,12 @@ async fn long_record_ids_are_capped_and_shortened_in_the_middle_of_the_table() {
     // complete ID for hover. The halves are adjacent, so the text is the ID.
     let (head, tail) = long.split_at(long.len() - 10);
     assert!(page.text().contains(&format!(
-        r#"<a href="/tasks/records/{long}" title="{long}" class="flex max-w-80 text-gray-600 hover:text-indigo-700 hover:underline"><span class="truncate">{head}</span><span class="shrink-0">{tail}</span></a>"#
+        r#"<a href="/tasks/records/{long}" title="{long}" class="flex max-w-80 font-mono text-gray-600 hover:text-indigo-700 hover:underline"><span class="truncate">{head}</span><span class="shrink-0">{tail}</span></a>"#
     )));
     assert_eq!(tail, "b42c6feb79");
     // A short ID is never cut, so it is one span and needs no tooltip.
     assert!(page.text().contains(
-        r#"<a href="/tasks/records/acme-renewal" class="flex max-w-80 text-gray-600 hover:text-indigo-700 hover:underline"><span class="truncate">acme-renewal</span></a>"#
+        r#"<a href="/tasks/records/acme-renewal" class="flex max-w-80 font-mono text-gray-600 hover:text-indigo-700 hover:underline"><span class="truncate">acme-renewal</span></a>"#
     ));
 }
 
@@ -1860,6 +1866,97 @@ async fn automatic_columns_follow_the_schema_then_the_order_records_are_written_
     let stage = notes.text().find("Sort by Stage ascending").unwrap();
     let author = notes.text().find("Sort by Author ascending").unwrap();
     assert!(name < stage && stage < author);
+}
+
+#[tokio::test]
+async fn a_table_leads_with_the_records_title_and_keeps_the_id_on_hover() {
+    let (_temporary, database) = test_database("views-title-column");
+    database
+        .create(
+            "deals",
+            "acme-renewal",
+            &[
+                Assignment::from_str("name=Acme annual renewal").unwrap(),
+                Assignment::from_str("stage=won").unwrap(),
+            ],
+            "",
+        )
+        .unwrap();
+    database
+        .create(
+            "deals",
+            "unnamed",
+            &[Assignment::from_str("stage=lost").unwrap()],
+            "",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let page = request(&app, Method::GET, "/deals", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    // The first column is the name, sorted by name, with the ID it replaces
+    // in the tooltip.
+    assert!(
+        page.text()
+            .contains(r#"aria-label="Sort by Name ascending""#)
+    );
+    assert!(!page.text().contains(r#"aria-label="Sort by record ID"#));
+    assert!(page.text().contains(
+        "<a href=\"/deals/records/acme-renewal\" title=\"Acme annual renewal\nacme-renewal\" class=\"flex max-w-80 font-semibold text-gray-900 hover:text-indigo-700 hover:underline\"><span class=\"truncate\">Acme annual renewal</span></a>"
+    ));
+    // Not repeated among the other columns.
+    assert_eq!(page.text().matches("Sort by Name").count(), 1);
+    assert!(!page.text().contains(">Acme annual renewal</a>"));
+    // A record without one is shown by its ID.
+    assert!(page.text().contains(
+        r#"<a href="/deals/records/unnamed" class="flex max-w-80 font-mono text-gray-600 hover:text-indigo-700 hover:underline"><span class="truncate">unnamed</span></a>"#
+    ));
+
+    // A schema can name another field, and every page names the record by it.
+    fs::create_dir_all(database.root().join(".cr/schemas")).unwrap();
+    fs::write(
+        database.root().join(".cr/schemas/tickets.json"),
+        r#"{ "type": "object", "x-cr-ui": { "title": "subject" },
+             "properties": { "subject": { "type": "string", "title": "Subject line" },
+                             "name": { "type": "string" } } }"#,
+    )
+    .unwrap();
+    database
+        .create(
+            "tickets",
+            "t-1",
+            &[
+                Assignment::from_str("name=Requester").unwrap(),
+                Assignment::from_str("subject=Printer on fire").unwrap(),
+            ],
+            "",
+        )
+        .unwrap();
+    let tickets = request(&app, Method::GET, "/tickets", None, &[]).await;
+    assert!(
+        tickets
+            .text()
+            .contains(r#"aria-label="Sort by Subject line ascending""#)
+    );
+    assert!(
+        tickets
+            .text()
+            .contains(r#"<span class="truncate">Printer on fire</span>"#)
+    );
+    // `name` is an ordinary column here.
+    assert!(
+        tickets
+            .text()
+            .contains(r#"aria-label="Sort by Name ascending""#)
+    );
+    let record = request(&app, Method::GET, "/tickets/records/t-1", None, &[]).await;
+    assert!(
+        record
+            .text()
+            .contains("<title>Printer on fire · cr</title>")
+    );
+    let delete = request(&app, Method::GET, "/tickets/records/t-1/delete", None, &[]).await;
+    assert!(delete.text().contains("Delete Printer on fire"));
 }
 
 #[tokio::test]

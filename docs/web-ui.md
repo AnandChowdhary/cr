@@ -93,9 +93,9 @@ of the viewport without losing labels or accessible fallbacks.
 
 Every table opens with two columns the database derives rather than stores:
 **Created** and **Updated**, read from the audit journal and shown right after
-the record ID. Nothing in front matter records a record's age, and a field that
-claimed to would be a second copy a direct edit could contradict, so the journal
-stays the only source. A record written directly and not yet saved has no
+the record's [title](#use-schema-driven-record-forms) or ID. Nothing in front
+matter records a record's age, and a field that claimed to would be a second
+copy a direct edit could contradict, so the journal stays the only source. A record written directly and not yet saved has no
 audited age and shows `—`. Both columns sort like any other, and both follow
 audit-read permission: a principal sees a timestamp exactly where `cr audit log`
 would show it the event.
@@ -290,6 +290,26 @@ Use the optional `x-cr-ui.order` schema extension to control field order without
 ```
 
 Fields omitted from the order remain visible after configured fields, with required fields first.
+
+Records are called by their name wherever the UI names one: a table's first
+column, a Kanban card's heading, the record page's title, the delete
+confirmation, and relations. By default that is a non-empty `name` field, or
+else `title`. Set `x-cr-ui.title` to name the records by another top-level
+string field instead:
+
+```json
+{
+  "type": "object",
+  "x-cr-ui": { "title": "subject" },
+  "properties": { "subject": { "type": "string" } }
+}
+```
+
+A table with a title field leads with it in place of the record ID: the title
+in bold, the heading sorting by that field, and the ID in the tooltip beneath
+the full title. The field is not repeated among the other columns. A Kanban
+card shows the title with the ID in small type below it. A record with no value
+for the field is shown by its ID, as before.
 
 Tables and Kanban cards use the same words as the form. A column heading is the field's schema `title`, or its key made readable (`expected_close` becomes **Expected Close**), and an enum's value reads as the form's option does (`negotiation` becomes **Negotiation**). Give a number an `x-cr-unit` to show it as an amount, with its digits grouped and its unit after it. The unit is either a fixed string or the name of another field that holds it:
 

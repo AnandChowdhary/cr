@@ -3473,10 +3473,11 @@ async fn change_relation_form(
                 )?,
             };
             // Named only when this perspective may read it, like the panel.
+            let target_schema = database.schema(&target_collection).ok().flatten();
             let target = database
                 .get(&target_collection, &target_id)
                 .map(|target| {
-                    record_name(&target.attributes)
+                    record_name(&target.attributes, target_schema.as_ref())
                         .unwrap_or(&target.id)
                         .to_owned()
                 })
@@ -3579,7 +3580,7 @@ async fn confirm_delete_record(
     let result: ApiResult<Markup> = async {
         let requested_view = view_name.clone();
         let requested_id = id.clone();
-        let (view, record, navigation) = run_database(&state, &headers, move |database| {
+        let (view, record, schema, navigation) = run_database(&state, &headers, move |database| {
             let view = database.view(&requested_view)?;
             let record = database.get(&view.collection, &requested_id)?;
             let resource = AccessResource::record(&view.collection, &record.id);
@@ -3591,7 +3592,9 @@ async fn confirm_delete_record(
                 .into());
             }
             let navigation = database.views()?;
-            Ok((view, record, navigation))
+            // Only to name the record the way its collection does.
+            let schema = database.schema(&view.collection).ok().flatten();
+            Ok((view, record, schema, navigation))
         })
         .await?;
         let ui = ui_context(&state, &headers).await?;
@@ -3599,6 +3602,7 @@ async fn confirm_delete_record(
             &Representation::requested(&headers),
             &view,
             &record,
+            schema.as_ref(),
             &navigation,
             ui.as_ref(),
             &state.csrf_token,
@@ -6653,10 +6657,18 @@ fn render_view_records(
 /// matter key — which is what a reader correlating the table with a record file
 /// needs to see — while being read out humanized.
 fn sortable_headings<'a>(
-    columns: &'a [String],
+    title_field: Option<&'a str>,
+    columns: &[&'a String],
     schema: Option<&JsonValue>,
 ) -> Vec<(&'a str, String, String)> {
-    std::iter::once(("$id", "ID".to_owned(), "record ID".to_owned()))
+    let first = match title_field {
+        Some(field) => {
+            let label = field_label(schema, field);
+            (field, label.clone(), label)
+        }
+        None => ("$id", "ID".to_owned(), "record ID".to_owned()),
+    };
+    std::iter::once(first)
         .chain(
             ACTIVITY_COLUMNS
                 .iter()
@@ -6936,16 +6948,29 @@ fn render_record_id_link(href: &str, id: &str) -> Markup {
     html! {
         @match tail_start {
             Some(tail_start) => {
-                a href=(href) title=(id) class="flex max-w-80 text-gray-600 hover:text-indigo-700 hover:underline" {
+                a href=(href) title=(id) class="flex max-w-80 font-mono text-gray-600 hover:text-indigo-700 hover:underline" {
                     span class="truncate" { (&id[..tail_start]) }
                     span class="shrink-0" { (&id[tail_start..]) }
                 }
             }
             None => {
-                a href=(href) class="flex max-w-80 text-gray-600 hover:text-indigo-700 hover:underline" {
+                a href=(href) class="flex max-w-80 font-mono text-gray-600 hover:text-indigo-700 hover:underline" {
                     span class="truncate" { (id) }
                 }
             }
+        }
+    }
+}
+
+/// A record's title in the first cell of a table row, linking to the record.
+///
+/// The title is what a reader scans for, so it is the row's one bold value,
+/// and the ID it replaces is kept in the tooltip beneath the title, in full,
+/// for whoever needs the stable identifier.
+fn render_record_title_link(href: &str, title: &str, id: &str) -> Markup {
+    html! {
+        a href=(href) title=(format!("{title}\n{id}")) class="flex max-w-80 font-semibold text-gray-900 hover:text-indigo-700 hover:underline" {
+            span class="truncate" { (title) }
         }
     }
 }
@@ -6997,6 +7022,13 @@ fn view_results(
     updatable: &BTreeSet<String>,
 ) -> Markup {
     let (first, last) = page_range(page);
+    // The title field is the first column, so it is not repeated among the
+    // others.
+    let title_field = view_title_field(schema, &page.records);
+    let shown_columns = columns
+        .iter()
+        .filter(|column| Some(column.as_str()) != title_field)
+        .collect::<Vec<_>>();
     html! {
         div id=(VIEW_TABLE_REGION) {
             @if view.layout == ViewLayout::Kanban {
@@ -7014,7 +7046,7 @@ fn view_results(
                                 // one of them now needs its position for
                                 // `sort_link_id` and a position is only
                                 // meaningful across the whole row.
-                                @for (index, (field, heading, spoken)) in sortable_headings(columns, schema).iter().enumerate() {
+                                @for (index, (field, heading, spoken)) in sortable_headings(title_field, &shown_columns, schema).iter().enumerate() {
                                     th scope="col" aria-sort=(sort_aria_state(query, field)) class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" {
                                         a id=(sort_link_id(index)) href=(view_sort_url(view, query, field, page.limit)) aria-label=(sort_link_label(query, spoken, field)) class="inline-flex items-center gap-1.5 hover:text-indigo-700"
                                             hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_FROM_INSIDE) hx-push-url="true" {
@@ -7027,13 +7059,17 @@ fn view_results(
                         }
                         tbody class="divide-y divide-gray-100" {
                             @if page.records.is_empty() {
-                                tr { td colspan=(columns.len() + ACTIVITY_COLUMNS.len() + 2) class="px-4 py-12 text-center text-gray-500" { "No records match this view." } }
+                                tr { td colspan=(shown_columns.len() + ACTIVITY_COLUMNS.len() + 2) class="px-4 py-12 text-center text-gray-500" { "No records match this view." } }
                             } @else {
                                 @for record in &page.records {
                                     @let record_activity = activity.get(&record.id);
+                                    @let href = format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id));
                                     tr {
-                                        td class="px-4 py-3 font-mono text-xs" {
-                                            (render_record_id_link(&format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id)), &record.id))
+                                        td class="px-4 py-3" {
+                                            @match title_field.and_then(|field| record_title(record, field)) {
+                                                Some(title) => (render_record_title_link(&href, title, &record.id)),
+                                                None => (render_record_id_link(&href, &record.id)),
+                                            }
                                         }
                                         td class="whitespace-nowrap px-4 py-3" {
                                             (render_timestamp(record_activity.map(|activity| activity.created_at.as_str())))
@@ -7041,7 +7077,7 @@ fn view_results(
                                         td class="whitespace-nowrap px-4 py-3" {
                                             (render_timestamp(record_activity.map(|activity| activity.updated_at.as_str())))
                                         }
-                                        @for column in columns {
+                                        @for column in &shown_columns {
                                             @let value = display_field(record, column, schema);
                                             td class="px-4 py-3 text-gray-700" {
                                                 a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) title=[cell_title(&value)] class="block max-w-xs truncate hover:text-indigo-700 hover:underline" { (value) }
@@ -7158,9 +7194,10 @@ fn render_kanban_board(
         .as_deref()
         .expect("validated Kanban views have a group_by field");
     let lanes = kanban_lanes(&page.records, group_by, schema);
+    let title_field = view_title_field(schema, &page.records);
     let card_columns = columns
         .iter()
-        .filter(|column| column.as_str() != group_by)
+        .filter(|column| column.as_str() != group_by && Some(column.as_str()) != title_field)
         .take(5)
         .collect::<Vec<_>>();
     let (first, last) = page_range(page);
@@ -7202,7 +7239,18 @@ fn render_kanban_board(
                                     class=(if can_move { "cr-kanban-card cursor-grab p-3 active:cursor-grabbing" } else { "cr-kanban-card p-3" })
                                 {
                                     div class="flex items-start justify-between gap-3" {
-                                        a href=(format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id))) class="break-all font-mono text-sm font-bold text-gray-900 hover:text-indigo-700 hover:underline" { (&record.id) }
+                                        @let href = format!("/{}/records/{}", encode_segment(&view.name), encode_segment(&record.id));
+                                        @match title_field.and_then(|field| record_title(record, field)) {
+                                            Some(title) => {
+                                                div class="min-w-0" {
+                                                    a href=(href) class="text-sm font-semibold text-gray-900 hover:text-indigo-700 hover:underline" { (title) }
+                                                    p class="mt-0.5 break-all font-mono text-xs text-gray-500" { (&record.id) }
+                                                }
+                                            }
+                                            None => {
+                                                a href=(href) class="break-all font-mono text-sm font-bold text-gray-900 hover:text-indigo-700 hover:underline" { (&record.id) }
+                                            }
+                                        }
                                         span aria-hidden="true" class="select-none text-gray-300" { "⠿" }
                                     }
                                     @if !card_columns.is_empty() {
@@ -7644,16 +7692,65 @@ fn group_digits(number: &str) -> String {
     grouped
 }
 
-/// What a record is called on screen: a non-empty `name` or `title` field,
-/// which is what nearly every collection names its records by. `None` sends
-/// the caller back to the record ID, which is always there.
-fn record_name(attributes: &Mapping) -> Option<&str> {
-    ["name", "title"].into_iter().find_map(|key| {
-        match attributes.get(YamlValue::String(key.to_owned())) {
-            Some(YamlValue::String(name)) if !name.trim().is_empty() => Some(name.as_str()),
-            _ => None,
-        }
+/// The fields a collection names its records by when its schema does not
+/// say, in the order they are tried.
+const CONVENTIONAL_TITLE_FIELDS: [&str; 2] = ["name", "title"];
+
+/// The top-level field a collection's schema says names its records:
+/// `x-cr-ui.title`. A presentation hint like the others under `x-cr-ui`, so a
+/// value that is not a field name is ignored rather than refused.
+fn schema_title_field(schema: Option<&JsonValue>) -> Option<&str> {
+    schema?
+        .get("x-cr-ui")?
+        .get("title")?
+        .as_str()
+        .filter(|field| !field.trim().is_empty())
+}
+
+/// What a record is called on screen: the field `x-cr-ui.title` names when
+/// the schema names one, and otherwise a non-empty `name` or `title` field,
+/// which is what nearly every collection names its records by. Only a
+/// non-empty string counts. `None` sends the caller back to the record ID,
+/// which is always there.
+fn record_name<'a>(attributes: &'a Mapping, schema: Option<&JsonValue>) -> Option<&'a str> {
+    let named = |key: &str| match attributes.get(YamlValue::String(key.to_owned())) {
+        Some(YamlValue::String(name)) if !name.trim().is_empty() => Some(name.as_str()),
+        _ => None,
+    };
+    match schema_title_field(schema) {
+        Some(field) => named(field),
+        None => CONVENTIONAL_TITLE_FIELDS.into_iter().find_map(named),
+    }
+}
+
+/// The field a table's first column and a Kanban card's heading show for the
+/// records of one collection, if it names them by one.
+///
+/// One field for the whole table rather than [`record_name`]'s choice per
+/// record, because the column has one heading and sorts by one field. The
+/// schema's `x-cr-ui.title` when it sets one, and otherwise the first
+/// conventional field the schema declares or a record on the page has. A
+/// record without a value for it is shown by its ID instead.
+fn view_title_field<'a>(schema: Option<&'a JsonValue>, records: &[Record]) -> Option<&'a str> {
+    schema_title_field(schema).or_else(|| {
+        CONVENTIONAL_TITLE_FIELDS.into_iter().find(|field| {
+            schema
+                .and_then(|schema| schema.get("properties"))
+                .is_some_and(|properties| properties.get(field).is_some())
+                || records
+                    .iter()
+                    .any(|record| record_title(record, field).is_some())
+        })
     })
+}
+
+/// `record`'s value for its collection's title field, when it is a non-empty
+/// string.
+fn record_title<'a>(record: &'a Record, field: &str) -> Option<&'a str> {
+    match record.attributes.get(YamlValue::String(field.to_owned())) {
+        Some(YamlValue::String(title)) if !title.trim().is_empty() => Some(title.as_str()),
+        _ => None,
+    }
 }
 
 fn schema_field_is_wide(kind: &SchemaFieldKind) -> bool {
@@ -8142,12 +8239,14 @@ fn record_relations(
 ) -> RecordRelations {
     let mut readable = Vec::new();
     let mut titles = BTreeMap::new();
+    let mut schemas = BTreeMap::new();
     let mut audited_states = None;
     for model in database.collection_models().unwrap_or_default() {
         titles.insert(
             model.name.clone(),
             CollectionPresentation::from_schema(model.schema.as_ref()).title(&model.name),
         );
+        schemas.insert(model.name.clone(), model.schema.clone());
         if let Ok(records) = database.list_with_audited_cache(&model.name, &[], &mut audited_states)
         {
             readable.extend(records);
@@ -8163,6 +8262,7 @@ fn record_relations(
             .cloned()
             .unwrap_or_else(|| humanize_field_name(collection))
     };
+    let schema = |collection: &str| schemas.get(collection).and_then(Option::as_ref);
     let describe = |relation: &str, collection: &str, id: &str| {
         let found = index.get(&(collection, id));
         RelatedRecord {
@@ -8170,7 +8270,7 @@ fn record_relations(
             collection: collection.to_owned(),
             id: id.to_owned(),
             name: found.map(|other| {
-                record_name(&other.attributes)
+                record_name(&other.attributes, schema(collection))
                     .unwrap_or(&other.id)
                     .to_owned()
             }),
@@ -8204,7 +8304,7 @@ fn record_relations(
                 format!("{}/{}", other.collection, other.id),
                 format!(
                     "{} · {}",
-                    record_name(&other.attributes).unwrap_or(&other.id),
+                    record_name(&other.attributes, schema(&other.collection)).unwrap_or(&other.id),
                     title(&other.collection)
                 ),
             )
@@ -8451,7 +8551,7 @@ fn render_record_form(
     // identifier it is, rather than by the ID alone: "Acme annual renewal", not
     // "Edit acme-renewal". Whether the page can edit is said by the form
     // itself, so the title carries no verb for it.
-    let name = record.map(|record| record_name(&record.attributes).unwrap_or(&record.id));
+    let name = record.map(|record| record_name(&record.attributes, schema).unwrap_or(&record.id));
     let title = name
         .map(str::to_owned)
         .unwrap_or_else(|| format!("New {} record", view.collection));
@@ -8945,6 +9045,7 @@ fn render_delete_confirmation(
     representation: &Representation,
     view: &ViewDefinition,
     record: &Record,
+    schema: Option<&JsonValue>,
     navigation: &[ViewDefinition],
     ui: Option<&UiContext>,
     csrf_token: &str,
@@ -8955,7 +9056,7 @@ fn render_delete_confirmation(
         encode_segment(&view.name),
         encode_segment(&record.id)
     );
-    let name = record_name(&record.attributes).unwrap_or(&record.id);
+    let name = record_name(&record.attributes, schema).unwrap_or(&record.id);
     page_or_content(
         representation,
         &format!("Delete {name}"),
