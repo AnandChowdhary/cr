@@ -1640,7 +1640,7 @@ async fn the_records_table_scrolls_in_its_own_box_with_its_heading_and_edges_pin
     assert_eq!(page.status, StatusCode::OK);
     assert!(
         page.text().contains(
-            r#"<div class="cr-table-scroll"><table class="min-w-full text-left text-sm">"#
+            r#"<div class="cr-table-scroll"><table class="min-w-full text-left text-sm" data-date-groups="created">"#
         )
     );
     // The box is bounded, so the heading can stick to its top edge.
@@ -2546,6 +2546,54 @@ async fn applied_filters_are_chips_that_each_remove_their_condition() {
     )
     .await;
     assert!(any.text().contains(">Any of<"));
+}
+
+#[tokio::test]
+async fn a_table_ordered_by_time_is_marked_for_grouping_by_day() {
+    let (_temporary, database) = test_database("views-date-groups");
+    database
+        .create(
+            "tasks",
+            "alpha",
+            &[Assignment::from_str("name=Alpha").unwrap()],
+            "",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    // Newest first by default, so grouped by the day each was created.
+    let page = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert!(page.text().contains(r#"data-date-groups="created""#));
+    assert!(page.text().contains(
+        r#"<td class="whitespace-nowrap px-4 py-3" data-activity="created"><time datetime=""#
+    ));
+    assert!(page.text().contains(
+        r#"<td class="whitespace-nowrap px-4 py-3" data-activity="updated"><time datetime=""#
+    ));
+    let updated = request(
+        &app,
+        Method::GET,
+        "/tasks?sort_field=%24updated_at&sort_direction=asc",
+        None,
+        &[],
+    )
+    .await;
+    assert!(updated.text().contains(r#"data-date-groups="updated""#));
+    // Any other order has no days to group by.
+    let by_name = request(&app, Method::GET, "/tasks?sort_field=name", None, &[]).await;
+    assert!(!by_name.text().contains("data-date-groups"));
+
+    // The browser does the grouping, in the reader's time zone.
+    let script = page
+        .text()
+        .split(r#"<script src=""#)
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|src| src.starts_with("/static/cr-"))
+        .expect("the page links cr.js");
+    let script = request(&app, Method::GET, script, None, &[]).await;
+    assert!(script.text().contains("const enhanceDateGroups = () => {"));
+    assert!(script.text().contains("enhanceDateGroups();"));
 }
 
 #[tokio::test]

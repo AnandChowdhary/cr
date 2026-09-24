@@ -7236,6 +7236,23 @@ fn quick_filter_selection(query: &ViewQuery, field: &str) -> QuickFilterSelectio
     }
 }
 
+/// Which timestamp a table's rows are grouped by day on, when it is ordered by
+/// one.
+///
+/// The server only names the column. Where a day begins depends on the
+/// reader's time zone, which the browser knows and the server does not, so
+/// `cr.js` reads the `<time>` in that column of each row and heads each run of
+/// rows from one local day with it: "Today", "Yesterday", a weekday within the
+/// week, then a date. Without JavaScript the table is the same table,
+/// ungrouped.
+fn date_groups(query: &ViewQuery) -> Option<&'static str> {
+    match view_sort_field(query) {
+        Some("$created_at") => Some("created"),
+        Some("$updated_at") => Some("updated"),
+        _ => None,
+    }
+}
+
 /// The URL's filter conditions as chips, each with a link that removes it.
 ///
 /// The Filter button counted the conditions a page applied but did not say
@@ -7419,7 +7436,7 @@ fn view_results(
             }
             div class="cr-table-shell" {
                 div class="cr-table-scroll" {
-                    table class="min-w-full text-left text-sm" {
+                    table class="min-w-full text-left text-sm" data-date-groups=[date_groups(query)] {
                         thead {
                             tr {
                                 // One loop over the three kinds of sortable
@@ -7454,10 +7471,10 @@ fn view_results(
                                                 None => (render_record_id_link(&href, &record.id)),
                                             }
                                         }
-                                        td class="whitespace-nowrap px-4 py-3" {
+                                        td class="whitespace-nowrap px-4 py-3" data-activity="created" {
                                             (render_timestamp(record_activity.map(|activity| activity.created_at.as_str())))
                                         }
-                                        td class="whitespace-nowrap px-4 py-3" {
+                                        td class="whitespace-nowrap px-4 py-3" data-activity="updated" {
                                             (render_timestamp(record_activity.map(|activity| activity.updated_at.as_str())))
                                         }
                                         @for column in &shown_columns {
@@ -10250,6 +10267,19 @@ html {
 .cr-pill-positive { border-color: var(--color-emerald-200); background: var(--color-emerald-50); color: var(--color-emerald-700); }
 .cr-pill-negative { border-color: var(--cr-invalid-line); background: var(--cr-invalid-soft); color: var(--cr-danger); }
 .cr-pill-active { border-color: var(--cr-info-line); background: var(--cr-info-soft); color: var(--cr-info-ink); }
+
+/* A day's heading in a table ordered by time, added by cr.js. The label stays
+   at the left edge when the table scrolls sideways. */
+.cr-table-shell .cr-date-group th {
+  padding: 12px 12px 4px !important;
+  background: var(--cr-gray-0);
+  color: var(--cr-gray-500) !important;
+  font-size: 0.72rem;
+  text-align: left;
+}
+.cr-table-shell tbody + tbody .cr-date-group th { border-top: 1px solid var(--cr-gray-200); }
+.cr-date-group th span { position: sticky; left: 12px; }
+.cr-table-shell tbody tr.cr-date-group:hover { background: none; }
 
 /* A condition the URL applies, with the link that removes it. */
 .cr-active-filter {

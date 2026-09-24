@@ -101,7 +101,15 @@ audit-read permission: a principal sees a timestamp exactly where `cr audit log`
 would show it the event.
 
 Views are ordered newest first by default — `$created_at` descending — so the
-first page answers "what changed?" before it answers "what exists?". A view
+first page answers "what changed?" before it answers "what exists?". While a
+table is ordered by **Created** or **Updated**, in either direction, its rows
+are grouped by day under headings — **Today**, **Yesterday**, a weekday within
+the last week, then a date — so a page of records made hours apart does not
+repeat "5 hours ago" down the column without saying where one day ends. Days
+are the reader's own: the browser groups the rows in its time zone, since the
+server knows each instant but not where the reader's midnight falls. Records
+with no audited history come last under **No history**. Without JavaScript the
+table is not grouped. A view
 definition's own `sort_by` still wins, and any column heading or the sorting
 panel overrides both for the current URL.
 

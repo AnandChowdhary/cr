@@ -219,6 +219,64 @@ const enhanceTimes = () => {
   });
 };
 
+// Date groups. A table ordered by when its records were created or updated
+// says which column in `data-date-groups`, and each run of rows from one day
+// is headed with that day. Days are the reader's, which is why this is here:
+// the server knows each instant but not where the reader's midnight falls.
+// The rows move into one `<tbody>` per day, each headed by a row whose `<th>`
+// labels the group. A table restored from htmx's history snapshot is already
+// grouped, and grouping it again would head each group twice, so a table that
+// has a heading is left alone.
+const startOfDay = (date) => new Date(date.getFullYear(), date.getMonth(), date.getDate());
+
+const dayLabel = (date, now) => {
+  if (Number.isNaN(date.getTime())) return 'Unknown date';
+  // Rounded, because a day with a daylight-saving change is 23 or 25 hours.
+  const days = Math.round((startOfDay(now) - startOfDay(date)) / 86400000);
+  if (days <= 0) return 'Today';
+  if (days === 1) return 'Yesterday';
+  if (days < 7) return date.toLocaleDateString(undefined, { weekday: 'long' });
+  return date.toLocaleDateString(undefined, date.getFullYear() === now.getFullYear()
+    ? { month: 'long', day: 'numeric' }
+    : { month: 'long', day: 'numeric', year: 'numeric' });
+};
+
+const enhanceDateGroups = () => {
+  document.querySelectorAll('table[data-date-groups]').forEach((table) => {
+    if (!claim(table) || table.querySelector('.cr-date-group')) return;
+    const body = table.tBodies[0];
+    const columns = table.tHead?.rows[0]?.cells.length ?? 1;
+    const now = new Date();
+    const groups = [];
+    for (const row of body?.rows ?? []) {
+      // The empty state is one cell across the table, with nothing to group.
+      if (row.cells.length === 1) return;
+      const time = row.querySelector(`td[data-activity="${table.dataset.dateGroups}"] time[datetime]`);
+      // A record with no audited history has no time, and sorts last.
+      const label = time ? dayLabel(new Date(time.dateTime), now) : 'No history';
+      if (groups.at(-1)?.label !== label) groups.push({ label, rows: [] });
+      groups.at(-1).rows.push(row);
+    }
+    if (groups.length === 0) return;
+    for (const { label, rows } of groups) {
+      const section = document.createElement('tbody');
+      section.className = body.className;
+      const heading = section.insertRow();
+      heading.className = 'cr-date-group';
+      const cell = document.createElement('th');
+      cell.scope = 'rowgroup';
+      cell.colSpan = columns;
+      const text = document.createElement('span');
+      text.textContent = label;
+      cell.append(text);
+      heading.append(cell);
+      section.append(...rows);
+      table.insertBefore(section, body);
+    }
+    body.remove();
+  });
+};
+
 // Unsaved edits. A navigation swaps the page body rather than loading a new
 // document, so a click on the sidebar in the middle of an edit used to throw
 // the edit away without a word. A record form becomes unsaved at its first
@@ -471,6 +529,7 @@ document.addEventListener('htmx:sendError', (event) => {
 const enhanceAll = () => {
   enhanceNotice();
   enhanceTimes();
+  enhanceDateGroups();
   enhanceRecordForm();
   enhanceFilterBuilder();
   enhanceViewLayout();
