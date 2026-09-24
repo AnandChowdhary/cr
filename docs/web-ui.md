@@ -324,6 +324,11 @@ Tables and Kanban cards use the same words as the form. A column heading is the 
 
 With those, a deal shows `125,000 USD` and `80%` instead of `125000` and `80`. A number with no unit is shown exactly as stored, because it may be a year or a postcode. Like `x-cr-ui`, `x-cr-unit` changes only presentation, never what validates.
 
+A field a record does not have and one it has with nothing in it read the
+same: a missing field, a blank string (`''`), `null`, `[]`, and `{}` all show a
+light grey `—`, quieter than any value, so a mostly empty column reads as the
+absence it is. Zero and `false` are values and show as such.
+
 An enum's value is a badge, and so is a string in a field named `status` or
 `state`, which is what a collection without a schema calls its states; each
 value in a list of enum values is a badge of its own. A badge is coloured by
