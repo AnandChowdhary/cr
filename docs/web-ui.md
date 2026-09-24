@@ -111,7 +111,11 @@ matter. A saved view's own columns come first. The rest follow the schema's
 the order it lists them, then every other field by where it sits in the front
 matter of the records that have it, averaged over those records so one file
 written in an unusual order does not move a column. Fields only the schema
-declares come last, and the name breaks ties. Its dense header keeps search and its submit action immediately
+declares come last, and the name breaks ties. A view without columns of its own
+shows the first six of them, passing over the title field, which is already the
+first column, and any field whose values are objects or lists of objects, which
+a one-line cell can only print as a run of `key: value` pairs. Every field
+except the title stays in the column picker. Its dense header keeps search and its submit action immediately
 available.
 **Filter** opens the complete schema-aware condition, column, and sorting panel
 only when needed, and shows the number of active ad hoc conditions. Rows use the
@@ -140,7 +144,7 @@ Every generated page also has schema-aware sorting. Choose a field and direction
 
 Pages hold 25 rows unless a view or the URL's `limit` says otherwise. The footer offers 10, 25, 50, and 100 rows per page, leaving out any size above the server's `--max-page-size` and adding the current size if a view or URL chose another; each is a link to the first page at that size. Beside the range it states the page number, such as "Page 2 of 7". On a table with more than one page, **Previous** and **Next** both stay in place, the one that cannot be used drawn greyed out, and they are cursors rather than offsets. Each link names the record the next page continues after (`after=<id>`) or ends before (`before=<id>`), so creating a record while someone is paging does not push a row they have already seen onto the next page. The footer still reports an exact position and total, because the ordered result is assembled before the page is cut from it. A cursor naming a record that no longer matches — deleted, or filtered out by an edited query — starts again from the first page, and `offset` remains accepted so links shared before cursors existed still resolve.
 
-Open **Columns** in the same panel to choose the visible table fields or Kanban card details. The selection is encoded as `columns=custom` plus repeated `column` parameters, so it survives sorting and pagination and can be shared as part of the URL. At least one of the fields available from the saved view, schema, or current records must remain selected. The record ID stays visible as the stable link in tables and is not part of the field selection.
+Open **Columns** in the same panel to choose the visible table fields or Kanban card details. The selection is encoded as `columns=custom` plus repeated `column` parameters, so it survives sorting and pagination and can be shared as part of the URL. At least one of the fields available from the saved view, schema, or current records must remain selected. The record's title, or its ID when it has none, stays visible as the link in the first column, so neither is part of the field selection.
 
 ## Inspect internal records
 
