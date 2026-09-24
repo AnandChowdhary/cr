@@ -2848,12 +2848,17 @@ async fn view_records(
             query.offset,
             state.max_page_size,
         )?;
-        let page = paginate_view(
-            records,
-            bounds.limit,
-            state.max_page_size,
-            view_position(&query, bounds.offset),
-        );
+        let page = match (view.layout, view.group_by.as_deref()) {
+            (ViewLayout::Kanban, Some(group_by)) => {
+                paginate_board(records, bounds.limit, state.max_page_size, group_by)
+            }
+            _ => paginate_view(
+                records,
+                bounds.limit,
+                state.max_page_size,
+                view_position(&query, bounds.offset),
+            ),
+        };
         let ui = ui_context(&state, &headers).await?;
         Ok(render_view_records(
             &Representation::requested(&headers),
@@ -6891,6 +6896,9 @@ fn view_page_size_links(view: &ViewDefinition, query: &ViewQuery, page: &ViewPag
 /// inconsistently — as a pause, as "dash", or as nothing — and this string
 /// exists only to be spoken.
 fn view_results_summary(page: &ViewPage) -> String {
+    if page.lanes.is_some() {
+        return format!("Showing {} of {} records", page.records.len(), page.total);
+    }
     let (first, last) = page_range(page);
     if page.records.is_empty() {
         if page.total == 0 {
@@ -7622,8 +7630,6 @@ fn render_kanban_board(
     } else {
         |activity| activity.created_at.as_str()
     };
-    let (first, last) = page_range(page);
-
     html! {
         div class="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-gray-600" {
             p {
@@ -7637,16 +7643,24 @@ fn render_kanban_board(
         }
         div class="overflow-x-auto pb-3" {
             div data-kanban-board="true" class="flex min-w-max items-start gap-3" {
-                @for lane in &lanes {
+                @for (lane_index, lane) in lanes.iter().enumerate() {
                     section
                         data-kanban-lane="true"
                         data-kanban-target=(kanban_target_json(&lane.target))
                         data-kanban-csrf=(csrf_token)
                         class="cr-kanban-lane w-72 shrink-0 p-2.5"
                     {
-                        div class="mb-2 flex items-center justify-between gap-3 px-1" {
-                            h2 class="text-sm font-semibold text-gray-900" { (&lane.label) }
-                            span class="cr-pill bg-white" { (lane.records.len()) }
+                        @let lane_total = lane_total(page, &lane.target).max(lane.records.len());
+                        div class="cr-lane-head" {
+                            span class=(match &lane.target {
+                                KanbanTarget::Value { value } => match yaml_serde::from_str::<YamlValue>(value).ok().and_then(|value| value.as_str().and_then(badge_tone)) {
+                                    Some(tone) => format!("cr-lane-dot {tone}"),
+                                    None => "cr-lane-dot".to_owned(),
+                                },
+                                KanbanTarget::Unset => "cr-lane-dot".to_owned(),
+                            }) aria-hidden="true" {}
+                            h2 { (&lane.label) }
+                            span class="cr-lane-count" { (lane_total) }
                         }
                         div class="min-h-20 space-y-1.5" {
                             @if lane.records.is_empty() {
@@ -7703,15 +7717,57 @@ fn render_kanban_board(
                                 }
                             }
                         }
+                        @if lane_total > lane.records.len() {
+                            (render_lane_more(view, query, page, lane_index, lane_total - lane.records.len()))
+                        }
                     }
                 }
             }
         }
-        div class="cr-surface mt-1 flex flex-col gap-2 px-3 py-2 text-xs sm:flex-row sm:items-center sm:justify-between" {
-            p class="text-gray-600" {
-                "Showing " (first) "–" (last) " of " (page.total)
+        p class="mt-1 text-xs text-gray-500" data-board-summary="true" {
+            "Showing " (page.records.len()) " of " (count_noun(page.total, "record", "records"))
+            @if page.records.len() < page.total {
+                ", up to " (page.limit) " in each lane"
             }
-            (view_pager_links(view, query, page))
+        }
+    }
+}
+
+/// How many records the lane for `target` holds in the whole view.
+fn lane_total(page: &ViewPage, target: &KanbanTarget) -> usize {
+    let key = match target {
+        KanbanTarget::Value { value } => Some(value.clone()),
+        KanbanTarget::Unset => None,
+    };
+    page.lanes
+        .as_ref()
+        .and_then(|lanes| lanes.get(&key))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// The foot of a lane that holds more records than it shows: a link to the
+/// same board showing more of every lane, or, once a lane is at the most the
+/// server will send, a word on how to see the rest.
+///
+/// The link swaps the board alone, as the pager does a table's page, and has
+/// an id so that focus comes back to it after the swap.
+fn render_lane_more(
+    view: &ViewDefinition,
+    query: &ViewQuery,
+    page: &ViewPage,
+    lane: usize,
+    hidden: usize,
+) -> Markup {
+    let more = page.limit.saturating_mul(2).min(page.max_limit);
+    html! {
+        @if more > page.limit {
+            a id=(format!("cr-lane-more-{lane}")) href=(view_page_url(view, query, more, ViewPosition::Start)) class="cr-lane-more"
+                hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_FROM_INSIDE) hx-push-url="true" {
+                "Show " (hidden.min(more - page.limit)) " more"
+            }
+        } @else {
+            p class="cr-lane-more" { (hidden) " more not shown; filter the board to reach them" }
         }
     }
 }
@@ -10626,6 +10682,18 @@ html {
   background: var(--cr-gray-50);
   box-shadow: none;
 }
+/* A lane's heading: a dot in its state's colour, its name, and how many
+   records it holds in the whole view. */
+.cr-lane-head { display: flex; align-items: center; gap: 7px; margin-bottom: 8px; padding: 0 3px; }
+.cr-lane-head h2 { min-width: 0; overflow: hidden; color: var(--cr-gray-900); font-size: 0.8rem; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
+.cr-lane-count { color: var(--cr-gray-500); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+.cr-lane-dot { width: 8px; height: 8px; flex: 0 0 auto; border: 1.5px solid var(--cr-gray-400); border-radius: 999px; background: transparent; padding: 0; }
+.cr-lane-dot.cr-pill-positive { border-color: var(--color-emerald-600); background: var(--color-emerald-600); }
+.cr-lane-dot.cr-pill-negative { border-color: var(--cr-danger); background: var(--cr-danger); }
+.cr-lane-dot.cr-pill-active { border-color: var(--cr-info-strong); background: var(--cr-info-strong); }
+.cr-lane-dot.cr-pill-warn { border-color: var(--cr-warn-ink); background: transparent; }
+.cr-lane-more { display: block; margin-top: 6px; border-radius: 6px; color: var(--cr-gray-500); padding: 5px 6px; font-size: 0.72rem; font-weight: 600; text-align: center; }
+a.cr-lane-more:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
 
 /* A card: its title in two lines at most, the ID in one quiet line under it,
    then a row of the values it holds. */
@@ -12366,6 +12434,10 @@ struct ViewPage {
     total: usize,
     next: Option<String>,
     previous: Option<String>,
+    /// On a Kanban board, how many records each lane holds in the whole view,
+    /// keyed by the lane's serialized value, `None` for records without one.
+    /// A board is not paged; each lane shows up to `limit` of its own.
+    lanes: Option<BTreeMap<Option<String>, usize>>,
 }
 
 /// Where a view page begins.
@@ -12428,6 +12500,50 @@ fn paginate_view(
         total,
         next,
         previous,
+        lanes: None,
+    }
+}
+
+/// Cut a Kanban board out of the ordered result: up to `limit` records from
+/// each lane, in order, and how many each lane holds.
+///
+/// A board used to be one page of the view, cut across all its lanes before
+/// they were filled, so a lane showed however many of the page's records fell
+/// into it: a queue of fifteen said six, and the next page moved every lane at
+/// once. Now each lane shows the first `limit` of its own records and says
+/// how many it has, and asking for more asks for more of every lane. Every
+/// record is already in memory for the ordering, so counting the lanes costs
+/// nothing more; what stays bounded is what is sent, at `limit` per lane.
+fn paginate_board(
+    records: Vec<Record>,
+    limit: usize,
+    max_limit: usize,
+    group_by: &str,
+) -> ViewPage {
+    let total = records.len();
+    let mut lanes = BTreeMap::<Option<String>, usize>::new();
+    let records = records
+        .into_iter()
+        .filter(|record| {
+            let lane = record
+                .field(group_by)
+                .ok()
+                .flatten()
+                .map(serialize_yaml_value);
+            let shown = lanes.entry(lane).or_default();
+            *shown += 1;
+            *shown <= limit
+        })
+        .collect();
+    ViewPage {
+        records,
+        limit,
+        max_limit,
+        start: 0,
+        total,
+        next: None,
+        previous: None,
+        lanes: Some(lanes),
     }
 }
 

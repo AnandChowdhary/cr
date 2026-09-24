@@ -197,7 +197,12 @@ async fn a_results_swap_patches_the_regions_contents_and_leaves_the_element() {
     let (_temporary, database) = database_with_deals("live-region-swap");
     let app = router(database, ServerConfig::default()).unwrap();
 
-    for uri in ["/deals?limit=2", "/pipeline?limit=2"] {
+    // A table's page is a range of the ordering; a board shows up to `limit`
+    // of each lane, so it says how many of the whole it shows.
+    for (uri, shown) in [
+        ("/deals?limit=2", "Showing records 1 to 2 of 3"),
+        ("/pipeline?limit=1", "Showing 2 of 3 records"),
+    ] {
         let fragment = swap(&app, uri, VIEW_TABLE_REGION).await;
         // `innerHTML`, not `true`. `true` replaces the element, and replacing
         // the node an assistive technology is watching with an identical one
@@ -209,8 +214,10 @@ async fn a_results_swap_patches_the_regions_contents_and_leaves_the_element() {
             "{uri} does not patch the live region's contents: {fragment}"
         );
         assert!(
-            fragment.contains("Showing records 1 to 2 of 3"),
-            "{uri} announces something other than what is on screen: {fragment}"
+            fragment.contains(&format!(
+                "<div id=\"{ANNOUNCE_REGION}\" hx-swap-oob=\"innerHTML\">{shown}</div>"
+            )),
+            "{uri} announces something other than {shown}: {fragment}"
         );
         // The patch is a passenger, not the answer: it must not be inside the
         // region being swapped, or it would be destroyed by the very swap it
