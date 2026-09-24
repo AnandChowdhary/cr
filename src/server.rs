@@ -6291,7 +6291,7 @@ fn render_filter_operator_control(
         operators.push(selected_operator);
     }
     html! {
-        select name="filter_operator" data-filter-operator="true" aria-label=(format!("Filter operator {}", index + 1)) class="min-w-0 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 xl:col-span-3" {
+        select name="filter_operator" data-filter-operator="true" aria-label=(format!("Filter operator {}", index + 1)) class="cr-input" {
             @for operator in operators {
                 option value=(operator.as_str()) selected[operator == selected_operator] { (operator.label()) }
             }
@@ -6306,10 +6306,10 @@ fn render_filter_value_control(
     selected_operator: ViewFilterOperator,
     value: &str,
 ) -> Markup {
+    // "Owner is empty" is the whole condition, so the slot stays blank.
     if !selected_operator.requires_value() {
         return html! {
             input type="hidden" name="filter_value" data-filter-value="true" value="";
-            span class="block px-3 py-2 text-sm text-gray-400" { "No value needed" }
         };
     }
     let definition = fields.iter().find(|field| field.key == selected_field);
@@ -6320,8 +6320,8 @@ fn render_filter_value_control(
                 .iter()
                 .any(|option| serialize_yaml_value(option) == value);
             html! {
-                select name="filter_value" data-filter-value="true" aria-label=(aria_label) class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
-                    option value="" selected[value.is_empty()] { "Select a value…" }
+                select name="filter_value" data-filter-value="true" aria-label=(aria_label) class="cr-input" {
+                    option value="" selected[value.is_empty()] { "Choose a value…" }
                     @for option in options {
                         @let serialized = serialize_yaml_value(option);
                         option value=(serialized.clone()) selected[serialized == value] { (schema_value_label(option)) }
@@ -6333,23 +6333,23 @@ fn render_filter_value_control(
             }
         }
         Some(SchemaFieldKind::Boolean) => html! {
-            select name="filter_value" data-filter-value="true" aria-label=(aria_label) class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
-                option value="" selected[value.is_empty()] { "Select a value…" }
+            select name="filter_value" data-filter-value="true" aria-label=(aria_label) class="cr-input" {
+                option value="" selected[value.is_empty()] { "Choose a value…" }
                 option value="true" selected[value == "true"] { "True" }
                 option value="false" selected[value == "false"] { "False" }
             }
         },
         Some(SchemaFieldKind::Integer { .. }) => html! {
-            input type="number" step="1" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Exact number" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+            input type="number" step="1" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Number" class="cr-input";
         },
         Some(SchemaFieldKind::Number { .. }) => html! {
-            input type="number" step="any" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Exact number" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+            input type="number" step="any" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Number" class="cr-input";
         },
         Some(SchemaFieldKind::String { input_type, .. }) => html! {
-            input type=(input_type) name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Exact value" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+            input type=(input_type) name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Value" class="cr-input";
         },
         _ => html! {
-            input type="text" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Typed YAML value" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 font-mono text-sm outline-none ring-indigo-500 focus:ring-2";
+            input type="text" name="filter_value" data-filter-value="true" aria-label=(aria_label) value=(value) placeholder="Value" title="Read as YAML: 10 is a number, \"10\" is text" class="cr-input";
         },
     }
 }
@@ -6363,8 +6363,18 @@ fn render_filter_row(
 ) -> Markup {
     let selected_known = fields.iter().any(|field| field.key == selected_field);
     html! {
-        div data-filter-row="true" class="grid gap-2 rounded-xl border border-gray-200 bg-gray-50 p-3 md:grid-cols-2 xl:grid-cols-12 xl:items-center" {
-            select name="filter_field" data-filter-field="true" aria-label=(format!("Filter field {}", index + 1)) class="min-w-0 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 xl:col-span-4" {
+        div data-filter-row="true" class="cr-filter-row" {
+            // A row reads as a sentence: "Where Stage is Proposal", then "and
+            // Value is at least 10000". All three words are always here and the
+            // stylesheet shows the one that fits the row's place and the match
+            // mode, so they stay right as rows come and go and as All and Any
+            // are switched, with or without the script.
+            span class="cr-filter-join" {
+                span class="cr-filter-join-where" { "Where" }
+                span class="cr-filter-join-all" { "and" }
+                span class="cr-filter-join-any" { "or" }
+            }
+            select name="filter_field" data-filter-field="true" aria-label=(format!("Filter field {}", index + 1)) class="cr-input" {
                 option value="" selected[selected_field.is_empty()] data-filter-kind="input" data-filter-input-type="text" data-filter-options="[]" data-filter-operators=(filter_operators_json(&SchemaFieldKind::Yaml)) { "Choose a field…" }
                 @for field in fields {
                     @let (kind, input_type) = filter_kind_data(&field.kind);
@@ -6375,10 +6385,10 @@ fn render_filter_row(
                 }
             }
             (render_filter_operator_control(fields, index, selected_field, selected_operator))
-            div data-filter-value-slot="true" class="min-w-0 md:col-span-2 xl:col-span-4" {
+            div data-filter-value-slot="true" class="cr-filter-value" {
                 (render_filter_value_control(fields, index, selected_field, selected_operator, value))
             }
-            button type="button" data-remove-filter="true" aria-label=(format!("Remove filter {}", index + 1)) class="justify-self-start rounded-lg px-3 py-2 text-sm font-semibold text-gray-500 hover:bg-red-50 hover:text-red-700 md:col-span-2 xl:col-span-1 xl:justify-self-end" { "Remove" }
+            button type="button" data-remove-filter="true" aria-label=(format!("Remove filter {}", index + 1)) title="Remove filter" class="cr-filter-remove" { "×" }
         }
     }
 }
@@ -6497,7 +6507,7 @@ fn render_view_records(
                 html! {
                     // One form, two submit buttons, and both of them only change
                     // which records are listed: the magnifying glass beside the
-                    // search box and "Apply view" at the bottom of the filter
+                    // search box and "Apply" at the bottom of the filter
                     // panel. Targeting the results region is what keeps the
                     // panel open across an apply — it is not re-rendered, so the
                     // browser never has a reason to close it or to forget what
@@ -6528,68 +6538,45 @@ fn render_view_records(
                         }
                         details class="relative" data-filter-disclosure="true" {
                             (view_filter_summary(active_filter_count, OutOfBand::No))
-                            div data-filter-panel="true" class="cr-popover cr-filter-popover z-30 space-y-4 overflow-y-auto p-4 sm:p-5" {
-                                div {
-                                    div class="mb-3 flex flex-wrap items-center justify-between gap-3" {
-                                        div {
-                                            div class="flex items-center gap-2" {
-                                                h2 class="text-sm font-bold text-gray-900" { "Filters" }
-                                                label {
-                                                    span class="sr-only" { "Condition match mode" }
-                                                    select name="filter_match" aria-label="Condition match mode" class="rounded-full border-0 bg-gray-100 py-1 pl-2.5 pr-8 text-xs font-semibold text-gray-600 outline-none ring-indigo-500 focus:ring-2" {
-                                                        option value="all" selected[query.filter_match == ViewFilterMatch::All] { "All conditions match" }
-                                                        option value="any" selected[query.filter_match == ViewFilterMatch::Any] { "Any condition matches" }
+                            div data-filter-panel="true" class="cr-popover cr-filter-popover z-30" {
+                                div class="cr-filter-body" {
+                                    section class="cr-filter-section" aria-labelledby="cr-filter-heading" {
+                                        div class="cr-filter-section-head" {
+                                            h2 id="cr-filter-heading" { "Filters" }
+                                            // Only a choice once there are two
+                                            // conditions to combine, so the
+                                            // stylesheet hides it until then. The
+                                            // checked radio is still submitted.
+                                            div class="cr-filter-match" {
+                                                span id="cr-filter-match-label" { "Match" }
+                                                div role="radiogroup" aria-labelledby="cr-filter-match-label" class="cr-choice-row cr-choice-row-small" {
+                                                    label class="cr-choice-option" {
+                                                        input type="radio" name="filter_match" value="all" checked[query.filter_match == ViewFilterMatch::All];
+                                                        "All"
+                                                    }
+                                                    label class="cr-choice-option" {
+                                                        input type="radio" name="filter_match" value="any" checked[query.filter_match == ViewFilterMatch::Any];
+                                                        "Any"
                                                     }
                                                 }
                                             }
-                                            p class="mt-1 text-xs text-gray-500" { "Field controls and allowed values come from the collection schema." }
                                         }
-                                        div class="flex items-center gap-2" {
-                                            button type="button" data-add-filter="true" class="cr-button disabled:cursor-not-allowed disabled:opacity-40" { "+ Add condition" }
-                                            button type="button" data-close-filter="true" class="cr-button" { "Close" }
-                                        }
-                                    }
-                                    div data-filter-list="true" class="space-y-2" {
-                                        @for (index, (field, operator, value)) in filter_rows.iter().enumerate() {
-                                            (render_filter_row(&filter_fields, index, field, *operator, value))
-                                        }
-                                    }
-                                    template data-filter-template="true" {
-                                        (render_filter_row(&filter_fields, 0, "", ViewFilterOperator::default(), ""))
-                                    }
-                                }
-                                div class="border-t border-gray-100 pt-4" {
-                                    details open[query_columns_custom(query)] {
-                                        summary class="cursor-pointer list-none text-sm font-bold text-gray-900" {
-                                            span class="inline-flex items-center gap-2" {
-                                                "Columns"
-                                                span class="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-semibold text-gray-600" { (columns.iter().filter(|column| Some(column.as_str()) != title_field).count()) " shown" }
+                                        div data-filter-list="true" class="cr-filter-list" {
+                                            @for (index, (field, operator, value)) in filter_rows.iter().enumerate() {
+                                                (render_filter_row(&filter_fields, index, field, *operator, value))
                                             }
                                         }
-                                        input type="hidden" name="columns" value="custom";
-                                        p class="mt-1 text-xs text-gray-500" { "Choose the fields shown in the table or on Kanban cards. Select at least one." }
-                                        div role="group" aria-label="Visible columns" class="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" {
-                                            // The title field is the first column, or a card's
-                                            // heading, whatever is chosen here, so like the ID it
-                                            // is not offered.
-                                            @for column in available_columns.iter().filter(|column| Some(column.as_str()) != title_field) {
-                                                label class="flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-700 hover:border-indigo-300 hover:bg-indigo-50/40" {
-                                                    input type="checkbox" name="column" value=(column) checked[columns.contains(column)] class="size-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500";
-                                                    span class="truncate" title=(column) { (field_label(schema, column)) }
-                                                }
-                                            }
+                                        template data-filter-template="true" {
+                                            (render_filter_row(&filter_fields, 0, "", ViewFilterOperator::default(), ""))
                                         }
+                                        button type="button" data-add-filter="true" class="cr-filter-add" { "+ Add filter" }
                                     }
-                                }
-                                div class="border-t border-gray-100 pt-4" {
-                                    div class="mb-3" {
-                                        h2 class="text-sm font-bold text-gray-900" { "Sorting" }
-                                        p class="mt-1 text-xs text-gray-500" { "Newest first by default. Missing values stay last; record ID breaks ties." }
-                                    }
-                                    div class="grid gap-3 sm:grid-cols-2" {
-                                        label {
-                                            span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Sort by" }
-                                            select name="sort_field" aria-label="Sort by" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                                    section class="cr-filter-section" aria-labelledby="cr-sort-heading" {
+                                        div class="cr-filter-section-head" {
+                                            h2 id="cr-sort-heading" { "Sort" }
+                                        }
+                                        div class="cr-sort-row" {
+                                            select name="sort_field" aria-label="Sort by" class="cr-input" {
                                                 option value="" selected[view_sort_field(query).is_none()] { "None (record ID order)" }
                                                 option value="$created_at" selected[view_sort_field(query) == Some("$created_at")] { "Created (default)" }
                                                 option value="$updated_at" selected[view_sort_field(query) == Some("$updated_at")] { "Updated" }
@@ -6598,18 +6585,41 @@ fn render_view_records(
                                                     option value=(&field.key) selected[view_sort_field(query) == Some(field.key.as_str())] { (&field.label) }
                                                 }
                                             }
-                                        }
-                                        label {
-                                            span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Direction" }
-                                            select name="sort_direction" aria-label="Sort direction" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
-                                                option value="asc" selected[query.sort_direction == ViewSortDirection::Asc] { "Ascending" }
-                                                option value="desc" selected[query.sort_direction == ViewSortDirection::Desc] { "Descending" }
+                                            div role="radiogroup" aria-label="Sort direction" class="cr-choice-row" {
+                                                label class="cr-choice-option" {
+                                                    input type="radio" name="sort_direction" value="asc" checked[query.sort_direction == ViewSortDirection::Asc];
+                                                    "Ascending"
+                                                }
+                                                label class="cr-choice-option" {
+                                                    input type="radio" name="sort_direction" value="desc" checked[query.sort_direction == ViewSortDirection::Desc];
+                                                    "Descending"
+                                                }
                                             }
                                         }
+                                        p class="cr-field-help" { "Missing values stay last in either direction, and record ID breaks ties." }
+                                    }
+                                    details class="cr-filter-section cr-filter-columns" open[query_columns_custom(query)] {
+                                        summary class="cr-filter-section-head" {
+                                            h2 { "Columns" }
+                                            span class="cr-pill" { (columns.iter().filter(|column| Some(column.as_str()) != title_field).count()) " shown" }
+                                        }
+                                        input type="hidden" name="columns" value="custom";
+                                        div role="group" aria-label="Visible columns" class="cr-checkbox-row" {
+                                            // The title field is the first column, or a card's
+                                            // heading, whatever is chosen here, so like the ID it
+                                            // is not offered.
+                                            @for column in available_columns.iter().filter(|column| Some(column.as_str()) != title_field) {
+                                                label class="cr-checkbox-option" title=(column) {
+                                                    input type="checkbox" name="column" value=(column) checked[columns.contains(column)];
+                                                    span { (field_label(schema, column)) }
+                                                }
+                                            }
+                                        }
+                                        p class="cr-field-help" { "Shown in the table, or on Kanban cards. Keep at least one." }
                                     }
                                 }
-                                div class="flex flex-wrap items-center justify-end gap-2 border-t border-gray-100 pt-4" {
-                                    // "Clear all" is the one control in this
+                                div class="cr-filter-footer" {
+                                    // "Reset" is the one control in this
                                     // panel that is deliberately *not* a
                                     // targeted swap. It goes to the view's bare
                                     // URL, and the conditions it clears are the
@@ -6620,8 +6630,8 @@ fn render_view_records(
                                     // no longer reflect them. A whole page is the
                                     // correct answer for the one action whose
                                     // point is that the panel should be empty.
-                                    a href=(reset_url.clone()) class="cr-button" { "Clear all" }
-                                    button type="submit" class="cr-button cr-button-primary" { "Apply view" }
+                                    a href=(reset_url.clone()) class="cr-button" { "Reset" }
+                                    button type="submit" class="cr-button cr-button-primary" { "Apply" }
                                 }
                             }
                         }
@@ -10668,15 +10678,6 @@ html {
   box-shadow: var(--cr-shadow-popover);
 }
 
-.cr-filter-popover {
-  position: fixed;
-  top: 60px;
-  right: max(16px, env(safe-area-inset-right));
-  width: min(42rem, calc(100vw - 32px));
-  max-height: calc(100vh - 88px);
-  overscroll-behavior: contain;
-}
-
 .cr-audit-list { overflow: hidden; border: 1px solid var(--cr-gray-200); border-radius: var(--cr-radius); background: var(--cr-gray-0); }
 .cr-audit-entry { border-bottom: 1px solid var(--cr-gray-200); background: var(--cr-gray-0); padding: 13px 14px; }
 .cr-audit-entry:last-child { border-bottom: 0; }
@@ -10719,6 +10720,42 @@ html {
   margin: 0 -4px;
   padding: 0 4px 2px;
   scrollbar-width: thin;
+  scroll-timeline: --cr-lane-y block;
+}
+/* A lane's cards fade at its edges while there are more past them, as the
+   sidebar's list does: at the foot while cards are hidden below, clearing at
+   the last one, and under the heading once cards have scrolled up past it.
+   Each fade takes no room: its height and the gap beside it are given back by
+   a negative margin, and it does not shrink, because the column it sits in is
+   full whenever it shows. */
+@supports (animation-timeline: scroll()) {
+  .cr-lane-cards::before,
+  .cr-lane-cards::after {
+    position: sticky;
+    z-index: 1;
+    display: block;
+    height: 32px;
+    flex: 0 0 auto;
+    margin-right: -4px;
+    margin-left: -4px;
+    content: "";
+    opacity: 0;
+    pointer-events: none;
+  }
+  .cr-lane-cards::before {
+    top: 0;
+    margin-bottom: -38px;
+    background: linear-gradient(var(--cr-gray-50), transparent);
+    animation: cr-more-behind linear both;
+    animation-timeline: --cr-lane-y;
+  }
+  .cr-lane-cards::after {
+    bottom: -2px;
+    margin-top: -38px;
+    background: linear-gradient(transparent, var(--cr-gray-50));
+    animation: cr-more-ahead linear both;
+    animation-timeline: --cr-lane-y;
+  }
 }
 /* Whether the board goes on past either side, as a table's edges say. */
 @supports (animation-timeline: scroll()) {
@@ -10964,6 +11001,130 @@ a.cr-field-open:hover { color: var(--cr-accent); }
 
 .cr-button-danger { color: var(--cr-danger); }
 .cr-button-danger:hover { border-color: var(--cr-invalid-line); background: var(--cr-invalid-soft); color: var(--cr-danger); }
+
+/* The filter panel, in the form's controls. Each condition reads as a
+   sentence — "Where Stage is Proposal", "and Value is at least 10000" — then
+   come the sort and the columns, and Reset and Apply stay at the bottom edge
+   while the rest scrolls. Its rows lay out by the panel's own width rather
+   than the window's, which is what used to put Remove on top of the value box
+   in a panel narrower than the window it was sized for. */
+.cr-filter-popover {
+  position: fixed;
+  top: 60px;
+  right: max(16px, env(safe-area-inset-right));
+  display: flex;
+  width: min(40rem, calc(100vw - 32px));
+  max-height: calc(100vh - 88px);
+  flex-direction: column;
+  container-type: inline-size;
+}
+[data-filter-disclosure][open] > summary { border-color: var(--cr-gray-400); background: var(--cr-gray-100); color: var(--cr-gray-900); }
+.cr-filter-body { flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain; padding: 0 16px; }
+.cr-filter-section { padding: 14px 0 16px; }
+.cr-filter-section + .cr-filter-section { border-top: 1px solid var(--cr-gray-100); }
+.cr-filter-section-head { display: flex; min-height: 28px; align-items: center; gap: 8px; margin-bottom: 8px; }
+.cr-filter-section-head h2 { color: var(--cr-gray-900); font-size: 0.8rem; font-weight: 650; }
+.cr-filter-popover .cr-input { min-height: 32px; padding: 5px 9px; font-size: 0.8rem; }
+.cr-filter-popover .cr-choice-row { min-height: 32px; }
+.cr-filter-popover .cr-field-help { margin-top: 8px; }
+
+/* All or Any, which only means something once there are two conditions. */
+.cr-filter-match { display: flex; align-items: center; gap: 8px; margin-left: auto; color: var(--cr-gray-500); font-size: 0.75rem; font-weight: 550; }
+.cr-filter-popover:not(:has(.cr-filter-row + .cr-filter-row)) .cr-filter-match { display: none; }
+.cr-filter-popover .cr-choice-row-small { min-height: 28px; }
+.cr-choice-row-small .cr-choice-option { padding: 2px 10px; font-size: 0.75rem; }
+
+.cr-filter-list { display: flex; flex-direction: column; gap: 6px; }
+.cr-filter-row {
+  display: grid;
+  grid-template-areas: "join field operator value remove";
+  grid-template-columns: 2.75rem minmax(0, 1.1fr) minmax(0, 0.9fr) minmax(0, 1.2fr) 28px;
+  align-items: center;
+  gap: 6px;
+}
+.cr-filter-join { grid-area: join; color: var(--cr-gray-500); font-size: 0.78rem; font-weight: 550; }
+.cr-filter-row [data-filter-field] { grid-area: field; }
+.cr-filter-row [data-filter-operator] { grid-area: operator; }
+.cr-filter-value { grid-area: value; min-width: 0; }
+.cr-filter-remove { grid-area: remove; }
+
+/* "Where" leads, and each condition after it says how it combines. */
+.cr-filter-join > span { display: none; }
+.cr-filter-row:first-child .cr-filter-join-where,
+.cr-filter-row:not(:first-child) .cr-filter-join-all { display: inline; }
+.cr-filter-popover:has([name="filter_match"][value="any"]:checked) .cr-filter-row:not(:first-child) .cr-filter-join-all { display: none; }
+.cr-filter-popover:has([name="filter_match"][value="any"]:checked) .cr-filter-row:not(:first-child) .cr-filter-join-any { display: inline; }
+
+/* Until a field is chosen there is nothing to compare, so a new row is just
+   "Where Choose a field…", and the only row has nothing to remove. */
+.cr-filter-row:has([data-filter-field] > option[value=""]:checked) :is([data-filter-operator], .cr-filter-value) { visibility: hidden; }
+.cr-filter-row:only-child:has([data-filter-field] > option[value=""]:checked) .cr-filter-remove { visibility: hidden; }
+
+.cr-filter-remove {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: var(--cr-gray-400);
+  font-size: 1.05rem;
+  line-height: 1;
+}
+.cr-filter-remove:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
+
+.cr-filter-add {
+  display: inline-flex;
+  align-items: center;
+  margin: 8px 0 0 -8px;
+  border-radius: 6px;
+  color: var(--cr-gray-600);
+  padding: 5px 8px;
+  font-size: 0.77rem;
+  font-weight: 600;
+}
+.cr-filter-add:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
+.cr-filter-add:disabled { background: none; color: var(--cr-gray-400); cursor: not-allowed; }
+
+/* In a narrow panel the comparison moves under the field. */
+@container (max-width: 32rem) {
+  .cr-filter-row {
+    grid-template-areas: "join field field remove" ". operator value .";
+    grid-template-columns: 2.75rem minmax(0, 1fr) minmax(0, 1fr) 28px;
+  }
+  .cr-filter-row + .cr-filter-row { margin-top: 8px; }
+  .cr-filter-row:has([data-filter-field] > option[value=""]:checked) :is([data-filter-operator], .cr-filter-value) { display: none; }
+}
+
+.cr-sort-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.cr-sort-row > select { flex: 1 1 12rem; width: auto; }
+
+.cr-filter-columns > summary { cursor: pointer; list-style: none; margin-bottom: 0; }
+.cr-filter-columns > summary::-webkit-details-marker { display: none; }
+.cr-filter-columns > summary::after {
+  width: 7px;
+  height: 7px;
+  margin: 0 4px 3px auto;
+  border-right: 1.5px solid var(--cr-gray-500);
+  border-bottom: 1.5px solid var(--cr-gray-500);
+  content: "";
+  transform: rotate(45deg);
+}
+.cr-filter-columns[open] > summary { margin-bottom: 8px; }
+.cr-filter-columns[open] > summary::after { margin-bottom: -2px; transform: rotate(-135deg); }
+.cr-filter-columns > summary:hover h2 { color: var(--cr-accent); }
+.cr-filter-columns .cr-checkbox-option { min-height: 30px; max-width: 100%; padding: 3px 10px 3px 8px; font-size: 0.77rem; }
+.cr-filter-columns .cr-checkbox-option > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.cr-filter-footer {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid var(--cr-gray-200);
+  padding: 12px 16px;
+}
 
 .cr-record-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; align-items: start; gap: 32px; }
 .cr-record-activity { position: sticky; top: 20px; min-width: 0; max-height: calc(100vh - 40px); overflow-y: auto; padding: 2px; scrollbar-width: thin; }
