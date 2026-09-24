@@ -1687,6 +1687,100 @@ async fn table_rows_keep_to_one_line_and_long_values_show_in_full_on_hover() {
 }
 
 #[tokio::test]
+async fn the_pager_shows_the_page_number_and_offers_other_page_sizes() {
+    let (_temporary, database) = test_database("views-page-sizes");
+    for index in 0..30 {
+        database
+            .create(
+                "tasks",
+                &format!("task-{index:02}"),
+                &[Assignment::from_str("status=done").unwrap()],
+                "",
+            )
+            .unwrap();
+    }
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    // Twenty-five rows unless something asks for another number.
+    let first = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert!(first.text().contains("<p>Showing 1\u{2013}25 of 30</p>"));
+    assert!(first.text().contains(">Page 1 of 2</p>"));
+    // Previous is drawn on the first page, unusable, so Next stays put.
+    assert!(first.text().contains(
+        r#"<span class="cr-button" data-disabled="true" aria-hidden="true">Previous</span>"#
+    ));
+    assert!(first.text().contains(r#"id="cr-page-next""#));
+    // Each size is a link to the first page of the same view at that size, and
+    // the current one says so.
+    assert!(
+        first
+            .text()
+            .contains(r#"role="group" aria-label="Rows per page""#)
+    );
+    assert!(first.text().contains(
+        r#"href="/tasks?filter_match=all&amp;sort_field=%24created_at&amp;sort_direction=desc&amp;limit=10" aria-label="10 rows per page""#
+    ));
+    assert!(
+        first
+            .text()
+            .contains(r#"aria-label="25 rows per page" aria-current="true""#)
+    );
+    assert!(first.text().contains(r#"aria-label="100 rows per page""#));
+
+    let second = request(&app, Method::GET, "/tasks?limit=10&offset=10", None, &[]).await;
+    assert!(second.text().contains(">Page 2 of 3</p>"));
+    assert!(second.text().contains(r#"id="cr-page-previous""#));
+    assert!(second.text().contains(r#"id="cr-page-next""#));
+    assert!(
+        !second
+            .text()
+            .contains(r#"<span class="cr-button" data-disabled"#)
+    );
+
+    let last = request(&app, Method::GET, "/tasks?limit=25&offset=25", None, &[]).await;
+    assert!(last.text().contains(">Page 2 of 2</p>"));
+    assert!(last.text().contains(
+        r#"<span class="cr-button" data-disabled="true" aria-hidden="true">Next</span>"#
+    ));
+
+    // A size the server would refuse is never offered, and a size a view or
+    // URL chose is offered beside the standard ones.
+    let bounded = router(
+        database.clone(),
+        ServerConfig {
+            max_page_size: 30,
+            ..ServerConfig::default()
+        },
+    )
+    .unwrap();
+    let page = request(&bounded, Method::GET, "/tasks?limit=12", None, &[]).await;
+    assert!(
+        page.text()
+            .contains(r#"aria-label="12 rows per page" aria-current="true""#)
+    );
+    assert!(page.text().contains(r#"aria-label="25 rows per page""#));
+    assert!(!page.text().contains(r#"aria-label="50 rows per page""#));
+
+    // One page of records that fit the smallest size needs neither control.
+    let (_small_temporary, small) = test_database("views-one-page");
+    small
+        .create(
+            "tasks",
+            "only",
+            &[Assignment::from_str("status=done").unwrap()],
+            "",
+        )
+        .unwrap();
+    let app = router(small, ServerConfig::default()).unwrap();
+    let single = request(&app, Method::GET, "/tasks", None, &[]).await;
+    assert!(single.text().contains(">Page 1 of 1</p>"));
+    assert!(!single.text().contains("Rows per page"));
+    assert!(!single.text().contains("Previous"));
+    assert!(!single.text().contains(r#"id="cr-page-next""#));
+}
+
+#[tokio::test]
 async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
     let (_temporary, database) = test_database("views-index");
     for (id, status) in [("alpha", "open"), ("beta", "open"), ("gamma", "won")] {

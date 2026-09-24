@@ -25,7 +25,7 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
     assert_eq!(automatic["where_expr"], serde_json::json!([]));
     assert!(automatic["sort_by"].is_null());
     assert_eq!(automatic["sort_direction"], "asc");
-    assert_eq!(automatic["page_size"], 10);
+    assert_eq!(automatic["page_size"], 25);
 
     assert_eq!(
         run_success(database.command().args([

@@ -10,12 +10,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
     AccessAction, AccessResource, AgentEvidence, Aggregation, Assignment, AttributionOverrides,
-    AuditFilter, CheckReport, CheckScope, CollectionAccessPolicy, CollectionPresentation, Database,
-    DomainError, Filter, FilterExpression, Projection, Record, RecordPrecondition,
-    RecordVisibility, Role, SchemaReview, SearchQuery, SearchTarget, SortDirection,
-    SyncAttribution, UserDeleteOptions, UserEnsureOutcome, UserKind, UserRegistrationOptions,
-    UserStatus, UserUpdate, ViewLayout, parse_threshold, sort_by_record_field,
-    sort_records_by_field,
+    AuditFilter, CheckReport, CheckScope, CollectionAccessPolicy, CollectionPresentation,
+    DEFAULT_VIEW_PAGE_SIZE, Database, DomainError, Filter, FilterExpression, Projection, Record,
+    RecordPrecondition, RecordVisibility, Role, SchemaReview, SearchQuery, SearchTarget,
+    SortDirection, SyncAttribution, UserDeleteOptions, UserEnsureOutcome, UserKind,
+    UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout, parse_threshold,
+    sort_by_record_field, sort_records_by_field,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -1181,7 +1181,7 @@ enum ViewCommand {
         sort_direction: Option<ViewSortDirectionArgument>,
 
         /// Default records per page.
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = DEFAULT_VIEW_PAGE_SIZE)]
         page_size: usize,
     },
 
