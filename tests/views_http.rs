@@ -218,6 +218,12 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert!(automatic.text().contains("data-filter-builder=\"true\""));
     assert!(automatic.text().contains("data-view-search=\"true\""));
     assert!(automatic.text().contains("aria-label=\"Submit search\""));
+    // The magnifier leads the box, drawn rather than typed as a glyph.
+    assert!(automatic.text().contains(
+        r#"class="absolute inset-y-1 left-1 inline-flex w-7 items-center justify-center rounded-md text-gray-400 hover:bg-gray-100 hover:text-blue-700"><svg aria-hidden="true" focusable="false""#
+    ));
+    assert!(automatic.text().contains("py-2 pl-9 pr-3 text-sm"));
+    assert!(!automatic.text().contains("⌕"));
     assert!(automatic.text().contains("data-filter-disclosure=\"true\""));
     // The applied-condition count states itself on the disclosure's `<summary>`
     // rather than on the `<details>` around it, because the summary is the one
