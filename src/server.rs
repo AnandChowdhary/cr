@@ -6484,16 +6484,19 @@ fn render_view_records(
                     div class="flex flex-wrap items-center gap-2" {
                         span class="cr-title-icon" aria-hidden="true" { (view_icon(view)) }
                         h1 class="cr-title" { (&view.title) }
-                        span class="cr-pill" {
-                            @if view.saved { "saved view" } @else { "automatic view" }
-                        }
-                        @if view.layout == ViewLayout::Kanban {
-                            span class="cr-pill cr-pill-accent" { "kanban" }
-                        }
-                        (view_record_count(page.total, OutOfBand::No))
                     }
-                    p class="cr-lede mt-1" {
-                        "Collection " code class="cr-filter-tag" { (&view.collection) }
+                    // What the page is, in one quiet line under its title
+                    // rather than a row of badges beside it: what kind of view,
+                    // of which collection, and how many records it shows.
+                    p class="cr-lede mt-1" data-view-summary="true" {
+                        (match (view.saved, view.layout) {
+                            (false, _) => "Automatic view",
+                            (true, ViewLayout::Table) => "Saved view",
+                            (true, ViewLayout::Kanban) => "Saved Kanban view",
+                        })
+                        " of the " code class="font-mono text-gray-700" { (&view.collection) } " collection"
+                        span class="mx-1.5 text-gray-300" aria-hidden="true" { "·" }
+                        (view_record_count(page.total, OutOfBand::No))
                     }
                     @if !view.filters.is_empty() || !view.where_expr.is_empty() || !view.filter_groups.is_empty() {
                         div class="mt-2 flex flex-wrap gap-1.5" {
@@ -6791,7 +6794,7 @@ impl OutOfBand {
     }
 }
 
-/// The heading's "*n* records" pill.
+/// The "*n* records" in the line under a view's title.
 ///
 /// Lives outside the results region and is changed by every filter and search
 /// that hits it, which is why it is a function: the heading renders it and a
@@ -6800,7 +6803,9 @@ impl OutOfBand {
 /// pager six inches below it.
 fn view_record_count(total: usize, out_of_band: OutOfBand) -> Markup {
     html! {
-        span id=(VIEW_COUNT_ID) class="cr-pill" hx-swap-oob=[out_of_band.attribute()] { (total) " records" }
+        span id=(VIEW_COUNT_ID) hx-swap-oob=[out_of_band.attribute()] {
+            (total) @if total == 1 { " record" } @else { " records" }
+        }
     }
 }
 
