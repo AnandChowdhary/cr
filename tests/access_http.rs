@@ -233,6 +233,39 @@ async fn rest_reads_and_writes_enforce_record_owned_visibility() {
 }
 
 #[tokio::test]
+async fn users_table_folds_grants_after_the_first_three() {
+    let (_temporary, database) = seeded_database("users-grant-fold");
+    for resource in [
+        AccessResource::collection("notes"),
+        AccessResource::collection("tasks"),
+        AccessResource::record("deals", "secret"),
+    ] {
+        database
+            .grant_access("reader@example.com", resource, Role::Viewer)
+            .unwrap();
+    }
+    let app = router(database, ServerConfig::default()).unwrap();
+
+    let users = request(&app, Method::GET, "/users", None, None, &[]).await;
+    assert_eq!(users.status, StatusCode::OK, "{}", users.text());
+    let page = users.text();
+    let table = &page[page.find("<tbody").unwrap()..];
+    let row = &table[table.find("reader@example.com").unwrap()..];
+    let row = &row[..row.find("</tr>").unwrap()];
+    // Sorted by resource, the collections come first and a record folds away,
+    // still in the page for the reader who opens it.
+    let fold = row.find("<details class=\"cr-access-more\">").unwrap();
+    assert!(row.contains(">+1</span>"), "{row}");
+    assert!(row[..fold].contains("viewer · collection:notes"));
+    assert!(row[..fold].contains("viewer · collection:tasks"));
+    assert!(row[..fold].contains("viewer · record:deals/public"));
+    assert!(row[fold..].contains("viewer · record:deals/secret"));
+    // A principal with three grants or fewer has nothing to fold.
+    let editor = &table[table.find("editor@example.com").unwrap()..];
+    assert!(!editor[..editor.find("</tr>").unwrap()].contains("cr-access-more"));
+}
+
+#[tokio::test]
 async fn internal_user_records_are_readable_without_any_web_mutation() {
     let (_temporary, database) = seeded_database("internal-users");
     let app = router(database.clone(), ServerConfig::default()).unwrap();

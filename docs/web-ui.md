@@ -213,12 +213,16 @@ http://127.0.0.1:3000/users
 ```
 
 The page shows every registered principal, its name, email, kind, status,
-direct grants, and any application-owned profile fields. It is strictly
-read-only: there is no create, edit, or delete control anywhere on it, and the
-record routes that serve collection views never reach `users`. Register a
-principal, change a role, or disable an identity with `cr user` and `cr access`
-(see [Control record access](access-control.md)), or through the REST API.
-Those paths enforce the reserved-field rules browser forms cannot express.
+direct grants, and any application-owned profile fields. A principal's first
+three grants are listed and the rest fold behind a `+N` that opens to show
+them, so somebody granted a long run of single records keeps a one-line row.
+Grants are sorted by resource, which puts collection and database grants before
+record ones. It is strictly read-only: there is no create, edit, or delete
+control anywhere on it, and the record routes that serve collection views never
+reach `users`. Register a principal, change a role, or disable an identity with
+`cr user` and `cr access` (see [Control record access](access-control.md)), or
+through the REST API. Those paths enforce the reserved-field rules browser
+forms cannot express.
 
 The section only appears for a perspective that may read access policy—database
 owners and access managers—and `/users` itself answers `403 Forbidden` to
