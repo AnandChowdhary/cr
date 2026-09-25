@@ -1092,3 +1092,247 @@ async fn a_record_created_from_the_structured_form_keeps_the_form_order() {
         ]
     );
 }
+
+/// A collection whose objects the schema describes: two the form can edit a
+/// property at a time, one holding an object and a list it cannot, and one
+/// that is usually empty.
+fn tasks_database(name: &str) -> (TempDir, Database) {
+    let (temporary, database) = test_database(name);
+    fs::write(
+        database.root().join(".cr/schemas/tasks.json"),
+        r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["name"],
+  "properties": {
+    "name": { "type": "string" },
+    "costs": {
+      "type": "object",
+      "properties": {
+        "worker": { "type": "number", "minimum": 0 },
+        "total": { "type": "number", "minimum": 0 }
+      }
+    },
+    "claim": {
+      "type": "object",
+      "properties": {
+        "pid": { "type": "integer", "minimum": 0 },
+        "at": { "type": "string" }
+      }
+    },
+    "learning": {
+      "type": "object",
+      "properties": {
+        "status": { "enum": ["pending", "done"] },
+        "retry": { "type": "object", "properties": { "at": { "type": "string" } } }
+      }
+    },
+    "delivery": {
+      "type": "object",
+      "properties": {
+        "target": { "type": "string" },
+        "files": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+    (temporary, database)
+}
+
+/// Everything the tasks form sends for `costs` and nothing else, the rest of
+/// the form left as a browser would send it untouched.
+fn tasks_submission(page: &str, costs: [(&str, &str); 2]) -> String {
+    form(&[
+        ("_csrf", csrf(page)),
+        ("_expected_record_hash", expected_record_hash(page)),
+        ("_form_mode", "structured"),
+        ("attribute.name", "Rate applicant"),
+        ("attribute.costs.worker", costs[0].1),
+        ("attribute.costs.total", costs[1].1),
+        ("attribute.claim.pid", "3"),
+        ("attribute.claim.at", "2026-09-25T09:00:00Z"),
+        ("attribute.learning.status", "done"),
+        ("attribute.learning.retry", "at: soon\n"),
+        ("attribute.delivery.target", ""),
+        ("attribute.delivery.files", ""),
+        ("markdown", "Body"),
+    ])
+}
+
+fn create_task(database: &Database) {
+    let assignments = [
+        "name=Rate applicant",
+        "costs.worker=0.4",
+        "costs.total=0.7",
+        "claim.pid=3",
+        "claim.at=2026-09-25T09:00:00Z",
+        "learning.status=done",
+        "learning.retry.at=soon",
+    ]
+    .map(|assignment| Assignment::from_str(assignment).unwrap());
+    database
+        .create("tasks", "rate", &assignments, "Body")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_object_the_schema_describes_is_edited_one_property_at_a_time() {
+    let (_temporary, database) = tasks_database("object-fields");
+    create_task(&database);
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/tasks/records/rate", None, &[]).await;
+    let html = &page.body;
+
+    // Each property is its own control, typed by its own schema.
+    assert!(
+        html.contains(r#"type="number" step="any" name="attribute.costs.worker" value="0.4""#),
+        "{html}"
+    );
+    assert!(html.contains(r#"type="number" step="1" name="attribute.claim.pid" value="3""#));
+    assert!(html.contains(r#"name="attribute.learning.status" value="done" checked"#));
+    assert!(!html.contains(r#"name="attribute.costs""#));
+    // One level down only: an object or list inside the object is a YAML box.
+    assert!(html.contains(r#"name="attribute.learning.retry" rows="5""#));
+    assert!(html.contains(r#"name="attribute.delivery.files" rows="5""#));
+    // An object holding something is open, and an empty one folded.
+    assert!(html.contains(r#"<details id="field-costs" open"#));
+    assert!(html.contains(r#"<details id="field-delivery" class="#));
+
+    let saved = request(
+        &app,
+        Method::POST,
+        "/tasks/records/rate",
+        Some(tasks_submission(
+            html,
+            [("worker", "0.4"), ("total", "0.9")],
+        )),
+        &[],
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.body);
+    let record = database.get("tasks", "rate").unwrap();
+    assert_eq!(record.attributes["costs"]["total"].as_f64(), Some(0.9));
+    assert_eq!(record.attributes["claim"]["pid"].as_u64(), Some(3));
+    assert_eq!(record.attributes["learning"]["retry"]["at"], "soon");
+    // The object keeps the order its file had, not the form's, and an object
+    // left empty is not written at all.
+    let costs = record.attributes["costs"]
+        .as_mapping()
+        .unwrap()
+        .keys()
+        .map(|key| key.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(costs, ["worker", "total"]);
+    assert!(record.attributes.get("delivery").is_none());
+    database.audit_verify(None).unwrap();
+}
+
+#[tokio::test]
+async fn an_object_holding_keys_its_schema_does_not_declare_stays_yaml() {
+    let (_temporary, database) = tasks_database("object-extra-keys");
+    let assignments = [
+        "name=Rate applicant",
+        "costs.worker=0.4",
+        "costs.note=estimated",
+    ]
+    .map(|assignment| Assignment::from_str(assignment).unwrap());
+    database
+        .create("tasks", "rate", &assignments, "Body")
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/tasks/records/rate", None, &[]).await;
+
+    // A group would have nowhere to show `note`, so the whole object is YAML
+    // and saving it writes it back as it was.
+    assert!(
+        page.body
+            .contains("name=\"attribute.costs\" rows=\"5\" spellcheck=\"false\"")
+    );
+    assert!(!page.body.contains(r#"name="attribute.costs.worker""#));
+    let saved = request(
+        &app,
+        Method::POST,
+        "/tasks/records/rate",
+        Some(form(&[
+            ("_csrf", csrf(&page.body)),
+            ("_expected_record_hash", expected_record_hash(&page.body)),
+            ("_form_mode", "structured"),
+            ("attribute.name", "Rate applicant"),
+            ("attribute.costs", "worker: 0.4\nnote: estimated\n"),
+            ("markdown", "Body"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.body);
+    let record = database.get("tasks", "rate").unwrap();
+    assert_eq!(record.attributes["costs"]["note"], "estimated");
+}
+
+#[tokio::test]
+async fn a_refusal_inside_an_object_is_shown_beside_the_property_it_is_about() {
+    let (_temporary, database) = tasks_database("object-refusal");
+    create_task(&database);
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/tasks/records/rate", None, &[]).await;
+    let before = database.get("tasks", "rate").unwrap().version;
+
+    let refused = request(
+        &app,
+        Method::POST,
+        "/tasks/records/rate",
+        Some(tasks_submission(
+            &page.body,
+            [("worker", "0.40"), ("total", "-1")],
+        )),
+        &[],
+    )
+    .await;
+    let html = &refused.body;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY, "{html}");
+    // Beside the property's own control, inside the object's group.
+    let (before_control, _) = html
+        .split_once(r#"id="field-costs.total""#)
+        .expect("the property's control is rendered");
+    let (_, inside_group) = before_control
+        .split_once(r#"id="field-costs""#)
+        .expect("the object's group is rendered");
+    assert!(inside_group.contains("minimum of 0"), "{html}");
+    assert!(html.contains(r#"name="attribute.costs.total" value="-1""#));
+    assert_eq!(html.matches(r#"aria-invalid="true""#).count(), 1, "{html}");
+    // The typed text comes back, not the number it parsed as.
+    assert!(html.contains(r#"name="attribute.costs.worker" value="0.40""#));
+    assert_eq!(database.get("tasks", "rate").unwrap().version, before);
+}
+
+#[tokio::test]
+async fn an_object_submitted_both_as_yaml_and_as_fields_is_refused() {
+    let (_temporary, database) = tasks_database("object-both");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/tasks/new", None, &[]).await;
+    // A new record's objects are all groups, folded while empty.
+    assert!(page.body.contains(r#"name="attribute.costs.total""#));
+    assert!(!page.body.contains(r#"<details id="field-costs" open"#));
+
+    let refused = request(
+        &app,
+        Method::POST,
+        "/tasks/records",
+        Some(form(&[
+            ("_csrf", csrf(&page.body)),
+            ("_form_mode", "structured"),
+            ("id", "rate"),
+            ("attribute.name", "Rate applicant"),
+            ("attribute.costs", "total: 1\n"),
+            ("attribute.costs.total", "2"),
+            ("markdown", ""),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert!(refused.body.contains("both as YAML and as separate fields"));
+    assert!(database.get("tasks", "rate").is_err());
+}
