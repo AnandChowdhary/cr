@@ -1158,6 +1158,11 @@ struct SchemaFormField {
     inferred: Option<InferredFieldKind>,
     /// The unit a number is in, from its `x-cr-unit`, shown beside the box.
     unit: Option<String>,
+    /// An object's own fields, when the form edits it as a group of controls
+    /// rather than as one YAML box. Empty for every other field. Each member's
+    /// `key` is its path, `costs.total`, which is also what a violation inside
+    /// the object is reported against.
+    members: Vec<SchemaFormField>,
 }
 
 #[derive(Clone, Debug)]
@@ -7969,6 +7974,7 @@ fn schema_form_fields(schema: &JsonValue, attributes: &Mapping) -> Option<Vec<Sc
             unit: definition
                 .get("x-cr-unit")
                 .and_then(|unit| amount_unit(unit, Some(attributes))),
+            members: Vec::new(),
         })
         .collect::<Vec<_>>();
     fields.sort_by(|left, right| {
@@ -7986,6 +7992,87 @@ fn schema_form_fields(schema: &JsonValue, attributes: &Mapping) -> Option<Vec<Sc
             .then_with(|| left.label.cmp(&right.label))
     });
     Some(fields)
+}
+
+/// The structured form's fields: [`schema_form_fields`], with each object the
+/// form can edit as a group of controls given its members. An object that
+/// another top-level property's name starts with, `costs` beside `costs.total`,
+/// stays YAML, because the two would name one control.
+fn record_form_fields(schema: &JsonValue, attributes: &Mapping) -> Option<Vec<SchemaFormField>> {
+    let properties = schema.get("properties")?.as_object()?;
+    let mut fields = schema_form_fields(schema, attributes)?;
+    for field in &mut fields {
+        let prefix = format!("{}.", field.key);
+        if let Some(definition) = properties.get(&field.key)
+            && !properties.keys().any(|key| key.starts_with(&prefix))
+            && object_value_fits_group(definition, field.value.as_ref())
+        {
+            field.members = object_members(field, definition);
+        }
+    }
+    Some(fields)
+}
+
+/// The properties of an object the form can edit one control per property,
+/// or `None` when it stays a YAML box.
+///
+/// Only an object the schema describes, one level down: a property inside it
+/// that is itself an object, or a list the schema gives no options for, is a
+/// YAML box within the group. A name with a `.` in it stays YAML too, because
+/// the form names each control by its dotted path and could not tell
+/// `costs.total` inside `costs` from a property called `costs.total`.
+fn object_group_properties(definition: &JsonValue) -> Option<&serde_json::Map<String, JsonValue>> {
+    if definition.get("type").and_then(JsonValue::as_str) != Some("object")
+        || definition.get("enum").is_some()
+    {
+        return None;
+    }
+    let properties = definition.get("properties")?.as_object()?;
+    (!properties.is_empty()
+        && properties
+            .keys()
+            .all(|key| !key.is_empty() && !key.contains('.')))
+    .then_some(properties)
+}
+
+/// Whether a stored value can be shown as the group of controls its schema
+/// describes without leaving any of it out. A record that has none yet can.
+/// One holding a key the schema does not declare, or something other than a
+/// mapping, is shown as YAML, so everything in it is still in front of the
+/// reader and saving the form writes it back as it was.
+fn object_value_fits_group(definition: &JsonValue, value: Option<&YamlValue>) -> bool {
+    let Some(properties) = object_group_properties(definition) else {
+        return false;
+    };
+    match value {
+        None | Some(YamlValue::Null) => true,
+        Some(YamlValue::Mapping(object)) => object
+            .keys()
+            .all(|key| key.as_str().is_some_and(|key| properties.contains_key(key))),
+        Some(_) => false,
+    }
+}
+
+/// An object's controls, each keyed by its path. A property is required here
+/// only when the object is, so leaving an optional object empty is not refused
+/// by the browser for a property the object would need if it existed.
+fn object_members(field: &SchemaFormField, definition: &JsonValue) -> Vec<SchemaFormField> {
+    if field.key.contains('.') {
+        return Vec::new();
+    }
+    let object = match &field.value {
+        Some(YamlValue::Mapping(object)) => object.clone(),
+        _ => Mapping::new(),
+    };
+    schema_form_fields(definition, &object)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|member| SchemaFormField {
+            key: format!("{}.{}", field.key, member.key),
+            required: field.required && member.required,
+            ..member
+        })
+        .collect()
 }
 
 fn schema_field_kind(definition: &JsonValue) -> SchemaFieldKind {
@@ -8741,6 +8828,63 @@ fn render_schema_field(field: &SchemaFormField, diagnostics: &[String]) -> Marku
     }
 }
 
+/// An object as a group of controls, one per property its schema declares,
+/// under the object's own label. What is said about the object as a whole, a
+/// missing property for one, is shown under that label.
+///
+/// An optional object with nothing in it is folded to its label. A record can
+/// declare a dozen objects and hold two, and a dozen boxes of empty controls
+/// would bury the two. It opens when it holds something, when the schema
+/// requires it, and when a refusal has something to say inside it.
+fn render_object_field(field: &SchemaFormField, rejection: Option<&RecordFormRejection>) -> Markup {
+    let id = format!("field-{}", field.key);
+    let help = field.description.as_ref().map(|_| format!("{id}-help"));
+    let diagnostics = form_diagnostics(rejection, &field.key);
+    let holds_something = field.members.iter().any(|member| match &member.submitted {
+        Some(values) => values.iter().any(|value| !value.is_empty()),
+        None => member
+            .value
+            .as_ref()
+            .is_some_and(|value| !is_empty_value(value)),
+    });
+    let open = field.required
+        || holds_something
+        || !diagnostics.is_empty()
+        || field
+            .members
+            .iter()
+            .any(|member| !form_diagnostics(rejection, &member.key).is_empty());
+    html! {
+        details id=(&id) open[open] aria-describedby=[help.as_deref()] class=(if diagnostics.is_empty() { "cr-field cr-field-wide cr-field-group" } else { "cr-field cr-field-wide cr-field-group cr-field-invalid" }) {
+            summary class="cr-field-label" {
+                (&field.label)
+                @if field.required {
+                    span class="cr-required" aria-hidden="true" { "*" }
+                }
+            }
+            (render_field_diagnostics(diagnostics))
+            @if let (Some(help), Some(description)) = (&help, &field.description) {
+                p id=(help) class="cr-field-help" { (description) }
+            }
+            div class="cr-form-grid cr-field-group-grid" {
+                @for member in &field.members {
+                    (render_schema_field(member, form_diagnostics(rejection, &member.key)))
+                }
+            }
+        }
+    }
+}
+
+/// Whether a structured submission edited `key` as a group of controls rather
+/// than as a YAML box: it sent a control for a property inside the object.
+fn submitted_as_group(submitted: &HtmlDocumentForm, key: &str) -> bool {
+    let prefix = format!("{key}.");
+    submitted
+        .fields
+        .keys()
+        .any(|field| field.starts_with(&prefix))
+}
+
 /// The diagnostics about one control, rendered where that control is.
 ///
 /// `role="alert"` rather than plain text: after an htmx swap there is no page
@@ -8837,9 +8981,10 @@ fn rejected_form_headline(editing: bool) -> &'static str {
 /// at the top of a long form, but only if it lands on the right one. The mapping
 /// is therefore explicit: a violation about a field the structured or fields
 /// form renders goes to that field's control; one about `profile.team` goes to
-/// the `profile` control, keeping the full path in its text, because that is the
-/// box the value was typed into; and anything the form does not render a control
-/// for — an attribute the schema does not declare, or a schema-shaped name on a
+/// the `team` control when the form rendered `profile` as a group, and
+/// otherwise to the `profile` control, keeping the full path in its text,
+/// because that is the box the value was typed into; and anything the form
+/// does not render a control for — an attribute the schema does not declare, or a schema-shaped name on a
 /// form that has no schema — goes to whichever free-text box carries it, which is
 /// the whole point of that box existing. A fields form has no such box, so there
 /// it stays in the message at the top.
@@ -8854,13 +8999,23 @@ fn record_form_diagnostics(
     error_field: Option<&str>,
     violations: &[SchemaViolation],
 ) -> BTreeMap<String, Vec<String>> {
-    // The fields the form rendered a control of their own for.
+    // The fields the form rendered a control of their own for, and each
+    // property of an object it rendered as a group.
     let rendered = match submitted.mode {
         DocumentFormMode::Structured => schema
-            .and_then(|schema| schema.get("properties"))
-            .and_then(JsonValue::as_object)
-            .map(|properties| properties.keys().cloned().collect::<BTreeSet<_>>())
-            .unwrap_or_default(),
+            .and_then(|schema| record_form_fields(schema, &Mapping::new()))
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|field| {
+                let members =
+                    if !field.members.is_empty() && submitted_as_group(submitted, &field.key) {
+                        field.members.into_iter().map(|member| member.key).collect()
+                    } else {
+                        Vec::new()
+                    };
+                std::iter::once(field.key).chain(members)
+            })
+            .collect::<BTreeSet<_>>(),
         DocumentFormMode::Fields => submitted
             .field_kinds
             .iter()
@@ -8876,7 +9031,14 @@ fn record_form_diagnostics(
         DocumentFormMode::Fields => None,
     };
     let control_for = |field: &str| -> Option<String> {
-        let root = field.split('.').next().unwrap_or(field);
+        let mut segments = field.splitn(3, '.');
+        let root = segments.next().unwrap_or(field);
+        if let Some(property) = segments.next() {
+            let member = format!("{root}.{property}");
+            if rendered.contains(&member) {
+                return Some(member);
+            }
+        }
         if rendered.contains(root) {
             return Some(root.to_owned());
         }
@@ -9214,6 +9376,7 @@ fn inferred_form_fields(attributes: &Mapping) -> Option<Vec<SchemaFormField>> {
                 kind: kind.control(value.as_str()),
                 inferred: Some(kind),
                 unit: None,
+                members: Vec::new(),
             })
         })
         .collect()
@@ -9236,6 +9399,7 @@ fn submitted_inferred_fields(submitted: &HtmlDocumentForm) -> Vec<SchemaFormFiel
                 submitted: Some(values),
                 inferred: Some(*kind),
                 unit: None,
+                members: Vec::new(),
             }
         })
         .collect()
@@ -9302,7 +9466,7 @@ fn render_record_form(
     let attributes = record
         .map(|record| &record.attributes)
         .unwrap_or(&empty_attributes);
-    let schema_fields = schema.and_then(|schema| schema_form_fields(schema, attributes));
+    let schema_fields = schema.and_then(|schema| record_form_fields(schema, attributes));
     let inferred_fields = if schema_fields.is_none() {
         inferred_form_fields(attributes)
     } else {
@@ -9338,7 +9502,31 @@ fn render_record_form(
             if let Some(submitted) =
                 submitted.filter(|submitted| submitted.mode == DocumentFormMode::Structured)
             {
+                // What each object's group is when nothing is stored in it.
+                let groups = schema
+                    .and_then(|schema| record_form_fields(schema, &Mapping::new()))
+                    .unwrap_or_default();
                 for field in &mut fields {
+                    // An object comes back the way it was submitted: as the
+                    // group of controls or as the YAML box, whichever the
+                    // browser sent, even if the record has changed since.
+                    if submitted.fields.contains_key(&field.key) {
+                        field.members.clear();
+                    } else if field.members.is_empty()
+                        && submitted_as_group(submitted, &field.key)
+                        && let Some(group) = groups.iter().find(|group| group.key == field.key)
+                    {
+                        field.members = group.members.clone();
+                    }
+                    for member in &mut field.members {
+                        member.submitted = Some(
+                            submitted
+                                .fields
+                                .get(&member.key)
+                                .cloned()
+                                .unwrap_or_default(),
+                        );
+                    }
                     field.submitted = Some(
                         submitted
                             .fields
@@ -9483,6 +9671,8 @@ fn render_record_form(
                                 input type="hidden" name=(format!("_field.{}", field.key)) value=(kind.token());
                             }
                             input type="hidden" name=(format!("attribute.{}", field.key)) value=(field_yaml_text(field));
+                        } @else if !field.members.is_empty() {
+                            (render_object_field(field, rejection))
                         } @else {
                             (render_schema_field(field, form_diagnostics(rejection, &field.key)))
                         }
@@ -10906,6 +11096,12 @@ a.cr-lane-more:hover { background: var(--cr-gray-100); color: var(--cr-gray-900)
 
 .cr-field { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
 .cr-field-wide { grid-column: 1 / -1; }
+/* An object edited as a group: its own fields, boxed under its label, which
+   folds it away when it is empty. */
+.cr-field-group > summary { width: fit-content; cursor: pointer; }
+.cr-field-group > summary:hover { color: var(--cr-gray-900); }
+.cr-field-group:not([open]) > summary { color: var(--cr-gray-500); font-weight: 550; }
+.cr-field-group-grid { border: 1px solid var(--cr-gray-200); border-radius: var(--cr-radius); padding: 14px; }
 
 .cr-field-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .cr-field-label { color: var(--cr-gray-700); font-size: 0.78rem; font-weight: 600; line-height: 1.3; }
@@ -13097,8 +13293,16 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
                 "structured fields require schema properties",
             )
         })?;
+    let fields = record_form_fields(schema, &Mapping::new()).unwrap_or_default();
+    let controls = fields
+        .iter()
+        .flat_map(|field| {
+            std::iter::once(field.key.as_str())
+                .chain(field.members.iter().map(|member| member.key.as_str()))
+        })
+        .collect::<BTreeSet<_>>();
     for field in form.fields.keys() {
-        if !properties.contains_key(field) {
+        if !controls.contains(field.as_str()) {
             return Err(ApiError::bad_request(
                 "invalid_form",
                 format!("attribute '{field}' is not declared by the collection schema"),
@@ -13142,7 +13346,23 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
     // new record's file reads in the same order as its form. Saving an
     // existing record puts its own order back; see `in_stored_order`.
     let mut attributes = Mapping::new();
-    for field in schema_form_fields(schema, &Mapping::new()).unwrap_or_default() {
+    for field in fields {
+        if !field.members.is_empty() && submitted_as_group(form, &field.key) {
+            if form.fields.contains_key(&field.key) {
+                return Err(ApiError::bad_request(
+                    "invalid_form",
+                    format!(
+                        "attribute '{}' cannot be submitted both as YAML and as separate fields",
+                        field.key
+                    ),
+                )
+                .with_field(&field.key));
+            }
+            if let Some(object) = parse_object_group(form, &field, &properties[&field.key])? {
+                attributes.insert(YamlValue::String(field.key), object);
+            }
+            continue;
+        }
         let key = field.key;
         let values = form.fields.get(&key).map(Vec::as_slice).unwrap_or(&[]);
         // Every refusal from here names the property it is about, so a
@@ -13162,6 +13382,45 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
     Ok(attributes)
 }
 
+/// The object a group of controls describes, each property read as the
+/// top-level field it would be. A group left entirely empty is no object at
+/// all unless the schema requires one, which is then `{}` for the schema to
+/// judge.
+fn parse_object_group(
+    form: &HtmlDocumentForm,
+    field: &SchemaFormField,
+    definition: &JsonValue,
+) -> ApiResult<Option<YamlValue>> {
+    let values = |member: &SchemaFormField| {
+        form.fields
+            .get(&member.key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    };
+    let untouched = field
+        .members
+        .iter()
+        .all(|member| values(member).iter().all(String::is_empty));
+    if untouched && !field.required {
+        return Ok(None);
+    }
+    let mut object = Mapping::new();
+    for member in &field.members {
+        let property = &member.key[field.key.len() + 1..];
+        if let Some(value) = parse_schema_form_value(
+            &member.key,
+            &definition["properties"][property],
+            member.required,
+            values(member),
+        )
+        .map_err(|error| error.with_field(&member.key))?
+        {
+            object.insert(YamlValue::String(property.to_owned()), value);
+        }
+    }
+    Ok(Some(YamlValue::Mapping(object)))
+}
+
 /// `attributes` with the keys `stored` has in the order it has them, and any
 /// others after those in the order they came.
 ///
@@ -13170,14 +13429,33 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
 /// or by hand has its own. Writing the form's order back moved the front
 /// matter's lines around on every save, so a one-field change showed up in the
 /// file's diff as a reshuffle of all of them.
-fn in_stored_order(mut attributes: Mapping, stored: &Mapping) -> Mapping {
-    let mut ordered = Mapping::with_capacity(attributes.len());
+///
+/// Each object's own keys are put back in their stored order too, one level
+/// down, for the same reason: the form lists an object's properties in its
+/// schema's order.
+fn in_stored_order(attributes: Mapping, stored: &Mapping) -> Mapping {
+    keys_in_stored_order(attributes, stored)
+        .into_iter()
+        .map(|(key, value)| {
+            let value = match (value, stored.get(&key)) {
+                (YamlValue::Mapping(object), Some(YamlValue::Mapping(stored))) => {
+                    YamlValue::Mapping(keys_in_stored_order(object, stored))
+                }
+                (value, _) => value,
+            };
+            (key, value)
+        })
+        .collect()
+}
+
+fn keys_in_stored_order(mut mapping: Mapping, stored: &Mapping) -> Mapping {
+    let mut ordered = Mapping::with_capacity(mapping.len());
     for key in stored.keys() {
-        if let Some(value) = attributes.shift_remove(key) {
+        if let Some(value) = mapping.shift_remove(key) {
             ordered.insert(key.clone(), value);
         }
     }
-    ordered.extend(attributes);
+    ordered.extend(mapping);
     ordered
 }
 
