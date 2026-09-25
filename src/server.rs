@@ -5541,6 +5541,20 @@ fn view_icon(view: &ViewDefinition) -> &str {
     view.icon.as_deref().unwrap_or(DEFAULT_COLLECTION_ICON)
 }
 
+/// How many of a principal's grants the users table lists before folding the
+/// rest behind a `+N` that opens to show them. Grants are kept sorted by
+/// resource, so the broad ones on a collection or the database come first and
+/// a long run of per-record grants is what folds away.
+const ACCESS_GRANTS_SHOWN: usize = 3;
+
+fn render_access_grant(grant: &crate::AccessGrant) -> Markup {
+    html! {
+        span class="cr-pill" title=(format!("{} at {}", grant.role, grant.resource)) {
+            (grant.role) " · " (grant.resource)
+        }
+    }
+}
+
 fn render_users_view(
     representation: &Representation,
     users: &[(String, User)],
@@ -5623,10 +5637,22 @@ fn render_users_view(
                                             @if user.access.is_empty() {
                                                 span class="text-gray-500" { "no access" }
                                             } @else {
+                                                @let (shown, more) = user.access.split_at(user.access.len().min(ACCESS_GRANTS_SHOWN));
                                                 div class="flex flex-wrap gap-1.5" {
-                                                    @for grant in &user.access {
-                                                        span class="cr-pill" title=(format!("{} at {}", grant.role, grant.resource)) {
-                                                            (grant.role) " · " (grant.resource)
+                                                    @for grant in shown {
+                                                        (render_access_grant(grant))
+                                                    }
+                                                    @if !more.is_empty() {
+                                                        details class="cr-access-more" {
+                                                            summary class="cr-pill" title=(count_noun(more.len(), "more grant", "more grants")) {
+                                                                span class="cr-access-more-count" { "+" (more.len()) }
+                                                                span class="cr-access-more-less" { "Show fewer" }
+                                                            }
+                                                            div class="flex flex-wrap gap-1.5" {
+                                                                @for grant in more {
+                                                                    (render_access_grant(grant))
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -10471,6 +10497,17 @@ html {
   font-weight: 600;
   line-height: 1.2;
 }
+
+/* The users table's `+N`: a pill that opens onto a principal's remaining
+   grants, on a line of their own beneath the first few. */
+.cr-access-more > summary { cursor: pointer; list-style: none; }
+.cr-access-more > summary::-webkit-details-marker { display: none; }
+.cr-access-more > summary:hover { border-color: var(--cr-gray-300); color: var(--cr-gray-900); }
+.cr-access-more[open] { flex-basis: 100%; }
+.cr-access-more[open] > summary { margin-bottom: 6px; }
+.cr-access-more-less,
+.cr-access-more[open] .cr-access-more-count { display: none; }
+.cr-access-more[open] .cr-access-more-less { display: inline; }
 
 .cr-pill-accent { border-color: var(--cr-info-line); background: var(--cr-accent-soft); color: var(--cr-info-strong); }
 .cr-pill-warn { border-color: var(--cr-warn-line); background: var(--cr-warn-soft); color: var(--cr-warn-ink); }
