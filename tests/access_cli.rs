@@ -178,6 +178,87 @@ fn record_owned_collection_keeps_creators_private_and_can_share_individual_recor
 }
 
 #[test]
+fn record_owned_collection_tells_a_missing_record_apart_from_a_private_one() {
+    let database = TestDatabase::new("record-owned-missing");
+    initialize(&database);
+    add_user(&database, "bob@example.com", "Bob");
+    add_user(&database, "reader@example.com", "Reader");
+    for principal in ["bob@example.com", "reader@example.com"] {
+        run_success(as_principal(&database, OWNER).args([
+            "access",
+            "grant",
+            principal,
+            "editor",
+            "collection:secrets",
+        ]));
+    }
+    run_success(as_principal(&database, OWNER).args([
+        "access",
+        "policy",
+        "set",
+        "collection:secrets",
+        "--mode",
+        "record-owned",
+    ]));
+    run_success(as_principal(&database, BOB).args(["create", "secrets", "bob-token"]));
+
+    let error = |arguments: &[&str]| -> Value {
+        serde_json::from_str(&run_failure(
+            as_principal(&database, READER)
+                .arg("--json-errors")
+                .args(arguments),
+        ))
+        .unwrap()
+    };
+
+    assert_eq!(
+        error(&["get", "secrets", "no-such-secret"]),
+        serde_json::json!({ "error": {
+            "code": "not_found",
+            "message": "record secrets/no-such-secret does not exist",
+        }})
+    );
+    assert_eq!(
+        error(&["get", "secrets", "bob-token"]),
+        serde_json::json!({ "error": {
+            "code": "forbidden",
+            "message": "principal 'reader@example.com' cannot read record:secrets/bob-token",
+        }})
+    );
+    for arguments in [
+        &["update", "secrets", "no-such-secret", "--set", "service=x"][..],
+        &["delete", "secrets", "no-such-secret", "--yes"],
+        &[
+            "access",
+            "visibility",
+            "secrets",
+            "no-such-secret",
+            "shared",
+        ],
+    ] {
+        assert_eq!(
+            error(arguments)["error"]["code"],
+            "not_found",
+            "{arguments:?}"
+        );
+    }
+    assert_eq!(
+        error(&["delete", "secrets", "bob-token", "--yes"])["error"]["code"],
+        "forbidden"
+    );
+    // A database owner reads a missing record the same way.
+    let owner_error: Value = serde_json::from_str(&run_failure(
+        as_principal(&database, OWNER).arg("--json-errors").args([
+            "get",
+            "secrets",
+            "no-such-secret",
+        ]),
+    ))
+    .unwrap();
+    assert_eq!(owner_error["error"]["code"], "not_found");
+}
+
+#[test]
 fn record_owned_policy_refuses_nonempty_collections() {
     let database = TestDatabase::new("record-owned-nonempty");
     initialize(&database);

@@ -1141,23 +1141,32 @@ impl Database {
                         &policy_hash,
                         &resource_policy_hash,
                     )
-                } else {
+                } else if let Some(decision) = user
+                    .access
+                    .iter()
+                    .any(|grant| grant.role == Role::Owner && grant.resource.contains(resource))
+                    .then(|| {
+                        user.decision(&self.principal, &self.actor, action, resource, &policy_hash)
+                    })
+                    .flatten()
+                {
                     // Preserve the normal not-found boundary for owners while
                     // never letting a collection role inherit into a missing
                     // or malformed creator-owned record.
-                    user.access
-                        .iter()
-                        .any(|grant| grant.role == Role::Owner && grant.resource.contains(resource))
-                        .then(|| {
-                            user.decision(
-                                &self.principal,
-                                &self.actor,
-                                action,
-                                resource,
-                                &policy_hash,
-                            )
-                        })
-                        .flatten()
+                    Some(decision)
+                } else if user.status == UserStatus::Active
+                    && action != AccessAction::ReadAudit
+                    && !self.record_exists_unchecked(collection, id)?
+                {
+                    // Record-owned collections keep a record's contents
+                    // private, not its ID: a create of a taken ID already
+                    // answers already_exists. So a mistyped ID reads as a
+                    // missing record rather than as somebody else's. Audit
+                    // history keeps the refusal, because it outlives the
+                    // record file.
+                    return Err(DomainError::record_not_found(collection, id).into());
+                } else {
+                    None
                 }
             }
             _ => user.decision(&self.principal, &self.actor, action, resource, &policy_hash),
@@ -1179,8 +1188,14 @@ impl Database {
     /// Whether a user record has a materialized file, without parsing or
     /// otherwise revealing its contents before authorization succeeds.
     fn user_record_exists_unchecked(&self, id: &str) -> Result<bool> {
-        let path = self.record_path(USERS_COLLECTION, id)?;
-        Ok(paths::entry_kind(&self.root, &path, &record_label(USERS_COLLECTION, id))?.is_some())
+        self.record_exists_unchecked(USERS_COLLECTION, id)
+    }
+
+    /// Whether a record has a materialized file, without parsing or otherwise
+    /// revealing its contents before authorization succeeds.
+    fn record_exists_unchecked(&self, collection: &str, id: &str) -> Result<bool> {
+        let path = self.record_path(collection, id)?;
+        Ok(paths::entry_kind(&self.root, &path, &record_label(collection, id))?.is_some())
     }
 
     /// Authorize an ordinary user-field update, including the built-in rule
@@ -1214,7 +1229,14 @@ impl Database {
     fn can_access(&self, action: AccessAction, resource: &AccessResource) -> Result<bool> {
         match self.authorize(action, resource) {
             Ok(_) => Ok(true),
-            Err(error) if matches!(DomainError::of(&error), Some(DomainError::Forbidden(_))) => {
+            // A record-owned record that vanished between listing and
+            // authorizing is not permitted, just as it was before it existed.
+            Err(error)
+                if matches!(
+                    DomainError::of(&error),
+                    Some(DomainError::Forbidden(_) | DomainError::NotFound(_))
+                ) =>
+            {
                 Ok(false)
             }
             Err(error) => Err(error),
