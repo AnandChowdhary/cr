@@ -240,7 +240,8 @@ Database owners also get a **Browse** section in the sidebar, after
 http://127.0.0.1:3000/browse
 ```
 
-It is a read-only fallback for inspecting files that are not CR records. The
+It is a fallback for inspecting, and when needed fixing, files that are not
+CR records. The
 first page is the canonical database root and lists every visible entry,
 including dotfiles, with directories first. Like a view table, each entry shows
 when it was **Created** and **Updated**—here the filesystem's birth and
@@ -273,9 +274,40 @@ when RBAC is active, only a database-owner perspective sees its navigation
 entry, and a direct request from an editor or access manager receives `403
 Forbidden`. Without RBAC it is unlinked and returns `404 Not Found`, because a
 local process with no principal registry cannot prove that a requester is an
-administrator. Every response remains `no-store`. Apart from pinning, the route
-supports only `GET`; it has no create, upload, rename, edit, or delete
-operation.
+administrator. Every response remains `no-store`. Browsing itself only reads;
+pinning, editing, and deleting are separate `POST` routes behind the same
+owner check and the form's CSRF token. There is no create, upload, or rename.
+
+### Edit and delete files
+
+Every file panel — an opened file, or a README or `SKILL.md` beneath a
+listing — ends its header with a pencil and a trash can. The pencil turns the
+preview into a textarea where it stands, with **Save** and **Cancel** in place
+of the icons; with JavaScript off it opens the same editor as a page of its
+own at `/browse/edit`. **Save** writes the file and returns to the page it was
+edited on. Only a file whose preview is the whole file as text can be edited,
+so a binary file or a text file over 1 MiB shows the pencil disabled, with the
+reason on hover.
+
+Saving is checked the way a record form is. The editor carries the SHA-256 of
+the file it opened, and a file that has changed since — an agent, an editor,
+another tab — is not overwritten: the save answers `412 Precondition Failed`
+with the editor again, holding exactly what you typed. A browser sends every
+line break in a textarea as CRLF, so a file written with line feeds keeps line
+feeds and one written with CRLF keeps CRLF. The new contents are staged beside
+the file with its permission bits and renamed over it, refusing a symbolic
+link rather than following it. Leaving an editor with unsaved changes asks
+first, as a record form does.
+
+The trash can opens a confirmation page naming the file, its size, and its
+directory; only that page carries the form, so nothing deletes a file on one
+click. Deleting removes the file from disk rather than moving it to a trash,
+returns to its directory, and refuses directories and symbolic links.
+
+Neither is audited. A change to a file inside the database — a record's
+Markdown file included — is a direct edit like one made in any other editor:
+the editor and the confirmation page say so, and `cr status` lists a changed or
+deleted record until `cr save` accepts it.
 
 ### Pin locations to the sidebar
 
@@ -317,9 +349,9 @@ sidebar says so and every page keeps working; `cr pin` refuses to overwrite the
 file until it is fixed.
 
 **Browse can reveal every secret readable by the operating-system account that
-runs `cr serve`, including files outside the database.** Keep the RBAC console
-on its enforced loopback bind and do not treat read-only access as a reason to
-weaken the host, reverse-proxy, or bearer-token boundary.
+runs `cr serve`, including files outside the database, and change or delete any
+file that account may write.** Keep the RBAC console on its enforced loopback
+bind and do not weaken the host, reverse-proxy, or bearer-token boundary.
 
 ## Use schema-driven record forms
 

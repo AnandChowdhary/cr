@@ -409,6 +409,47 @@ async fn internal_user_records_are_readable_without_any_web_mutation() {
     .await;
     assert_eq!(manager_pin.status, StatusCode::FORBIDDEN);
     assert_eq!(database.pins().unwrap().len(), 1);
+
+    // Nor may an access manager open, save, or delete a file.
+    let file = database.root().join("notes.txt");
+    std::fs::write(&file, "owner's notes").unwrap();
+    let file_path = file.to_str().unwrap();
+    let encoded = form(&[("path", file_path)]);
+    for (method, uri, body) in [
+        (Method::GET, format!("/browse/edit?{encoded}"), None),
+        (
+            Method::POST,
+            "/browse/edit".to_owned(),
+            Some(form(&[
+                ("_csrf", &csrf),
+                ("path", file_path),
+                ("from", file_path),
+                ("_expected_version", "sha256:0"),
+                ("contents", "overwritten"),
+            ])),
+        ),
+        (Method::GET, format!("/browse/delete?{encoded}"), None),
+        (
+            Method::POST,
+            "/browse/delete".to_owned(),
+            Some(form(&[("_csrf", &csrf), ("path", file_path)])),
+        ),
+    ] {
+        let content_type = body
+            .is_some()
+            .then_some("application/x-www-form-urlencoded");
+        let response = request(
+            &app,
+            method,
+            &uri,
+            body,
+            content_type,
+            &[("cookie", &editor_cookie)],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "owner's notes");
 }
 
 #[tokio::test]

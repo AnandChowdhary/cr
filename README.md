@@ -53,7 +53,7 @@
     </td>
     <td width="50%">
       <img src="docs/screenshots/file-browser.jpg" alt="The owner-only file browser listing the database root, with its README previewed below">
-      <br><sub><strong>File browser</strong> — a read-only, owner-only view of the files around the database.</sub>
+      <br><sub><strong>File browser</strong> — an owner-only view of the files around the database, with in-place editing and confirmed deletes.</sub>
     </td>
   </tr>
   <tr>

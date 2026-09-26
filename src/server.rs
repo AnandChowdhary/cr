@@ -45,7 +45,8 @@ use crate::{
     RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SchemaReview, SchemaViolation,
     SearchQuery, SearchTarget, SortDirection, USERS_COLLECTION, User, UserKind, UserStatus,
     ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch, audit::AuditChange,
-    database::relation_references, sort_by_record_field, sort_records_by_field,
+    database::relation_references, error::is_missing, paths, sort_by_record_field,
+    sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -402,6 +403,11 @@ struct BrowserFile {
     bytes_shown: usize,
     total_bytes: u64,
     truncated: bool,
+    /// The file's version when the preview is the whole file as text, which is
+    /// exactly when it may be edited: a textarea holding a truncated preview
+    /// would save the truncation, and one holding a hex dump would save the
+    /// dump.
+    version: Option<String>,
 }
 
 #[derive(Debug)]
@@ -434,6 +440,8 @@ struct BrowserDocument {
     /// stable links to the section itself.
     anchor: &'static str,
     name: String,
+    /// Where the document is, which its edit and delete controls act on.
+    path: PathBuf,
     href: Option<String>,
     preview: Result<BrowserFile, String>,
 }
@@ -572,6 +580,15 @@ struct BrowseQuery {
     path: Option<String>,
     sort_field: Option<BrowseSortField>,
     sort_direction: Option<ViewSortDirection>,
+}
+
+/// The file an edit or delete page acts on, and the browse page it was opened
+/// from, which Cancel returns to.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowseFileQuery {
+    path: String,
+    from: Option<String>,
 }
 
 /// Scope and window for an integrity report.
@@ -1215,6 +1232,28 @@ struct HtmlPinForm {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct HtmlFileEditForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    path: String,
+    /// The browse page the editor was opened from, which a save returns to.
+    from: String,
+    /// The version of the file the text was edited from.
+    #[serde(rename = "_expected_version")]
+    expected_version: String,
+    contents: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HtmlFileDeleteForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HtmlPerspectiveForm {
     #[serde(rename = "_csrf")]
     csrf: String,
@@ -1647,6 +1686,13 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         .route("/browse", get(browse_view))
         .route("/browse/pin", post(pin_location_form))
         .route("/browse/unpin", post(unpin_location_form))
+        // Like a record's delete, each is one path for both methods: `GET`
+        // renders the editor or the question, and `POST` writes.
+        .route("/browse/edit", get(edit_file_view).post(save_file_form))
+        .route(
+            "/browse/delete",
+            get(confirm_delete_file).post(delete_file_form),
+        )
         .route("/{view}", get(view_records))
         .route("/{view}/save-view", post(save_view_form))
         .route("/{view}/new", get(new_record_form))
@@ -2352,26 +2398,8 @@ async fn browse_view(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let result: ApiResult<Markup> = async {
-        if !state.access_controlled {
-            return Err(ApiError::new(
-                StatusCode::NOT_FOUND,
-                "route_not_found",
-                "route not found",
-            ));
-        }
+        let (start, navigation) = authorize_file_browser(&state, &headers).await?;
         let query: BrowseQuery = parse_query(raw)?;
-        let (start, navigation) = run_database(&state, &headers, |database| {
-            if !database.owner_access_allowed(&AccessResource::Database)? {
-                return Err(DomainError::Forbidden(
-                    "principal cannot browse server files".to_owned(),
-                )
-                .into());
-            }
-            let start = database.root().to_path_buf();
-            let navigation = database.views()?;
-            Ok((start, navigation))
-        })
-        .await?;
         let sort = BrowseSort::requested(&query);
         let requested = query.path;
         let page = tokio::task::spawn_blocking(move || {
@@ -2393,6 +2421,7 @@ async fn browse_view(
                 documents.push(BrowserDocument {
                     anchor,
                     name: entry.name.clone(),
+                    path: page.location.join(&entry.name),
                     href: entry.href.clone(),
                     // Published here rather than on the blocking worker:
                     // publishing logs the full chain under this request's ID,
@@ -2415,6 +2444,267 @@ async fn browse_view(
     }
     .await;
     html_result(result)
+}
+
+/// The check every file-browser route makes before it touches the filesystem:
+/// the routes exist only under RBAC, and only a database owner may use them.
+///
+/// Returns the database root, where browsing starts and which the editor and
+/// the delete page compare a file against, and the sidebar's views.
+async fn authorize_file_browser(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> ApiResult<(PathBuf, Vec<ViewDefinition>)> {
+    if !state.access_controlled {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "route_not_found",
+            "route not found",
+        ));
+    }
+    run_database(state, headers, |database| {
+        if !database.owner_access_allowed(&AccessResource::Database)? {
+            return Err(
+                DomainError::Forbidden("principal cannot browse server files".to_owned()).into(),
+            );
+        }
+        Ok((database.root().to_path_buf(), database.views()?))
+    })
+    .await
+}
+
+/// A text file, open for editing.
+///
+/// The pencil on a file panel links here, so with no JavaScript this is a page
+/// of its own: the file's panel with a textarea where the preview was. htmx
+/// asks for the panel alone, naming the section it sits in as the target, and
+/// swaps it into that section, so the preview becomes the editor where it
+/// stands — beneath a directory's listing too. That answer carries
+/// `HX-Push-Url: false`: htmx pushes the URL of every boosted request, and an
+/// editor in the middle of a page is not a page, so the address bar stays on
+/// the one it was opened from. The attribute cannot say so; htmx ignores
+/// `hx-push-url="false"` on a boosted link.
+///
+/// Only a file whose preview is the whole file as text can be edited. Anything
+/// else is refused rather than offered as a truncation or a hex dump, which
+/// saving would then write back over the file.
+async fn edit_file_view(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let result: ApiResult<Response> = async {
+        let (root, navigation) = authorize_file_browser(&state, &headers).await?;
+        let query: BrowseFileQuery = parse_query(raw)?;
+        let requested = absolute_browse_path(&query.path)?;
+        let from = query
+            .from
+            .as_deref()
+            .map(absolute_browse_path)
+            .transpose()?;
+        let (path, file) = tokio::task::spawn_blocking(move || {
+            let path = std::fs::canonicalize(&requested)
+                .map_err(|error| browse_io_error(error, "could not resolve the file to edit"))?;
+            let file = browse_file(&path)?;
+            Ok::<_, ApiError>((path, file))
+        })
+        .await
+        .map_err(|error| {
+            ApiError::internal(anyhow!(error).context("filesystem browser task failed"))
+        })??;
+        let (BrowserFileContents::Text(contents), Some(version)) = (file.contents, file.version)
+        else {
+            return Err(ApiError::unprocessable(format!(
+                "only a text file of at most {} can be edited in the browser",
+                format_file_size(MAX_FILE_PREVIEW_BYTES as u64)
+            )));
+        };
+        let representation = Representation::requested(&headers);
+        let region = FILE_PANEL_REGIONS
+            .into_iter()
+            .find(|region| representation.wants(region));
+        let editor = FileEditor {
+            from: from.unwrap_or_else(|| path.clone()),
+            path,
+            region: region.unwrap_or(FILE_PANEL_REGION),
+            contents,
+            version,
+            rejection: None,
+        };
+        if region.is_some() {
+            let mut response = html_response(
+                StatusCode::OK,
+                render_file_editor(&editor, &root, &state.csrf_token),
+            );
+            response.headers_mut().insert(
+                HeaderName::from_static("hx-push-url"),
+                HeaderValue::from_static("false"),
+            );
+            return Ok(response);
+        }
+        let ui = ui_context(&state, &headers).await?;
+        Ok(html_response(
+            StatusCode::OK,
+            render_file_editor_page(
+                &representation,
+                &editor,
+                &root,
+                &navigation,
+                ui.as_ref(),
+                &state.csrf_token,
+            ),
+        ))
+    }
+    .await;
+    result.unwrap_or_else(html_error)
+}
+
+/// Save an edited file and return to the page it was edited on.
+///
+/// A save that fails once the form is known to be genuine — the file changed
+/// since it was opened, it has gone, the server process may not write there —
+/// answers with the editor again, holding exactly what was typed, under the
+/// status of the refusal. The form is native, so a browser shows that page
+/// whatever the status, and the typed text is never lost to a failed save.
+async fn save_file_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawForm(raw): RawForm,
+) -> Response {
+    let result: ApiResult<Response> = async {
+        let (root, navigation) = authorize_file_browser(&state, &headers).await?;
+        let form: HtmlFileEditForm = parse_html_form(&raw)?;
+        verify_csrf(&state, &form.csrf)?;
+        let path = absolute_browse_path(&form.path)?;
+        let from = absolute_browse_path(&form.from)?;
+        let saved = {
+            let path = path.clone();
+            let expected = form.expected_version.clone();
+            let contents = form.contents.clone();
+            tokio::task::spawn_blocking(move || save_browser_file(&path, &expected, &contents))
+                .await
+                .map_err(|error| {
+                    ApiError::internal(anyhow!(error).context("filesystem browser task failed"))
+                })?
+        };
+        let region = file_panel_region(&path, &from);
+        let Err(error) = saved else {
+            return see_other(&file_panel_url(&from, region));
+        };
+        let error = error.publish();
+        let status = error.status;
+        let ui = ui_context(&state, &headers).await?;
+        let editor = FileEditor {
+            path,
+            from,
+            region,
+            contents: form.contents,
+            version: form.expected_version,
+            rejection: Some(error),
+        };
+        Ok(html_response(
+            status,
+            render_file_editor_page(
+                &Representation::requested(&headers),
+                &editor,
+                &root,
+                &navigation,
+                ui.as_ref(),
+                &state.csrf_token,
+            ),
+        ))
+    }
+    .await;
+    result.unwrap_or_else(html_error)
+}
+
+/// Ask before deleting a file, the way a record's deletion is asked.
+///
+/// The trash can on a file panel is a link to this page, and only this page
+/// carries the form and the token, so nothing deletes a file on one click,
+/// with or without JavaScript.
+async fn confirm_delete_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let result: ApiResult<Markup> = async {
+        let (root, navigation) = authorize_file_browser(&state, &headers).await?;
+        let query: BrowseFileQuery = parse_query(raw)?;
+        let requested = absolute_browse_path(&query.path)?;
+        let from = query
+            .from
+            .as_deref()
+            .map(absolute_browse_path)
+            .transpose()?;
+        let (path, size) = tokio::task::spawn_blocking(move || {
+            let path = std::fs::canonicalize(&requested)
+                .map_err(|error| browse_io_error(error, "could not resolve the file to delete"))?;
+            let metadata = std::fs::metadata(&path)
+                .map_err(|error| browse_io_error(error, "could not inspect the file to delete"))?;
+            if !metadata.is_file() {
+                return Err(ApiError::unprocessable(
+                    "only a regular file can be deleted in the browser",
+                ));
+            }
+            Ok((path, metadata.len()))
+        })
+        .await
+        .map_err(|error| {
+            ApiError::internal(anyhow!(error).context("filesystem browser task failed"))
+        })??;
+        let from = from.unwrap_or_else(|| path.clone());
+        let ui = ui_context(&state, &headers).await?;
+        Ok(render_file_delete_confirmation(
+            &Representation::requested(&headers),
+            &path,
+            &from,
+            size,
+            &root,
+            &navigation,
+            ui.as_ref(),
+            &state.csrf_token,
+        ))
+    }
+    .await;
+    html_result(result)
+}
+
+/// Delete a file and return to the directory that held it.
+///
+/// A file that is already gone is not an error: the form is native, so a double
+/// click submits twice and the second has nothing left to do.
+async fn delete_file_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawForm(raw): RawForm,
+) -> Response {
+    let result: ApiResult<Response> = async {
+        authorize_file_browser(&state, &headers).await?;
+        let form: HtmlFileDeleteForm = parse_html_form(&raw)?;
+        verify_csrf(&state, &form.csrf)?;
+        let path = absolute_browse_path(&form.path)?;
+        let (Some(directory), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(ApiError::unprocessable(
+                "only a regular file can be deleted in the browser",
+            ));
+        };
+        let back = browse_url(&directory.to_string_lossy());
+        let (directory, name) = (directory.to_path_buf(), PathBuf::from(name));
+        tokio::task::spawn_blocking(move || {
+            match paths::remove_file(&directory, &name, BROWSER_FILE) {
+                Err(error) if !is_missing(&error) => Err(browse_change_error(error)),
+                _ => Ok(()),
+            }
+        })
+        .await
+        .map_err(|error| {
+            ApiError::internal(anyhow!(error).context("filesystem browser task failed"))
+        })??;
+        see_other(&back)
+    }
+    .await;
+    result.unwrap_or_else(html_error)
 }
 
 async fn pin_location_form(
@@ -2638,6 +2928,7 @@ fn browse_file(path: &FilePath) -> ApiResult<BrowserFile> {
             bytes_shown,
             total_bytes,
             truncated,
+            version: (!truncated).then(|| file_version(&bytes)),
         });
     }
 
@@ -2648,6 +2939,7 @@ fn browse_file(path: &FilePath) -> ApiResult<BrowserFile> {
         bytes_shown: binary_bytes,
         total_bytes,
         truncated,
+        version: None,
     })
 }
 
@@ -2747,6 +3039,161 @@ fn browse_io_error(error: io::Error, context: &'static str) -> ApiError {
             field: None,
         },
         _ => ApiError::internal(detail),
+    }
+}
+
+/// What the symlink-safe file operations call the file the browser edits or
+/// deletes, in the refusals a caller may see.
+const BROWSER_FILE: &str = "the file";
+
+/// Which of a browse page's file panels an in-place edit replaces, by the id
+/// of the element holding it: an opened file's, or a directory's README or
+/// `SKILL.md`, whose sections are named by their anchors.
+const FILE_PANEL_REGION: &str = "file";
+const FILE_PANEL_REGIONS: [&str; 3] = [FILE_PANEL_REGION, "readme", "skill"];
+
+/// The panel `path` is shown in on the browse page for `from`: the directory
+/// document it is, or else the page's own file panel.
+fn file_panel_region(path: &FilePath, from: &FilePath) -> &'static str {
+    let name = path.file_name().and_then(|name| name.to_str());
+    match name {
+        Some(name) if path.parent() == Some(from) => {
+            if README_NAMES
+                .iter()
+                .any(|readme| name.eq_ignore_ascii_case(readme))
+            {
+                "readme"
+            } else if name.eq_ignore_ascii_case(SKILL_NAME) {
+                "skill"
+            } else {
+                FILE_PANEL_REGION
+            }
+        }
+        _ => FILE_PANEL_REGION,
+    }
+}
+
+/// The browse page for `from`, scrolled to the panel in `region` when it is a
+/// directory document rather than the page's own file.
+fn file_panel_url(from: &FilePath, region: &str) -> String {
+    let url = browse_url(&from.to_string_lossy());
+    if region == FILE_PANEL_REGION {
+        url
+    } else {
+        format!("{url}#{region}")
+    }
+}
+
+/// A route acting on one file, with the browse page it was opened from.
+fn file_action_url(route: &str, path: &str, from: &str) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("path", path);
+    serializer.append_pair("from", from);
+    format!("{route}?{}", serializer.finish())
+}
+
+fn absolute_browse_path(path: &str) -> ApiResult<PathBuf> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(ApiError::bad_request(
+            "invalid_browse_path",
+            "filesystem browser paths must be absolute",
+        ));
+    }
+    Ok(path)
+}
+
+/// A file's exact bytes as the version an edit must still match to be saved.
+fn file_version(bytes: &[u8]) -> String {
+    format!("sha256:{}", hexadecimal(&Sha256::digest(bytes)))
+}
+
+/// Replace a file the browser edited, if it still holds what was edited.
+///
+/// The version is the hash of the whole file as the editor opened it, so a file
+/// changed since — by an agent, an editor, another tab — is refused with `412`
+/// rather than overwritten. A submission the file already holds is accepted
+/// without writing, which is also what makes a second click on the native
+/// form's Save harmless rather than a refusal of the first.
+///
+/// The write is the one a record's is: staged beside the file, given the
+/// file's permissions, renamed over it through the directory's descriptor, and
+/// synced, refusing a symbolic link at either end rather than following it.
+fn save_browser_file(path: &FilePath, expected_version: &str, submitted: &str) -> ApiResult<()> {
+    let (Some(directory), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(ApiError::unprocessable(
+            "the requested filesystem location is not a regular file",
+        ));
+    };
+    let name = FilePath::new(name);
+    let mut current = Vec::new();
+    paths::open_file(directory, name, BROWSER_FILE)
+        .map_err(browse_change_error)?
+        .take(MAX_FILE_PREVIEW_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut current)
+        .map_err(|error| browse_io_error(error, "could not read the file being saved"))?;
+    // A textarea submits every line break as CRLF. A file written with CRLF
+    // throughout keeps it; any other file gets back the line feeds it had.
+    let crlf = current.windows(2).any(|pair| pair == b"\r\n")
+        && current
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| *byte != b'\n' || index > 0 && current[index - 1] == b'\r');
+    let contents = if crlf {
+        submitted.to_owned()
+    } else {
+        form_text(submitted)
+    };
+    if current == contents.as_bytes() {
+        return Ok(());
+    }
+    if file_version(&current) != expected_version {
+        return Err(ApiError::new(
+            StatusCode::PRECONDITION_FAILED,
+            "precondition_failed",
+            "the file changed after it was opened, so it was not overwritten; open it again to see what changed",
+        ));
+    }
+    if contents.len() > MAX_FILE_PREVIEW_BYTES {
+        return Err(ApiError::unprocessable(format!(
+            "the browser saves a file of at most {}",
+            format_file_size(MAX_FILE_PREVIEW_BYTES as u64)
+        )));
+    }
+    paths::write_replace(directory, name, contents.as_bytes(), BROWSER_FILE)
+        .map_err(browse_change_error)
+}
+
+/// Classify a failure to change a file from the browser: a refused link or
+/// special file as the conflict it is, and the operating system's refusals by
+/// kind, never by their text.
+fn browse_change_error(error: anyhow::Error) -> ApiError {
+    if DomainError::of(&error).is_some() {
+        return ApiError::from_domain(error);
+    }
+    let kind = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .map(io::Error::kind);
+    let (status, code, message) = match kind {
+        Some(io::ErrorKind::NotFound) => (
+            StatusCode::NOT_FOUND,
+            "filesystem_not_found",
+            "the requested filesystem location does not exist",
+        ),
+        Some(io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem) => (
+            StatusCode::FORBIDDEN,
+            "filesystem_permission_denied",
+            "the CR server process cannot change this filesystem location",
+        ),
+        _ => return ApiError::internal(error),
+    };
+    ApiError {
+        status,
+        code,
+        message: message.to_owned(),
+        detail: Some(error),
+        field: None,
     }
 }
 
@@ -5417,7 +5864,6 @@ fn view_index_region(
                             span {}
                             div class="cr-view-kind" {
                                 span class="cr-pill" { "owner only" }
-                                span class="cr-pill cr-pill-warn" { "read-only" }
                                 span class="text-xs text-gray-500" { "Files visible to the server process" }
                             }
                             span class="cr-view-arrow" aria-hidden="true" { "→" }
@@ -5703,7 +6149,6 @@ fn render_browse_view(
     ui: Option<&UiContext>,
     csrf_token: &str,
 ) -> Markup {
-    let location = page.location.to_string_lossy();
     // The page addresses itself by its canonical location, which is how a
     // pin's link is built too, so the sidebar can tell which entry this is.
     let current_path = page
@@ -5726,11 +6171,7 @@ fn render_browse_view(
                 Some(ALL_FILES_ICON),
                 "All files",
                 html! {
-                    span class="cr-page-meta" {
-                        "owner only"
-                        span class="mx-1.5 text-gray-300" aria-hidden="true" { "·" }
-                        "read-only"
-                    }
+                    span class="cr-page-meta" { "owner only" }
                 },
                 html! {
                     @if let Some(here) = page.location.to_str() {
@@ -5742,15 +6183,7 @@ fn render_browse_view(
                     }
                 },
             ))
-            // Where this is, as the path's own steps, each one a way back up.
-            nav aria-label="Location" class="cr-page-note flex min-w-0 flex-wrap items-center gap-x-1 font-mono text-xs" title=(&location) {
-                @for (index, crumb) in page.crumbs.iter().enumerate() {
-                    @if index > 0 {
-                        span class="text-gray-300" aria-hidden="true" { "/" }
-                    }
-                    a href=(sort.carry(&crumb.href)) class="max-w-48 truncate hover:text-gray-900" { (&crumb.label) }
-                }
-            }
+            (render_browse_location(&page.location, &page.crumbs, sort))
             @match &page.item {
                 BrowserItem::Directory(entries) => {
                     div class="cr-table-shell" {
@@ -5833,7 +6266,11 @@ fn render_browse_view(
                         section id=(document.anchor) aria-label=(&document.name) class="mt-6" {
                             @match &document.preview {
                                 Ok(file) => {
-                                    (render_file_preview(file, Some((&document.name, document.href.as_deref()))))
+                                    (render_file_preview(
+                                        file,
+                                        Some((&document.name, document.href.as_deref())),
+                                        FilePanel { path: &document.path, page: &page.location, region: document.anchor },
+                                    ))
                                 }
                                 Err(message) => {
                                     div class="cr-table-shell px-4 py-3 text-sm text-gray-600" {
@@ -5846,7 +6283,13 @@ fn render_browse_view(
                     }
                 }
                 BrowserItem::File(file) => {
-                    (render_file_preview(file, None))
+                    div id=(FILE_PANEL_REGION) {
+                        (render_file_preview(
+                            file,
+                            None,
+                            FilePanel { path: &page.location, page: &page.location, region: FILE_PANEL_REGION },
+                        ))
+                    }
                 }
                 BrowserItem::Other => {
                     div class="cr-empty-state" {
@@ -5861,6 +6304,24 @@ fn render_browse_view(
         ui,
         csrf_token,
     )
+}
+
+/// Where a browse page is, as the path's own steps, each one a way back up.
+fn render_browse_location(
+    location: &FilePath,
+    crumbs: &[BrowserCrumb],
+    sort: BrowseSort,
+) -> Markup {
+    html! {
+        nav aria-label="Location" class="cr-page-note flex min-w-0 flex-wrap items-center gap-x-1 font-mono text-xs" title=(location.to_string_lossy()) {
+            @for (index, crumb) in crumbs.iter().enumerate() {
+                @if index > 0 {
+                    span class="text-gray-300" aria-hidden="true" { "/" }
+                }
+                a href=(sort.carry(&crumb.href)) class="max-w-48 truncate hover:text-gray-900" { (&crumb.label) }
+            }
+        }
+    }
 }
 
 /// Pin or unpin the location a browse page shows.
@@ -5907,10 +6368,40 @@ fn render_pin_control(here: &str, pinned: Option<&UiPin>, csrf_token: &str) -> M
 /// still breaks instead of pushing the panel wider than the page. A hex dump is
 /// the opposite case: its value is in the aligned offset, byte, and character
 /// columns, which wrapping would scramble, so it keeps horizontal scrolling.
-fn render_file_preview(file: &BrowserFile, document: Option<(&str, Option<&str>)>) -> Markup {
+///
+/// Its header ends in the file's two actions. Edit is a link to the editor that
+/// htmx follows into this panel's own section, so the preview turns into a
+/// textarea in place; it is offered only when the preview is the whole file as
+/// text, and otherwise shown disabled with the reason. Delete is a link to a
+/// confirmation page, as a record's is. Neither is offered for a path that is
+/// not UTF-8, which cannot be put in a URL.
+fn render_file_preview(
+    file: &BrowserFile,
+    document: Option<(&str, Option<&str>)>,
+    panel: FilePanel<'_>,
+) -> Markup {
     let (contents, class) = match &file.contents {
         BrowserFileContents::Text(contents) => (contents, "cr-file-preview cr-file-preview-wrap"),
         BrowserFileContents::Binary(contents) => (contents, "cr-file-preview"),
+    };
+    let name = panel
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let actions = panel
+        .path
+        .to_str()
+        .zip(panel.page.to_str())
+        .map(|(path, page)| {
+            (
+                file_action_url("/browse/edit", path, page),
+                file_action_url("/browse/delete", path, page),
+            )
+        });
+    let not_editable = match file.contents {
+        BrowserFileContents::Binary(_) => "A binary file cannot be edited here",
+        BrowserFileContents::Text(_) => "A file larger than 1.0 MiB cannot be edited here",
     };
     html! {
         div class="cr-table-shell overflow-hidden" {
@@ -5929,9 +6420,28 @@ fn render_file_preview(file: &BrowserFile, document: Option<(&str, Option<&str>)
                     }
                     span { (format_file_size(file.total_bytes)) }
                 }
-                span {
-                    "Showing " (format_file_size(file.bytes_shown as u64))
-                    @if file.truncated { " · preview truncated" }
+                div class="flex items-center gap-3" {
+                    span {
+                        "Showing " (format_file_size(file.bytes_shown as u64))
+                        @if file.truncated { " · preview truncated" }
+                    }
+                    @if let Some((edit, delete)) = &actions {
+                        div class="flex items-center gap-1" {
+                            @if file.version.is_some() {
+                                a href=(edit) hx-target=(format!("#{}", panel.region)) hx-swap="innerHTML show:none" class="cr-icon-button" title="Edit" aria-label=(format!("Edit {name}")) {
+                                    (PreEscaped(PENCIL_ICON))
+                                }
+                            } @else {
+                                span class="cr-icon-button" data-disabled="true" title=(not_editable) {
+                                    (PreEscaped(PENCIL_ICON))
+                                    span class="sr-only" { (not_editable) }
+                                }
+                            }
+                            a href=(delete) class="cr-icon-button cr-icon-button-danger" title="Delete" aria-label=(format!("Delete {name}")) {
+                                (PreEscaped(TRASH_ICON))
+                            }
+                        }
+                    }
                 }
             }
             pre class=(class) tabindex="0" {
@@ -5939,6 +6449,202 @@ fn render_file_preview(file: &BrowserFile, document: Option<(&str, Option<&str>)
             }
         }
     }
+}
+
+/// Which file a panel shows and where, for its edit and delete actions.
+#[derive(Clone, Copy)]
+struct FilePanel<'a> {
+    path: &'a FilePath,
+    /// The browse page the panel is on — the file itself, or the directory it
+    /// documents — which the editor and the delete page return to.
+    page: &'a FilePath,
+    /// The id of the element holding the panel, which an in-place edit
+    /// replaces the contents of.
+    region: &'static str,
+}
+
+/// A text file open in the browser's editor.
+struct FileEditor {
+    path: PathBuf,
+    /// The browse page the editor was opened from, which Save and Cancel return
+    /// to.
+    from: PathBuf,
+    /// The panel the editor stands in on that page.
+    region: &'static str,
+    /// What the textarea holds: the file as it was read, or, after a refused
+    /// save, exactly what was submitted.
+    contents: String,
+    /// The version of the file the text was edited from. A refused save keeps
+    /// the one it was submitted with, so saving again cannot quietly overwrite
+    /// whatever changed the file.
+    version: String,
+    rejection: Option<PublicError>,
+}
+
+/// The editor itself: a file panel whose preview is a textarea, with Save and
+/// Cancel where the panel's actions were.
+///
+/// The form is native (`UNBOOSTED`), as the pin and delete forms are. A save
+/// answers with a redirect back to the page, and a refusal with the editor page
+/// and what was typed, which a browser shows whatever the status and htmx would
+/// not swap into a failed `POST`.
+fn render_file_editor(editor: &FileEditor, root: &FilePath, csrf_token: &str) -> Markup {
+    let name = editor
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let textarea = format!("{}-editor", editor.region);
+    html! {
+        form method="post" action="/browse/edit" hx-boost=(UNBOOSTED) data-file-editor="true" class="cr-table-shell overflow-hidden" {
+            input type="hidden" name="_csrf" value=(csrf_token);
+            input type="hidden" name="path" value=(editor.path.to_string_lossy());
+            input type="hidden" name="from" value=(editor.from.to_string_lossy());
+            input type="hidden" name="_expected_version" value=(&editor.version);
+            div class="flex flex-wrap items-center justify-between gap-2 border-b border-gray-200 bg-gray-50 px-4 py-3 text-xs text-gray-600" {
+                div class="flex flex-wrap items-center gap-2" {
+                    label for=(&textarea) class="font-mono text-sm font-semibold text-gray-900" { (name) }
+                    span class="cr-pill" { "editing" }
+                }
+                div class="flex items-center gap-2" {
+                    // A link rather than a second button, because cancelling is
+                    // a navigation back to the preview and must not be able to
+                    // submit the form it sits inside. Boosted again, since the
+                    // form's `UNBOOSTED` is inherited: a boosted navigation is
+                    // one the unsaved-changes guard can ask about in words.
+                    a href=(file_panel_url(&editor.from, editor.region)) hx-boost="true" class="cr-button cr-button-small" { "Cancel" }
+                    button type="submit" class="cr-button cr-button-small cr-button-primary" { "Save" }
+                }
+            }
+            @if let Some(error) = &editor.rejection {
+                div role="alert" class="border-b border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" {
+                    p class="font-semibold" { "The file was not saved" }
+                    p class="mt-1" { (&error.message) }
+                    p class="mt-2 text-xs text-red-700" {
+                        "The text below is exactly what you submitted. Request ID " (&error.request_id)
+                    }
+                }
+            }
+            textarea id=(&textarea) name="contents" spellcheck="false" autofocus class="cr-file-editor" { (textarea_text(&editor.contents)) }
+            @if editor.path.starts_with(root) {
+                p class="border-t border-gray-200 bg-gray-50 px-4 py-2 text-xs text-gray-600" {
+                    "This file is inside the database, and saving it here records no audit event. A changed record is listed by "
+                    code { "cr status" } " until " code { "cr save" } " accepts it."
+                }
+            }
+        }
+    }
+}
+
+/// The editor as a page of its own: what a browser with no JavaScript gets for
+/// the pencil, and what a refused save answers with.
+fn render_file_editor_page(
+    representation: &Representation,
+    editor: &FileEditor,
+    root: &FilePath,
+    views: &[ViewDefinition],
+    ui: Option<&UiContext>,
+    csrf_token: &str,
+) -> Markup {
+    let name = editor
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    page_or_content(
+        representation,
+        &format!("Edit {name}"),
+        &browse_url(&editor.path.to_string_lossy()),
+        views,
+        html! {
+            (page_bar(
+                &[
+                    ("/".to_owned(), None, "Views"),
+                    ("/browse".to_owned(), Some(ALL_FILES_ICON), "All files"),
+                ],
+                None,
+                "Edit",
+                html! { span class="cr-page-meta" { "owner only" } },
+                html! {},
+            ))
+            (render_browse_location(&editor.path, &browse_crumbs(&editor.path), BrowseSort::DEFAULT))
+            (render_file_editor(editor, root, csrf_token))
+        },
+        ui,
+        csrf_token,
+    )
+}
+
+/// The question before a file is deleted: which file, what cannot be undone,
+/// and the two ways out.
+#[allow(clippy::too_many_arguments)]
+fn render_file_delete_confirmation(
+    representation: &Representation,
+    path: &FilePath,
+    from: &FilePath,
+    size: u64,
+    root: &FilePath,
+    views: &[ViewDefinition],
+    ui: Option<&UiContext>,
+    csrf_token: &str,
+) -> Markup {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let directory = path
+        .parent()
+        .map(|directory| directory.to_string_lossy())
+        .unwrap_or_default();
+    page_or_content(
+        representation,
+        &format!("Delete {name}"),
+        &browse_url(&path.to_string_lossy()),
+        views,
+        html! {
+            (page_bar(
+                &[
+                    ("/".to_owned(), None, "Views"),
+                    ("/browse".to_owned(), Some(ALL_FILES_ICON), "All files"),
+                ],
+                None,
+                "Delete",
+                html! { span class="cr-page-meta" { "owner only" } },
+                html! {},
+            ))
+            (render_browse_location(path, &browse_crumbs(path), BrowseSort::DEFAULT))
+            div class="mx-auto max-w-2xl" {
+                div class="cr-record-danger rounded-xl border border-red-200 bg-red-50 p-6" {
+                    h2 class="text-lg font-semibold text-red-900" { "Delete this file?" }
+                    p class="mt-2 text-sm text-red-800" {
+                        "You are about to delete "
+                        code class="cr-filter-tag" { (name) }
+                        " (" (format_file_size(size)) ") from "
+                        code class="cr-filter-tag" { (directory) }
+                        "."
+                    }
+                    p class="mt-2 text-sm text-red-700" {
+                        "The file is removed from disk, not moved to a trash, so this cannot be undone from the web app."
+                        @if path.starts_with(root) {
+                            " It is inside the database, and deleting it here records no audit event: a deleted record is listed by "
+                            code class="cr-filter-tag" { "cr status" }
+                            " until "
+                            code class="cr-filter-tag" { "cr save" }
+                            " accepts the deletion or the file is restored."
+                        }
+                    }
+                    form method="post" action="/browse/delete" hx-boost=(UNBOOSTED) class="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center" {
+                        input type="hidden" name="_csrf" value=(csrf_token);
+                        input type="hidden" name="path" value=(path.to_string_lossy());
+                        button type="submit" class="rounded-lg border border-red-300 bg-red-700 px-4 py-2 text-sm font-semibold text-white hover:bg-red-800" { "Delete file" }
+                        a href=(file_panel_url(from, file_panel_region(path, from))) class="cr-button" { "Cancel" }
+                    }
+                }
+            }
+        },
+        ui,
+        csrf_token,
+    )
 }
 
 /// A sortable directory-listing heading, in the same shape as a view table's.
@@ -7296,6 +8002,12 @@ fn quick_filter_selection(query: &ViewQuery, field: &str) -> QuickFilterSelectio
         _ => QuickFilterSelection::Other,
     }
 }
+
+/// A pencil for a file panel's Edit action, drawn like the magnifier.
+const PENCIL_ICON: &str = r#"<svg aria-hidden="true" focusable="false" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10.75 2.75l2.5 2.5-8 8H2.75v-2.5z"/><path d="m9 4.5 2.5 2.5"/></svg>"#;
+
+/// A trash can for a file panel's Delete action, drawn like the magnifier.
+const TRASH_ICON: &str = r#"<svg aria-hidden="true" focusable="false" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.75 4.25h10.5"/><path d="M6.25 4.25v-1.5h3.5v1.5"/><path d="M4.25 4.25l.6 8.5a1 1 0 0 0 1 .95h4.3a1 1 0 0 0 1-.95l.6-8.5"/><path d="M6.75 7v4M9.25 7v4"/></svg>"#;
 
 /// A magnifier for the search box's submit button, in the text's colour.
 const SEARCH_ICON: &str = r#"<svg aria-hidden="true" focusable="false" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="7" cy="7" r="4.75"/><path d="m10.5 10.5 3.25 3.25"/></svg>"#;
@@ -10812,6 +11524,44 @@ html {
 /* Keep every space and newline, wrap at the panel edge, and break a token with
    no spaces at all — a URL, a minified line — rather than overflow. */
 .cr-file-preview-wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* A file panel's Edit and Delete, icons the size of a small button. */
+.cr-icon-button {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: var(--cr-gray-500);
+}
+.cr-icon-button:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
+.cr-icon-button-danger:hover { background: var(--cr-invalid-soft); color: var(--cr-danger); }
+.cr-icon-button[data-disabled="true"] { background: transparent; color: var(--cr-gray-300); cursor: not-allowed; }
+
+/* A file being edited: the preview's type and measure, in a box that grows
+   with the file up to the preview's height and then scrolls. */
+.cr-app textarea.cr-file-editor {
+  display: block;
+  width: 100%;
+  min-height: 16rem;
+  max-height: 70vh;
+  field-sizing: content;
+  resize: vertical;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  padding: 16px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.25rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* The panel clips an outline drawn outside the box to two stray lines, so the
+   editor's focus ring is drawn inside it. */
+.cr-app textarea.cr-file-editor:focus,
+.cr-app textarea.cr-file-editor:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--cr-accent); }
 .cr-table-shell table { font-variant-numeric: tabular-nums; }
 .cr-table-shell thead { background: var(--cr-gray-50); }
 .cr-table-shell th { padding: 8px 12px !important; color: var(--cr-gray-600) !important; font-size: 0.72rem; font-weight: 620 !important; }
@@ -11595,10 +12345,9 @@ fn browse_navigation(current_path: &str, ui: &UiContext) -> Markup {
     let all_files = in_browser && !on_pin;
     html! {
         p class="cr-sidebar-label" { "Browse" }
-        a href="/browse" class=(if all_files { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[all_files.then_some("page")] title="Every file visible to the server · owner only · read-only" {
+        a href="/browse" class=(if all_files { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[all_files.then_some("page")] title="Every file visible to the server · owner only" {
             span class="cr-nav-glyph" aria-hidden="true" { (ALL_FILES_ICON) }
             span class="truncate" { "All files" }
-            span class="cr-nav-note" { "read-only" }
         }
         @for pin in &ui.pins {
             @let active = pin.href == current_path;

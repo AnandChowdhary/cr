@@ -389,6 +389,18 @@ const enhanceRecordForm = () => {
   form.addEventListener('submit', () => unsavedForms.delete(form));
 };
 
+// The file browser's editor is guarded the same way. It can arrive in the
+// middle of a page, swapped into the panel whose pencil was clicked, so it is
+// found by its attribute rather than an id, and there may be one per panel.
+const enhanceFileEditors = () => {
+  document.querySelectorAll('[data-file-editor]').forEach((form) => {
+    if (!claim(form)) return;
+    if (form.querySelector('[role="alert"]')) unsavedForms.add(form);
+    form.addEventListener('input', () => unsavedForms.add(form));
+    form.addEventListener('submit', () => unsavedForms.delete(form));
+  });
+};
+
 // Save-as-view: a Kanban view needs a grouping field and a table view has no
 // use for one, so the control follows the chosen layout.
 const enhanceViewLayout = () => {
@@ -633,6 +645,7 @@ const enhanceAll = () => {
   enhanceDateGroups();
   enhanceRowLinks();
   enhanceRecordForm();
+  enhanceFileEditors();
   enhanceFilterBuilder();
   enhanceViewLayout();
   enhanceKanbanBoard();
