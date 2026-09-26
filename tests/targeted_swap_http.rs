@@ -66,6 +66,8 @@ use tower::ServiceExt;
 const VIEW_TABLE_REGION: &str = "cr-view-table";
 const VIEW_COUNT_ID: &str = "cr-view-count";
 const VIEW_FILTER_SUMMARY_ID: &str = "cr-view-filter-summary";
+const VIEW_SAVE_STATE_ID: &str = "cr-view-save-state";
+const VIEW_EDIT_LINK_ID: &str = "cr-view-edit";
 const ANNOUNCE_REGION: &str = "cr-announce";
 
 /// The three attributes a targeted control carries, and the two swap styles.
@@ -138,13 +140,17 @@ async fn swap(app: &Router, uri: &str) -> TestResponse {
 }
 
 /// A results answer, taken apart: the title htmx applies to the tab, the region it
-/// swaps, the out-of-band elements it patches into the heading, and the sentence
-/// it patches into the page's live region.
+/// swaps, the out-of-band elements it patches into the heading and its view
+/// controls, and the sentence it patches into the page's live region.
 struct Results {
     title: String,
     region: String,
     count: String,
     summary: String,
+    /// The hidden inputs "Save as view" submits.
+    save_state: String,
+    /// "Edit view", which only a saved view has.
+    edit_link: Option<String>,
     announcement: String,
 }
 
@@ -166,16 +172,34 @@ fn results(uri: &str, body: &str) -> Results {
         .find(&format!("<summary id=\"{VIEW_FILTER_SUMMARY_ID}\""))
         .unwrap_or_else(|| panic!("{uri} carries no filter-summary patch"));
     let (count, rest) = rest.split_at(summary_at);
+    let save_state_at = rest
+        .find(&format!("<div id=\"{VIEW_SAVE_STATE_ID}\""))
+        .unwrap_or_else(|| panic!("{uri} carries no save-view state patch"));
+    let (summary, rest) = rest.split_at(save_state_at);
     let announcement_at = rest
         .find(&format!("<div id=\"{ANNOUNCE_REGION}\""))
         .unwrap_or_else(|| panic!("{uri} carries no announcement"));
-    let (summary, announcement) = rest.split_at(announcement_at);
+    let (controls, announcement) = rest.split_at(announcement_at);
+    let (save_state, edit_link) = match controls.find(&format!("<a id=\"{VIEW_EDIT_LINK_ID}\"")) {
+        Some(edit_at) => {
+            let (save_state, edit_link) = controls.split_at(edit_at);
+            (save_state, Some(edit_link.to_owned()))
+        }
+        None => (controls, None),
+    };
     assert!(
         region.starts_with(&format!("<div id=\"{VIEW_TABLE_REGION}\">"))
             && region.ends_with("</div>"),
         "{uri} is not rooted at the region it replaces: {region:.120}"
     );
-    for (name, patch) in [("record count", count), ("filter summary", summary)] {
+    for (name, patch) in [
+        ("record count", count),
+        ("filter summary", summary),
+        ("save-view state", save_state),
+    ]
+    .into_iter()
+    .chain(edit_link.as_deref().map(|link| ("edit link", link)))
+    {
         assert!(
             patch.contains(" hx-swap-oob=\"true\""),
             "{uri} sends the {name} without marking it out of band: {patch}"
@@ -196,6 +220,8 @@ fn results(uri: &str, body: &str) -> Results {
         region: region.to_owned(),
         count: count.to_owned(),
         summary: summary.to_owned(),
+        save_state: save_state.to_owned(),
+        edit_link,
         announcement: announcement.to_owned(),
     }
 }
@@ -365,7 +391,11 @@ async fn each_control_answers_with_the_results_region_and_the_heading_it_changes
         // attribute added. Asserting it this way is what stops them drifting:
         // there is one renderer, and the only difference between its two outputs
         // is the marker that tells htmx to patch rather than to swap.
-        for (name, patch) in [("count", &answer.count), ("summary", &answer.summary)] {
+        for (name, patch) in [
+            ("count", &answer.count),
+            ("summary", &answer.summary),
+            ("save-view state", &answer.save_state),
+        ] {
             let stripped = patch.replace(" hx-swap-oob=\"true\"", "");
             assert!(
                 document.body.contains(&stripped),
@@ -542,6 +572,56 @@ async fn a_kanban_board_is_paged_and_filtered_by_the_same_controls() {
             "a card gained a targeted swap its drag-and-drop twin cannot make"
         );
     }
+}
+
+/// The view controls sit in the heading, which a swap leaves alone, so what they
+/// submit has to arrive with the swap. Before it did, "Save as view" after an
+/// apply saved the page as it was loaded — with none of the filters on screen.
+#[tokio::test]
+async fn the_view_controls_carry_the_state_a_swap_applied() {
+    let (_temporary, database) = database_with_deals("swap-view-controls");
+    let app = router(database, ServerConfig::default()).unwrap();
+    let filtered = "filter_match=all&filter_field=stage&filter_operator=eq&filter_value=won&sort_field=value&sort_direction=desc&limit=2";
+
+    let table = results(
+        "/deals",
+        &swap(&app, &format!("/deals?{filtered}")).await.body,
+    );
+    for input in [
+        "name=\"filter_field\" value=\"stage\"",
+        "name=\"filter_operator\" value=\"eq\"",
+        "name=\"filter_value\" value=\"won\"",
+        "name=\"sort_field\" value=\"value\"",
+        "name=\"sort_direction\" value=\"desc\"",
+    ] {
+        assert!(
+            table.save_state.contains(input),
+            "the save form would not submit {input}: {}",
+            table.save_state
+        );
+    }
+    // A collection's own view has no definition to edit.
+    assert!(table.edit_link.is_none());
+
+    let board = results(
+        "/pipeline",
+        &swap(&app, &format!("/pipeline?{filtered}")).await.body,
+    );
+    let edit_link = board.edit_link.expect("a saved view patches its edit link");
+    assert!(
+        edit_link.contains(&format!(
+            "href=\"/pipeline/edit?{}\"",
+            filtered.replace('&', "&amp;")
+        )),
+        "the edit link does not open the editor on the swapped state: {edit_link}"
+    );
+    let editor = get(&app, &format!("/pipeline/edit?{filtered}"), &[]).await;
+    assert_eq!(editor.status, StatusCode::OK);
+    let conditions = between(&editor.body, "data-filter-list", "data-filter-template");
+    assert!(
+        conditions.contains("value=\"stage\" selected") && conditions.contains("value=\"won\""),
+        "the editor does not start from the applied filter: {conditions}"
+    );
 }
 
 #[tokio::test]

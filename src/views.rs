@@ -28,7 +28,7 @@ const VIEW_FORMAT_VERSION: u32 = 1;
 /// collection of a hundred and fifty records sixteen pages long. Twenty-five
 /// fill the screen, and the table's footer offers other sizes.
 pub const DEFAULT_VIEW_PAGE_SIZE: usize = 25;
-const MAX_VIEW_PAGE_SIZE: usize = 1_000;
+pub(crate) const MAX_VIEW_PAGE_SIZE: usize = 1_000;
 const MAX_VIEW_FILTER_GROUPS: usize = 20;
 const MAX_VIEW_GROUP_EXPRESSIONS: usize = 20;
 const RESERVED_VIEW_NAMES: &[&str] = &[
@@ -313,6 +313,74 @@ impl Database {
         Ok(to_public(name, stored, true))
     }
 
+    /// Overwrite a saved view's definition in place.
+    ///
+    /// The name and the collection stay: the name is the view's route and its
+    /// file, and a view of another collection is another view. Everything else
+    /// is replaced, and validated exactly as `create_view_with_options`
+    /// validates it. Only a saved view can be replaced; an automatic view has
+    /// no definition to overwrite, so it is refused as missing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_view(
+        &self,
+        name: &str,
+        title: &str,
+        filters: Vec<String>,
+        where_expr: Vec<String>,
+        filter_groups: Vec<ViewFilterGroup>,
+        columns: Vec<String>,
+        page_size: usize,
+        layout: ViewLayout,
+        group_by: Option<String>,
+        sort_by: Option<String>,
+        sort_direction: SortDirection,
+    ) -> Result<ViewDefinition> {
+        self.authorize_owner(&AccessResource::Database)?;
+        let existing = self.read_view(name)?;
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(invalid("view title cannot be empty"));
+        }
+
+        let stored = StoredViewDefinition {
+            version: VIEW_FORMAT_VERSION,
+            title: title.to_owned(),
+            collection: existing.collection,
+            filters,
+            where_expr,
+            filter_groups,
+            columns,
+            layout,
+            group_by,
+            sort_by,
+            sort_direction,
+            page_size,
+        };
+        validate_stored(name, &stored)?;
+
+        let serialized = yaml_serde::to_string(&stored).context("could not serialize view")?;
+        paths::write_replace(
+            self.root(),
+            &view_path(name),
+            serialized.as_bytes(),
+            &view_label(name),
+        )
+        .map_err(|error| missing_view(error, name))?;
+        Ok(to_public(name, stored, true))
+    }
+
+    /// Delete a saved view's definition, returning what it was.
+    ///
+    /// A saved view that shared its collection's name gives the route back to
+    /// the collection's automatic view. Deleting a view deletes no records.
+    pub fn delete_view(&self, name: &str) -> Result<ViewDefinition> {
+        self.authorize_owner(&AccessResource::Database)?;
+        let existing = self.read_view(name)?;
+        paths::remove_file(self.root(), &view_path(name), &view_label(name))
+            .map_err(|error| missing_view(error, name))?;
+        Ok(existing)
+    }
+
     pub fn view(&self, name: &str) -> Result<ViewDefinition> {
         validate_component(name, "view")?;
         if RESERVED_VIEW_NAMES.contains(&name) {
@@ -420,6 +488,16 @@ fn view_path(name: &str) -> PathBuf {
 
 fn view_label(name: &str) -> String {
     format!("view '{name}'")
+}
+
+/// A definition that went missing between being read and being written, which
+/// is the same answer as one that was never there.
+fn missing_view(error: anyhow::Error, name: &str) -> anyhow::Error {
+    if is_missing(&error) {
+        error.context(DomainError::view_not_found(name))
+    } else {
+        error
+    }
 }
 
 fn validate_view_name(name: &str) -> Result<()> {
@@ -832,6 +910,125 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("invalid group_by")
+        );
+    }
+
+    #[test]
+    fn a_saved_view_is_replaced_in_place_and_deleted_without_its_records() {
+        let temporary = tempdir().unwrap();
+        let database = Database::init(temporary.path().join("database")).unwrap();
+        database.create("deals", "one", &[], "").unwrap();
+        database
+            .create_view(
+                "open",
+                Some("Open deals"),
+                "deals",
+                vec!["status=open".into()],
+                vec![],
+                25,
+            )
+            .unwrap();
+
+        let replaced = database
+            .replace_view(
+                "open",
+                " Won deals ",
+                vec![],
+                vec![],
+                vec![ViewFilterGroup {
+                    match_mode: ViewPredicateMatch::All,
+                    expressions: vec!["status=won".into()],
+                }],
+                vec!["value".into()],
+                50,
+                ViewLayout::Kanban,
+                Some("stage".into()),
+                Some("value".into()),
+                SortDirection::Desc,
+            )
+            .unwrap();
+        assert_eq!(replaced.title, "Won deals");
+        assert_eq!(replaced.collection, "deals");
+        assert_eq!(database.view("open").unwrap(), replaced);
+        let stored = fs::read_to_string(database.root().join(".cr/views/open.yaml")).unwrap();
+        assert!(stored.contains("title: Won deals"));
+        assert!(stored.contains("filters: []"));
+        assert!(stored.contains("- status=won"));
+
+        // A replacement is validated like a new definition, and a refused one
+        // leaves the file as it was.
+        let refused = database.replace_view(
+            "open",
+            "Board",
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            25,
+            ViewLayout::Kanban,
+            None,
+            None,
+            SortDirection::Asc,
+        );
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("requires group_by")
+        );
+        assert!(
+            database
+                .replace_view(
+                    "open",
+                    "  ",
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                    25,
+                    ViewLayout::Table,
+                    None,
+                    None,
+                    SortDirection::Asc,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("title cannot be empty")
+        );
+        assert_eq!(database.view("open").unwrap(), replaced);
+
+        // An automatic view has no definition to replace or delete.
+        for error in [
+            database
+                .replace_view(
+                    "deals",
+                    "Deals",
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                    25,
+                    ViewLayout::Table,
+                    None,
+                    None,
+                    SortDirection::Asc,
+                )
+                .unwrap_err(),
+            database.delete_view("deals").unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("does not exist"), "{error}");
+        }
+
+        assert_eq!(database.delete_view("open").unwrap(), replaced);
+        assert!(!database.root().join(".cr/views/open.yaml").exists());
+        assert!(database.view("open").is_err());
+        assert_eq!(database.list("deals", &[]).unwrap().len(), 1);
+        assert!(
+            database
+                .delete_view("open")
+                .unwrap_err()
+                .to_string()
+                .contains("does not exist")
         );
     }
 

@@ -1202,6 +1202,9 @@ enum ViewCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Delete a saved view definition from .cr/views. Records are not touched.
+    Delete { name: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1829,6 +1832,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 } else {
                     print!("{}", yaml_serde::to_string(&view)?);
                 }
+            }
+            ViewCommand::Delete { name } => {
+                let view = database.delete_view(&name)?;
+                println!("Deleted view /{}", view.name);
             }
         },
         Command::Pin { command } => match command {

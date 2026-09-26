@@ -33,7 +33,7 @@ Open **Columns** to show only the fields you need. The same control chooses tabl
 
 The `high-value-deals` route demonstrates a reusable typed saved query. Its YAML combines `status=open` with `value>=50000`; browser filters remain additive and cannot escape that scope.
 
-Use **Save as view** on any table or Kanban page to turn the currently applied filters, visible columns, and sorting into another named route. Choose **Kanban** and a grouping field such as `stage` to create another board entirely in the browser. The form preserves **all** versus **any** matching and creates a new file under `.cr/views/`; search text remains in the shareable URL rather than being persisted.
+Use **Save as view** on any table or Kanban page to turn the currently applied filters, visible columns, and sorting into another named route. Choose **Kanban** and a grouping field such as `stage` to create another board entirely in the browser. The form preserves **all** versus **any** matching and creates a new file under `.cr/views/`; search text remains in the shareable URL rather than being persisted. On a saved view, **Edit view** changes its title, conditions, sort, columns, and layout in place, and **Delete view…** at the bottom of that page removes the view without touching a record.
 
 Useful CLI queries:
 

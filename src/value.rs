@@ -264,10 +264,11 @@ impl From<Assignment> for FilterExpression {
     }
 }
 
-impl FromStr for FilterExpression {
-    type Err = anyhow::Error;
-
-    fn from_str(input: &str) -> Result<Self> {
+impl FilterExpression {
+    /// The field, operator, and value text of an expression such as
+    /// `value>=10000`, split exactly as `from_str` splits it, so a form can put
+    /// a stored expression back into its three controls.
+    pub fn split(input: &str) -> Result<(&str, FilterOperator, &str)> {
         let operators = [
             (" is-not-empty", FilterOperator::IsNotEmpty),
             (" not-contains ", FilterOperator::NotContains),
@@ -290,8 +291,19 @@ impl FromStr for FilterExpression {
                 "expected a filter expression such as value>=10000, name contains Acme, or owner is-empty"
                     .to_owned(),
             ))?;
-        let path = input[..position].trim();
-        let raw_value = input[position + token.len()..].trim();
+        Ok((
+            input[..position].trim(),
+            operator,
+            input[position + token.len()..].trim(),
+        ))
+    }
+}
+
+impl FromStr for FilterExpression {
+    type Err = anyhow::Error;
+
+    fn from_str(input: &str) -> Result<Self> {
+        let (path, operator, raw_value) = Self::split(input)?;
         Self::new(path, operator, raw_value)
     }
 }

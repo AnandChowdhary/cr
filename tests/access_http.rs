@@ -818,3 +818,77 @@ async fn user_profile_patches_follow_editor_grants_and_self_name_updates() {
         "owner@example.com"
     );
 }
+
+#[tokio::test]
+async fn only_an_owner_may_edit_or_delete_a_saved_view() {
+    let (_temporary, database) = seeded_database("perspective-saved-views");
+    database
+        .create_view(
+            "open-deals",
+            Some("Open deals"),
+            "deals",
+            vec!["stage=open".into()],
+            vec![],
+            25,
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let owner_view = request(&app, Method::GET, "/open-deals", None, None, &[]).await;
+    assert_eq!(owner_view.status, StatusCode::OK);
+    assert!(owner_view.text().contains("id=\"cr-view-edit\""));
+    let owner_editor = request(&app, Method::GET, "/open-deals/edit", None, None, &[]).await;
+    assert_eq!(owner_editor.status, StatusCode::OK);
+    let csrf = csrf(owner_editor.text()).to_owned();
+
+    let selected_reader = request(
+        &app,
+        Method::POST,
+        "/perspective",
+        Some(form(&[
+            ("_csrf", &csrf),
+            ("principal", "reader@example.com"),
+        ])),
+        Some("application/x-www-form-urlencoded"),
+        &[],
+    )
+    .await;
+    let reader_cookie = perspective_cookie(&selected_reader);
+    let reader = [("cookie", reader_cookie.as_str())];
+
+    let reader_view = request(&app, Method::GET, "/open-deals", None, None, &reader).await;
+    assert_eq!(reader_view.status, StatusCode::OK);
+    assert!(!reader_view.text().contains("id=\"cr-view-edit\""));
+    assert!(!reader_view.text().contains("id=\"cr-view-save-state\""));
+    for (method, uri, body) in [
+        (Method::GET, "/open-deals/edit", None),
+        (Method::GET, "/open-deals/delete", None),
+        (
+            Method::POST,
+            "/open-deals/edit",
+            Some(form(&[
+                ("_csrf", &csrf),
+                ("title", "Taken over"),
+                ("sort_field", "$id"),
+                ("page_size", "25"),
+            ])),
+        ),
+        (
+            Method::POST,
+            "/open-deals/delete",
+            Some(form(&[("_csrf", &csrf)])),
+        ),
+    ] {
+        let refused = request(
+            &app,
+            method.clone(),
+            uri,
+            body,
+            Some("application/x-www-form-urlencoded"),
+            &reader,
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    assert_eq!(database.view("open-deals").unwrap().title, "Open deals");
+}
