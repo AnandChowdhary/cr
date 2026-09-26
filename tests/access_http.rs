@@ -212,6 +212,17 @@ async fn rest_reads_and_writes_enforce_record_owned_visibility() {
     )
     .await;
     assert_eq!(private.status, StatusCode::FORBIDDEN);
+    let missing = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/secrets/records/deploy-typo",
+        None,
+        None,
+        &[("cookie", &reader_cookie)],
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND, "{}", missing.text());
+    assert_eq!(missing.json()["error"]["code"], "not_found");
 
     database
         .impersonate("editor@example.com")

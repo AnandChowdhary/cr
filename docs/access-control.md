@@ -141,6 +141,14 @@ changes are ordinary record audit diffs; allowed mutations also carry a
 field, REST, search, relation, view, and audit reads pass through the same
 decision. Deleting and recreating an ID creates a new owner boundary.
 
+The policy keeps a record's contents private, not its ID. Reading, updating,
+or deleting an ID that does not exist fails with `not_found` (`record
+secrets/X does not exist`), while an existing record the principal cannot use
+is refused with `forbidden`. A mistyped ID therefore reads as a wrong ID
+rather than as somebody else's record — creating a taken ID answers
+`already_exists` anyway. Record audit history keeps the `forbidden` answer,
+because history outlives the record file.
+
 Activation is limited to an empty collection with no audit history. This keeps
 the first record atomic and fail-closed instead of temporarily assigning an
 owner to existing data. To consolidate older private/shared collections,
