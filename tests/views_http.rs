@@ -3484,7 +3484,6 @@ async fn owners_can_browse_and_preview_the_filesystem_without_mutating_it() {
     assert_eq!(root.status, StatusCode::OK, "{}", root.text());
     assert!(root.text().contains("<span>All files</span></h1>"));
     assert!(root.text().contains("owner only"));
-    assert!(root.text().contains("read-only"));
     assert!(root.text().contains("notes"));
     assert!(root.text().contains(".."));
     assert!(root.text().contains("hidden files included"));
@@ -3527,6 +3526,8 @@ async fn owners_can_browse_and_preview_the_filesystem_without_mutating_it() {
     assert_eq!(relative.status, StatusCode::BAD_REQUEST);
     assert!(relative.text().contains("must be absolute"));
 
+    // Looking changes nothing: the page itself answers only `GET`, and editing
+    // and deleting are routes of their own.
     let post = request(&app, Method::POST, "/browse", None, &[]).await;
     assert_eq!(post.status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(
@@ -3721,6 +3722,329 @@ async fn directories_preview_their_readme_and_skill_and_text_previews_wrap() {
     // A directory with no README is just a listing.
     let root = request(&app, Method::GET, &browse_uri(database.root()), None, &[]).await;
     assert!(!root.text().contains("id=\"readme\""));
+}
+
+fn file_action_uri(route: &str, path: &Path, from: &Path) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("path", path.to_str().unwrap());
+    serializer.append_pair("from", from.to_str().unwrap());
+    format!("{route}?{}", serializer.finish())
+}
+
+fn expected_version(html: &str) -> &str {
+    let marker = "name=\"_expected_version\" value=\"";
+    let rest = html
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("file version field missing from HTML:\n{html}"))
+        .1;
+    rest.split_once('"').unwrap().0
+}
+
+/// The pencil on a file panel opens the file in a textarea — in place for htmx,
+/// as a page of its own without it — and Save writes it back, refusing a file
+/// that changed underneath the editor without losing what was typed.
+#[tokio::test]
+async fn owners_edit_a_text_file_and_save_it_back() {
+    let (_temporary, database) = test_database("filesystem-edit");
+    let database = database.with_actor("Owner <owner@example.com>").unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    let skills = database.root().join("skills");
+    fs::create_dir(&skills).unwrap();
+    let skill = skills.join("SKILL.md");
+    // A leading blank line, which a textarea drops unless one is added for it.
+    fs::write(&skill, "\n---\nname: docs\n---\nold <instructions>\n").unwrap();
+    fs::write(skills.join("data.bin"), [0_u8, 1, 2, 255]).unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    // The listing's SKILL.md panel offers Edit, in place, and Delete.
+    let listing = request(&app, Method::GET, &browse_uri(&skills), None, &[]).await;
+    assert_eq!(listing.status, StatusCode::OK, "{}", listing.text());
+    let edit_uri = file_action_uri("/browse/edit", &skill, &skills);
+    let panel = &listing.text()[listing.text().find("id=\"skill\"").unwrap()..];
+    assert!(panel.contains(&format!(
+        "href=\"{}\" hx-target=\"#skill\" hx-swap=\"innerHTML show:none\"",
+        edit_uri.replace('&', "&amp;")
+    )));
+    assert!(panel.contains("aria-label=\"Edit SKILL.md\""));
+    assert!(panel.contains(&format!(
+        "href=\"{}\"",
+        file_action_uri("/browse/delete", &skill, &skills).replace('&', "&amp;")
+    )));
+
+    // htmx asks for the panel alone and swaps it into the section.
+    let fragment = request(
+        &app,
+        Method::GET,
+        &edit_uri,
+        None,
+        &[("hx-request", "true"), ("hx-target", "skill")],
+    )
+    .await;
+    assert_eq!(fragment.status, StatusCode::OK, "{}", fragment.text());
+    // An editor in the middle of a page is not a page of its own.
+    assert_eq!(fragment.headers["hx-push-url"], "false");
+    assert!(
+        fragment
+            .text()
+            .starts_with("<form method=\"post\" action=\"/browse/edit\"")
+    );
+    assert!(!fragment.text().contains("<html"));
+    assert!(fragment.text().contains("id=\"skill-editor\""));
+
+    // Without JavaScript the same URL is a page, whose textarea holds the file
+    // exactly, escaped.
+    let page = request(&app, Method::GET, &edit_uri, None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.text());
+    assert!(!page.headers.contains_key("hx-push-url"));
+    assert!(page.text().contains("<span>Edit</span></h1>"));
+    assert!(page.text().contains(
+        "name=\"contents\" spellcheck=\"false\" autofocus class=\"cr-file-editor\">\n\n---\nname: docs\n---\nold &lt;instructions&gt;\n</textarea>"
+    ));
+    assert!(page.text().contains("This file is inside the database"));
+    let token = csrf(page.text()).to_owned();
+    let version = expected_version(page.text()).to_owned();
+    assert!(version.starts_with("sha256:"));
+
+    // A textarea sends CRLF; a file written with line feeds keeps them. Save
+    // returns to the directory, at the panel.
+    let skill_path = skill.to_str().unwrap();
+    let skills_path = skills.to_str().unwrap();
+    let save = |contents: &'static str, version: String, token: String| {
+        let app = app.clone();
+        async move {
+            request(
+                &app,
+                Method::POST,
+                "/browse/edit",
+                Some(form(&[
+                    ("_csrf", &token),
+                    ("path", skill_path),
+                    ("from", skills_path),
+                    ("_expected_version", &version),
+                    ("contents", contents),
+                ])),
+                &[],
+            )
+            .await
+        }
+    };
+    let saved = save(
+        "\r\n---\r\nname: docs\r\n---\r\nnew instructions\r\n",
+        version.clone(),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.text());
+    assert_eq!(
+        saved.headers[header::LOCATION],
+        format!("{}#skill", browse_uri(&skills)).as_str()
+    );
+    assert_eq!(
+        fs::read_to_string(&skill).unwrap(),
+        "\n---\nname: docs\n---\nnew instructions\n"
+    );
+    // The native form's second submission finds its text already saved.
+    let again = save(
+        "\r\n---\r\nname: docs\r\n---\r\nnew instructions\r\n",
+        version.clone(),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::SEE_OTHER, "{}", again.text());
+
+    // A file that changed since it was opened is not overwritten, and the
+    // editor comes back with what was typed.
+    let stale = save("my lost work", version.clone(), token.clone()).await;
+    assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+    assert!(stale.text().contains("The file was not saved"));
+    assert!(stale.text().contains("changed after it was opened"));
+    assert!(stale.text().contains(">my lost work</textarea>"));
+    assert!(stale.text().contains(&format!("value=\"{version}\"")));
+    assert_eq!(
+        fs::read_to_string(&skill).unwrap(),
+        "\n---\nname: docs\n---\nnew instructions\n"
+    );
+
+    // A forged token writes nothing.
+    let reopened = request(&app, Method::GET, &edit_uri, None, &[]).await;
+    let current = expected_version(reopened.text()).to_owned();
+    let forged = save("forged", current.clone(), "forged".to_owned()).await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    assert!(
+        fs::read_to_string(&skill)
+            .unwrap()
+            .contains("new instructions")
+    );
+
+    // A binary file offers no editor, and asking for one is refused.
+    let binary = skills.join("data.bin");
+    let binary_page = request(&app, Method::GET, &browse_uri(&binary), None, &[]).await;
+    assert!(
+        binary_page
+            .text()
+            .contains("title=\"A binary file cannot be edited here\"")
+    );
+    assert!(
+        !binary_page
+            .text()
+            .contains(&file_action_uri("/browse/edit", &binary, &binary).replace('&', "&amp;"))
+    );
+    let binary_editor = request(
+        &app,
+        Method::GET,
+        &file_action_uri("/browse/edit", &binary, &binary),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(binary_editor.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let relative = request(&app, Method::GET, "/browse/edit?path=skills", None, &[]).await;
+    assert_eq!(relative.status, StatusCode::BAD_REQUEST);
+}
+
+/// Saving keeps what the file was: CRLF line endings and permission bits.
+#[cfg(unix)]
+#[tokio::test]
+async fn saving_a_file_keeps_its_line_endings_and_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (temporary, database) = test_database("filesystem-edit-preserve");
+    let database = database.with_actor("Owner <owner@example.com>").unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    // Outside the database, which the editor does not warn about.
+    let notes = temporary.path().join("notes.txt");
+    fs::write(&notes, "one\r\ntwo\r\n").unwrap();
+    fs::set_permissions(&notes, fs::Permissions::from_mode(0o640)).unwrap();
+    let notes = fs::canonicalize(&notes).unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let file = request(&app, Method::GET, &browse_uri(&notes), None, &[]).await;
+    assert!(file.text().contains("id=\"file\""));
+    assert!(file.text().contains("hx-target=\"#file\""));
+    let edit_uri = file_action_uri("/browse/edit", &notes, &notes);
+    let page = request(&app, Method::GET, &edit_uri, None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.text());
+    assert!(!page.text().contains("This file is inside the database"));
+    let notes_path = notes.to_str().unwrap();
+    let saved = request(
+        &app,
+        Method::POST,
+        "/browse/edit",
+        Some(form(&[
+            ("_csrf", csrf(page.text())),
+            ("path", notes_path),
+            ("from", notes_path),
+            ("_expected_version", expected_version(page.text())),
+            ("contents", "one\r\ntwo\r\nthree"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.text());
+    // An opened file is its own page, so there is no panel to scroll to.
+    assert_eq!(saved.headers[header::LOCATION], browse_uri(&notes).as_str());
+    assert_eq!(fs::read(&notes).unwrap(), b"one\r\ntwo\r\nthree");
+    assert_eq!(
+        fs::metadata(&notes).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+}
+
+/// The trash can asks first, on a page the server renders, then deletes the
+/// file and returns to its directory. Only regular files are deleted.
+#[tokio::test]
+async fn owners_delete_a_file_after_confirming() {
+    let (_temporary, database) = test_database("filesystem-delete");
+    let database = database.with_actor("Owner <owner@example.com>").unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    let docs = database.root().join("docs");
+    fs::create_dir(&docs).unwrap();
+    let readme = docs.join("README.md");
+    fs::write(&readme, "# Going away\n").unwrap();
+    let nested = docs.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let confirm_uri = file_action_uri("/browse/delete", &readme, &docs);
+    let confirm = request(&app, Method::GET, &confirm_uri, None, &[]).await;
+    assert_eq!(confirm.status, StatusCode::OK, "{}", confirm.text());
+    let text = confirm.text();
+    assert!(text.contains("Delete this file?"));
+    assert!(text.contains("<code class=\"cr-filter-tag\">README.md</code> (13 B)"));
+    assert!(text.contains("not moved to a trash"));
+    assert!(text.contains("It is inside the database"));
+    assert!(text.contains("action=\"/browse/delete\""));
+    // Cancel returns to the panel the trash can was on.
+    assert!(text.contains(&format!(
+        "href=\"{}#readme\" class=\"cr-button\">Cancel<",
+        browse_uri(&docs).replace('&', "&amp;")
+    )));
+    // Asking deleted nothing.
+    assert!(readme.exists());
+
+    let token = csrf(text).to_owned();
+    let delete = |path: String, token: String| {
+        let app = app.clone();
+        async move {
+            request(
+                &app,
+                Method::POST,
+                "/browse/delete",
+                Some(form(&[("_csrf", &token), ("path", &path)])),
+                &[],
+            )
+            .await
+        }
+    };
+    let readme_path = readme.to_str().unwrap().to_owned();
+    let forged = delete(readme_path.clone(), "forged".to_owned()).await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    assert!(readme.exists());
+
+    let deleted = delete(readme_path.clone(), token.clone()).await;
+    assert_eq!(deleted.status, StatusCode::SEE_OTHER, "{}", deleted.text());
+    assert_eq!(
+        deleted.headers[header::LOCATION],
+        browse_uri(&docs).as_str()
+    );
+    assert!(!readme.exists());
+    // A second submission of the native form has nothing left to do.
+    let again = delete(readme_path, token.clone()).await;
+    assert_eq!(again.status, StatusCode::SEE_OTHER);
+
+    // A directory is not a file: neither asked about nor deleted.
+    let directory = request(
+        &app,
+        Method::GET,
+        &file_action_uri("/browse/delete", &nested, &docs),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(directory.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let refused = delete(nested.to_str().unwrap().to_owned(), token.clone()).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert!(nested.is_dir());
+
+    #[cfg(unix)]
+    {
+        // Nor is a link followed to whatever it points at.
+        let target = docs.join("target.txt");
+        fs::write(&target, "kept").unwrap();
+        let link = docs.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let refused = delete(link.to_str().unwrap().to_owned(), token).await;
+        assert_eq!(refused.status, StatusCode::CONFLICT);
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "kept");
+    }
 }
 
 /// A README the server cannot read is reported in place rather than taking the
@@ -3947,6 +4271,24 @@ async fn the_internal_users_page_is_unlinked_until_access_control_exists() {
     .await;
     assert_eq!(pin.status, StatusCode::NOT_FOUND);
     assert!(!home.text().contains("All files"));
+
+    // So are editing and deleting files.
+    for (method, uri) in [
+        (Method::GET, "/browse/edit?path=%2Ftmp%2Fx"),
+        (Method::POST, "/browse/edit"),
+        (Method::GET, "/browse/delete?path=%2Ftmp%2Fx"),
+        (Method::POST, "/browse/delete"),
+    ] {
+        let response = request(
+            &app,
+            method,
+            uri,
+            Some(form(&[("_csrf", "x"), ("path", "/tmp/x")])),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND, "{uri}");
+    }
 }
 
 #[tokio::test]

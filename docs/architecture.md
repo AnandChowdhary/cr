@@ -534,9 +534,9 @@ Markdown directory and authenticates each client.
 The server's `/browse` page deliberately steps outside the database-relative
 path boundary: its purpose is owner-only inspection of the complete filesystem
 visible to the process. That route therefore exists only for an RBAC-enabled
-server, evaluates the selected perspective with
-`owner_access_allowed(Database)` before doing any filesystem work, and has no
-mutation method. It starts at the canonical database root but accepts canonical
+server, and it and its `/browse/edit` and `/browse/delete` companions evaluate
+the selected perspective with `owner_access_allowed(Database)` before doing any
+filesystem work. It starts at the canonical database root but accepts canonical
 absolute parent and descendant locations up to `/`. Directory enumeration uses
 non-following entry types so links are labelled honestly; opening an entry
 canonicalizes the selected target. Regular-file previews are opened
@@ -550,6 +550,18 @@ that same path — chosen only among regular entries, so a symbolic link named
 `README.md` is listed but never followed — and a failure is published on the
 request's own task so the log line carries the request ID, then shown in place
 of the preview rather than failing the listing.
+
+Editing and deleting reuse the database's symlink-safe file layer with the
+file's own directory as the root: a save reads the current bytes through a
+descriptor opened with `O_NOFOLLOW`, refuses with `412` unless their SHA-256 is
+the version the editor was rendered with, then stages the text beside the file
+with its permission bits and renames it over the file through the directory's
+descriptor; a delete unlinks through that descriptor and refuses anything but a
+regular file. The version check and the rename are two steps with no lock
+between them, because an arbitrary file has no lock that other writers honour —
+the window is the one any editor's save has. Neither writes an audit event: a
+record file changed here is a direct edit, reported by `cr status` until
+`cr save` accepts it, exactly as one made in any other editor.
 
 `audit verify` validates the chain and reconciles every latest record hash, including deleted-record absence and manually added untracked files. `audit baseline` explicitly introduces legacy records into the chain. It cannot silently baseline a record that already has history.
 
