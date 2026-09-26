@@ -81,6 +81,7 @@ cr view create NAME --collection COLLECTION [--where KEY=YAML]... [--column FIEL
                     [--sort-by FIELD] [--sort-direction asc|desc] [--page-size N]
 cr view list [--json]
 cr view show NAME [--json]
+cr view delete NAME
 
 cr pin add PATH [--label LABEL]
 cr pin remove PATH

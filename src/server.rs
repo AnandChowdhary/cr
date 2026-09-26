@@ -757,6 +757,15 @@ impl From<ViewSortDirection> for SortDirection {
     }
 }
 
+impl From<SortDirection> for ViewSortDirection {
+    fn from(direction: SortDirection) -> Self {
+        match direction {
+            SortDirection::Asc => Self::Asc,
+            SortDirection::Desc => Self::Desc,
+        }
+    }
+}
+
 impl ViewSortDirection {
     fn as_str(self) -> &'static str {
         match self {
@@ -856,6 +865,43 @@ impl From<ViewFilterOperator> for FilterOperator {
             ViewFilterOperator::EndsWith => Self::EndsWith,
             ViewFilterOperator::IsEmpty => Self::IsEmpty,
             ViewFilterOperator::IsNotEmpty => Self::IsNotEmpty,
+        }
+    }
+}
+
+impl From<FilterOperator> for ViewFilterOperator {
+    fn from(operator: FilterOperator) -> Self {
+        match operator {
+            FilterOperator::Equal => Self::Eq,
+            FilterOperator::NotEqual => Self::Ne,
+            FilterOperator::GreaterThan => Self::Gt,
+            FilterOperator::GreaterThanOrEqual => Self::Gte,
+            FilterOperator::LessThan => Self::Lt,
+            FilterOperator::LessThanOrEqual => Self::Lte,
+            FilterOperator::Contains => Self::Contains,
+            FilterOperator::NotContains => Self::NotContains,
+            FilterOperator::StartsWith => Self::StartsWith,
+            FilterOperator::EndsWith => Self::EndsWith,
+            FilterOperator::IsEmpty => Self::IsEmpty,
+            FilterOperator::IsNotEmpty => Self::IsNotEmpty,
+        }
+    }
+}
+
+impl From<ViewFilterMatch> for ViewPredicateMatch {
+    fn from(filter_match: ViewFilterMatch) -> Self {
+        match filter_match {
+            ViewFilterMatch::All => Self::All,
+            ViewFilterMatch::Any => Self::Any,
+        }
+    }
+}
+
+impl From<ViewPredicateMatch> for ViewFilterMatch {
+    fn from(match_mode: ViewPredicateMatch) -> Self {
+        match match_mode {
+            ViewPredicateMatch::All => Self::All,
+            ViewPredicateMatch::Any => Self::Any,
         }
     }
 }
@@ -1306,6 +1352,52 @@ struct HtmlSaveViewForm {
     group_by: Option<String>,
 }
 
+/// A confirmation that carries nothing but the token, such as deleting a
+/// saved view.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HtmlCsrfForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+}
+
+/// The saved-view editor's submission: the whole definition apart from its
+/// name and collection, which it cannot change.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HtmlViewEditForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    filter_match: ViewFilterMatch,
+    #[serde(default)]
+    filter_field: Vec<String>,
+    #[serde(default)]
+    filter_operator: Vec<ViewFilterOperator>,
+    #[serde(default)]
+    filter_value: Vec<String>,
+    /// Each `any` group the editor could not fold into its conditions, as
+    /// JSON, submitted only while its checkbox is ticked.
+    #[serde(default)]
+    keep_group: Vec<String>,
+    #[serde(default)]
+    sort_field: String,
+    #[serde(default)]
+    sort_direction: ViewSortDirection,
+    #[serde(default)]
+    column: Vec<String>,
+    /// The columns the view picked for itself when the editor opened, so
+    /// leaving them as they were keeps the view picking.
+    #[serde(default)]
+    automatic_column: Vec<String>,
+    layout: Option<ViewLayout>,
+    group_by: Option<String>,
+    #[serde(default)]
+    page_size: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum KanbanTarget {
@@ -1695,6 +1787,11 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         )
         .route("/{view}", get(view_records))
         .route("/{view}/save-view", post(save_view_form))
+        .route("/{view}/edit", get(edit_view_form).post(update_view_form))
+        .route(
+            "/{view}/delete",
+            get(confirm_delete_view).post(delete_view_form),
+        )
         .route("/{view}/new", get(new_record_form))
         .route("/{view}/records", post(create_record_form))
         .route(
@@ -3354,7 +3451,12 @@ async fn save_view_form(
             ));
         }
         let title = (!form.title.trim().is_empty()).then(|| form.title.trim().to_owned());
-        let filter_group = save_view_filter_group(&form)?;
+        let filter_group = submitted_filter_group(
+            form.filter_match,
+            &form.filter_field,
+            &form.filter_operator,
+            &form.filter_value,
+        )?;
         let sort_by = form
             .sort_field
             .as_deref()
@@ -3415,6 +3517,237 @@ async fn save_view_form(
         })
         .await?;
         see_other(&notice_url(&saved.name, "View saved"))
+    }
+    .await;
+    result.unwrap_or_else(html_error)
+}
+
+/// Everything the saved-view editor shows besides the draft in its controls.
+struct ViewEditorContext {
+    view: ViewDefinition,
+    schema: Option<JsonValue>,
+    /// Every record of the collection, to offer its fields as columns and
+    /// filters and to find its title field.
+    records: Vec<Record>,
+    navigation: Vec<ViewDefinition>,
+}
+
+async fn view_editor_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    view_name: &str,
+) -> ApiResult<ViewEditorContext> {
+    let requested_view = view_name.to_owned();
+    run_database(state, headers, move |database| {
+        let view = saved_view(database, &requested_view)?;
+        let records = database.list(&view.collection, &[])?;
+        let schema = collection_schema(database, &view.collection)?;
+        let navigation = database.views()?;
+        Ok(ViewEditorContext {
+            view,
+            schema,
+            records,
+            navigation,
+        })
+    })
+    .await
+}
+
+/// A saved view the principal may change, refusing an automatic one, which
+/// has no definition to edit or delete.
+fn saved_view(database: &Database, name: &str) -> Result<ViewDefinition> {
+    if !database.owner_access_allowed(&AccessResource::Database)? {
+        return Err(DomainError::Forbidden(format!(
+            "principal '{}' must be an owner of the database to change saved views",
+            database.principal()
+        ))
+        .into());
+    }
+    let view = database.view(name)?;
+    if !view.saved {
+        return Err(DomainError::NotFound(format!(
+            "'{name}' is a collection's own view rather than a saved view, so there is nothing to edit or delete"
+        ))
+        .into());
+    }
+    Ok(view)
+}
+
+/// The editor, opened on the view as the page that linked here showed it.
+async fn edit_view_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(view_name): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let result: ApiResult<Markup> = async {
+        let query: ViewQuery = parse_query(raw)?;
+        let applied = submitted_filter_group(
+            query.filter_match,
+            &query.filter_field,
+            &query.filter_operator,
+            &query.filter_value,
+        )?;
+        let context = view_editor_context(&state, &headers, &view_name).await?;
+        let draft = opened_view_draft(&context, &query, applied, state.max_page_size)?;
+        let ui = ui_context(&state, &headers).await?;
+        Ok(render_view_editor(
+            &Representation::requested(&headers),
+            &context,
+            &draft,
+            ui.as_ref(),
+            &state.csrf_token,
+            None,
+        ))
+    }
+    .await;
+    html_result(result)
+}
+
+async fn update_view_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(view_name): Path<String>,
+    RawForm(raw): RawForm,
+) -> Response {
+    let form: HtmlViewEditForm = match parse_html_form(&raw) {
+        Ok(form) => form,
+        Err(error) => return html_error(error),
+    };
+    if let Err(error) = verify_csrf(&state, &form.csrf) {
+        return html_error(error);
+    }
+    let result: ApiResult<Response> = async {
+        let edit = submitted_view_edit(&form)?;
+        let requested_view = view_name.clone();
+        run_database(&state, &headers, move |database| {
+            let view = saved_view(database, &requested_view)?;
+            // What the reader left as it was stays as it was written, so a
+            // new title does not rewrite a hand-written file's conditions,
+            // sort or columns into the editor's equivalent spelling of them.
+            let (sort_by, sort_direction) =
+                if (edit.sort_field.as_str(), edit.sort_direction) == view_default_sort(&view) {
+                    (view.sort_by.clone(), view.sort_direction)
+                } else {
+                    (Some(edit.sort_field), edit.sort_direction.into())
+                };
+            let (filters, where_expr, filter_groups) =
+                if edit.conditions == fold_view_conditions(&view, None) {
+                    (view.filters, view.where_expr, view.filter_groups)
+                } else {
+                    (Vec::new(), Vec::new(), edit.conditions.into_filter_groups())
+                };
+            let columns = if edit.automatic_columns && view.columns.is_empty() {
+                Vec::new()
+            } else {
+                edit.columns
+            };
+            database.replace_view(
+                &requested_view,
+                &edit.title,
+                filters,
+                where_expr,
+                filter_groups,
+                columns,
+                edit.page_size,
+                edit.layout,
+                edit.group_by,
+                sort_by,
+                sort_direction,
+            )
+        })
+        .await?;
+        see_other(&notice_url(&view_name, "View updated"))
+    }
+    .await;
+    match result {
+        Ok(response) => response,
+        // A refusal of what was typed goes back to the form, holding it.
+        Err(error)
+            if matches!(
+                error.status,
+                StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+            ) =>
+        {
+            reject_view_edit(&state, &headers, &view_name, &form, error).await
+        }
+        Err(error) => html_error(error),
+    }
+}
+
+async fn reject_view_edit(
+    state: &AppState,
+    headers: &HeaderMap,
+    view_name: &str,
+    form: &HtmlViewEditForm,
+    error: ApiError,
+) -> Response {
+    let context = match view_editor_context(state, headers, view_name).await {
+        Ok(context) => context,
+        Err(error) => return html_error(error),
+    };
+    let ui = match ui_context(state, headers).await {
+        Ok(ui) => ui,
+        Err(error) => return html_error(error),
+    };
+    let error = error.publish();
+    html_response(
+        error.status,
+        render_view_editor(
+            &Representation::requested(headers),
+            &context,
+            &submitted_view_draft(form),
+            ui.as_ref(),
+            &state.csrf_token,
+            Some(&error),
+        ),
+    )
+}
+
+async fn confirm_delete_view(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(view_name): Path<String>,
+) -> Response {
+    let result: ApiResult<Markup> = async {
+        let (view, navigation) = run_database(&state, &headers, move |database| {
+            Ok((saved_view(database, &view_name)?, database.views()?))
+        })
+        .await?;
+        let ui = ui_context(&state, &headers).await?;
+        Ok(render_view_delete_confirmation(
+            &Representation::requested(&headers),
+            &view,
+            &navigation,
+            ui.as_ref(),
+            &state.csrf_token,
+        ))
+    }
+    .await;
+    html_result(result)
+}
+
+async fn delete_view_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(view_name): Path<String>,
+    RawForm(raw): RawForm,
+) -> Response {
+    let result: ApiResult<Response> = async {
+        let form: HtmlCsrfForm = parse_html_form(&raw)?;
+        verify_csrf(&state, &form.csrf)?;
+        let location = run_database(&state, &headers, move |database| {
+            let view = saved_view(database, &view_name)?;
+            database.delete_view(&view.name)?;
+            // Back to the records the view was of, which is still a page
+            // unless the view's collection is one the reader cannot see.
+            Ok(match database.view(&view.collection) {
+                Ok(collection) => notice_url(&collection.name, "View deleted"),
+                Err(_) => "/".to_owned(),
+            })
+        })
+        .await?;
+        see_other(&location)
     }
     .await;
     result.unwrap_or_else(html_error)
@@ -7192,15 +7525,17 @@ fn render_view_records(
     // the heading, the search box and the filter panel, none of which the
     // request asked for.
     //
-    // Three elements travel with the region, marked `hx-swap-oob` so htmx
+    // Other elements travel with the region, marked `hx-swap-oob` so htmx
     // applies each to the element of the same id already on the page and then
-    // drops it from the content it swaps. Two are the whole of the heading that
-    // depends on the results — the record count and the badge counting applied
-    // filters — and they are rendered here by the same functions the heading
-    // below calls, with the attribute as their only difference, so neither can
+    // drops it from the content it swaps. Two are the heading's facts about
+    // the results — the record count and the badge counting applied filters —
+    // and, for a reader who may change views, two more carry the page's state
+    // into its view controls: the hidden inputs "Save as view" submits and the
+    // "Edit view" link. Each is rendered here by the same function the heading
+    // below calls, with the attribute as its only difference, so none can
     // start disagreeing with the page it patches.
     //
-    // The third is the announcement, and it is last because it is not part of
+    // The last is the announcement, and it is last because it is not part of
     // the page's appearance at all: it is the sentence a reader who cannot see
     // the table is told about the swap that just happened, sent into the live
     // region the shell rendered. It patches that region's *contents* rather than
@@ -7212,6 +7547,12 @@ fn render_view_records(
                 (results)
                 (view_record_count(page.total, OutOfBand::Yes))
                 (view_filter_summary(active_filter_count, OutOfBand::Yes))
+                @if can_manage_views {
+                    (view_save_state(query, columns, OutOfBand::Yes))
+                    @if view.saved {
+                        (view_edit_link(view, query, page.limit, OutOfBand::Yes))
+                    }
+                }
                 (view_results_announcement(page))
             },
         );
@@ -7374,6 +7715,9 @@ fn render_view_records(
                         }
                     }
                     @if can_manage_views {
+                        @if view.saved {
+                            (view_edit_link(view, query, page.limit, OutOfBand::No))
+                        }
                         (render_save_view_control(
                             view,
                             query,
@@ -8065,24 +8409,6 @@ fn render_active_filters(
         };
         view_page_url(view, &next, page.limit, ViewPosition::Start)
     };
-    let describe = |field: &str, operator: ViewFilterOperator, value: &str| {
-        let label = field_label(schema, field);
-        match operator {
-            ViewFilterOperator::IsEmpty | ViewFilterOperator::IsNotEmpty => {
-                format!("{label} {}", operator.label())
-            }
-            _ => {
-                let enum_option = property_definition(schema, field)
-                    .is_some_and(|definition| definition.get("enum").is_some());
-                let value = if enum_option {
-                    humanize_field_name(value)
-                } else {
-                    value.to_owned()
-                };
-                format!("{label} {} {value}", operator.label())
-            }
-        }
-    };
     html! {
         @if !conditions.is_empty() {
             div data-filter-chips=(conditions.len()) class="mb-3 flex flex-wrap items-center gap-1.5" {
@@ -8090,7 +8416,7 @@ fn render_active_filters(
                     @if query.filter_match == ViewFilterMatch::Any && conditions.len() > 1 { "Any of" } @else { "Filtered by" }
                 }
                 @for (index, (field, operator, value)) in conditions.iter().enumerate() {
-                    @let text = describe(field, *operator, value);
+                    @let text = describe_condition(schema, field, *operator, value);
                     span class="cr-active-filter" {
                         (text)
                         a href=(without(Some(index))) aria-label=(format!("Remove filter: {text}")) class="cr-active-filter-remove" {
@@ -8102,6 +8428,32 @@ fn render_active_filters(
                     a href=(without(None)) class="text-xs text-gray-500 hover:text-gray-900 hover:underline" { "Clear filters" }
                 }
             }
+        }
+    }
+}
+
+/// A condition in the filter panel's words: "Status is Failed", "Assignee is
+/// empty".
+fn describe_condition(
+    schema: Option<&JsonValue>,
+    field: &str,
+    operator: ViewFilterOperator,
+    value: &str,
+) -> String {
+    let label = field_label(schema, field);
+    match operator {
+        ViewFilterOperator::IsEmpty | ViewFilterOperator::IsNotEmpty => {
+            format!("{label} {}", operator.label())
+        }
+        _ => {
+            let enum_option = property_definition(schema, field)
+                .is_some_and(|definition| definition.get("enum").is_some());
+            let value = if enum_option {
+                humanize_field_name(value)
+            } else {
+                value.to_owned()
+            };
+            format!("{label} {} {value}", operator.label())
         }
     }
 }
@@ -8308,19 +8660,7 @@ fn render_save_view_control(
             div class="cr-popover absolute right-0 z-20 mt-2 w-80 p-4" {
                 form method="post" action=(action) hx-boost=(UNBOOSTED) class="space-y-3" {
                     input type="hidden" name="_csrf" value=(csrf_token);
-                    input type="hidden" name="filter_match" value=(match query.filter_match { ViewFilterMatch::All => "all", ViewFilterMatch::Any => "any" });
-                    @for (index, (field, value)) in query.filter_field.iter().zip(&query.filter_value).enumerate() {
-                        input type="hidden" name="filter_field" value=(field);
-                        input type="hidden" name="filter_operator" value=(query.filter_operator.get(index).copied().unwrap_or_default().as_str());
-                        input type="hidden" name="filter_value" value=(value);
-                    }
-                    @if let Some(field) = query.sort_field.as_deref() {
-                        input type="hidden" name="sort_field" value=(field);
-                    }
-                    input type="hidden" name="sort_direction" value=(query.sort_direction.as_str());
-                    @for column in columns {
-                        input type="hidden" name="column" value=(column);
-                    }
+                    (view_save_state(query, columns, OutOfBand::No))
                     div {
                         h2 class="text-sm font-bold text-gray-900" { "Save current view" }
                         p class="mt-1 text-xs leading-5 text-gray-500" { "Preserves applied filters, all/any matching, layout, columns, and sorting. Search text remains shareable in the URL." }
@@ -8357,6 +8697,662 @@ fn render_save_view_control(
             }
         }
     }
+}
+
+/// The page's current filters, sort and columns as the hidden inputs of "Save
+/// as view", in the element a results swap patches; see `VIEW_SAVE_STATE_ID`.
+fn view_save_state(query: &ViewQuery, columns: &[String], out_of_band: OutOfBand) -> Markup {
+    html! {
+        div id=(VIEW_SAVE_STATE_ID) hidden hx-swap-oob=[out_of_band.attribute()] {
+            input type="hidden" name="filter_match" value=(match query.filter_match { ViewFilterMatch::All => "all", ViewFilterMatch::Any => "any" });
+            @for (index, (field, value)) in query.filter_field.iter().zip(&query.filter_value).enumerate() {
+                input type="hidden" name="filter_field" value=(field);
+                input type="hidden" name="filter_operator" value=(query.filter_operator.get(index).copied().unwrap_or_default().as_str());
+                input type="hidden" name="filter_value" value=(value);
+            }
+            @if let Some(field) = query.sort_field.as_deref() {
+                input type="hidden" name="sort_field" value=(field);
+            }
+            input type="hidden" name="sort_direction" value=(query.sort_direction.as_str());
+            @for column in columns {
+                input type="hidden" name="column" value=(column);
+            }
+        }
+    }
+}
+
+/// "Edit view" on a saved view, linking to its editor with the page's query,
+/// so the editor starts from the filters, sort, columns and page size on
+/// screen rather than from the file alone.
+fn view_edit_link(
+    view: &ViewDefinition,
+    query: &ViewQuery,
+    limit: usize,
+    out_of_band: OutOfBand,
+) -> Markup {
+    let href = format!(
+        "{}?{}",
+        view_edit_path(view),
+        view_query_string(query, limit, ViewPosition::Start)
+    );
+    html! {
+        a id=(VIEW_EDIT_LINK_ID) href=(href) class="cr-button" hx-swap-oob=[out_of_band.attribute()] { "Edit view" }
+    }
+}
+
+fn view_edit_path(view: &ViewDefinition) -> String {
+    format!("/{}/edit", encode_segment(&view.name))
+}
+
+fn view_delete_path(view: &ViewDefinition) -> String {
+    format!("/{}/delete", encode_segment(&view.name))
+}
+
+/// A view's conditions folded into the one list the filter builder edits,
+/// plus the groups that cannot join it.
+///
+/// A definition can hold equality `filters`, `where_expr` expressions and any
+/// number of groups, each matching all or any of its own expressions, and all
+/// of them must hold. Everything that must hold together is one `all` list:
+/// the filters, the expressions, every `all` group, and every group of one.
+/// An `any` group of several cannot join that list without changing what the
+/// view matches, so it stays a group of its own — unless it is the only
+/// condition there is, when the builder can show it as its `any` list.
+#[derive(Debug, PartialEq, Eq)]
+struct FoldedConditions {
+    filter_match: ViewFilterMatch,
+    expressions: Vec<String>,
+    groups: Vec<ViewFilterGroup>,
+}
+
+impl FoldedConditions {
+    fn into_filter_groups(self) -> Vec<ViewFilterGroup> {
+        let mut groups = Vec::new();
+        if !self.expressions.is_empty() {
+            groups.push(ViewFilterGroup {
+                match_mode: self.filter_match.into(),
+                expressions: self.expressions,
+            });
+        }
+        groups.extend(self.groups);
+        groups
+    }
+}
+
+/// Fold a view's conditions, and `applied` — the filters on the page that
+/// opened the editor — with them.
+fn fold_view_conditions(
+    view: &ViewDefinition,
+    applied: Option<ViewFilterGroup>,
+) -> FoldedConditions {
+    let mut all = Vec::new();
+    let mut any = Vec::new();
+    for expression in view.filters.iter().chain(&view.where_expr) {
+        push_unique(&mut all, canonical_expression(expression));
+    }
+    for group in view.filter_groups.iter().cloned().chain(applied) {
+        let group = canonical_group(group);
+        if group.match_mode == ViewPredicateMatch::All || group.expressions.len() == 1 {
+            for expression in group.expressions {
+                push_unique(&mut all, expression);
+            }
+        } else {
+            push_unique(&mut any, group);
+        }
+    }
+    if all.is_empty() && any.len() == 1 {
+        let group = any.remove(0);
+        return FoldedConditions {
+            filter_match: ViewFilterMatch::Any,
+            expressions: group.expressions,
+            groups: Vec::new(),
+        };
+    }
+    FoldedConditions {
+        filter_match: ViewFilterMatch::All,
+        expressions: all,
+        groups: any,
+    }
+}
+
+fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
+    if !items.contains(&item) {
+        items.push(item);
+    }
+}
+
+/// An expression spelled the way the filter builder writes it, so `stage =
+/// won` in a hand-written file and `stage=won` from the form compare equal.
+fn canonical_expression(expression: &str) -> String {
+    match FilterExpression::split(expression) {
+        Ok((field, operator, value)) => filter_expression_text(field, operator.into(), value),
+        Err(_) => expression.to_owned(),
+    }
+}
+
+fn canonical_group(group: ViewFilterGroup) -> ViewFilterGroup {
+    ViewFilterGroup {
+        match_mode: group.match_mode,
+        expressions: group
+            .expressions
+            .iter()
+            .map(|expression| canonical_expression(expression))
+            .collect(),
+    }
+}
+
+/// Stored expressions as the builder's `(field, operator, value)` rows.
+fn expression_rows(expressions: &[String]) -> Vec<(String, ViewFilterOperator, String)> {
+    expressions
+        .iter()
+        .filter_map(|expression| FilterExpression::split(expression).ok())
+        .map(|(field, operator, value)| (field.to_owned(), operator.into(), value.to_owned()))
+        .collect()
+}
+
+/// The order a view opens in when no URL chooses one: its own default, or
+/// newest first.
+fn view_default_sort(view: &ViewDefinition) -> (&str, ViewSortDirection) {
+    match view.sort_by.as_deref() {
+        Some(field) => (field, view.sort_direction.into()),
+        None => (DEFAULT_VIEW_SORT_FIELD, ViewSortDirection::Desc),
+    }
+}
+
+/// A saved view as its editor shows it: one control per setting, holding
+/// either the view as it was opened or what a refused submission typed.
+struct ViewDraft {
+    title: String,
+    filter_match: ViewFilterMatch,
+    conditions: Vec<(String, ViewFilterOperator, String)>,
+    /// The `any` groups `FoldedConditions` keeps apart, each kept or removed
+    /// whole with a checkbox.
+    groups: Vec<ViewFilterGroup>,
+    sort_field: String,
+    sort_direction: ViewSortDirection,
+    columns: Vec<String>,
+    automatic_columns: Vec<String>,
+    layout: ViewLayout,
+    group_by: Option<String>,
+    page_size: String,
+}
+
+fn opened_view_draft(
+    context: &ViewEditorContext,
+    query: &ViewQuery,
+    applied: Option<ViewFilterGroup>,
+    max_page_size: usize,
+) -> ApiResult<ViewDraft> {
+    let view = &context.view;
+    let schema = context.schema.as_ref();
+    let folded = fold_view_conditions(view, applied);
+    let available = view_available_columns(view, &context.records, schema);
+    let columns = selected_view_columns(view, query, &available, schema, &context.records)?;
+    // What the view picks for itself, which the page's links spell out as a
+    // choice once the filter panel has been applied.
+    let automatic_columns = if view.columns.is_empty() {
+        selected_view_columns(
+            view,
+            &ViewQuery::default(),
+            &available,
+            schema,
+            &context.records,
+        )?
+    } else {
+        Vec::new()
+    };
+    let (sort_field, sort_direction) = match query.sort_field.as_deref().map(str::trim) {
+        // The page's "None", which is record ID order.
+        Some("") => ("$id".to_owned(), ViewSortDirection::Asc),
+        Some(field) => (field.to_owned(), query.sort_direction),
+        None => {
+            let (field, direction) = view_default_sort(view);
+            (field.to_owned(), direction)
+        }
+    };
+    Ok(ViewDraft {
+        title: view.title.clone(),
+        filter_match: folded.filter_match,
+        conditions: expression_rows(&folded.expressions),
+        groups: folded.groups,
+        sort_field,
+        sort_direction,
+        columns,
+        automatic_columns,
+        layout: view.layout,
+        group_by: view.group_by.clone(),
+        // Every link on a view page names its limit, so only one other than
+        // the page's own default is a choice the reader made.
+        page_size: query
+            .limit
+            .filter(|limit| *limit != view.page_size.min(max_page_size))
+            .unwrap_or(view.page_size)
+            .to_string(),
+    })
+}
+
+fn submitted_view_draft(form: &HtmlViewEditForm) -> ViewDraft {
+    ViewDraft {
+        title: form.title.clone(),
+        filter_match: form.filter_match,
+        conditions: form
+            .filter_field
+            .iter()
+            .zip(&form.filter_value)
+            .enumerate()
+            .filter(|(_, (field, value))| !(field.is_empty() && value.is_empty()))
+            .map(|(index, (field, value))| {
+                (
+                    field.clone(),
+                    form.filter_operator.get(index).copied().unwrap_or_default(),
+                    value.clone(),
+                )
+            })
+            .collect(),
+        groups: form
+            .keep_group
+            .iter()
+            .filter_map(|group| serde_json::from_str(group).ok())
+            .collect(),
+        sort_field: form.sort_field.clone(),
+        sort_direction: form.sort_direction,
+        columns: form.column.clone(),
+        automatic_columns: form.automatic_column.clone(),
+        layout: form.layout.unwrap_or_default(),
+        group_by: form
+            .group_by
+            .clone()
+            .filter(|field| !field.trim().is_empty()),
+        page_size: form.page_size.clone(),
+    }
+}
+
+/// What an editor submission asks the view to become, read from the form
+/// alone; `update_view_form` then keeps whatever it left unchanged.
+struct ViewEdit {
+    title: String,
+    conditions: FoldedConditions,
+    sort_field: String,
+    sort_direction: ViewSortDirection,
+    columns: Vec<String>,
+    /// The columns are the ones the view picked for itself when the editor
+    /// opened, so it should go on picking them.
+    automatic_columns: bool,
+    layout: ViewLayout,
+    group_by: Option<String>,
+    page_size: usize,
+}
+
+fn submitted_view_edit(form: &HtmlViewEditForm) -> ApiResult<ViewEdit> {
+    let invalid = |message: &str| ApiError::bad_request("invalid_form", message);
+    let title = form.title.trim();
+    if title.is_empty() {
+        return Err(invalid("give the view a title"));
+    }
+    let (filter_match, expressions) = match submitted_filter_group(
+        form.filter_match,
+        &form.filter_field,
+        &form.filter_operator,
+        &form.filter_value,
+    )? {
+        Some(group) => (group.match_mode.into(), group.expressions),
+        None => (ViewFilterMatch::All, Vec::new()),
+    };
+    let groups = form
+        .keep_group
+        .iter()
+        .map(|group| {
+            serde_json::from_str::<ViewFilterGroup>(group)
+                .map(canonical_group)
+                .map_err(|error| invalid(&format!("a kept filter group is not valid: {error}")))
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    let sort_field = form.sort_field.trim();
+    if sort_field.is_empty() {
+        return Err(invalid("choose a field to sort by"));
+    }
+    let layout = form.layout.unwrap_or_default();
+    let group_by = match layout {
+        ViewLayout::Table => None,
+        ViewLayout::Kanban => Some(
+            form.group_by
+                .as_deref()
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .ok_or_else(|| invalid("choose a field to group the Kanban board by"))?
+                .to_owned(),
+        ),
+    };
+    let page_size = form
+        .page_size
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|size| (1..=crate::views::MAX_VIEW_PAGE_SIZE).contains(size))
+        .ok_or_else(|| {
+            invalid(&format!(
+                "rows per page must be a whole number from 1 to {}",
+                crate::views::MAX_VIEW_PAGE_SIZE
+            ))
+        })?;
+    let mut distinct = BTreeSet::new();
+    if let Some(column) = form.column.iter().find(|column| !distinct.insert(*column)) {
+        return Err(invalid(&format!(
+            "column '{column}' cannot be selected more than once"
+        )));
+    }
+    if form.column.len() > MAX_VIEW_COLUMNS {
+        return Err(invalid(&format!(
+            "a view can show at most {MAX_VIEW_COLUMNS} columns"
+        )));
+    }
+    let automatic_columns = !form.automatic_column.is_empty()
+        && distinct == form.automatic_column.iter().collect::<BTreeSet<_>>();
+    Ok(ViewEdit {
+        title: title.to_owned(),
+        conditions: FoldedConditions {
+            // One condition matches the same under either word.
+            filter_match: if expressions.len() > 1 {
+                filter_match
+            } else {
+                ViewFilterMatch::All
+            },
+            expressions,
+            groups,
+        },
+        sort_field: sort_field.to_owned(),
+        sort_direction: form.sort_direction,
+        columns: form.column.clone(),
+        automatic_columns,
+        layout,
+        group_by,
+        page_size,
+    })
+}
+
+/// The saved-view editor: a page, like a record's, holding every setting of
+/// the definition, with deleting the view kept apart below it.
+///
+/// The filter builder is the filter panel's own — the same rows, the same
+/// `data-filter-builder` enhancement, the same sentences — so a condition is
+/// written the same way whether it narrows a page or defines a view.
+fn render_view_editor(
+    representation: &Representation,
+    context: &ViewEditorContext,
+    draft: &ViewDraft,
+    ui: Option<&UiContext>,
+    csrf_token: &str,
+    error: Option<&PublicError>,
+) -> Markup {
+    let view = &context.view;
+    let schema = context.schema.as_ref();
+    let view_url = format!("/{}", encode_segment(&view.name));
+    let available = view_available_columns(view, &context.records, schema);
+    let filter_fields = view_filter_fields(schema, &available);
+    let title_field = view_title_field(schema, &context.records);
+    let mut rows = draft.conditions.clone();
+    if rows.is_empty() {
+        rows.push((String::new(), ViewFilterOperator::default(), String::new()));
+    }
+    let mut sort_options = vec![
+        ("$created_at".to_owned(), "Created".to_owned()),
+        ("$updated_at".to_owned(), "Updated".to_owned()),
+        ("$id".to_owned(), "Record ID".to_owned()),
+    ];
+    sort_options.extend(
+        filter_fields
+            .iter()
+            .map(|field| (field.key.clone(), field.label.clone())),
+    );
+    if !sort_options.iter().any(|(key, _)| *key == draft.sort_field) {
+        sort_options.push((
+            draft.sort_field.clone(),
+            format!("{} (custom)", draft.sort_field),
+        ));
+    }
+    let mut column_options = available
+        .iter()
+        .filter(|column| Some(column.as_str()) != title_field)
+        .collect::<Vec<_>>();
+    for column in &draft.columns {
+        if !column_options.contains(&column) && Some(column.as_str()) != title_field {
+            column_options.push(column);
+        }
+    }
+    page_or_content(
+        representation,
+        &format!("Edit {}", view.title),
+        &view_url,
+        &context.navigation,
+        html! {
+            (page_bar(
+                &[
+                    ("/".to_owned(), None, "Views"),
+                    (view_url.clone(), Some(view_icon(view)), &view.title),
+                ],
+                None,
+                "Edit view",
+                html! {
+                    span class="cr-page-meta" {
+                        "Saved view of " code class="font-mono text-gray-700" { (&view.collection) }
+                        span class="mx-1.5 text-gray-300" aria-hidden="true" { "·" }
+                        code class="font-mono text-gray-700" { (&view_url) }
+                    }
+                },
+                html! {},
+            ))
+            // Native rather than boosted, as "Save as view" is: a refusal is
+            // this page again with an alert, which htmx would not swap into a
+            // boosted `POST`.
+            form method="post" action=(view_edit_path(view)) hx-boost=(UNBOOSTED)
+                data-filter-builder="true" data-max-filters=(MAX_VIEW_FILTERS) data-view-editor="true"
+                class="cr-view-editor" {
+                input type="hidden" name="_csrf" value=(csrf_token);
+                @if let Some(error) = error {
+                    div role="alert" class="cr-form-alert rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" {
+                        p class="font-semibold" { "The view was not saved." }
+                        p class="mt-1 whitespace-pre-line" { (&error.message) }
+                        p class="mt-2 text-xs text-red-700" { "Its definition is unchanged. The form below holds what you submitted. Request ID " (&error.request_id) }
+                    }
+                }
+                section class="cr-filter-section" {
+                    div class="cr-filter-section-head" {
+                        h2 { label for="cr-view-title" { "Title" } }
+                    }
+                    input id="cr-view-title" name="title" value=(&draft.title) required autocomplete="off" class="cr-input";
+                }
+                section class="cr-filter-section" aria-labelledby="cr-view-filters-heading" {
+                    div class="cr-filter-section-head" {
+                        h2 id="cr-view-filters-heading" { "Filters" }
+                        div class="cr-filter-match" {
+                            span id="cr-view-match-label" { "Match" }
+                            div role="radiogroup" aria-labelledby="cr-view-match-label" class="cr-choice-row cr-choice-row-small" {
+                                label class="cr-choice-option" {
+                                    input type="radio" name="filter_match" value="all" checked[draft.filter_match == ViewFilterMatch::All];
+                                    "All"
+                                }
+                                label class="cr-choice-option" {
+                                    input type="radio" name="filter_match" value="any" checked[draft.filter_match == ViewFilterMatch::Any];
+                                    "Any"
+                                }
+                            }
+                        }
+                    }
+                    div data-filter-list="true" class="cr-filter-list" {
+                        @for (index, (field, operator, value)) in rows.iter().enumerate() {
+                            (render_filter_row(&filter_fields, index, field, *operator, value))
+                        }
+                    }
+                    template data-filter-template="true" {
+                        (render_filter_row(&filter_fields, 0, "", ViewFilterOperator::default(), ""))
+                    }
+                    button type="button" data-add-filter="true" class="cr-filter-add" { "+ Add filter" }
+                    @if !draft.groups.is_empty() {
+                        div class="cr-view-editor-groups" data-view-groups=(draft.groups.len()) {
+                            p class="cr-field-label" { "Also required" }
+                            @for group in &draft.groups {
+                                @let text = expression_rows(&group.expressions)
+                                    .iter()
+                                    .map(|(field, operator, value)| describe_condition(schema, field, *operator, value))
+                                    .collect::<Vec<_>>()
+                                    .join(" or ");
+                                label class="cr-checkbox-option" {
+                                    input type="checkbox" name="keep_group" value=(serde_json::to_string(group).expect("filter groups are JSON serializable")) checked;
+                                    span { "Any of: " (text) }
+                                }
+                            }
+                            p class="cr-field-help" { "Each of these matches when any one of its conditions does. Uncheck one to remove it." }
+                        }
+                    }
+                    p class="cr-field-help" { "Every record in the view meets these conditions. Filters applied on the view's page narrow it further without changing it." }
+                }
+                section class="cr-filter-section" {
+                    div class="cr-filter-section-head" {
+                        h2 id="cr-view-sort-heading" { "Sort" }
+                    }
+                    div class="cr-sort-row" {
+                        select name="sort_field" aria-labelledby="cr-view-sort-heading" class="cr-input" {
+                            @for (key, label) in &sort_options {
+                                option value=(key) selected[*key == draft.sort_field] { (label) }
+                            }
+                        }
+                        div role="radiogroup" aria-label="Sort direction" class="cr-choice-row" {
+                            label class="cr-choice-option" {
+                                input type="radio" name="sort_direction" value="asc" checked[draft.sort_direction == ViewSortDirection::Asc];
+                                "Ascending"
+                            }
+                            label class="cr-choice-option" {
+                                input type="radio" name="sort_direction" value="desc" checked[draft.sort_direction == ViewSortDirection::Desc];
+                                "Descending"
+                            }
+                        }
+                    }
+                }
+                section class="cr-filter-section" {
+                    div class="cr-filter-section-head" {
+                        h2 id="cr-view-columns-heading" { "Columns" }
+                    }
+                    // The title field heads every row and card whatever is
+                    // chosen, so like the filter panel this does not offer it,
+                    // but a view that names it keeps it.
+                    @for column in draft.columns.iter().filter(|column| Some(column.as_str()) == title_field) {
+                        input type="hidden" name="column" value=(column);
+                    }
+                    @for column in &draft.automatic_columns {
+                        input type="hidden" name="automatic_column" value=(column);
+                    }
+                    div role="group" aria-labelledby="cr-view-columns-heading" class="cr-checkbox-row" {
+                        @for column in column_options {
+                            label class="cr-checkbox-option" title=(column) {
+                                input type="checkbox" name="column" value=(column) checked[draft.columns.contains(column)];
+                                span { (field_label(schema, column)) }
+                            }
+                        }
+                    }
+                    p class="cr-field-help" { "Shown in the table, or on Kanban cards. With none chosen, the view picks for itself." }
+                }
+                section class="cr-filter-section" {
+                    div class="cr-view-editor-grid" {
+                        label class="cr-field" {
+                            span class="cr-field-label" { "Layout" }
+                            select name="layout" data-view-layout="true" class="cr-input" {
+                                option value="table" selected[draft.layout == ViewLayout::Table] { "Table" }
+                                option value="kanban" selected[draft.layout == ViewLayout::Kanban] { "Kanban" }
+                            }
+                        }
+                        label class="cr-field" {
+                            span class="cr-field-label" { "Group Kanban by" }
+                            select name="group_by" data-view-group-by="true" class="cr-input" {
+                                option value="" selected[draft.group_by.is_none()] { "Choose a field…" }
+                                @for column in &available {
+                                    option value=(column) selected[draft.group_by.as_deref() == Some(column.as_str())] { (field_label(schema, column)) }
+                                }
+                                @if let Some(group_by) = draft.group_by.as_deref().filter(|field| !available.iter().any(|column| column == field)) {
+                                    option value=(group_by) selected { (group_by) " (custom)" }
+                                }
+                            }
+                        }
+                        label class="cr-field" {
+                            span class="cr-field-label" { "Rows per page" }
+                            input type="number" name="page_size" value=(&draft.page_size) min="1" max=(crate::views::MAX_VIEW_PAGE_SIZE) step="1" required class="cr-input";
+                        }
+                    }
+                }
+                div class="cr-view-editor-footer" {
+                    a href=(&view_url) class="cr-button" { "Cancel" }
+                    button type="submit" class="cr-button cr-button-primary" { "Save changes" }
+                }
+            }
+            div class="cr-view-editor-danger cr-record-danger rounded-xl border border-red-200 bg-red-50 p-5" {
+                h2 class="text-sm font-semibold text-red-900" { "Delete this view" }
+                p class="mt-1 text-sm text-red-800" { "Removes the view from the sidebar and its route. The records it shows are not touched." }
+                a href=(view_delete_path(view)) class="mt-3 inline-flex rounded-lg border border-red-300 bg-white px-3 py-1.5 text-sm font-semibold text-red-700 hover:bg-red-100" { "Delete view…" }
+            }
+        },
+        ui,
+        csrf_token,
+    )
+}
+
+/// Asked before a saved view is deleted, as a record's deletion is.
+fn render_view_delete_confirmation(
+    representation: &Representation,
+    view: &ViewDefinition,
+    navigation: &[ViewDefinition],
+    ui: Option<&UiContext>,
+    csrf_token: &str,
+) -> Markup {
+    let view_url = format!("/{}", encode_segment(&view.name));
+    let edit_url = view_edit_path(view);
+    page_or_content(
+        representation,
+        &format!("Delete {}", view.title),
+        &view_url,
+        navigation,
+        html! {
+            (page_bar(
+                &[
+                    ("/".to_owned(), None, "Views"),
+                    (view_url.clone(), Some(view_icon(view)), &view.title),
+                    (edit_url.clone(), None, "Edit view"),
+                ],
+                None,
+                "Delete",
+                html! {},
+                html! {},
+            ))
+            div class="mx-auto max-w-2xl" {
+                div class="cr-record-danger rounded-xl border border-red-200 bg-red-50 p-6" {
+                    h2 class="text-lg font-semibold text-red-900" { "Delete this view?" }
+                    p class="mt-2 text-sm text-red-800" {
+                        "You are about to delete the saved view "
+                        strong { (&view.title) }
+                        " ("
+                        code class="cr-filter-tag" { (&view_url) }
+                        ")."
+                    }
+                    p class="mt-2 text-sm text-red-700" {
+                        "Only its definition, "
+                        code class="cr-filter-tag" { ".cr/views/" (&view.name) ".yaml" }
+                        ", is removed. Every record in "
+                        code class="cr-filter-tag" { (&view.collection) }
+                        " stays as it is"
+                        @if view.name == view.collection {
+                            ", and " code class="cr-filter-tag" { (&view_url) } " goes back to showing all of them"
+                        }
+                        "."
+                    }
+                    form method="post" action=(view_delete_path(view)) hx-boost=(UNBOOSTED) class="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center" {
+                        input type="hidden" name="_csrf" value=(csrf_token);
+                        button type="submit" class="rounded-lg border border-red-300 bg-red-700 px-4 py-2 text-sm font-semibold text-white hover:bg-red-800" { "Delete view" }
+                        a href=(&edit_url) class="cr-button" { "Cancel" }
+                    }
+                }
+            }
+        },
+        ui,
+        csrf_token,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12013,7 +13009,7 @@ a.cr-field-open:hover { color: var(--cr-accent); }
 
 /* All or Any, which only means something once there are two conditions. */
 .cr-filter-match { display: flex; align-items: center; gap: 8px; margin-left: auto; color: var(--cr-gray-500); font-size: 0.75rem; font-weight: 550; }
-.cr-filter-popover:not(:has(.cr-filter-row + .cr-filter-row)) .cr-filter-match { display: none; }
+:is(.cr-filter-popover, .cr-view-editor):not(:has(.cr-filter-row + .cr-filter-row)) .cr-filter-match { display: none; }
 .cr-filter-popover .cr-choice-row-small { min-height: 28px; }
 .cr-choice-row-small .cr-choice-option { padding: 2px 10px; font-size: 0.75rem; }
 
@@ -12035,8 +13031,8 @@ a.cr-field-open:hover { color: var(--cr-accent); }
 .cr-filter-join > span { display: none; }
 .cr-filter-row:first-child .cr-filter-join-where,
 .cr-filter-row:not(:first-child) .cr-filter-join-all { display: inline; }
-.cr-filter-popover:has([name="filter_match"][value="any"]:checked) .cr-filter-row:not(:first-child) .cr-filter-join-all { display: none; }
-.cr-filter-popover:has([name="filter_match"][value="any"]:checked) .cr-filter-row:not(:first-child) .cr-filter-join-any { display: inline; }
+:is(.cr-filter-popover, .cr-view-editor):has([name="filter_match"][value="any"]:checked) .cr-filter-row:not(:first-child) .cr-filter-join-all { display: none; }
+:is(.cr-filter-popover, .cr-view-editor):has([name="filter_match"][value="any"]:checked) .cr-filter-row:not(:first-child) .cr-filter-join-any { display: inline; }
 
 /* Until a field is chosen there is nothing to compare, so a new row is just
    "Where Choose a field…", and the only row has nothing to remove. */
@@ -12098,6 +13094,20 @@ a.cr-field-open:hover { color: var(--cr-accent); }
 .cr-filter-columns > summary:hover h2 { color: var(--cr-accent); }
 .cr-filter-columns .cr-checkbox-option { min-height: 30px; max-width: 100%; padding: 3px 10px 3px 8px; font-size: 0.77rem; }
 .cr-filter-columns .cr-checkbox-option > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* The saved-view editor: the filter panel's sections laid out as a page,
+   with its own width for the rows to lay out by. */
+.cr-view-editor { max-width: 48rem; margin: 0 auto; container-type: inline-size; }
+.cr-view-editor .cr-choice-row-small { min-height: 28px; }
+.cr-view-editor-groups { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; margin-top: 14px; }
+.cr-view-editor-groups .cr-checkbox-option { max-width: 100%; }
+.cr-view-editor .cr-filter-section > .cr-field-help { margin-top: 8px; }
+.cr-view-editor-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+@container (max-width: 32rem) {
+  .cr-view-editor-grid { grid-template-columns: minmax(0, 1fr); }
+}
+.cr-view-editor-footer { display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--cr-gray-200); padding-top: 16px; }
+.cr-view-editor-danger { max-width: 48rem; margin: 32px auto 0; }
 
 .cr-filter-footer {
   display: flex;
@@ -12544,6 +13554,20 @@ const VIEW_COUNT_ID: &str = "cr-view-count";
 /// out-of-band element whose target does not exist is dropped, which would make
 /// "two filters" recoverable and "no filters" not.
 const VIEW_FILTER_SUMMARY_ID: &str = "cr-view-filter-summary";
+
+/// The DOM id of the hidden inputs inside "Save as view" that carry the page's
+/// current filters, sort and columns into the new definition.
+///
+/// A passenger of every results swap for the reason the filter summary is: an
+/// apply, a re-sort or a column change alters what the page shows while
+/// leaving the heading, and the save form in it, alone. Without the patch the
+/// form kept the state the page was *loaded* with, so filtering and then
+/// saving wrote a view of everything.
+const VIEW_SAVE_STATE_ID: &str = "cr-view-save-state";
+
+/// The DOM id of a saved view's "Edit view" link, which opens the editor on
+/// the page as the reader is looking at it and so changes with every swap.
+const VIEW_EDIT_LINK_ID: &str = "cr-view-edit";
 
 /// The DOM id of the record create and edit form.
 ///
@@ -13462,32 +14486,30 @@ fn view_filter_expressions(query: &ViewQuery) -> ApiResult<Vec<FilterExpression>
         .collect()
 }
 
-fn save_view_filter_group(form: &HtmlSaveViewForm) -> ApiResult<Option<ViewFilterGroup>> {
+/// The conditions a form submitted, as the filter group a saved view stores,
+/// or `None` when every row was left blank.
+fn submitted_filter_group(
+    filter_match: ViewFilterMatch,
+    fields: &[String],
+    operators: &[ViewFilterOperator],
+    values: &[String],
+) -> ApiResult<Option<ViewFilterGroup>> {
     let query = ViewQuery {
-        filter_match: form.filter_match,
-        filter_field: form.filter_field.clone(),
-        filter_operator: form.filter_operator.clone(),
-        filter_value: form.filter_value.clone(),
+        filter_match,
+        filter_field: fields.to_vec(),
+        filter_operator: operators.to_vec(),
+        filter_value: values.to_vec(),
         ..ViewQuery::default()
     };
     view_filter_expressions(&query)?;
 
     let mut expressions = Vec::new();
-    for (index, (field, value)) in form.filter_field.iter().zip(&form.filter_value).enumerate() {
+    for (index, (field, value)) in fields.iter().zip(values).enumerate() {
         if field.is_empty() && value.is_empty() {
             continue;
         }
-        let operator = form.filter_operator.get(index).copied().unwrap_or_default();
-        let expression = if operator.requires_value() {
-            format!(
-                "{}{}{}",
-                field.trim(),
-                operator.expression_token(),
-                value.trim()
-            )
-        } else {
-            format!("{}{}", field.trim(), operator.expression_token())
-        };
+        let operator = operators.get(index).copied().unwrap_or_default();
+        let expression = filter_expression_text(field, operator, value);
         FilterExpression::from_str(&expression).map_err(ApiError::from_domain)?;
         expressions.push(expression);
     }
@@ -13496,12 +14518,23 @@ fn save_view_filter_group(form: &HtmlSaveViewForm) -> ApiResult<Option<ViewFilte
         Ok(None)
     } else {
         Ok(Some(ViewFilterGroup {
-            match_mode: match form.filter_match {
-                ViewFilterMatch::All => ViewPredicateMatch::All,
-                ViewFilterMatch::Any => ViewPredicateMatch::Any,
-            },
+            match_mode: filter_match.into(),
             expressions,
         }))
+    }
+}
+
+/// A condition as the text a saved view stores it in, such as `value>=10000`.
+fn filter_expression_text(field: &str, operator: ViewFilterOperator, value: &str) -> String {
+    if operator.requires_value() {
+        format!(
+            "{}{}{}",
+            field.trim(),
+            operator.expression_token(),
+            value.trim()
+        )
+    } else {
+        format!("{}{}", field.trim(), operator.expression_token())
     }
 }
 
@@ -13778,6 +14811,16 @@ fn view_page_url(
     limit: usize,
     position: ViewPosition<'_>,
 ) -> String {
+    format!(
+        "/{}?{}",
+        encode_segment(&view.name),
+        view_query_string(query, limit, position)
+    )
+}
+
+/// The query string of a view page, shared by the page's own links and the
+/// link that opens its editor.
+fn view_query_string(query: &ViewQuery, limit: usize, position: ViewPosition<'_>) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     if let Some(q) = query.q.as_deref().filter(|value| !value.is_empty()) {
         serializer.append_pair("q", q);
@@ -13832,7 +14875,7 @@ fn view_page_url(
             serializer.append_pair("offset", &offset.to_string());
         }
     }
-    format!("/{}?{}", encode_segment(&view.name), serializer.finish())
+    serializer.finish()
 }
 
 fn view_sort_url(view: &ViewDefinition, query: &ViewQuery, field: &str, limit: usize) -> String {

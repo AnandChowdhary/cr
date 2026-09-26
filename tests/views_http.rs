@@ -4447,3 +4447,444 @@ async fn unclassified_html_failures_stay_generic() {
     assert!(!text.contains(&root), "leaked the database root");
     assert!(!text.contains("truncated tail"), "leaked internal context");
 }
+
+/// Deals to edit views over: two open, one won, with values to compare.
+fn database_for_view_editing(name: &str) -> (TempDir, Database) {
+    let (temporary, database) = test_database(name);
+    for (id, status, value) in [
+        ("alpha", "open", "12000"),
+        ("beta", "open", "8000"),
+        ("gamma", "won", "30000"),
+    ] {
+        database
+            .create(
+                "deals",
+                id,
+                &[
+                    Assignment::from_str(&format!("name={id}")).unwrap(),
+                    Assignment::from_str(&format!("status={status}")).unwrap(),
+                    Assignment::from_str(&format!("value={value}")).unwrap(),
+                ],
+                "",
+            )
+            .unwrap();
+    }
+    (temporary, database)
+}
+
+#[tokio::test]
+async fn a_saved_view_is_edited_in_place_from_the_page_as_it_is_shown() {
+    let (_temporary, database) = database_for_view_editing("views-edit");
+    database
+        .create_view(
+            "open-deals",
+            Some("Open deals"),
+            "deals",
+            vec!["status=open".into()],
+            vec!["name".into(), "value".into()],
+            25,
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    // Only a saved view offers "Edit view", and the link carries the page's
+    // own conditions so the editor starts from what is on screen.
+    let automatic = request(&app, Method::GET, "/deals", None, &[]).await;
+    assert!(!automatic.text().contains("id=\"cr-view-edit\""));
+    assert_eq!(
+        request(&app, Method::GET, "/deals/edit", None, &[])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    let page = request(
+        &app,
+        Method::GET,
+        "/open-deals?filter_match=all&filter_field=value&filter_operator=gte&filter_value=10000",
+        None,
+        &[],
+    )
+    .await;
+    assert!(page.text().contains(
+        "id=\"cr-view-edit\" href=\"/open-deals/edit?filter_match=all&amp;filter_field=value&amp;filter_operator=gte&amp;filter_value=10000"
+    ));
+
+    // The editor folds the view's filter and the page's into one list.
+    let editor = request(
+        &app,
+        Method::GET,
+        "/open-deals/edit?filter_match=all&filter_field=value&filter_operator=gte&filter_value=10000",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(editor.status, StatusCode::OK);
+    assert!(
+        editor
+            .text()
+            .contains("name=\"title\" value=\"Open deals\"")
+    );
+    let conditions = editor
+        .text()
+        .split_once("data-filter-list")
+        .unwrap()
+        .1
+        .split_once("data-filter-template")
+        .unwrap()
+        .0;
+    assert_eq!(conditions.matches("data-filter-row").count(), 2);
+    assert!(conditions.contains("value=\"status\" selected"));
+    assert!(conditions.contains("value=\"value\" selected"));
+    assert!(conditions.contains("value=\"10000\""));
+    assert!(editor.text().contains("href=\"/open-deals/delete\""));
+
+    // Saving replaces the definition under the same name and route.
+    let token = csrf(editor.text()).to_owned();
+    let saved = request(
+        &app,
+        Method::POST,
+        "/open-deals/edit",
+        Some(form(&[
+            ("_csrf", &token),
+            ("title", "Won big deals"),
+            ("filter_match", "all"),
+            ("filter_field", "status"),
+            ("filter_operator", "eq"),
+            ("filter_value", "won"),
+            ("filter_field", "value"),
+            ("filter_operator", "gte"),
+            ("filter_value", "10000"),
+            ("sort_field", "value"),
+            ("sort_direction", "desc"),
+            ("column", "value"),
+            ("layout", "table"),
+            ("page_size", "50"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        saved.headers[header::LOCATION],
+        "/open-deals?notice=View+updated"
+    );
+    let view = database.view("open-deals").unwrap();
+    assert_eq!(view.title, "Won big deals");
+    assert!(view.filters.is_empty());
+    assert_eq!(view.filter_groups.len(), 1);
+    assert_eq!(
+        view.filter_groups[0].expressions,
+        ["status=won", "value>=10000"]
+    );
+    assert_eq!(view.sort_by.as_deref(), Some("value"));
+    assert_eq!(view.sort_direction, cr::SortDirection::Desc);
+    assert_eq!(view.columns, ["value"]);
+    assert_eq!(view.page_size, 50);
+    let shown = request(&app, Method::GET, "/open-deals", None, &[]).await;
+    assert!(shown.text().contains("/open-deals/records/gamma"));
+    assert!(!shown.text().contains("/open-deals/records/alpha"));
+
+    // A stale or forged token changes nothing.
+    let forged = request(
+        &app,
+        Method::POST,
+        "/open-deals/edit",
+        Some(form(&[
+            ("_csrf", "wrong"),
+            ("title", "Forged"),
+            ("sort_field", "$id"),
+            ("page_size", "25"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    assert_eq!(database.view("open-deals").unwrap().title, "Won big deals");
+}
+
+#[tokio::test]
+async fn editing_only_a_title_leaves_a_hand_written_definition_as_it_was() {
+    let (_temporary, database) = database_for_view_editing("views-edit-title");
+    database
+        .create_view_with_options(
+            "big-open",
+            Some("Big open deals"),
+            "deals",
+            vec!["status=open".into()],
+            vec!["value >= 10000".into()],
+            vec![],
+            vec![],
+            25,
+            ViewLayout::Table,
+            None,
+            None,
+            cr::SortDirection::Asc,
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    // Opened from a page whose filter panel was applied, whose links spell out
+    // the default sort, columns and page size as if they were choices.
+    let editor = request(
+        &app,
+        Method::GET,
+        "/big-open/edit?filter_match=all&sort_field=%24created_at&sort_direction=desc&columns=custom&column=status&column=value&limit=25",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(editor.status, StatusCode::OK);
+    assert!(editor.text().contains("name=\"page_size\" value=\"25\""));
+    // What the form would submit untouched, with a new title.
+    let automatic_columns = editor
+        .text()
+        .split("name=\"automatic_column\" value=\"")
+        .skip(1)
+        .map(|rest| rest.split_once('"').unwrap().0.to_owned())
+        .collect::<Vec<_>>();
+    assert!(!automatic_columns.is_empty());
+    let token = csrf(editor.text()).to_owned();
+    let mut pairs = vec![
+        ("_csrf", token.as_str()),
+        ("title", "Large open deals"),
+        ("filter_match", "all"),
+        ("filter_field", "status"),
+        ("filter_operator", "eq"),
+        ("filter_value", "open"),
+        ("filter_field", "value"),
+        ("filter_operator", "gte"),
+        ("filter_value", "10000"),
+        ("sort_field", "$created_at"),
+        ("sort_direction", "desc"),
+        ("layout", "table"),
+        ("page_size", "25"),
+    ];
+    for column in &automatic_columns {
+        pairs.push(("column", column));
+        pairs.push(("automatic_column", column));
+    }
+    let saved = request(
+        &app,
+        Method::POST,
+        "/big-open/edit",
+        Some(form(&pairs)),
+        &[],
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    let view = database.view("big-open").unwrap();
+    assert_eq!(view.title, "Large open deals");
+    assert_eq!(view.filters, ["status=open"]);
+    assert_eq!(view.where_expr, ["value >= 10000"]);
+    assert!(view.filter_groups.is_empty());
+    assert_eq!(view.sort_by, None);
+    assert!(view.columns.is_empty());
+}
+
+#[tokio::test]
+async fn an_any_group_the_list_cannot_hold_is_kept_or_removed_whole() {
+    let (_temporary, database) = database_for_view_editing("views-edit-groups");
+    database
+        .create_view_with_options(
+            "focus",
+            Some("Focus"),
+            "deals",
+            vec!["status=open".into()],
+            vec![],
+            vec![cr::ViewFilterGroup {
+                match_mode: ViewPredicateMatch::Any,
+                expressions: vec!["value>=10000".into(), "name=beta".into()],
+            }],
+            vec![],
+            25,
+            ViewLayout::Table,
+            None,
+            None,
+            cr::SortDirection::Asc,
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let editor = request(&app, Method::GET, "/focus/edit", None, &[]).await;
+    assert!(editor.text().contains("Also required"));
+    assert!(
+        editor
+            .text()
+            .contains("Any of: Value is at least 10000 or Name is beta")
+    );
+    let group = editor
+        .text()
+        .split_once("name=\"keep_group\" value=\"")
+        .unwrap()
+        .1
+        .split_once('"')
+        .unwrap()
+        .0
+        .replace("&quot;", "\"")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&");
+    let token = csrf(editor.text()).to_owned();
+    let submit = |keep: bool| {
+        let mut pairs = vec![
+            ("_csrf", token.as_str()),
+            ("title", "Focus"),
+            ("filter_match", "all"),
+            ("filter_field", "status"),
+            ("filter_operator", "eq"),
+            ("filter_value", "open"),
+            ("sort_field", "$created_at"),
+            ("sort_direction", "desc"),
+            ("layout", "table"),
+            ("page_size", "25"),
+        ];
+        if keep {
+            pairs.push(("keep_group", group.as_str()));
+        }
+        form(&pairs)
+    };
+
+    // Kept as it was, the definition is untouched.
+    let kept = request(&app, Method::POST, "/focus/edit", Some(submit(true)), &[]).await;
+    assert_eq!(kept.status, StatusCode::SEE_OTHER);
+    let view = database.view("focus").unwrap();
+    assert_eq!(view.filters, ["status=open"]);
+    assert_eq!(view.filter_groups.len(), 1);
+
+    // Unchecked, it is gone and what is left is the one list.
+    let removed = request(&app, Method::POST, "/focus/edit", Some(submit(false)), &[]).await;
+    assert_eq!(removed.status, StatusCode::SEE_OTHER);
+    let view = database.view("focus").unwrap();
+    assert!(view.filters.is_empty());
+    assert_eq!(view.filter_groups.len(), 1);
+    assert_eq!(view.filter_groups[0].match_mode, ViewPredicateMatch::All);
+    assert_eq!(view.filter_groups[0].expressions, ["status=open"]);
+}
+
+#[tokio::test]
+async fn a_refused_edit_returns_the_form_as_it_was_typed() {
+    let (_temporary, database) = database_for_view_editing("views-edit-refused");
+    database
+        .create_view(
+            "open-deals",
+            Some("Open deals"),
+            "deals",
+            vec![],
+            vec![],
+            25,
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let editor = request(&app, Method::GET, "/open-deals/edit", None, &[]).await;
+    let token = csrf(editor.text()).to_owned();
+    for (pairs, message) in [
+        (
+            vec![
+                ("title", "Renamed"),
+                ("sort_field", "$id"),
+                ("page_size", "5000"),
+            ],
+            "rows per page must be a whole number from 1 to 1000",
+        ),
+        (
+            vec![("title", "  "), ("sort_field", "$id"), ("page_size", "25")],
+            "give the view a title",
+        ),
+        (
+            vec![
+                ("title", "Renamed"),
+                ("sort_field", "$id"),
+                ("page_size", "25"),
+                ("layout", "kanban"),
+            ],
+            "choose a field to group the Kanban board by",
+        ),
+    ] {
+        let mut body = vec![("_csrf", token.as_str())];
+        body.extend(pairs.iter().copied());
+        let refused = request(
+            &app,
+            Method::POST,
+            "/open-deals/edit",
+            Some(form(&body)),
+            &[],
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{message}");
+        assert!(refused.text().contains("role=\"alert\""));
+        assert!(refused.text().contains(message), "{}", refused.text());
+        let (_, value) = pairs.iter().find(|(name, _)| *name == "title").unwrap();
+        assert!(
+            refused
+                .text()
+                .contains(&format!("name=\"title\" value=\"{value}\""))
+        );
+    }
+    assert_eq!(database.view("open-deals").unwrap().title, "Open deals");
+}
+
+#[tokio::test]
+async fn deleting_a_saved_view_asks_first_and_leaves_the_records() {
+    let (_temporary, database) = database_for_view_editing("views-delete");
+    database
+        .create_view(
+            "won",
+            Some("Won deals"),
+            "deals",
+            vec!["status=won".into()],
+            vec![],
+            25,
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    let confirmation = request(&app, Method::GET, "/won/delete", None, &[]).await;
+    assert_eq!(confirmation.status, StatusCode::OK);
+    assert!(confirmation.text().contains("Delete this view?"));
+    assert!(confirmation.text().contains(".cr/views/won.yaml"));
+    let token = csrf(confirmation.text()).to_owned();
+
+    let forged = request(
+        &app,
+        Method::POST,
+        "/won/delete",
+        Some(form(&[("_csrf", "wrong")])),
+        &[],
+    )
+    .await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    assert!(database.view("won").is_ok());
+
+    let deleted = request(
+        &app,
+        Method::POST,
+        "/won/delete",
+        Some(form(&[("_csrf", &token)])),
+        &[],
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        deleted.headers[header::LOCATION],
+        "/deals?notice=View+deleted"
+    );
+    assert!(database.view("won").is_err());
+    assert!(!database.root().join(".cr/views/won.yaml").exists());
+    assert_eq!(database.list("deals", &[]).unwrap().len(), 3);
+    assert_eq!(
+        request(&app, Method::GET, "/won", None, &[]).await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    // A collection's own view is not a definition, so there is nothing to
+    // delete, and deleting twice finds nothing the second time.
+    for uri in ["/deals/delete", "/won/delete"] {
+        let missing = request(
+            &app,
+            Method::POST,
+            uri,
+            Some(form(&[("_csrf", &token)])),
+            &[],
+        )
+        .await;
+        assert_eq!(missing.status, StatusCode::NOT_FOUND, "{uri}");
+    }
+}

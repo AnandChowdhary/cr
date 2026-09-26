@@ -111,6 +111,43 @@ fn saved_views_are_file_backed_and_override_automatic_collection_pages() {
 }
 
 #[test]
+fn deleting_a_saved_view_removes_its_file_and_gives_the_route_back() {
+    let database = TestDatabase::new("views-cli-delete");
+    run_success(
+        database
+            .command()
+            .args(["create", "deals", "acme", "--set", "status=open"]),
+    );
+    run_success(database.command().args([
+        "view",
+        "create",
+        "deals",
+        "--collection",
+        "deals",
+        "--title",
+        "Open deals",
+        "--where",
+        "status=open",
+    ]));
+
+    assert_eq!(
+        run_success(database.command().args(["view", "delete", "deals"])),
+        "Deleted view /deals\n"
+    );
+    assert!(!database.root.join(".cr/views/deals.yaml").exists());
+    assert!(database.root.join("records/deals/acme.md").exists());
+    // The collection's own view has the route again, and it is not a
+    // definition that can be deleted.
+    let automatic: Value = serde_json::from_str(&run_success(
+        database.command().args(["view", "show", "deals", "--json"]),
+    ))
+    .unwrap();
+    assert_eq!(automatic["saved"], false);
+    let missing = run_failure(database.command().args(["view", "delete", "deals"]));
+    assert!(missing.contains("view 'deals' does not exist"));
+}
+
+#[test]
 fn view_cli_rejects_invalid_duplicate_reserved_and_malformed_definitions() {
     let database = TestDatabase::new("views-cli-errors");
 
