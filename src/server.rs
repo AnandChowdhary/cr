@@ -98,6 +98,9 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'|')
     .add(b'}');
+/// What a redirect target may not carry into its header as written; see
+/// `location_header`. Non-ASCII bytes are always escaped, whatever the set.
+const LOCATION_ENCODE_SET: &AsciiSet = &CONTROLS.add(b' ');
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -2215,7 +2218,7 @@ async fn switch_perspective(State(state): State<AppState>, RawForm(raw): RawForm
         );
         let cookie = HeaderValue::from_str(&cookie)
             .map_err(|error| ApiError::bad_request("invalid_principal", error.to_string()))?;
-        let mut response = see_other("/")?;
+        let mut response = see_other("/");
         response.headers_mut().insert(header::SET_COOKIE, cookie);
         Ok(response)
     }
@@ -2686,7 +2689,7 @@ async fn save_file_form(
         };
         let region = file_panel_region(&path, &from);
         let Err(error) = saved else {
-            return see_other(&file_panel_url(&from, region));
+            return Ok(see_other(&file_panel_url(&from, region)));
         };
         let error = error.publish();
         let status = error.status;
@@ -2798,7 +2801,7 @@ async fn delete_file_form(
         .map_err(|error| {
             ApiError::internal(anyhow!(error).context("filesystem browser task failed"))
         })??;
-        see_other(&back)
+        Ok(see_other(&back))
     }
     .await;
     result.unwrap_or_else(html_error)
@@ -2858,7 +2861,7 @@ async fn change_pin(
         let back = browse_url(&form.from);
         let path = form.path;
         run_database(&state, &headers, move |database| change(database, &path)).await?;
-        see_other(&back)
+        Ok(see_other(&back))
     }
     .await;
     result.unwrap_or_else(html_error)
@@ -3516,7 +3519,7 @@ async fn save_view_form(
             )
         })
         .await?;
-        see_other(&notice_url(&saved.name, "View saved"))
+        Ok(see_other(&notice_url(&saved.name, "View saved")))
     }
     .await;
     result.unwrap_or_else(html_error)
@@ -3657,7 +3660,7 @@ async fn update_view_form(
             )
         })
         .await?;
-        see_other(&notice_url(&view_name, "View updated"))
+        Ok(see_other(&notice_url(&view_name, "View updated")))
     }
     .await;
     match result {
@@ -3747,7 +3750,7 @@ async fn delete_view_form(
             })
         })
         .await?;
-        see_other(&location)
+        Ok(see_other(&location))
     }
     .await;
     result.unwrap_or_else(html_error)
@@ -3912,10 +3915,10 @@ async fn create_record_form(
         })
         .await
         .map_err(taken_record_id)?;
-        mutation_redirect(
+        Ok(mutation_redirect(
             &Representation::requested(&headers),
             &notice_url(&view_name, "Record created"),
-        )
+        ))
     }
     .await;
     match result {
@@ -3991,10 +3994,10 @@ async fn update_record_form(
             )
         })
         .await?;
-        mutation_redirect(
+        Ok(mutation_redirect(
             &Representation::requested(&headers),
             &notice_url(&view_name, "Record updated"),
-        )
+        ))
     }
     .await;
     match result {
@@ -4290,7 +4293,7 @@ async fn change_relation_form(
             })
         })
         .await?;
-        see_other(&record_notice_url(&view_name, &id, &notice))
+        Ok(see_other(&record_notice_url(&view_name, &id, &notice)))
     }
     .await;
     result.unwrap_or_else(html_error)
@@ -4354,7 +4357,7 @@ async fn move_kanban_card(
             }
         })
         .await?;
-        see_other(&notice_url(&view_name, "Card moved"))
+        Ok(see_other(&notice_url(&view_name, "Card moved")))
     }
     .await;
     result.unwrap_or_else(html_error)
@@ -4430,7 +4433,7 @@ async fn delete_record_form(
             database.delete_conditionally(&view.collection, &id, Some(&precondition))
         })
         .await?;
-        see_other(&notice_url(&view_name, "Record deleted"))
+        Ok(see_other(&notice_url(&view_name, "Record deleted")))
     }
     .await;
     result.unwrap_or_else(html_error)
@@ -4675,11 +4678,9 @@ async fn create_record(
     })
     .await?;
     let mut response = api_record_response(StatusCode::CREATED, record)?;
-    response.headers_mut().insert(
-        header::LOCATION,
-        HeaderValue::from_str(&location)
-            .map_err(|error| ApiError::bad_request("invalid_location", error.to_string()))?,
-    );
+    response
+        .headers_mut()
+        .insert(header::LOCATION, location_header(&location));
     Ok(response)
 }
 
@@ -15446,10 +15447,27 @@ fn hexadecimal(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn see_other(location: &str) -> ApiResult<Response> {
-    let location = HeaderValue::from_str(location)
-        .map_err(|error| ApiError::bad_request("invalid_location", error.to_string()))?;
-    Ok((StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response())
+/// A redirect target as a header value, which no target can fail to become.
+///
+/// Every location a route builds is already a URL, its dynamic parts escaped by
+/// `encode_segment` or `form_urlencoded`, and this changes none of them. What
+/// it adds is that the header no longer depends on every caller having done so:
+/// control characters — CR and LF among them, so no target can end the header
+/// and begin another — spaces, and non-ASCII bytes are percent-escaped, and
+/// what is left is visible ASCII, every byte of which `HeaderValue` accepts.
+/// `%` and the rest of URL syntax stay as the caller wrote them, so an escape
+/// already in the URL is not escaped twice.
+fn location_header(location: &str) -> HeaderValue {
+    let location = utf8_percent_encode(location, LOCATION_ENCODE_SET).to_string();
+    HeaderValue::try_from(location).expect("a percent-encoded location is visible ASCII")
+}
+
+fn see_other(location: &str) -> Response {
+    (
+        StatusCode::SEE_OTHER,
+        [(header::LOCATION, location_header(location))],
+    )
+        .into_response()
 }
 
 /// Answer a successful HTML form post, in the shape the client can act on.
@@ -15469,17 +15487,18 @@ fn see_other(location: &str) -> ApiResult<Response> {
 /// Only the routes whose forms are boosted answer this way. A form that is still
 /// an ordinary browser submission never sends `HX-Request`, so a shape nothing
 /// can request would be a branch nothing exercises; see `UNBOOSTED`.
-fn mutation_redirect(representation: &Representation, location: &str) -> ApiResult<Response> {
+fn mutation_redirect(representation: &Representation, location: &str) -> Response {
     if !representation.is_htmx() {
         return see_other(location);
     }
-    let location = HeaderValue::from_str(location)
-        .map_err(|error| ApiError::bad_request("invalid_location", error.to_string()))?;
-    Ok((
+    (
         StatusCode::NO_CONTENT,
-        [(HeaderName::from_static("hx-location"), location)],
+        [(
+            HeaderName::from_static("hx-location"),
+            location_header(location),
+        )],
     )
-        .into_response())
+        .into_response()
 }
 
 /// The response header that tells htmx this answer is a form, not a page.
@@ -16411,6 +16430,57 @@ mod tests {
         assert!(!published.request_id.is_empty());
         assert!(!published.message.contains("/private/db"));
         assert!(!published.message.contains("os error"));
+    }
+
+    /// A redirect's header cannot fail to build, so it has no error to answer
+    /// with. A URL built the way the routes build one passes through untouched,
+    /// and whatever else reaches it leaves with nothing that could end the
+    /// header early or that a header may not carry.
+    #[test]
+    fn every_redirect_target_becomes_a_header_that_cannot_split_the_response() {
+        use super::{
+            Representation, browse_url, encode_segment, location_header, mutation_redirect,
+            notice_url, record_notice_url, see_other,
+        };
+        use axum::http::{HeaderMap, HeaderValue, header};
+
+        let awkward = "a b%c?d#e/f\u{e9}\u{1f600}\t\r\n\0\x7f";
+        for url in [
+            notice_url(awkward, awkward),
+            record_notice_url(awkward, awkward, awkward),
+            browse_url(awkward),
+            format!(
+                "/api/v1/collections/{}/records/{}",
+                encode_segment(awkward),
+                encode_segment(awkward)
+            ),
+        ] {
+            assert_eq!(location_header(&url), url.as_str());
+        }
+
+        assert_eq!(
+            location_header(&format!("/{awkward}")),
+            "/a%20b%c?d#e/f%C3%A9%F0%9F%98%80%09%0D%0A%00%7F"
+        );
+        let injected = see_other("/deals\r\nSet-Cookie: session=stolen");
+        assert_eq!(injected.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            injected.headers()[header::LOCATION],
+            "/deals%0D%0ASet-Cookie:%20session=stolen"
+        );
+        assert!(!injected.headers().contains_key(header::SET_COOKIE));
+        let mut htmx = HeaderMap::new();
+        htmx.insert("hx-request", HeaderValue::from_static("true"));
+        let injected = mutation_redirect(&Representation::requested(&htmx), "/deals\n\r");
+        assert_eq!(injected.status(), StatusCode::NO_CONTENT);
+        assert_eq!(injected.headers()["hx-location"], "/deals%0A%0D");
+
+        // Every Unicode scalar value at once, so no character is left out.
+        let everything: String = (0..=u32::from(char::MAX))
+            .filter_map(char::from_u32)
+            .collect();
+        let value = location_header(&everything);
+        assert!(value.as_bytes().iter().all(u8::is_ascii_graphic));
     }
 
     #[test]
