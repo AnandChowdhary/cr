@@ -3,8 +3,11 @@
 //! The scripts that enhance the filter panel, the save-view control, and the
 //! Kanban board used to be Rust string constants inlined into every page that
 //! needed them. They are now one file compiled into the binary and served from
-//! `/static/<name>`, alongside a vendored copy of htmx and the compiled Tailwind
-//! utilities that replaced the Play CDN. These tests pin the properties that
+//! `/static/<name>`, alongside a vendored copy of htmx, the compiled Tailwind
+//! utilities that replaced the Play CDN, and — since the pages declared a
+//! content security policy — the server's own stylesheet and the tab icon,
+//! which used to be an inline `<style>` block and a `data:` URL in every page.
+//! These tests pin the properties that
 //! move made load bearing: each URL is content addressed so it can be cached
 //! forever, the route reaches nothing but the constants it was compiled with,
 //! rendered pages link the files rather than carrying their bodies around or
@@ -122,6 +125,39 @@ const TAILWIND_SOURCE: &str = include_str!("../src/static/tailwind.css");
 /// portions of it — and the compiled sheet opens with Tailwind's own reset.
 const TAILWIND_LICENSE: &str = include_str!("../src/static/tailwindcss-4.3.3.LICENSE.txt");
 
+/// The server's own stylesheet and the tab icon, as committed.
+const UI_STYLESHEET_SOURCE: &str = include_str!("../src/static/cr.css");
+const FAVICON_SOURCE: &str = include_str!("../src/static/favicon.svg");
+
+/// The `href` of the one `<link>` in a page whose `rel` and served name begin
+/// as given.
+fn linked(html: &str, rel: &str, prefix: &str) -> String {
+    let needle = format!("<link rel=\"{rel}\"");
+    html.split(needle.as_str())
+        .skip(1)
+        .filter_map(|rest| rest.split_once("href=\"").map(|(_, href)| href))
+        .map(|href| href.split_once('"').unwrap().0)
+        .find(|href| href.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no {rel} link to {prefix}* in HTML:\n{html}"))
+        .to_owned()
+}
+
+/// Assert that a served name is its prefix, eight bytes of digest in
+/// hexadecimal, and its extension: a content address, like `cr-<digest>.js`.
+fn assert_content_addressed(path: &str, prefix: &str, extension: &str) {
+    let digest = path
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(extension))
+        .unwrap_or_else(|| panic!("unexpected asset path {path}"));
+    assert_eq!(digest.len(), 16, "{path}");
+    assert!(
+        digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()),
+        "{path}"
+    );
+}
+
 fn kanban_database(name: &str) -> (TempDir, Database) {
     let temporary = tempfile::tempdir().unwrap();
     let database = Database::init(temporary.path().join(name)).unwrap();
@@ -218,6 +254,8 @@ async fn the_asset_route_cannot_be_walked_outside_the_binary() {
         "/static/tailwind.css",
         "/static/tailwind.input.css",
         "/static/tailwindcss-4.3.3.LICENSE.txt",
+        "/static/cr.css",
+        "/static/favicon.svg",
         "/static/",
         &format!("{real}%00"),
         &format!("{real}.map"),
@@ -380,6 +418,56 @@ async fn the_utility_stylesheet_is_compiled_in_and_served_from_this_origin() {
 }
 
 #[tokio::test]
+async fn the_server_stylesheet_and_the_icon_are_linked_rather_than_inlined() {
+    let (_temporary, database) = kanban_database("static-own-sheet");
+    let app = router(database, ServerConfig::default()).unwrap();
+    let home = request(&app, "/", &[]).await;
+
+    let sheet = linked(home.text(), "stylesheet", "/static/cr-");
+    assert_content_addressed(&sheet, "/static/cr-", ".css");
+    let icon = linked(home.text(), "icon", "/static/favicon-");
+    assert_content_addressed(&icon, "/static/favicon-", ".svg");
+
+    for (path, content_type, source) in [
+        (&sheet, "text/css; charset=utf-8", UI_STYLESHEET_SOURCE),
+        (&icon, "image/svg+xml", FAVICON_SOURCE),
+    ] {
+        let asset = request(&app, path, &[]).await;
+        assert_eq!(asset.status, StatusCode::OK, "{path}");
+        assert_eq!(asset.header(header::CONTENT_TYPE), content_type, "{path}");
+        assert_eq!(
+            asset.header(header::CACHE_CONTROL),
+            "public, max-age=31536000, immutable",
+            "{path}"
+        );
+        assert_eq!(asset.text(), source, "{path}");
+    }
+
+    // After the utilities, as the one sheet whose rules are outside every
+    // cascade layer: nothing depends on the order, and the utilities keep the
+    // first place the other tests look for them in.
+    let head = home.text().split_once("</head>").unwrap().0;
+    assert!(head.find(&stylesheet_path(home.text())).unwrap() < head.find(&sheet).unwrap());
+    // What the head used to carry instead.
+    for uri in ["/", "/deals", "/pipeline", "/deals/new", "/audit"] {
+        let page = request(&app, uri, &[]).await;
+        let head = page.text().split_once("</head>").unwrap().0;
+        assert!(
+            head.contains(&format!("<link rel=\"stylesheet\" href=\"{sheet}\">")),
+            "{uri}"
+        );
+        assert!(
+            head.contains(&format!(
+                "<link rel=\"icon\" type=\"image/svg+xml\" href=\"{icon}\">"
+            )),
+            "{uri}"
+        );
+        assert!(!head.contains("<style"), "{uri} still inlines a stylesheet");
+        assert!(!head.contains("data:"), "{uri} still inlines its icon");
+    }
+}
+
+#[tokio::test]
 async fn the_asset_stays_reachable_when_an_api_token_guards_every_other_route() {
     let (_temporary, database) = kanban_database("static-token");
     let config = ServerConfig {
@@ -409,4 +497,8 @@ async fn the_asset_stays_reachable_when_an_api_token_guards_every_other_route() 
     // A `<link>` cannot carry one either, and an unstyled page is the result.
     let stylesheet = stylesheet_path(page.text());
     assert_eq!(request(&app, &stylesheet, &[]).await.status, StatusCode::OK);
+    let own = linked(page.text(), "stylesheet", "/static/cr-");
+    assert_eq!(request(&app, &own, &[]).await.status, StatusCode::OK);
+    let icon = linked(page.text(), "icon", "/static/favicon-");
+    assert_eq!(request(&app, &icon, &[]).await.status, StatusCode::OK);
 }

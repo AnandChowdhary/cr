@@ -114,14 +114,27 @@ async fn rendered_pages(app: &Router) -> Vec<(&'static str, String)> {
     pages
 }
 
-/// The server's own stylesheet, which every document inlines in its `<head>`,
+/// A stylesheet a page links, found by the start of its served name and
+/// fetched from the server the way a browser would.
+async fn linked_stylesheet(app: &Router, html: &str, prefix: &str) -> String {
+    let path = html
+        .split(r#"<link rel="stylesheet" href=""#)
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|href| href.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no linked stylesheet named {prefix}*"));
+    let (status, css) = get(app, path).await;
+    assert_eq!(status, StatusCode::OK);
+    css
+}
+
+/// The server's own stylesheet, which every document links from its `<head>`,
 /// with its comments removed so that prose cannot pass for a declaration.
-fn stylesheet(html: &str) -> String {
-    let (_, rest) = html.split_once("<style>").expect("no inline stylesheet");
-    let sheet = rest.split_once("</style>").unwrap().0;
+async fn stylesheet(app: &Router, html: &str) -> String {
+    let sheet = linked_stylesheet(app, html, "/static/cr-").await;
     Regex::new(r"(?s)/\*.*?\*/")
         .unwrap()
-        .replace_all(sheet, "")
+        .replace_all(&sheet, "")
         .into_owned()
 }
 
@@ -140,12 +153,7 @@ fn dark_palette(sheet: &str) -> &str {
 
 /// The compiled utility stylesheet a page links, fetched from the server.
 async fn utility_stylesheet(app: &Router, html: &str) -> String {
-    let (_, rest) = html
-        .split_once(r#"<link rel="stylesheet" href=""#)
-        .expect("no linked stylesheet");
-    let (status, css) = get(app, rest.split_once('"').unwrap().0).await;
-    assert_eq!(status, StatusCode::OK);
-    css
+    linked_stylesheet(app, html, "/static/tailwind-").await
 }
 
 /// Every utility in a page's `class` attributes, with any variant prefix
@@ -183,7 +191,7 @@ async fn every_page_follows_the_system_colour_scheme() {
             );
         }
 
-        let sheet = stylesheet(&html);
+        let sheet = stylesheet(&app, &html).await;
         assert!(sheet.contains("color-scheme: light dark;"), "{uri}");
         let dark = dark_palette(&sheet);
         for captures in token.captures_iter(light_palette(&sheet)) {
@@ -204,7 +212,7 @@ async fn every_page_follows_the_system_colour_scheme() {
 async fn every_colour_a_utility_reads_has_a_dark_value() {
     let (_temporary, app) = app_with_a_board("scheme-palette");
     let (_, home) = get(&app, "/").await;
-    let dark = dark_palette(&stylesheet(&home)).to_owned();
+    let dark = dark_palette(&stylesheet(&app, &home).await).to_owned();
     let css = utility_stylesheet(&app, &home).await;
 
     let reads = Regex::new(r"var\((--(?:color|cr)-[a-z0-9-]+)\)").unwrap();
@@ -249,7 +257,7 @@ async fn every_colour_a_utility_reads_has_a_dark_value() {
 async fn the_sheets_rules_paint_only_with_tokens() {
     let (_temporary, app) = app_with_a_board("scheme-tokens");
     let (_, home) = get(&app, "/").await;
-    let sheet = stylesheet(&home);
+    let sheet = stylesheet(&app, &home).await;
     // Everything after the dark palette, which follows the light one.
     let (_, rules) = sheet.split_once(DARK_SCHEME).unwrap();
     let (_, rules) = rules.split_once("\n}\n").unwrap();
@@ -278,7 +286,7 @@ async fn hover_and_focus_states_change_without_animating() {
     let (_temporary, app) = app_with_a_board("scheme-motion");
     let declaration = Regex::new(r"[{;\s]transition(?:-[a-z]+)?\s*:").unwrap();
     for (uri, html) in rendered_pages(&app).await {
-        let sheet = stylesheet(&html);
+        let sheet = stylesheet(&app, &html).await;
         // Reduced motion may say anything about transitions; it only ever takes
         // them away.
         let (moving, _) = sheet

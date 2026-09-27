@@ -2317,6 +2317,42 @@ static TAILWIND_STYLESHEET_NAME: LazyLock<String> = LazyLock::new(|| {
 static TAILWIND_STYLESHEET_PATH: LazyLock<String> =
     LazyLock::new(|| format!("/static/{}", TAILWIND_STYLESHEET_NAME.as_str()));
 
+/// The server's own stylesheet: the colour tokens, the shell, and the `cr-`
+/// component classes.
+///
+/// It was a string constant inlined as a `<style>` block in every page, the
+/// last thing between these pages and a `style-src` that allows nothing inline.
+/// It is a constant either way, so it moved to a file beside `cr.js` for the
+/// reason the script did — an editor understands it there — and is linked like
+/// the utilities. That costs the first page a second stylesheet request, from
+/// the same origin and in parallel with the first, and costs every page after
+/// it nothing: the name is content addressed and cached as `immutable`.
+const UI_STYLESHEET: &str = include_str!("static/cr.css");
+
+/// `cr-<digest>.css`, content addressed like `cr-<digest>.js`.
+static UI_STYLESHEET_NAME: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "cr-{}.css",
+        hexadecimal(&Sha256::digest(UI_STYLESHEET)[..8])
+    )
+});
+
+/// The absolute path rendered pages link, as `/static/cr-<digest>.css`.
+static UI_STYLESHEET_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("/static/{}", UI_STYLESHEET_NAME.as_str()));
+
+/// The tab icon, served rather than written into every page as a `data:` URL,
+/// so that `img-src` needs no source beyond this origin.
+const FAVICON: &str = include_str!("static/favicon.svg");
+
+/// `favicon-<digest>.svg`, content addressed like the other assets.
+static FAVICON_NAME: LazyLock<String> =
+    LazyLock::new(|| format!("favicon-{}.svg", hexadecimal(&Sha256::digest(FAVICON)[..8])));
+
+/// The absolute path rendered pages link, as `/static/favicon-<digest>.svg`.
+static FAVICON_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("/static/{}", FAVICON_NAME.as_str()));
+
 /// `hx-boost="false"`: the value that hands one element back to the browser's
 /// own navigation, spelled as a constant so the reasons for using it are
 /// written down once rather than repeated at every call site.
@@ -2364,11 +2400,13 @@ static TAILWIND_STYLESHEET_PATH: LazyLock<String> =
 ///   still reload the page, which is the asymmetry this attribute exists to
 ///   prevent. It waits for the drag to go through htmx too.
 ///
-/// The **perspective** form is the one case where the attribute is belt and
-/// braces rather than load bearing: its `<select>` calls `form.submit()`, which
-/// fires no submit event, so htmx would never see it regardless. It is marked
-/// anyway so that the opt-out is a decision on the page rather than an accident
-/// of how that one control happens to submit.
+/// The **perspective** form answers a switch with `303 See Other` back to `/`
+/// and a new cookie. An `XMLHttpRequest` follows that redirect invisibly, so a
+/// boosted switch would swap the right page in while pushing `/perspective`
+/// into the address bar. The attribute used to be belt and braces here, because
+/// the `<select>` submitted itself with `form.submit()`, which fires no submit
+/// event; it is load bearing now that the form is submitted by its own button
+/// (see `perspective_control`).
 const UNBOOSTED: &str = "false";
 
 /// Serve one of the embedded UI assets.
@@ -2381,17 +2419,18 @@ const UNBOOSTED: &str = "false";
 /// static route that joined a request-supplied name onto a directory would
 /// reintroduce exactly the class of bug that walk exists to prevent.
 ///
-/// The content type is per asset, because one of them is a stylesheet. The
-/// cache lifetime is shared and never has to move into the match, because
-/// every name here is derived from the bytes it names.
+/// The content type is per asset, because they are scripts, stylesheets and an
+/// image. The cache lifetime is shared and never has to move into the match,
+/// because every name here is derived from the bytes it names.
 async fn static_asset(Path(file): Path<String>) -> Response {
     const JAVASCRIPT: &str = "text/javascript; charset=utf-8";
+    const CSS: &str = "text/css; charset=utf-8";
     let (content, content_type) = match file.as_str() {
         name if name == UI_SCRIPT_NAME.as_str() => (UI_SCRIPT, JAVASCRIPT),
         name if name == HTMX_SCRIPT_NAME.as_str() => (HTMX_SCRIPT, JAVASCRIPT),
-        name if name == TAILWIND_STYLESHEET_NAME.as_str() => {
-            (TAILWIND_STYLESHEET, "text/css; charset=utf-8")
-        }
+        name if name == TAILWIND_STYLESHEET_NAME.as_str() => (TAILWIND_STYLESHEET, CSS),
+        name if name == UI_STYLESHEET_NAME.as_str() => (UI_STYLESHEET, CSS),
+        name if name == FAVICON_NAME.as_str() => (FAVICON, "image/svg+xml"),
         _ => return not_found().await.into_response(),
     };
     (
@@ -12032,1509 +12071,30 @@ fn render_delete_confirmation(
     )
 }
 
-const GLOBAL_STYLES: &str = r#"
-:root {
-  /* The grey scale, and every neutral in the UI. The rules below use these
-     steps directly, and `src/static/tailwind.input.css` makes them the `gray`
-     and `white` utilities the markup uses, so `text-gray-500` and
-     `var(--cr-gray-500)` are one colour. 0 is the page and every surface on
-     it, 50 to 300 are fills and lines, and 400 to 900 are text. */
-  --cr-gray-0: #ffffff;
-  --cr-gray-50: #f7f7f5;
-  --cr-gray-100: #efefec;
-  --cr-gray-200: #e6e6e3;
-  --cr-gray-300: #d5d5d1;
-  --cr-gray-400: #a3a29e;
-  --cr-gray-500: #72716d;
-  --cr-gray-600: #5b5a57;
-  --cr-gray-700: #464543;
-  --cr-gray-900: #242424;
-
-  --cr-accent: #5e6ad2;
-  --cr-accent-hover: #4f5abf;
-  --cr-accent-soft: #f0f1fb;
-  --cr-focus-halo: rgb(37 99 235 / 0.12);
-  --cr-danger: #b91c1c;
-  --cr-info-line: #bfdbfe;
-  --cr-info-soft: #eff6ff;
-  --cr-info-ink: #1e3a8a;
-  --cr-info-strong: #1d4ed8;
-  --cr-warn-line: #fcd34d;
-  --cr-warn-soft: #fffbeb;
-  --cr-warn-ink: #92400e;
-  --cr-invalid-line: #fca5a5;
-  --cr-invalid-soft: #fef2f2;
-
-  --cr-radius: 8px;
-  --cr-emoji: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
-  --cr-sidebar-width: 232px;
-  --cr-shadow-popover: 0 18px 44px rgb(36 36 36 / 0.14), 0 2px 8px rgb(36 36 36 / 0.07);
-}
-
-/* Dark mode follows the operating system; there is no switch of its own.
-   `color-scheme` on `html` tells the browser both schemes are supported, which
-   is what darkens scrollbars, date pickers and select menus, and this block
-   swaps the palette when the system asks for dark. Every colour the rules
-   below use is a token above, so no rule has a dark variant to keep in step;
-   the only literals left are a card's faint shadows, which a dark canvas
-   simply swallows.
-
-   The grey scale runs the other way here, 0 the darkest step and 900 the
-   lightest, and because the `gray` and `white` utilities are these same
-   properties that one flip recolours the markup's greys too: `text-white` on
-   a `bg-gray-900` button is still the opposite of its fill. The markup's
-   other hues are Tailwind's own, which v4 resolves through `--color-*`
-   properties declared inside a cascade layer. A declaration outside any
-   layer beats every declaration inside one, so redefining them here recolours
-   every use at once, including the ones `cr.js` adds. Each is mapped the same
-   way round — a 50 becomes the darkest tint and a 950 the lightest ink — so
-   `bg-red-50 text-red-900` is still a quiet panel with legible text; the 500s
-   are the middle of their scales and keep their value. A colour a utility
-   reads with no dark value here would stay light on a dark page, which
-   `tests/stylesheet_http.rs` refuses. */
-@media (prefers-color-scheme: dark) {
-  :root {
-    --cr-gray-0: #191919;
-    --cr-gray-50: #1f1f1f;
-    --cr-gray-100: #272726;
-    --cr-gray-200: #30302f;
-    --cr-gray-300: #3f3f3d;
-    --cr-gray-400: #6e6d6a;
-    --cr-gray-500: #9b9a96;
-    --cr-gray-600: #b4b3af;
-    --cr-gray-700: #cac9c5;
-    --cr-gray-900: #ecebe7;
-
-    --cr-accent: #7d87e6;
-    --cr-accent-hover: #959df0;
-    --cr-accent-soft: #25273d;
-    --cr-focus-halo: rgb(125 135 230 / 0.3);
-    --cr-danger: #f87171;
-    --cr-info-line: #27406c;
-    --cr-info-soft: #172136;
-    --cr-info-ink: #bfd3fa;
-    --cr-info-strong: #9db9f9;
-    --cr-warn-line: #5b4517;
-    --cr-warn-soft: #2a2211;
-    --cr-warn-ink: #f3c46a;
-    --cr-invalid-line: #7a2f2f;
-    --cr-invalid-soft: #2c1b1b;
-
-    --cr-shadow-popover: 0 18px 44px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.4);
-
-    --color-red-50: oklch(25.5% 0.045 20);
-    --color-red-100: oklch(29% 0.065 21);
-    --color-red-200: oklch(35% 0.09 22);
-    --color-red-300: oklch(42% 0.12 24);
-    --color-red-400: oklch(57.7% 0.245 27.325);
-    --color-red-600: oklch(70.4% 0.191 22.216);
-    --color-red-700: oklch(80.8% 0.114 19.571);
-    --color-red-800: oklch(88.5% 0.062 18.334);
-    --color-red-900: oklch(93.6% 0.032 17.717);
-    --color-red-950: oklch(97.1% 0.013 17.38);
-
-    --color-emerald-50: oklch(25.5% 0.035 165);
-    --color-emerald-100: oklch(29% 0.05 165);
-    --color-emerald-200: oklch(35% 0.07 165);
-    --color-emerald-300: oklch(42% 0.09 164);
-    --color-emerald-400: oklch(59.6% 0.145 163.225);
-    --color-emerald-600: oklch(76.5% 0.177 163.223);
-    --color-emerald-700: oklch(84.5% 0.143 164.978);
-    --color-emerald-800: oklch(90.5% 0.093 164.15);
-    --color-emerald-900: oklch(95% 0.052 163.051);
-    --color-emerald-950: oklch(97.9% 0.021 166.113);
-
-    --color-indigo-50: oklch(25.5% 0.04 275);
-    --color-indigo-100: oklch(29% 0.06 275);
-    --color-indigo-200: oklch(35% 0.09 276);
-    --color-indigo-300: oklch(42% 0.12 277);
-    --color-indigo-400: oklch(51.1% 0.262 276.966);
-    --color-indigo-600: oklch(67.3% 0.182 276.935);
-    --color-indigo-700: oklch(78.5% 0.115 274.713);
-    --color-indigo-800: oklch(87% 0.065 274.039);
-    --color-indigo-900: oklch(93% 0.034 272.788);
-    --color-indigo-950: oklch(96.2% 0.018 272.314);
-
-    --color-blue-50: oklch(25.5% 0.04 260);
-    --color-blue-100: oklch(29% 0.06 260);
-    --color-blue-200: oklch(35% 0.08 258);
-    --color-blue-300: oklch(42% 0.11 257);
-    --color-blue-400: oklch(54.6% 0.245 262.881);
-    --color-blue-600: oklch(70.7% 0.165 254.624);
-    --color-blue-700: oklch(80.9% 0.105 251.813);
-    --color-blue-800: oklch(88.2% 0.059 254.128);
-    --color-blue-900: oklch(93.2% 0.032 255.585);
-    --color-blue-950: oklch(97% 0.014 254.604);
-  }
-}
-
-* { box-sizing: border-box; }
-
-html {
-  background: var(--cr-gray-0);
-  color-scheme: light dark;
-  scroll-behavior: smooth;
-}
-
-.cr-app {
-  background: var(--cr-gray-0);
-  color: var(--cr-gray-900);
-  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 14px;
-  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
-}
-
-.cr-app a,
-.cr-app button,
-.cr-app input,
-.cr-app select,
-.cr-app textarea,
-.cr-app summary {
-  touch-action: manipulation;
-}
-
-.cr-app :focus-visible {
-  outline: 2px solid var(--cr-accent);
-  outline-offset: 2px;
-}
-
-.cr-skip-link {
-  position: fixed;
-  top: 8px;
-  left: 8px;
-  z-index: 100;
-  transform: translateY(-150%);
-  border-radius: 6px;
-  background: var(--cr-gray-900);
-  color: var(--cr-gray-0);
-  padding: 8px 12px;
-  font-size: 0.875rem;
-  font-weight: 600;
-}
-
-.cr-skip-link:focus { transform: translateY(0); }
-
-/* The boosted-navigation progress bar, driven entirely by the `htmx-request`
-   class htmx puts on `#cr-progress` while a request is in flight. While it is
-   waiting it grows quickly at first and then slows, and never reaches the
-   right-hand edge, because the server reports no progress: a bar that filled
-   itself would be claiming something it cannot know. When the response lands
-   the class goes, the bar snaps to its resting full width and fades out over
-   150ms, so a finish reads as a finish rather than as an interruption.
-   Everything here is dormant until a navigation is actually waiting. */
-.cr-progress {
-  position: fixed;
-  top: 0;
-  right: 0;
-  left: 0;
-  z-index: 110;
-  height: 2px;
-  background: var(--cr-accent-soft);
-  opacity: 0;
-  transition: opacity 150ms ease-out;
-  pointer-events: none;
-}
-
-.cr-progress::after {
-  content: "";
-  display: block;
-  height: 100%;
-  background: var(--cr-accent);
-  transform: scaleX(1);
-  transform-origin: left center;
-}
-
-.cr-progress.htmx-request { opacity: 1; }
-
-.cr-progress.htmx-request::after {
-  animation: cr-progress 12s cubic-bezier(0, 0.65, 0.2, 1) forwards;
-}
-
-@keyframes cr-progress {
-  from { transform: scaleX(0.04); }
-  to { transform: scaleX(0.96); }
-}
-
-/* Present to a screen reader, absent from the layout. This is what hides the
-   live region `page_layout` renders, and `display: none` or
-   `visibility: hidden` — either of which would be simpler — would remove that
-   element from the accessibility tree along with the viewport, which is exactly
-   what it must not be. The 1px clipped box is the long-standing recipe for the
-   difference; `white-space: nowrap` keeps a long sentence from being wrapped
-   into that box and re-laying out the page around it. */
-.cr-visually-hidden {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
-  padding: 0;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-  border: 0;
-}
-
-.cr-shell {
-  display: grid;
-  grid-template-columns: var(--cr-sidebar-width) minmax(0, 1fr);
-  min-height: 100vh;
-}
-
-.cr-workspace { min-width: 0; background: var(--cr-gray-0); }
-
-.cr-sidebar {
-  position: sticky;
-  top: 0;
-  z-index: 30;
-  display: flex;
-  height: 100vh;
-  min-width: 0;
-  flex-direction: column;
-  border-right: 1px solid var(--cr-gray-200);
-  background: var(--cr-gray-50);
-  color: var(--cr-gray-600);
-}
-
-.cr-sidebar-brand {
-  display: flex;
-  height: 52px;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 12px;
-}
-
-.cr-wordmark {
-  display: inline-flex;
-  height: 32px;
-  gap: 8px;
-  align-items: center;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  color: var(--cr-gray-900);
-  font-size: 0.9rem;
-  font-weight: 700;
-  letter-spacing: -0.04em;
-}
-
-.cr-wordmark-mark {
-  display: inline-grid;
-  width: 24px;
-  height: 24px;
-  place-items: center;
-  border: 1px solid var(--cr-gray-300);
-  border-radius: 6px;
-  background: var(--cr-gray-0);
-  box-shadow: 0 1px 1px rgb(36 36 36 / 0.04);
-  font-size: 0.78rem;
-}
-
-.cr-local-badge {
-  border: 1px solid var(--cr-gray-300);
-  border-radius: 999px;
-  color: var(--cr-gray-500);
-  padding: 2px 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.62rem;
-  line-height: 1.3;
-}
-
-/* Views and collections scroll between the brand and the utility section,
-   which stay put however many there are. */
-.cr-sidebar-nav {
-  min-height: 0;
-  flex: 1 1 auto;
-  overflow-y: auto;
-  padding: 4px 8px 16px;
-  scrollbar-width: thin;
-  scroll-timeline: --cr-sidebar-y block;
-}
-
-/* The list's edges say whether it goes on, as a table's do: a fade above the
-   utility section while entries are hidden below it, which clears at the
-   last one, and a fade under the brand once entries have scrolled up past
-   it. Each is a pinned pseudo-element that takes no room in the list, and
-   starts hidden, because a list that fits has an inactive timeline and an
-   animation on one has no effect. */
-@supports (animation-timeline: scroll()) {
-  .cr-sidebar-nav::before,
-  .cr-sidebar-nav::after {
-    position: sticky;
-    z-index: 1;
-    display: block;
-    height: 32px;
-    margin-right: -8px;
-    margin-left: -8px;
-    content: "";
-    opacity: 0;
-    pointer-events: none;
-  }
-  /* Sticky offsets are measured inside the list's padding, so these reach
-     past it to the list's edges. The timeline follows the `animation`
-     shorthand, which resets it. */
-  .cr-sidebar-nav::before {
-    top: -4px;
-    margin-bottom: -32px;
-    background: linear-gradient(var(--cr-gray-50), transparent);
-    animation: cr-more-behind linear both;
-    animation-timeline: --cr-sidebar-y;
-  }
-  .cr-sidebar-nav::after {
-    bottom: -16px;
-    margin-top: -32px;
-    background: linear-gradient(transparent, var(--cr-gray-50));
-    animation: cr-more-ahead linear both;
-    animation-timeline: --cr-sidebar-y;
-  }
-}
-
-.cr-sidebar-label {
-  margin: 17px 8px 5px;
-  color: var(--cr-gray-400);
-  font-size: 0.68rem;
-  font-weight: 650;
-  letter-spacing: 0.015em;
-}
-
-.cr-sidebar-link {
-  position: relative;
-  display: flex;
-  min-width: 0;
-  min-height: 30px;
-  align-items: center;
-  gap: 8px;
-  border-radius: 5px;
-  color: var(--cr-gray-600);
-  padding: 5px 8px;
-  font-size: 0.79rem;
-  font-weight: 520;
-  line-height: 1.25;
-}
-
-.cr-sidebar-link:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
-.cr-sidebar-link.is-active { background: var(--cr-gray-200); color: var(--cr-gray-900); font-weight: 620; }
-
-/* Every navigation entry is marked by an emoji: a collection's own when its
-   schema names one, a fixed one otherwise. The box is a fixed square so that
-   labels line up whatever a platform's emoji font measures, and clips rather
-   than wraps the rare icon that is really a short word. */
-.cr-nav-glyph {
-  display: inline-flex;
-  width: 18px;
-  height: 18px;
-  flex: 0 0 18px;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-  font-family: var(--cr-emoji);
-  font-size: 0.86rem;
-  line-height: 1;
-}
-
-.cr-nav-note { margin-left: auto; color: var(--cr-gray-400); font-size: 0.62rem; font-weight: 550; }
-.cr-sidebar-hint { margin: 2px 8px; color: var(--cr-gray-400); font-size: 0.7rem; line-height: 1.4; }
-.cr-sidebar-hint strong { color: var(--cr-gray-500); font-weight: 600; }
-.cr-sidebar-notice { margin: 4px 8px; color: var(--cr-warn-ink); font-size: 0.68rem; line-height: 1.35; overflow-wrap: anywhere; }
-
-.cr-mobile-icon { margin-right: 4px; font-family: var(--cr-emoji); }
-.cr-file-icon { display: inline-block; width: 1.4em; font-family: var(--cr-emoji); }
-
-.cr-external { margin-left: auto; color: var(--cr-gray-400); font-size: 0.7rem; }
-
-.cr-sidebar-utility {
-  flex: 0 0 auto;
-  border-top: 1px solid var(--cr-gray-200);
-  padding: 8px;
-}
-
-.cr-sidebar-meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 9px 8px 2px;
-  color: var(--cr-gray-400);
-  font-size: 0.62rem;
-}
-
-.cr-mobile-header { display: none; }
-
-.cr-nav-link {
-  border-radius: 6px;
-  color: var(--cr-gray-600);
-  padding: 6px 8px;
-  font-size: 0.825rem;
-  font-weight: 550;
-}
-
-.cr-nav-link:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
-
-.cr-perspective { display: grid; gap: 5px; margin-top: 8px; border-top: 1px solid var(--cr-gray-200); padding: 10px 8px 2px; }
-
-.cr-perspective-label { color: var(--cr-gray-500); font-size: 0.65rem; font-weight: 650; }
-
-.cr-perspective select {
-  width: 100%;
-  min-height: 30px;
-  border: 1px solid var(--cr-gray-300);
-  padding: 4px 28px 4px 8px;
-  font-size: 0.72rem;
-  font-weight: 600;
-}
-
-.cr-perspective-banner {
-  border-bottom: 1px solid var(--cr-info-line);
-  background: var(--cr-info-soft);
-  color: var(--cr-info-ink);
-}
-
-/* The content area's padding is named, so the page bar can reach past it to
-   the area's edges. */
-.cr-main {
-  --cr-main-x: 16px;
-  --cr-main-y: 20px;
-  min-height: 100vh;
-  padding: var(--cr-main-y) var(--cr-main-x);
-}
-@media (min-width: 640px) { .cr-main { --cr-main-x: 24px; --cr-main-y: 24px; } }
-@media (min-width: 1280px) { .cr-main { --cr-main-x: 32px; } }
-
-/* The bar at the top of every page: a breadcrumb that ends in the page's
-   title, at the size of the text around it, a quiet word about what the page
-   holds, and the page's actions on the right, all on one line that spans the
-   content area and stays at its top while the page scrolls on a desktop. */
-.cr-page-bar {
-  display: flex;
-  min-height: 52px;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px 16px;
-  margin: calc(-1 * var(--cr-main-y)) calc(-1 * var(--cr-main-x)) 16px;
-  border-bottom: 1px solid var(--cr-gray-200);
-  background: var(--cr-gray-0);
-  padding: 9px var(--cr-main-x);
-}
-@media (min-width: 900px) { .cr-page-bar { position: sticky; top: 0; z-index: 25; } }
-.cr-page-bar-title { display: flex; min-width: 0; flex: 1 1 auto; align-items: center; gap: 8px; }
-.cr-page-path { display: flex; min-width: 0; flex: 0 1 auto; align-items: center; gap: 6px; }
-.cr-crumbs { display: flex; min-width: 0; flex: 0 1 auto; align-items: center; gap: 6px; color: var(--cr-gray-500); font-size: 0.84rem; font-weight: 520; }
-/* On a narrow screen each step gives way to an ellipsis rather than
-   running under the title, and the separators between them never do. */
-.cr-crumbs a { display: inline-flex; min-width: 0; align-items: center; gap: 6px; }
-.cr-crumbs a:hover { color: var(--cr-gray-900); }
-.cr-crumb-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cr-crumb-separator { flex: 0 0 auto; color: var(--cr-gray-300); }
-.cr-page-title {
-  display: flex;
-  min-width: 0;
-  flex: 0 1 auto;
-  align-items: center;
-  gap: 6px;
-  color: var(--cr-gray-900);
-  font-size: 0.84rem;
-  font-weight: 620;
-  line-height: 1.3;
-}
-.cr-page-title > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cr-page-icon { flex: 0 0 auto; font-family: var(--cr-emoji); font-size: 0.95rem; line-height: 1; }
-/* The meta gives way before the title does. */
-.cr-page-meta { min-width: 0; flex: 0 4 auto; overflow: hidden; color: var(--cr-gray-500); font-size: 0.78rem; text-overflow: ellipsis; white-space: nowrap; }
-.cr-page-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-/* On a phone the bar keeps only the nearest step back, since the view strip
-   above it reaches everything else, and the meta takes a line of its own
-   rather than squeezing the title. */
-@media (max-width: 639px) {
-  .cr-page-bar-title { flex-wrap: wrap; row-gap: 2px; }
-  .cr-page-meta { flex-basis: 100%; }
-  .cr-crumbs > :nth-last-child(n+3) { display: none; }
-}
-/* What a page needs said before it is used, one quiet line under the bar. */
-.cr-page-note { margin-bottom: 16px; color: var(--cr-gray-600); font-size: 0.8rem; line-height: 1.45; }
-
-/* Every button is one height, and so is the search box that sits among them
-   (`h-8` in its markup), so a row of controls lines up top and bottom
-   whatever each one holds. A height rather than a minimum, because a badge
-   inside a button, such as the Filter count, must not make it taller than its
-   neighbours; its text never wraps, so nothing else needs the room. */
-.cr-button {
-  display: inline-flex;
-  height: 32px;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--cr-gray-300);
-  border-radius: 7px;
-  background: var(--cr-gray-0);
-  color: var(--cr-gray-700);
-  padding: 0 12px;
-  font-size: 0.77rem;
-  font-weight: 600;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.cr-button > span[aria-hidden="true"] { margin-left: 0.2em; }
-.cr-button .cr-pill { padding: 1px 6px; }
-/* A button inside a card, such as a Kanban card's Move. */
-.cr-button-small { height: 28px; padding: 0 10px; font-size: 0.72rem; }
-
-.cr-button:hover { border-color: var(--cr-gray-400); background: var(--cr-gray-50); color: var(--cr-gray-900); }
-.cr-button:active { transform: translateY(1px); }
-.cr-button[data-disabled="true"] { border-color: var(--cr-gray-200); background: transparent; color: var(--cr-gray-400); cursor: default; transform: none; }
-
-.cr-button-primary {
-  border-color: var(--cr-gray-900);
-  background: var(--cr-gray-900);
-  color: var(--cr-gray-0);
-}
-
-.cr-button-primary:hover { border-color: var(--cr-gray-700); background: var(--cr-gray-700); color: var(--cr-gray-0); }
-
-.cr-empty-state {
-  border: 1px dashed var(--cr-gray-300);
-  border-radius: var(--cr-radius);
-  background: var(--cr-gray-0);
-  padding: 40px 24px;
-  text-align: center;
-}
-
-.cr-view-index {
-  overflow: hidden;
-  border: 1px solid var(--cr-gray-200);
-  border-radius: var(--cr-radius);
-  background: var(--cr-gray-0);
-}
-
-.cr-view-index-header,
-.cr-view-row {
-  display: grid;
-  grid-template-columns: minmax(200px, 1fr) 72px 118px minmax(0, 1.4fr) 20px;
-  align-items: center;
-  column-gap: 20px;
-}
-
-.cr-view-index-header {
-  border-bottom: 1px solid var(--cr-gray-200);
-  background: var(--cr-gray-50);
-  color: var(--cr-gray-500);
-  padding: 7px 14px;
-  font-size: 0.66rem;
-  font-weight: 650;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.cr-view-row {
-  min-height: 38px;
-  border-bottom: 1px solid var(--cr-gray-200);
-  padding: 5px 14px;
-}
-
-.cr-view-row:last-child { border-bottom: 0; }
-.cr-view-row:hover { background: var(--cr-gray-50); }
-.cr-view-row:hover h2 { color: var(--cr-accent); }
-
-.cr-view-name { display: flex; min-width: 0; align-items: center; gap: 8px; }
-.cr-view-name h2 { min-width: 0; color: var(--cr-gray-900); font-size: 0.85rem; font-weight: 600; }
-.cr-view-icon { flex: 0 0 auto; width: 18px; overflow: hidden; font-family: var(--cr-emoji); font-size: 0.95rem; line-height: 1; text-align: center; }
-.cr-view-source { flex: 0 1 auto; min-width: 0; overflow: hidden; color: var(--cr-gray-500); font-size: 0.72rem; text-overflow: ellipsis; white-space: nowrap; }
-.cr-view-source::before { content: "in "; }
-.cr-view-count { color: var(--cr-gray-900); font-size: 0.8rem; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
-.cr-view-updated { white-space: nowrap; }
-.cr-view-kind { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px; }
-
-/* A unit the column heading states where there is one: read aloud always,
-   shown only once the headings are hidden. */
-.cr-view-unit {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-}
-
-.cr-view-arrow {
-  color: var(--cr-gray-400);
-  font-size: 1rem;
-  text-align: right;
-}
-
-.cr-view-row:hover .cr-view-arrow { color: var(--cr-accent); transform: translateX(2px); }
-
-.cr-time { color: var(--cr-gray-500); white-space: nowrap; font-variant-numeric: tabular-nums; }
-
-.cr-data {
-  color: var(--cr-gray-500);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.72rem;
-  font-variant-numeric: tabular-nums;
-}
-
-.cr-pill,
-.cr-filter-tag {
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid var(--cr-gray-200);
-  border-radius: 999px;
-  background: var(--cr-gray-50);
-  color: var(--cr-gray-600);
-  padding: 3px 7px;
-  font-size: 0.68rem;
-  font-weight: 600;
-  line-height: 1.2;
-}
-
-/* The users table's `+N`: a pill that opens onto a principal's remaining
-   grants, on a line of their own beneath the first few. */
-.cr-access-more > summary { cursor: pointer; list-style: none; }
-.cr-access-more > summary::-webkit-details-marker { display: none; }
-.cr-access-more > summary:hover { border-color: var(--cr-gray-300); color: var(--cr-gray-900); }
-.cr-access-more[open] { flex-basis: 100%; }
-.cr-access-more[open] > summary { margin-bottom: 6px; }
-.cr-access-more-less,
-.cr-access-more[open] .cr-access-more-count { display: none; }
-.cr-access-more[open] .cr-access-more-less { display: inline; }
-
-.cr-pill-accent { border-color: var(--cr-info-line); background: var(--cr-accent-soft); color: var(--cr-info-strong); }
-.cr-pill-warn { border-color: var(--cr-warn-line); background: var(--cr-warn-soft); color: var(--cr-warn-ink); }
-/* A state's badge: finished well, did not, under way. Waiting is the warn
-   pill above. */
-.cr-pill-positive { border-color: var(--color-emerald-200); background: var(--color-emerald-50); color: var(--color-emerald-700); }
-.cr-pill-negative { border-color: var(--cr-invalid-line); background: var(--cr-invalid-soft); color: var(--cr-danger); }
-.cr-pill-active { border-color: var(--cr-info-line); background: var(--cr-info-soft); color: var(--cr-info-ink); }
-
-/* A day's heading in a table ordered by time, added by cr.js. The label stays
-   at the left edge when the table scrolls sideways. */
-.cr-table-shell .cr-date-group th {
-  padding: 12px 12px 4px !important;
-  background: var(--cr-gray-0);
-  color: var(--cr-gray-500) !important;
-  font-size: 0.72rem;
-  text-align: left;
-}
-.cr-table-shell tbody + tbody .cr-date-group th { border-top: 1px solid var(--cr-gray-200); }
-.cr-date-group th span { position: sticky; left: 12px; }
-.cr-table-shell tbody tr.cr-date-group:hover { background: none; }
-
-/* A condition the URL applies, with the link that removes it. */
-.cr-active-filter {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  border: 1px solid var(--cr-info-line);
-  border-radius: 999px;
-  background: var(--cr-accent-soft);
-  color: var(--cr-info-strong);
-  padding: 2px 4px 2px 10px;
-  font-size: 0.75rem;
-  font-weight: 550;
-}
-.cr-active-filter-remove {
-  display: inline-flex;
-  width: 18px;
-  height: 18px;
-  align-items: center;
-  justify-content: center;
-  border-radius: 999px;
-  color: var(--cr-info-strong);
-  font-size: 0.85rem;
-  line-height: 1;
-}
-.cr-active-filter-remove:hover { background: var(--cr-info-line); }
-
-/* A quick filter above a table, and the one applied. */
-.cr-quick-filter {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid var(--cr-gray-200);
-  border-radius: 999px;
-  background: var(--cr-gray-0);
-  color: var(--cr-gray-700);
-  padding: 3px 10px;
-  font-size: 0.75rem;
-  font-weight: 550;
-}
-.cr-quick-filter:hover { border-color: var(--cr-gray-400); color: var(--cr-gray-900); }
-.cr-quick-filter-count { color: var(--cr-gray-500); font-variant-numeric: tabular-nums; }
-.cr-quick-filter[aria-current="true"] { border-color: var(--cr-gray-900); background: var(--cr-gray-900); color: var(--cr-gray-0); }
-.cr-quick-filter[aria-current="true"] .cr-quick-filter-count { color: var(--cr-gray-300); }
-
-.cr-filter-tag {
-  border-radius: 5px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-weight: 500;
-}
-
-.cr-surface {
-  border: 1px solid var(--cr-gray-200);
-  border-radius: var(--cr-radius);
-  background: var(--cr-gray-0);
-  box-shadow: none;
-}
-
-.cr-app input:not([type="checkbox"]):not([type="radio"]),
-.cr-app select,
-.cr-app textarea {
-  border-color: var(--cr-gray-300);
-  border-radius: 7px;
-  background-color: var(--cr-gray-0);
-  color: var(--cr-gray-900);
-}
-
-.cr-app input:not([type="checkbox"]):not([type="radio"]):hover,
-.cr-app select:hover,
-.cr-app textarea:hover { border-color: var(--cr-gray-400); }
-
-.cr-app input:not([type="checkbox"]):not([type="radio"]):focus,
-.cr-app select:focus,
-.cr-app textarea:focus { border-color: var(--cr-accent); box-shadow: 0 0 0 3px var(--cr-focus-halo); }
-
-.cr-table-shell { overflow: hidden; border: 1px solid var(--cr-gray-200); border-radius: var(--cr-radius); background: var(--cr-gray-0); }
-
-/* File previews in the filesystem browser. */
-.cr-file-preview {
-  max-height: 70vh;
-  margin: 0;
-  overflow: auto;
-  background: var(--cr-gray-50);
-  color: var(--cr-gray-900);
-  padding: 16px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.75rem;
-  line-height: 1.25rem;
-}
-
-/* Keep every space and newline, wrap at the panel edge, and break a token with
-   no spaces at all — a URL, a minified line — rather than overflow. */
-.cr-file-preview-wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
-
-/* A file panel's Edit and Delete, icons the size of a small button. */
-.cr-icon-button {
-  display: inline-flex;
-  width: 28px;
-  height: 28px;
-  align-items: center;
-  justify-content: center;
-  border-radius: 6px;
-  color: var(--cr-gray-500);
-}
-.cr-icon-button:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
-.cr-icon-button-danger:hover { background: var(--cr-invalid-soft); color: var(--cr-danger); }
-.cr-icon-button[data-disabled="true"] { background: transparent; color: var(--cr-gray-300); cursor: not-allowed; }
-
-/* A file being edited: the preview's type and measure, in a box that grows
-   with the file up to the preview's height and then scrolls. */
-.cr-app textarea.cr-file-editor {
-  display: block;
-  width: 100%;
-  min-height: 16rem;
-  max-height: 70vh;
-  field-sizing: content;
-  resize: vertical;
-  margin: 0;
-  border: 0;
-  border-radius: 0;
-  padding: 16px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.75rem;
-  line-height: 1.25rem;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-/* The panel clips an outline drawn outside the box to two stray lines, so the
-   editor's focus ring is drawn inside it. */
-.cr-app textarea.cr-file-editor:focus,
-.cr-app textarea.cr-file-editor:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--cr-accent); }
-.cr-table-shell table { font-variant-numeric: tabular-nums; }
-.cr-table-shell thead { background: var(--cr-gray-50); }
-.cr-table-shell th { padding: 8px 12px !important; color: var(--cr-gray-600) !important; font-size: 0.72rem; font-weight: 620 !important; }
-.cr-table-shell td { padding: 8px 12px !important; font-size: 0.79rem; }
-.cr-table-shell tbody tr:hover { background: var(--cr-gray-50); }
-/* Set by cr.js once a click anywhere on a row opens its record. */
-.cr-rows-open tbody tr:has(td a[href]) { cursor: pointer; }
-
-/* A records table scrolls inside its own box rather than with the page, in
-   both directions. That is what lets the heading row stay put: the box has to
-   scroll horizontally once there are more columns than fit, and a box that
-   scrolls one way is a scroll container both ways, so a pinned heading could
-   only ever stick to the table's own top edge unless the table's height is
-   bounded. The bound leaves room for the page heading above and the pager
-   below. It also keeps the horizontal scrollbar on screen instead of at the
-   foot of a long table. */
-.cr-table-scroll {
-  max-height: max(20rem, calc(100dvh - 12.5rem));
-  overflow: auto;
-  overscroll-behavior-x: contain;
-  scroll-timeline: --cr-table-x x;
-}
-.cr-table-scroll tbody tr { --cr-row-bg: var(--cr-gray-0); }
-.cr-table-scroll tbody tr:hover { --cr-row-bg: var(--cr-gray-50); }
-/* A line under the heading drawn with box-shadow, because a collapsed table's
-   borders belong to the table and would scroll away from a pinned cell. */
-.cr-table-scroll thead th { position: sticky; top: 0; z-index: 2; background: var(--cr-gray-50); box-shadow: inset 0 -1px 0 var(--cr-gray-200); }
-/* The open action stays at the right edge, so every row keeps a way into its
-   record however far the reader has scrolled. */
-.cr-table-scroll thead th:last-child { right: 0; z-index: 3; }
-.cr-table-scroll tbody td:last-child:not([colspan]) { position: sticky; right: 0; z-index: 1; background: var(--cr-row-bg); }
-
-/* The record ID stays at the left edge on screens wide enough to spare it the
-   width, so a row scrolled sideways still says which record it is. */
-@media (min-width: 900px) {
-  .cr-table-scroll thead th:first-child { left: 0; z-index: 3; }
-  .cr-table-scroll tbody td:first-child:not([colspan]) { position: sticky; left: 0; z-index: 1; background: var(--cr-row-bg); }
-}
-
-/* Where the browser can tie an animation to a scroll position, the edges say
-   whether there is more table beyond them: a fade before the open action
-   while columns are hidden to the right, which clears once the reader reaches
-   the last one, and a darker edge after the ID once columns have scrolled
-   under it. A table that fits has no scroll range, so its timeline is
-   inactive and both keep the opacity they are given here, which is none.
-   Browsers without scroll-driven animations get the pinned edges alone. */
-@supports (animation-timeline: scroll()) {
-  .cr-table-scroll thead th:last-child::before,
-  .cr-table-scroll tbody td:last-child:not([colspan])::before {
-    position: absolute;
-    top: 0;
-    right: 100%;
-    bottom: 0;
-    width: 2rem;
-    background: linear-gradient(to right, transparent, var(--cr-row-bg, var(--cr-gray-50)));
-    content: "";
-    /* Hidden unless the scroll position says otherwise: a table that fits has
-       an inactive timeline, and an animation on one has no effect at all. */
-    opacity: 0;
-    pointer-events: none;
-    animation: cr-more-ahead linear both;
-    animation-timeline: --cr-table-x;
-  }
-  @media (min-width: 900px) {
-    .cr-table-scroll thead th:first-child::after,
-    .cr-table-scroll tbody td:first-child:not([colspan])::after {
-      position: absolute;
-      top: 0;
-      bottom: 0;
-      left: 100%;
-      width: 0.75rem;
-      box-shadow: inset 8px 0 8px -8px rgb(0 0 0 / 0.18);
-      content: "";
-      opacity: 0;
-      pointer-events: none;
-      animation: cr-more-behind linear both;
-      animation-timeline: --cr-table-x;
-    }
-  }
-}
-/* A scroll hint's opacity across its scroller's range: one that says there is
-   more ahead clears as the reader reaches the end, and one that says content
-   has scrolled past appears as soon as they leave the start. */
-@keyframes cr-more-ahead { 0%, 96% { opacity: 1; } 100% { opacity: 0; } }
-@keyframes cr-more-behind { 0% { opacity: 0; } 4%, 100% { opacity: 1; } }
-
-.cr-popover {
-  border: 1px solid var(--cr-gray-200);
-  border-radius: var(--cr-radius);
-  background: var(--cr-gray-0);
-  box-shadow: var(--cr-shadow-popover);
-}
-
-.cr-audit-list { overflow: hidden; border: 1px solid var(--cr-gray-200); border-radius: var(--cr-radius); background: var(--cr-gray-0); }
-.cr-audit-entry { border-bottom: 1px solid var(--cr-gray-200); background: var(--cr-gray-0); padding: 13px 14px; }
-.cr-audit-entry:last-child { border-bottom: 0; }
-.cr-audit-entry:target { background: var(--cr-accent-soft); }
-
-/* A board fits the window: it scrolls sideways once its lanes are wider than
-   the workspace, and each lane is at most as tall as the window leaves room
-   for, its cards scrolling inside it under a heading that stays put, so a
-   lane of a hundred cards neither stretches the page nor hides the lanes
-   beside it. */
-.cr-board-scroll {
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
-  padding-bottom: 8px;
-  scroll-timeline: --cr-board-x inline;
-}
-.cr-board { display: flex; width: max-content; align-items: flex-start; gap: 10px; }
-.cr-kanban-lane {
-  display: flex;
-  width: 272px;
-  max-height: max(22rem, calc(100dvh - 10.5rem));
-  flex: 0 0 auto;
-  flex-direction: column;
-  border: 1px solid var(--cr-gray-200);
-  border-radius: var(--cr-radius);
-  background: var(--cr-gray-50);
-  box-shadow: none;
-  padding: 10px 8px 8px;
-}
-/* The lane a dragged card would drop into. */
-.cr-kanban-lane[data-drop-target] { outline: 2px solid var(--cr-accent); outline-offset: -1px; }
-.cr-lane-cards {
-  display: flex;
-  min-height: 5rem;
-  flex: 1 1 auto;
-  flex-direction: column;
-  gap: 6px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  margin: 0 -4px;
-  padding: 0 4px 2px;
-  scrollbar-width: thin;
-  scroll-timeline: --cr-lane-y block;
-}
-/* A lane's cards fade at its edges while there are more past them, as the
-   sidebar's list does: at the foot while cards are hidden below, clearing at
-   the last one, and under the heading once cards have scrolled up past it.
-   Each fade takes no room: its height and the gap beside it are given back by
-   a negative margin, and it does not shrink, because the column it sits in is
-   full whenever it shows. */
-@supports (animation-timeline: scroll()) {
-  .cr-lane-cards::before,
-  .cr-lane-cards::after {
-    position: sticky;
-    z-index: 1;
-    display: block;
-    height: 32px;
-    flex: 0 0 auto;
-    margin-right: -4px;
-    margin-left: -4px;
-    content: "";
-    opacity: 0;
-    pointer-events: none;
-  }
-  .cr-lane-cards::before {
-    top: 0;
-    margin-bottom: -38px;
-    background: linear-gradient(var(--cr-gray-50), transparent);
-    animation: cr-more-behind linear both;
-    animation-timeline: --cr-lane-y;
-  }
-  .cr-lane-cards::after {
-    bottom: -2px;
-    margin-top: -38px;
-    background: linear-gradient(transparent, var(--cr-gray-50));
-    animation: cr-more-ahead linear both;
-    animation-timeline: --cr-lane-y;
-  }
-}
-/* Whether the board goes on past either side, as a table's edges say. */
-@supports (animation-timeline: scroll()) {
-  .cr-board::before,
-  .cr-board::after {
-    position: sticky;
-    z-index: 2;
-    width: 32px;
-    flex: 0 0 auto;
-    align-self: stretch;
-    content: "";
-    opacity: 0;
-    pointer-events: none;
-  }
-  /* Each takes no room: its width and the gap after or before it are given
-     back by a negative margin. */
-  .cr-board::before {
-    left: 0;
-    margin-right: -42px;
-    background: linear-gradient(to left, transparent, var(--cr-gray-0));
-    animation: cr-more-behind linear both;
-    animation-timeline: --cr-board-x;
-  }
-  .cr-board::after {
-    right: 0;
-    margin-left: -42px;
-    background: linear-gradient(to right, transparent, var(--cr-gray-0));
-    animation: cr-more-ahead linear both;
-    animation-timeline: --cr-board-x;
-  }
-}
-/* A lane's heading: a dot in its state's colour, its name, and how many
-   records it holds in the whole view. */
-.cr-lane-head { display: flex; align-items: center; gap: 7px; margin-bottom: 8px; padding: 0 3px; }
-.cr-lane-head h2 { min-width: 0; overflow: hidden; color: var(--cr-gray-900); font-size: 0.8rem; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
-.cr-lane-count { color: var(--cr-gray-500); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
-.cr-lane-dot { width: 8px; height: 8px; flex: 0 0 auto; border: 1.5px solid var(--cr-gray-400); border-radius: 999px; background: transparent; padding: 0; }
-.cr-lane-dot.cr-pill-positive { border-color: var(--color-emerald-600); background: var(--color-emerald-600); }
-.cr-lane-dot.cr-pill-negative { border-color: var(--cr-danger); background: var(--cr-danger); }
-.cr-lane-dot.cr-pill-active { border-color: var(--cr-info-strong); background: var(--cr-info-strong); }
-.cr-lane-dot.cr-pill-warn { border-color: var(--cr-warn-ink); background: transparent; }
-.cr-lane-more { display: block; margin-top: 6px; border-radius: 6px; color: var(--cr-gray-500); padding: 5px 6px; font-size: 0.72rem; font-weight: 600; text-align: center; }
-a.cr-lane-more:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
-
-/* A card: its title in two lines at most, the ID in one quiet line under it,
-   then a row of the values it holds. */
-.cr-kanban-card {
-  border: 1px solid var(--cr-gray-200);
-  border-radius: 8px;
-  background: var(--cr-gray-0);
-  box-shadow: 0 1px 2px rgb(36 36 36 / 0.04);
-  padding: 9px 10px;
-}
-
-.cr-kanban-card:hover { border-color: var(--cr-gray-300); box-shadow: 0 3px 8px rgb(36 36 36 / 0.07); }
-.cr-kanban-card:active { transform: rotate(0.25deg); }
-.cr-card-title {
-  display: -webkit-box;
-  overflow: hidden;
-  color: var(--cr-gray-900);
-  font-size: 0.8rem;
-  font-weight: 600;
-  line-height: 1.35;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}
-.cr-card-title:hover { color: var(--cr-accent); }
-/* A card with no title leads with its ID, on one line. */
-.cr-card-title-id { display: flex; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.74rem; }
-.cr-card-id {
-  display: flex;
-  margin-top: 2px;
-  color: var(--cr-gray-400);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.66rem;
-}
-.cr-card-props { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
-.cr-card-prop,
-.cr-card-prop-badge { display: inline-flex; min-width: 0; max-width: 100%; align-items: center; }
-.cr-card-prop {
-  border: 1px solid var(--cr-gray-200);
-  border-radius: 5px;
-  color: var(--cr-gray-600);
-  padding: 1px 6px;
-  font-size: 0.68rem;
-  line-height: 1.4;
-}
-.cr-card-prop > :last-child,
-.cr-card-prop { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* The keyboard's and a touch screen's way to move a card. On a screen with a
-   pointer, which can drag, it waits until the card is pointed at or has focus
-   inside it, so a lane is not a column of Move links; it is transparent rather
-   than hidden, so it can still be tabbed to. */
-.cr-card-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 8px; margin-top: 7px; font-size: 0.68rem; }
-.cr-card-foot .cr-time { font-size: 0.68rem; }
-.cr-kanban-move { margin-left: auto; }
-.cr-kanban-move[open] { flex-basis: 100%; }
-.cr-kanban-move summary { cursor: pointer; list-style: none; color: var(--cr-gray-500); font-size: 0.68rem; font-weight: 600; text-align: right; }
-.cr-kanban-move summary::-webkit-details-marker { display: none; }
-.cr-kanban-move[open] summary { margin-bottom: 6px; }
-@media (hover: hover) {
-  .cr-kanban-card:not(:hover):not(:focus-within) .cr-kanban-move:not([open]) summary { opacity: 0; }
-}
-
-/* The record form: fields straight on the page with a label above each
-   control, the notes under them, and the actions held at the bottom edge of
-   the window while a long form scrolls beneath them. */
-.cr-form-alert { margin-bottom: 20px; }
-.cr-form-section + .cr-form-section { margin-top: 18px; }
-.cr-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 16px; }
-
-.cr-field { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
-.cr-field-wide { grid-column: 1 / -1; }
-/* An object edited as a group: its own fields, boxed under its label, which
-   folds it away when it is empty. */
-.cr-field-group > summary { width: fit-content; cursor: pointer; }
-.cr-field-group > summary:hover { color: var(--cr-gray-900); }
-.cr-field-group:not([open]) > summary { color: var(--cr-gray-500); font-weight: 550; }
-.cr-field-group-grid { border: 1px solid var(--cr-gray-200); border-radius: var(--cr-radius); padding: 14px; }
-
-.cr-field-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
-.cr-field-label { color: var(--cr-gray-700); font-size: 0.78rem; font-weight: 600; line-height: 1.3; }
-.cr-field-hint { color: var(--cr-gray-400); font-size: 0.66rem; font-weight: 550; }
-a.cr-field-open { color: var(--cr-gray-500); font-weight: 600; }
-a.cr-field-open:hover { color: var(--cr-accent); }
-.cr-required { margin-left: 3px; color: var(--cr-danger); }
-.cr-field-help { color: var(--cr-gray-500); font-size: 0.72rem; line-height: 1.45; }
-
-.cr-app .cr-input {
-  display: block;
-  width: 100%;
-  min-height: 34px;
-  border-width: 1px;
-  border-style: solid;
-  padding: 6px 10px;
-  font-size: 0.84rem;
-  line-height: 1.45;
-  outline: none;
-}
-
-/* A text box grows with what is in it where the browser can size it that way,
-   and keeps its `rows` where it cannot. */
-.cr-app textarea.cr-input { min-height: 3.6rem; max-height: 30rem; field-sizing: content; resize: vertical; }
-.cr-app textarea.cr-input-tall { min-height: 9rem; max-height: none; }
-.cr-app .cr-input-code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.78rem; line-height: 1.6; }
-
-/* A number with a unit: the unit sits in the box's right edge. */
-.cr-input-group { display: flex; min-width: 0; }
-.cr-app .cr-input-group > input.cr-input:not([type="radio"]) { min-width: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; }
-.cr-input-unit {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  border: 1px solid var(--cr-gray-300);
-  border-left: 0;
-  border-radius: 0 7px 7px 0;
-  background: var(--cr-gray-50);
-  color: var(--cr-gray-500);
-  padding: 0 10px;
-  font-size: 0.78rem;
-  font-weight: 550;
-}
-
-/* A choice among two or three options: a row of buttons, one pressed. The
-   radio itself is hidden but still takes focus and arrow keys, and the
-   button it is in shows both. */
-.cr-choice-row {
-  display: inline-flex;
-  max-width: 100%;
-  min-height: 34px;
-  align-self: flex-start;
-  gap: 2px;
-  overflow-x: auto;
-  border: 1px solid var(--cr-gray-300);
-  border-radius: 7px;
-  background: var(--cr-gray-50);
-  padding: 2px;
-}
-.cr-choice-option {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 5px;
-  color: var(--cr-gray-600);
-  padding: 3px 12px;
-  font-size: 0.8rem;
-  font-weight: 550;
-  white-space: nowrap;
-  cursor: pointer;
-}
-.cr-choice-option input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
-.cr-choice-option:hover { color: var(--cr-gray-900); }
-.cr-choice-option:has(:checked) { background: var(--cr-gray-0); color: var(--cr-gray-900); box-shadow: 0 0 0 1px var(--cr-gray-200), 0 1px 2px rgb(0 0 0 / 0.08); }
-.cr-choice-option:has(:focus-visible) { outline: 2px solid var(--cr-accent); outline-offset: 1px; }
-.cr-choice-option:has(:disabled) { cursor: default; }
-.cr-choice-row[aria-invalid=true] { border-color: var(--cr-danger); }
-
-/* Several options, any of them: a checkbox in each chip. */
-.cr-checkbox-row { display: flex; flex-wrap: wrap; gap: 6px; }
-.cr-checkbox-option {
-  display: inline-flex;
-  min-height: 34px;
-  align-items: center;
-  gap: 7px;
-  border: 1px solid var(--cr-gray-300);
-  border-radius: 7px;
-  background: var(--cr-gray-0);
-  color: var(--cr-gray-700);
-  padding: 4px 11px 4px 9px;
-  font-size: 0.8rem;
-  font-weight: 550;
-  cursor: pointer;
-}
-.cr-checkbox-option input { width: 14px; height: 14px; accent-color: var(--cr-accent); }
-.cr-checkbox-option:hover { border-color: var(--cr-gray-400); }
-.cr-checkbox-option:has(:checked) { border-color: var(--cr-accent); background: var(--cr-accent-soft); color: var(--cr-gray-900); }
-.cr-checkbox-option:has(:focus-visible) { outline: 2px solid var(--cr-accent); outline-offset: 1px; }
-
-/* A field a refused submission had something to say about. Colour alone never
-   carries the message: the reason is rendered above the control as text, and the
-   control itself is marked `aria-invalid`. */
-.cr-field-invalid .cr-field-label { color: var(--cr-danger); }
-.cr-app .cr-field .cr-input[aria-invalid=true] { border-color: var(--cr-danger); background-color: var(--cr-invalid-soft); }
-
-.cr-form-more { margin-top: 18px; }
-.cr-form-more summary { width: fit-content; cursor: pointer; color: var(--cr-gray-600); font-size: 0.75rem; font-weight: 600; }
-.cr-form-more summary:hover { color: var(--cr-gray-900); }
-.cr-form-more[open] summary { margin-bottom: 10px; }
-
-.cr-form-footer {
-  position: sticky;
-  bottom: 0;
-  z-index: 5;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-top: 24px;
-  border-top: 1px solid var(--cr-gray-200);
-  background: color-mix(in srgb, var(--cr-gray-0) 92%, transparent);
-  backdrop-filter: blur(10px);
-  padding: 12px 0;
-}
-
-.cr-form-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
-.cr-form-link { color: var(--cr-gray-500); font-size: 0.75rem; font-weight: 600; }
-.cr-form-link:hover { color: var(--cr-gray-900); text-decoration: underline; }
-
-.cr-button-danger { color: var(--cr-danger); }
-.cr-button-danger:hover { border-color: var(--cr-invalid-line); background: var(--cr-invalid-soft); color: var(--cr-danger); }
-
-/* The filter panel, in the form's controls. Each condition reads as a
-   sentence — "Where Stage is Proposal", "and Value is at least 10000" — then
-   come the sort and the columns, and Reset and Apply stay at the bottom edge
-   while the rest scrolls. Its rows lay out by the panel's own width rather
-   than the window's, which is what used to put Remove on top of the value box
-   in a panel narrower than the window it was sized for. */
-.cr-filter-popover {
-  position: fixed;
-  top: 60px;
-  right: max(16px, env(safe-area-inset-right));
-  display: flex;
-  width: min(40rem, calc(100vw - 32px));
-  max-height: calc(100vh - 88px);
-  flex-direction: column;
-  container-type: inline-size;
-}
-[data-filter-disclosure][open] > summary { border-color: var(--cr-gray-400); background: var(--cr-gray-100); color: var(--cr-gray-900); }
-.cr-filter-body { flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain; padding: 0 16px; }
-.cr-filter-section { padding: 14px 0 16px; }
-.cr-filter-section + .cr-filter-section { border-top: 1px solid var(--cr-gray-100); }
-.cr-filter-section-head { display: flex; min-height: 28px; align-items: center; gap: 8px; margin-bottom: 8px; }
-.cr-filter-section-head h2 { color: var(--cr-gray-900); font-size: 0.8rem; font-weight: 650; }
-.cr-filter-popover .cr-input { min-height: 32px; padding: 5px 9px; font-size: 0.8rem; }
-.cr-filter-popover .cr-choice-row { min-height: 32px; }
-.cr-filter-popover .cr-field-help { margin-top: 8px; }
-
-/* All or Any, which only means something once there are two conditions. */
-.cr-filter-match { display: flex; align-items: center; gap: 8px; margin-left: auto; color: var(--cr-gray-500); font-size: 0.75rem; font-weight: 550; }
-:is(.cr-filter-popover, .cr-view-editor):not(:has(.cr-filter-row + .cr-filter-row)) .cr-filter-match { display: none; }
-.cr-filter-popover .cr-choice-row-small { min-height: 28px; }
-.cr-choice-row-small .cr-choice-option { padding: 2px 10px; font-size: 0.75rem; }
-
-.cr-filter-list { display: flex; flex-direction: column; gap: 6px; }
-.cr-filter-row {
-  display: grid;
-  grid-template-areas: "join field operator value remove";
-  grid-template-columns: 2.75rem minmax(0, 1.1fr) minmax(0, 0.9fr) minmax(0, 1.2fr) 28px;
-  align-items: center;
-  gap: 6px;
-}
-.cr-filter-join { grid-area: join; color: var(--cr-gray-500); font-size: 0.78rem; font-weight: 550; }
-.cr-filter-row [data-filter-field] { grid-area: field; }
-.cr-filter-row [data-filter-operator] { grid-area: operator; }
-.cr-filter-value { grid-area: value; min-width: 0; }
-.cr-filter-remove { grid-area: remove; }
-
-/* "Where" leads, and each condition after it says how it combines. */
-.cr-filter-join > span { display: none; }
-.cr-filter-row:first-child .cr-filter-join-where,
-.cr-filter-row:not(:first-child) .cr-filter-join-all { display: inline; }
-:is(.cr-filter-popover, .cr-view-editor):has([name="filter_match"][value="any"]:checked) .cr-filter-row:not(:first-child) .cr-filter-join-all { display: none; }
-:is(.cr-filter-popover, .cr-view-editor):has([name="filter_match"][value="any"]:checked) .cr-filter-row:not(:first-child) .cr-filter-join-any { display: inline; }
-
-/* Until a field is chosen there is nothing to compare, so a new row is just
-   "Where Choose a field…", and the only row has nothing to remove. */
-.cr-filter-row:has([data-filter-field] > option[value=""]:checked) :is([data-filter-operator], .cr-filter-value) { visibility: hidden; }
-.cr-filter-row:only-child:has([data-filter-field] > option[value=""]:checked) .cr-filter-remove { visibility: hidden; }
-
-.cr-filter-remove {
-  display: inline-flex;
-  width: 28px;
-  height: 28px;
-  align-items: center;
-  justify-content: center;
-  border-radius: 6px;
-  color: var(--cr-gray-400);
-  font-size: 1.05rem;
-  line-height: 1;
-}
-.cr-filter-remove:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
-
-.cr-filter-add {
-  display: inline-flex;
-  align-items: center;
-  margin: 8px 0 0 -8px;
-  border-radius: 6px;
-  color: var(--cr-gray-600);
-  padding: 5px 8px;
-  font-size: 0.77rem;
-  font-weight: 600;
-}
-.cr-filter-add:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
-.cr-filter-add:disabled { background: none; color: var(--cr-gray-400); cursor: not-allowed; }
-
-/* In a narrow panel the comparison moves under the field. */
-@container (max-width: 32rem) {
-  .cr-filter-row {
-    grid-template-areas: "join field field remove" ". operator value .";
-    grid-template-columns: 2.75rem minmax(0, 1fr) minmax(0, 1fr) 28px;
-  }
-  .cr-filter-row + .cr-filter-row { margin-top: 8px; }
-  .cr-filter-row:has([data-filter-field] > option[value=""]:checked) :is([data-filter-operator], .cr-filter-value) { display: none; }
-}
-
-.cr-sort-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.cr-sort-row > select { flex: 1 1 12rem; width: auto; }
-
-.cr-filter-columns > summary { cursor: pointer; list-style: none; margin-bottom: 0; }
-.cr-filter-columns > summary::-webkit-details-marker { display: none; }
-.cr-filter-columns > summary::after {
-  width: 7px;
-  height: 7px;
-  margin: 0 4px 3px auto;
-  border-right: 1.5px solid var(--cr-gray-500);
-  border-bottom: 1.5px solid var(--cr-gray-500);
-  content: "";
-  transform: rotate(45deg);
-}
-.cr-filter-columns[open] > summary { margin-bottom: 8px; }
-.cr-filter-columns[open] > summary::after { margin-bottom: -2px; transform: rotate(-135deg); }
-.cr-filter-columns > summary:hover h2 { color: var(--cr-accent); }
-.cr-filter-columns .cr-checkbox-option { min-height: 30px; max-width: 100%; padding: 3px 10px 3px 8px; font-size: 0.77rem; }
-.cr-filter-columns .cr-checkbox-option > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-/* The saved-view editor: the filter panel's sections laid out as a page,
-   with its own width for the rows to lay out by. */
-.cr-view-editor { max-width: 48rem; margin: 0 auto; container-type: inline-size; }
-.cr-view-editor .cr-choice-row-small { min-height: 28px; }
-.cr-view-editor-groups { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; margin-top: 14px; }
-.cr-view-editor-groups .cr-checkbox-option { max-width: 100%; }
-.cr-view-editor .cr-filter-section > .cr-field-help { margin-top: 8px; }
-.cr-view-editor-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
-@container (max-width: 32rem) {
-  .cr-view-editor-grid { grid-template-columns: minmax(0, 1fr); }
-}
-.cr-view-editor-footer { display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--cr-gray-200); padding-top: 16px; }
-.cr-view-editor-danger { max-width: 48rem; margin: 32px auto 0; }
-
-.cr-filter-footer {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  border-top: 1px solid var(--cr-gray-200);
-  padding: 12px 16px;
-}
-
-.cr-record-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; align-items: start; gap: 32px; }
-.cr-record-activity { position: sticky; top: 20px; min-width: 0; max-height: calc(100vh - 40px); overflow-y: auto; padding: 2px; scrollbar-width: thin; }
-
-.cr-aside-heading { color: var(--cr-gray-900); font-size: 0.8rem; font-weight: 650; }
-.cr-aside-link { color: var(--cr-gray-500); font-size: 0.72rem; font-weight: 600; white-space: nowrap; }
-.cr-aside-link:hover { color: var(--cr-gray-900); }
-
-/* A record's recent history, as a timeline down the side of the page. */
-.cr-activity { margin: 12px 0 0 3px; border-left: 1px solid var(--cr-gray-200); }
-.cr-activity-empty { margin-top: 6px; color: var(--cr-gray-500); font-size: 0.75rem; }
-.cr-activity-item { position: relative; padding: 0 0 16px 16px; }
-.cr-activity-item:last-child { padding-bottom: 2px; }
-.cr-activity-item::before {
-  content: "";
-  position: absolute;
-  top: 5px;
-  left: -4px;
-  width: 7px;
-  height: 7px;
-  border-radius: 999px;
-  background: var(--cr-gray-300);
-  box-shadow: 0 0 0 3px var(--cr-gray-0);
-}
-.cr-activity-item:first-child::before { background: var(--cr-gray-500); }
-.cr-activity-item:target::before { background: var(--cr-accent); }
-.cr-activity-title { color: var(--cr-gray-900); font-size: 0.78rem; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
-.cr-activity-fields { color: var(--cr-gray-600); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.72rem; font-weight: 500; }
-.cr-activity-meta { margin-top: 2px; color: var(--cr-gray-500); font-size: 0.72rem; line-height: 1.45; overflow-wrap: anywhere; }
-.cr-activity-message { margin-top: 4px; color: var(--cr-gray-700); font-size: 0.75rem; line-height: 1.45; }
-.cr-activity-changes summary { width: fit-content; margin-top: 3px; cursor: pointer; color: var(--cr-gray-500); font-size: 0.72rem; font-weight: 600; }
-.cr-activity-changes summary:hover { color: var(--cr-gray-900); }
-
-/* The record page's relations panel, above its activity. */
-.cr-relations { margin-bottom: 28px; }
-.cr-relations-label { display: block; margin: 12px 0 5px; color: var(--cr-gray-500); font-size: 0.66rem; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
-.cr-relations-list { overflow: hidden; border: 1px solid var(--cr-gray-200); border-radius: var(--cr-radius); background: var(--cr-gray-0); }
-.cr-relation { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--cr-gray-200); padding: 8px 10px; }
-.cr-relation:last-child { border-bottom: 0; }
-.cr-relation-kind { display: block; color: var(--cr-gray-500); font-size: 0.66rem; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
-.cr-relation-target { display: block; overflow: hidden; color: var(--cr-gray-900); font-size: 0.82rem; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-a.cr-relation-target:hover { color: var(--cr-accent); text-decoration: underline; }
-.cr-relation-missing { display: block; overflow: hidden; color: var(--cr-gray-500); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.75rem; text-overflow: ellipsis; white-space: nowrap; }
-.cr-relation-meta { display: block; color: var(--cr-gray-500); font-size: 0.7rem; }
-.cr-relation-remove { flex: 0 0 auto; border-radius: 5px; color: var(--cr-gray-500); padding: 3px 6px; font-size: 0.7rem; font-weight: 600; }
-.cr-relation-remove:hover { background: var(--cr-gray-100); color: var(--cr-danger); }
-.cr-relation-add { margin-top: 10px; }
-.cr-relation-add summary { cursor: pointer; color: var(--cr-gray-600); font-size: 0.75rem; font-weight: 600; }
-.cr-relation-add summary:hover { color: var(--cr-gray-900); }
-.cr-relation-form { display: grid; gap: 8px; margin-top: 8px; border: 1px dashed var(--cr-gray-300); border-radius: var(--cr-radius); padding: 10px; }
-.cr-relation-form .cr-relations-label { margin-top: 0; }
-
-@media (min-width: 1200px) {
-  .cr-activity-jump { display: none; }
-}
-
-@media (max-width: 1199px) {
-  .cr-record-layout { display: block; }
-  .cr-record-activity { position: static; max-height: none; margin-top: 28px; overflow: visible; }
-}
-
-@media (max-width: 640px) {
-  .cr-form-grid { grid-template-columns: minmax(0, 1fr); }
-}
-
-@media (max-width: 899px) {
-  .cr-shell { display: block; }
-  .cr-sidebar { display: none; }
-  .cr-mobile-header {
-    position: sticky;
-    top: 0;
-    z-index: 40;
-    display: block;
-    border-bottom: 1px solid var(--cr-gray-200);
-    background: color-mix(in srgb, var(--cr-gray-0) 96%, transparent);
-    backdrop-filter: blur(14px);
-  }
-  .cr-mobile-topbar { display: flex; min-height: 46px; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 16px; }
-  .cr-mobile-utilities { display: flex; align-items: center; gap: 2px; }
-  .cr-mobile-view-strip { display: flex; gap: 4px; overflow-x: auto; border-top: 1px solid var(--cr-gray-100); padding: 5px 12px 6px; scrollbar-width: none; }
-  .cr-mobile-view-strip::-webkit-scrollbar { display: none; }
-  .cr-mobile-view-strip a { flex: 0 0 auto; border-radius: 5px; color: var(--cr-gray-500); padding: 4px 7px; font-size: 0.72rem; font-weight: 550; }
-  .cr-mobile-view-strip a:hover,
-  .cr-mobile-view-strip a.is-active { background: var(--cr-gray-100); color: var(--cr-gray-900); }
-  .cr-mobile-header .cr-perspective { display: flex; align-items: center; gap: 6px; margin: 0; border: 0; padding: 0; }
-  .cr-mobile-header .cr-perspective-label { display: none; }
-  .cr-mobile-header .cr-perspective select { width: auto; max-width: 210px; }
-  .cr-main { min-height: calc(100vh - 82px); }
-  .cr-filter-popover { top: 94px; }
-}
-
-@media (max-width: 640px) {
-  .cr-view-index-header { display: none; }
-  .cr-view-row { grid-template-columns: minmax(0, 1fr) auto 20px; column-gap: 10px; row-gap: 4px; padding: 8px 12px; }
-  .cr-view-name { grid-column: 1; grid-row: 1; }
-  .cr-view-count { grid-column: 2; grid-row: 1; color: var(--cr-gray-500); font-size: 0.72rem; }
-  .cr-view-updated { display: none; }
-  .cr-view-kind { grid-column: 1 / span 2; grid-row: 2; }
-  .cr-view-arrow { grid-column: 3; grid-row: 1 / span 2; }
-  .cr-view-unit { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
-  .cr-mobile-header .cr-perspective select { max-width: 155px; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  html { scroll-behavior: auto; }
-  .cr-app *, .cr-app *::before, .cr-app *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
-  /* The blanket rule above already collapses the progress bar's growth, but by
-     accident rather than on purpose, and a 0.01ms animation is a strange thing
-     to leave in the sheet. State the intent instead: no motion at all, which
-     leaves the bar at the full width it rests at, so the feedback survives the
-     preference as a plain static strip even though the movement does not. */
-  .cr-progress { transition: none; }
-  .cr-progress.htmx-request::after { animation: none; }
-}
-"#;
-
 fn perspective_control(ui: &UiContext, csrf_token: &str, id: &str) -> Markup {
     html! {
         form method="post" action="/perspective" hx-boost=(UNBOOSTED) class="cr-perspective" {
             input type="hidden" name="_csrf" value=(csrf_token);
             label for=(id) class="cr-perspective-label" { "Viewing as" }
-            select id=(id) name="principal" aria-label="View as user" onchange="this.form.submit()" {
-                @for user in &ui.users {
-                    option value=(&user.id) selected[user.id == ui.selected] {
-                        (&user.name) " — " (&user.role)
-                        @if user.status == UserStatus::Disabled { " (disabled)" }
+            // Choosing a user changes nothing until the button is pressed. The
+            // select used to submit itself from an inline `onchange`, so
+            // arrowing through the options with a keyboard switched perspective,
+            // and reloaded the page, at every option it passed: a change of
+            // context on input, which WCAG 3.2.2 rules out. It was also the last
+            // inline handler, which the content security policy refuses. The
+            // button used to be inside `<noscript>`; it is now how everyone
+            // switches, with or without JavaScript.
+            div class="cr-perspective-choice" {
+                select id=(id) name="principal" aria-label="View as user" {
+                    @for user in &ui.users {
+                        option value=(&user.id) selected[user.id == ui.selected] {
+                            (&user.name) " — " (&user.role)
+                            @if user.status == UserStatus::Disabled { " (disabled)" }
+                        }
                     }
                 }
+                button type="submit" class="cr-button" { "Switch" }
             }
-            noscript { button type="submit" class="cr-button" { "View" } }
         }
     }
 }
@@ -14084,20 +12644,24 @@ fn page_layout(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                // Both schemes, matching `color-scheme` in `GLOBAL_STYLES`:
+                // Both schemes, matching `color-scheme` in `static/cr.css`:
                 // said here as well so the browser paints the right canvas
                 // before the sheet has been parsed, instead of flashing white.
                 meta name="color-scheme" content="light dark";
                 meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff";
                 meta name="theme-color" media="(prefers-color-scheme: dark)" content="#191919";
                 meta name="robots" content="noindex, nofollow";
-                link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='1' y='1' width='30' height='30' rx='7' fill='%23fff' stroke='%23d4d4d0'/%3E%3Cpath d='M20.5 20.2c-1.1 1-2.4 1.5-4 1.5-3.5 0-6-2.4-6-5.8s2.5-5.8 6-5.8c1.6 0 3 .5 4 1.5l-1.7 2a3.2 3.2 0 0 0-2.2-.8c-1.8 0-3 1.2-3 3.1s1.2 3.1 3 3.1c.9 0 1.6-.3 2.2-.8l1.7 2z' fill='%23242424'/%3E%3C/svg%3E";
+                // A file on this origin rather than a `data:` URL, for the
+                // content security policy; see `CONTENT_SECURITY_POLICY`.
+                link rel="icon" type="image/svg+xml" href=(FAVICON_PATH.as_str());
                 (document_title(title))
-                // Linked, so it blocks the first paint until it has loaded
-                // rather than restyling a page the reader is already looking
-                // at. Its rules are all inside cascade layers and the sheet
-                // below is not, so the two need no particular order.
+                // Both sheets are linked, so they block the first paint until
+                // they have loaded rather than restyling a page the reader is
+                // already looking at. The utilities' rules are all inside
+                // cascade layers and the server's own are not, so the two need
+                // no particular order.
                 link rel="stylesheet" href=(TAILWIND_STYLESHEET_PATH.as_str());
+                link rel="stylesheet" href=(UI_STYLESHEET_PATH.as_str());
                 // htmx is linked before `cr.js` because `cr.js` configures
                 // it, and two deferred scripts run in document order.
                 script src=(HTMX_SCRIPT_PATH.as_str()) defer {}
@@ -14106,7 +12670,6 @@ fn page_layout(
                 // against a parsed document, and a deferred head script runs at
                 // the same point without blocking the parse to get there.
                 script src=(UI_SCRIPT_PATH.as_str()) defer {}
-                style { (PreEscaped(GLOBAL_STYLES)) }
             }
             // `hx-boost` makes every same-origin link and every form in the
             // page an htmx request whose response replaces the body's contents,
@@ -14129,7 +12692,7 @@ fn page_layout(
                 a href=(format!("#{CONTENT_REGION}")) class="cr-skip-link" { "Skip to content" }
                 // The navigation progress bar. htmx adds its `htmx-request`
                 // class to whatever `hx-indicator` names for exactly as long as
-                // a request is in flight, and `.cr-progress` in `GLOBAL_STYLES`
+                // a request is in flight, and `.cr-progress` in `static/cr.css`
                 // animates from nothing else, so this is inert markup rather
                 // than a second mechanism to keep in step with the first. A
                 // boosted navigation shows nothing at all until the response
@@ -15886,6 +14449,46 @@ fn html_error(error: ApiError) -> Response {
 /// invisible until someone puts a proxy in front of `cr serve`.
 const HTML_VARY: &str = "Cookie, HX-Request, HX-Target, HX-History-Restore-Request";
 
+/// The content security policy every HTML answer carries.
+///
+/// Templates escape every value they render, so this is the second line of
+/// defence rather than the first: if an escape were ever missed, injected
+/// markup could still not run a script, load anything from another origin, or
+/// send a form anywhere else. It costs the pages nothing, because they already
+/// work within it: every script, both stylesheets and the icon are files under
+/// `/static/`, and no page carries an inline `<script>`, `<style>`, `style=`
+/// attribute or event handler attribute. `tests/csp_http.rs` holds every page
+/// to that.
+///
+/// * `default-src 'self'` is the fallback for every fetch: scripts, styles,
+///   images, fonts, frames, workers, and htmx's requests. This origin and
+///   nothing else. With no `'unsafe-inline'` no inline script or event
+///   handler runs and no `<style>` block or `style=` attribute applies, and
+///   with no `'unsafe-eval'` neither does `eval`, which `cr.js` also tells
+///   htmx not to use (`allowEval`).
+/// * `object-src 'none'`: no plugin content, which the fallback would allow
+///   from this origin and nothing here uses.
+/// * `base-uri 'none'`: no page uses `<base>`, and an injected one would
+///   re-point every relative URL on the page, the script sources included.
+///   `default-src` does not cover it.
+/// * `form-action 'self'`: every form submits to this origin, so an injected
+///   form cannot send what is typed into it, or the CSRF token, anywhere else.
+///   `default-src` does not cover this either. Browsers apply it to the
+///   redirects that follow a submission too, so behind an authenticating proxy
+///   whose expired session redirects a form post to a sign-in page on another
+///   origin, that one submission is refused rather than followed. The next
+///   link followed reaches the sign-in page as before.
+/// * `frame-ancestors 'none'`: no other page may frame these. A delete is two
+///   clicks on pages this server renders, and a page that framed them under
+///   something else could collect both. It is what `X-Frame-Options: DENY`
+///   says, in the form that supersedes it.
+///
+/// There is no `upgrade-insecure-requests`, because `cr serve` speaks plain
+/// HTTP and would be told to fetch its own assets over a scheme it does not
+/// serve, and no reporting endpoint, because there is nothing to collect
+/// reports.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
 fn html_response(status: StatusCode, markup: Markup) -> Response {
     let mut response = (status, Html(markup.into_string())).into_response();
     response
@@ -15897,6 +14500,10 @@ fn html_response(status: StatusCode, markup: Markup) -> Response {
     response.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
     );
     response
 }
