@@ -21,6 +21,12 @@ protected data unreadable.
 Treat checkpoints and stderr as non-secret operational metadata: never place
 credentials or other confidential values in either surface.
 
+The audit head can also be signed with an Ed25519 key named by
+`CR_AUDIT_SIGNING_KEY`. As with the encryption keyring, the private key must
+live outside the database, and a verifier must take the public key from
+outside it as well: a key file committed beside the journal can be replaced by
+whoever can rewrite the journal.
+
 ## Reporting a vulnerability
 
 Please report privately. **Do not open a public issue.**
@@ -49,6 +55,12 @@ In scope:
 
 - Forging, reordering, truncating, or replaying entries in the audit chain, or
   any way to change a record without producing a correct audit entry.
+- Making `cr audit verify --trusted-key` accept a journal the holder of that
+  key's private half never signed, or making a write with
+  `CR_AUDIT_SIGNING_KEY` set sign on top of history its stored checkpoint does
+  not vouch for. This is in scope even for an attacker who can rewrite every
+  file in the database directory, since that is who signing exists to stop,
+  as long as the private key and the trusted public key stay outside it.
 - Escaping the database root — path traversal, symlink escapes, or any read or
   write outside the configured directory.
 - Authentication or authorisation bypass in the REST API or the server-rendered
@@ -60,9 +72,14 @@ In scope:
 Out of scope:
 
 - Anything that requires an attacker who can already write to the database
-  directory or run as the serving user. `cr` deliberately treats direct file
-  edits as legitimate input, reviewed through `cr status` and `cr save`; the
-  audit chain records them rather than preventing them.
+  directory or run as the serving user, except defeating a signed checkpoint
+  as described above. `cr` deliberately treats direct file edits as legitimate
+  input, reviewed through `cr status` and `cr save`; the audit chain records
+  them rather than preventing them.
+- Rolling the journal and its signed checkpoint back together to an older
+  signed pair. A signature does not prove freshness; that is documented in
+  [Sign checkpoints](docs/audit.md#sign-checkpoints) and tracked in
+  [`TODO.md`](TODO.md).
 - Serving a database over an untrusted network without a TLS-terminating proxy.
   `cr serve` speaks plain HTTP by design.
 - A same-length rewrite of a sealed audit segment that also restores the

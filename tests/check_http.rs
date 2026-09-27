@@ -185,7 +185,10 @@ fn the_route_is_described_by_the_generated_openapi_document() {
         .iter()
         .map(|parameter| parameter["name"].as_str().unwrap())
         .collect();
-    assert_eq!(parameters, vec!["collection", "limit", "offset"]);
+    assert_eq!(
+        parameters,
+        vec!["collection", "trusted_key", "limit", "offset"]
+    );
 
     let report = &document["components"]["schemas"]["CheckReport"];
     assert_eq!(
@@ -223,6 +226,9 @@ fn the_route_is_described_by_the_generated_openapi_document() {
         "audit_anchor_mismatch",
         "audit_anchor_behind",
         "audit_anchor_missing",
+        "audit_signature_mismatch",
+        "audit_signature_behind",
+        "audit_signature_missing",
     ] {
         assert!(kinds.contains(&kind.to_owned()), "{kind} is undocumented");
     }

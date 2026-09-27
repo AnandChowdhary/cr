@@ -85,7 +85,7 @@ cr --actor 'admin@example.com' delete companies old-company --yes
 
 Identity is resolved from `--actor`, `CR_ACTOR`, `CR_NAME` and `CR_EMAIL`, Git author environment variables, Git `user.name` and `user.email`, `EMAIL`, and finally the operating-system username.
 
-This provides attribution, not cryptographically authenticated identity. For stronger assurance, store signed audit checkpoints outside the database.
+This provides attribution, not cryptographically authenticated identity. For stronger assurance that history was not rewritten afterwards, [sign audit checkpoints](audit.md#sign-checkpoints) with a key kept outside the database.
 
 ## How records work
 

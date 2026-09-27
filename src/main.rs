@@ -13,9 +13,9 @@ use cr::{
     AuditFilter, CheckReport, CheckScope, CollectionAccessPolicy, CollectionPresentation,
     DEFAULT_VIEW_PAGE_SIZE, Database, DomainError, Filter, FilterExpression, JournalVerification,
     Projection, Record, RecordPrecondition, RecordVisibility, Role, SchemaReview, SearchQuery,
-    SearchTarget, SortDirection, SortKey, SyncAttribution, UserDeleteOptions, UserEnsureOutcome,
-    UserKind, UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout, parse_sort_keys,
-    parse_threshold, sort_by_record_keys, sort_records,
+    SearchTarget, SigningKeySummary, SortDirection, SortKey, SyncAttribution, TrustedKeys,
+    UserDeleteOptions, UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus,
+    UserUpdate, ViewLayout, parse_sort_keys, parse_threshold, sort_by_record_keys, sort_records,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -742,6 +742,9 @@ enum Command {
         /// Lowest severity that makes this command exit 2: error, warning, or never.
         #[arg(long, value_name = "SEVERITY", default_value = "error")]
         fail_on: String,
+
+        #[command(flatten)]
+        trusted: TrustedKeyArgs,
     },
 
     /// Record selected direct Markdown changes in the audit journal.
@@ -1448,10 +1451,17 @@ enum AuditCommand {
     },
 
     /// Verify the hash chain and reconcile it with current records.
+    ///
+    /// With a trusted key, also verify the signed checkpoint in
+    /// .cr-audit-head.sig.json, and fail when it is missing, signed by a key
+    /// that is not trusted, or does not agree with the journal.
     Verify {
         /// Require the chain to end at an externally saved head hash.
         #[arg(long, value_name = "SHA256")]
         expected_head: Option<String>,
+
+        #[command(flatten)]
+        trusted: TrustedKeyArgs,
     },
 
     /// Print the current sequence and head hash for external anchoring.
@@ -1468,13 +1478,79 @@ enum AuditCommand {
     /// rewrite the journal, so its protection comes from the pushed history,
     /// not from its location on disk.
     Anchor {
-        /// Rewrite the anchor to the current head. Refuses if it disagrees.
+        /// Rewrite the anchor to the current head, and sign it when CR_AUDIT_SIGNING_KEY names a key. Refuses if either disagrees.
         #[arg(long)]
         write: bool,
 
         #[arg(long)]
         json: bool,
     },
+
+    /// Create and inspect the Ed25519 keys that sign audit checkpoints.
+    ///
+    /// Keep the private key outside the database: set CR_AUDIT_SIGNING_KEY
+    /// to its path wherever writes should be signed, and give verifiers the
+    /// public key.
+    Key {
+        #[command(subcommand)]
+        command: AuditKeyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditKeyCommand {
+    /// Write a new private signing key, readable by its owner only, and print its public key.
+    Generate {
+        /// Where to write the private key. It must not exist yet.
+        path: PathBuf,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print the public key and key ID of a private signing key.
+    Show {
+        /// The private key. Defaults to the one CR_AUDIT_SIGNING_KEY names.
+        path: Option<PathBuf>,
+
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The public keys a verification trusts, from outside the database.
+#[derive(Clone, Debug, Default, Args)]
+struct TrustedKeyArgs {
+    /// Verify the signed checkpoint against this public key (ed25519:...) or file of keys. Repeatable; replaces CR_AUDIT_TRUSTED_KEYS.
+    #[arg(long = "trusted-key", value_name = "KEY|FILE")]
+    keys: Vec<String>,
+}
+
+impl TrustedKeyArgs {
+    /// The keys to trust: the flags when given, otherwise
+    /// `CR_AUDIT_TRUSTED_KEYS`, otherwise none.
+    ///
+    /// Warns about a key file inside the database. It is read, because the
+    /// caller asked for it, but anybody who can rewrite the journal can
+    /// rewrite that file too, so verifying against it proves nothing.
+    fn resolve(&self, database: &Database) -> Result<Option<TrustedKeys>> {
+        let trusted = if self.keys.is_empty() {
+            TrustedKeys::from_environment()?
+        } else {
+            Some(TrustedKeys::parse(&self.keys)?)
+        };
+        if let Some(trusted) = &trusted {
+            for file in trusted.files() {
+                if file.starts_with(database.root()) {
+                    eprintln!(
+                        "warning: trusted key file {} is inside the database, so anyone who can rewrite the journal can rewrite it too; keep trusted keys outside the database",
+                        file.display()
+                    );
+                }
+            }
+        }
+        Ok(trusted)
+    }
 }
 
 /// Exit status for a command that ran successfully and found problems.
@@ -1595,6 +1671,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
         let database = Database::init(path)?;
         println!("Initialized database at {}", database.root().display());
         return Ok(ExitCode::SUCCESS);
+    }
+    // A signing key belongs to no database, and must not live inside one, so
+    // managing keys neither needs nor opens a database.
+    if let Command::Audit {
+        command: AuditCommand::Key { command },
+    } = cli.command
+    {
+        if cli.as_principal.is_some() {
+            return Err(usage_error(
+                "--as cannot be used with 'audit key', which opens no database",
+            ));
+        }
+        run_audit_key(command)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Command::Serve { .. } = &cli.command {
+        // Fail at launch rather than on the first write or verification a
+        // request makes: a signing key or trusted key the server cannot use
+        // is a configuration mistake, not something a caller did.
+        cr::describe_signing_key_from_environment()?;
+        TrustedKeys::from_environment()?;
     }
 
     // Before `--as`, so the delegation check and the command it delegates
@@ -2638,9 +2735,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
             collection,
             json,
             fail_on,
+            trusted,
         } => {
             let threshold = parse_threshold(&fail_on)?;
-            let report = database.check(&CheckScope { collection })?;
+            let trusted_keys = trusted.resolve(&database)?;
+            let report = database.check(&CheckScope {
+                collection,
+                trusted_keys,
+            })?;
             print_check(&report, json)?;
             if threshold.is_some_and(|threshold| report.summary.fails(threshold)) {
                 return Ok(ExitCode::from(FOUND_PROBLEMS));
@@ -2814,8 +2916,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     }
                 }
             }
-            AuditCommand::Verify { expected_head } => {
-                let verification = database.audit_verify(expected_head.as_deref())?;
+            AuditCommand::Verify {
+                expected_head,
+                trusted,
+            } => {
+                let trusted = trusted.resolve(&database)?;
+                let verification =
+                    database.audit_verify_trusting(expected_head.as_deref(), trusted.as_ref())?;
                 println!(
                     "Verified {} audit events and {} records; head {}",
                     verification.entries,
@@ -2824,6 +2931,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 );
                 if let Some(notice) = verification.anchor.notice() {
                     println!("{notice}");
+                }
+                if let Some(summary) = verification.signature.summary() {
+                    println!("{summary}");
                 }
             }
             AuditCommand::Head { json } => {
@@ -2839,16 +2949,23 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 }
             }
             AuditCommand::Anchor { write, json } if write => {
-                let anchor = database.audit_anchor_write()?;
+                let written = database.audit_anchor_write()?;
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&anchor)?);
+                    println!("{}", serde_json::to_string_pretty(&written)?);
                 } else {
-                    println!(
-                        "Anchored sequence {} at {}; commit .cr-audit-head.json",
-                        anchor.sequence, anchor.hash
-                    );
+                    match &written.signature {
+                        Some(signature) => println!(
+                            "Anchored and signed sequence {} at {} with key {}; commit .cr-audit-head.json and .cr-audit-head.sig.json",
+                            written.anchor.sequence, written.anchor.hash, signature.key_id
+                        ),
+                        None => println!(
+                            "Anchored sequence {} at {}; commit .cr-audit-head.json",
+                            written.anchor.sequence, written.anchor.hash
+                        ),
+                    }
                 }
             }
+            AuditCommand::Key { .. } => unreachable!(),
             AuditCommand::Anchor { json, .. } => {
                 let report = database.audit_anchor()?;
                 if json {
@@ -2867,6 +2984,73 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Generate or describe a checkpoint signing key.
+///
+/// The public key is printed alone on the last line, so it can be copied
+/// whole into `--trusted-key`, `CR_AUDIT_TRUSTED_KEYS`, or a key file.
+fn run_audit_key(command: AuditKeyCommand) -> Result<()> {
+    let (summary, json, heading) = match command {
+        AuditKeyCommand::Generate { path, json } => {
+            warn_if_inside_a_database(&path);
+            let summary = cr::generate_signing_key(&path)?;
+            let heading = format!(
+                "Wrote a private audit signing key to {}; keep it outside the database and point CR_AUDIT_SIGNING_KEY at it where writes should be signed",
+                summary.path.display()
+            );
+            (summary, json, heading)
+        }
+        AuditKeyCommand::Show { path, json } => {
+            let summary = match path {
+                Some(path) => cr::describe_signing_key(&path)?,
+                None => cr::describe_signing_key_from_environment()?.ok_or_else(|| {
+                    usage_error("name a private key file, or set CR_AUDIT_SIGNING_KEY to one")
+                })?,
+            };
+            let heading = format!("Private audit signing key {}", summary.path.display());
+            (summary, json, heading)
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        print_signing_key(&summary, &heading);
+    }
+    Ok(())
+}
+
+fn print_signing_key(summary: &SigningKeySummary, heading: &str) {
+    println!("{heading}");
+    println!("Key ID: {}", summary.key_id);
+    println!("Public key, for --trusted-key and CR_AUDIT_TRUSTED_KEYS:");
+    println!("{}", summary.public_key);
+}
+
+/// Warn when a new signing key is about to be written inside a database.
+///
+/// Not a refusal: `cr` cannot know which database a key will sign, and a
+/// database initialized at a home directory would contain every path. But a
+/// key stored in the tree it signs is readable by anybody who can rewrite
+/// that tree, which is the one person the signature exists to stop.
+fn warn_if_inside_a_database(path: &Path) {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let Ok(parent) = parent.canonicalize() else {
+        return;
+    };
+    if let Some(root) = parent
+        .ancestors()
+        .find(|directory| directory.join(".cr").is_dir())
+    {
+        eprintln!(
+            "warning: {} is inside the database at {}; anyone who can rewrite that database could read the key and sign whatever they wrote, so keep it elsewhere",
+            path.display(),
+            root.display()
+        );
+    }
 }
 
 /// Print an integrity report.

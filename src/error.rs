@@ -72,6 +72,23 @@ pub enum DomainError {
     /// established. It never means "the anchor is merely behind", which is a
     /// success with a notice rather than a failure.
     AnchorMismatch(String),
+    /// The journal could not be verified against a signed checkpoint and the
+    /// trusted keys the caller supplied.
+    ///
+    /// Its own variant rather than an [`Self::AnchorMismatch`], although the
+    /// two judge the same position. The anchor is an in-band file: anybody who
+    /// can rewrite the journal can rewrite it to match, so its disagreement is
+    /// evidence only until someone checks the committed history. A signature
+    /// under a key held outside the database is the one check such a person
+    /// cannot make pass again, and an auditor who could not tell its failure
+    /// from the anchor's would discount the stronger evidence as the weaker.
+    /// It also covers failures the anchor has no counterpart for: no signed
+    /// checkpoint at all, one made with a key the caller does not trust, and
+    /// one made for a different database.
+    ///
+    /// Only returned when trusted keys were given. It never means "the
+    /// signature is merely behind", which is a success with a notice.
+    SignatureMismatch(String),
     /// A sync adapter could not be started, outran its time or output bound,
     /// or exited unsuccessfully.
     ///
@@ -105,6 +122,7 @@ impl DomainError {
             Self::ApprovalMismatch(_) => "approval_mismatch",
             Self::AuditIntegrity(_) => "audit_integrity_failed",
             Self::AnchorMismatch(_) => "anchor_mismatch",
+            Self::SignatureMismatch(_) => "signature_mismatch",
             Self::AdapterFailed(_) => "adapter_failed",
         }
     }
@@ -122,6 +140,7 @@ impl DomainError {
             | Self::ApprovalMismatch(message)
             | Self::AuditIntegrity(message)
             | Self::AnchorMismatch(message)
+            | Self::SignatureMismatch(message)
             | Self::AdapterFailed(message) => message,
         }
     }
@@ -243,6 +262,11 @@ pub(crate) fn anchor_mismatch(message: impl Display) -> anyhow::Error {
     anyhow::Error::new(DomainError::AnchorMismatch(message.to_string()))
 }
 
+/// Build a signed-checkpoint verification failure for `bail!`-style returns.
+pub(crate) fn signature_mismatch(message: impl Display) -> anyhow::Error {
+    anyhow::Error::new(DomainError::SignatureMismatch(message.to_string()))
+}
+
 /// Build a failed-sync-adapter failure for `bail!`-style returns.
 pub(crate) fn adapter_failed(message: impl Display) -> anyhow::Error {
     anyhow::Error::new(DomainError::AdapterFailed(message.to_string()))
@@ -271,7 +295,7 @@ mod tests {
     use super::{
         DomainError, adapter_failed, anchor_mismatch, approval_mismatch, audit_integrity, conflict,
         forbidden, idempotency_conflict, invalid, is_already_exists, is_missing,
-        precondition_failed,
+        precondition_failed, signature_mismatch,
     };
     use anyhow::anyhow;
 
@@ -331,6 +355,11 @@ mod tests {
         assert_eq!(
             DomainError::of(&anchor_mismatch("anchor is not the head")).map(DomainError::code),
             Some("anchor_mismatch")
+        );
+        assert_eq!(
+            DomainError::of(&signature_mismatch("signed by an untrusted key"))
+                .map(DomainError::code),
+            Some("signature_mismatch")
         );
         assert_eq!(
             DomainError::of(&adapter_failed("sync 'daily' exited unsuccessfully"))

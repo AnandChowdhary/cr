@@ -112,13 +112,16 @@ cr sync state NAME
 
 cr status [--json]
 cr check [--collection COLLECTION] [--json] [--fail-on error|warning|never]
+         [--trusted-key KEY|FILE]...
 cr save COLLECTION/ID... [--message TEXT] [--json] [--preview] [ATTRIBUTION]
 cr save --all [--message TEXT] [--json] [--preview] [ATTRIBUTION]
 
 cr audit log [COLLECTION] [ID] [--by-agent AGENT] [--by-session SESSION] [--limit N] [--json]
-cr audit verify [--expected-head HASH]
+cr audit verify [--expected-head HASH] [--trusted-key KEY|FILE]...
 cr audit head [--json]
 cr audit anchor [--write] [--json]
+cr audit key generate PATH [--json]
+cr audit key show [PATH] [--json]
 cr audit baseline
 
 SORT = --sort KEY [--sort KEY]... | --sort FIELD --desc
@@ -141,5 +144,14 @@ a single key written without one, and is refused with several; see
 command, beneath the flags. `CR_HOOK_AGENT` and `CR_HOOK_AUTHORIZATION` are the
 layer a harness hook fills in, beneath those; see
 [Let Claude Code fill in the attribution](agents.md#let-claude-code-fill-in-the-attribution).
+
+`CR_AUDIT_SIGNING_KEY` names a private key from `cr audit key generate`; while
+it is set, every command that records an audit event also signs the new head
+into `.cr-audit-head.sig.json`, and `cr audit anchor --write` signs the current
+one. `--trusted-key` takes an `ed25519:` public key or a file of them, one per
+line, and may be repeated; without it, `CR_AUDIT_TRUSTED_KEYS` supplies the
+same values separated by commas. A failed signature check is
+`signature_mismatch`. `audit key` opens no database. See
+[Sign checkpoints](audit.md#sign-checkpoints).
 
 Run `cr COMMAND --help` for complete command-specific help.

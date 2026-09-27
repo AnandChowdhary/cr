@@ -14,6 +14,7 @@ mod query;
 mod readiness;
 mod search;
 pub mod server;
+mod signing;
 mod sort;
 mod sync;
 mod traverse;
@@ -35,8 +36,9 @@ pub use attribution::{
     parse_authorization, parse_intent,
 };
 pub use audit::{
-    AnchorReport, AnchorStatus, AuditAction, AuditAnchor, AuditChange, AuditEntry, AuditFilter,
-    AuditHead, AuditSource, AuditVerification, ChangePreview, JournalVerification, RecordActivity,
+    AnchorReport, AnchorStatus, AnchorWrite, AuditAction, AuditAnchor, AuditChange, AuditEntry,
+    AuditFilter, AuditHead, AuditSource, AuditVerification, ChangePreview, JournalVerification,
+    RecordActivity, SignatureStatus,
 };
 pub use check::{
     CheckReport, CheckScope, CheckSummary, Finding, FindingKind, Severity, parse_threshold,
@@ -50,6 +52,10 @@ pub use pins::Pin;
 pub use projection::Projection;
 pub use query::Filter;
 pub use search::{SearchQuery, SearchTarget};
+pub use signing::{
+    PublicKey, SignedCheckpoint, SigningKeySummary, TrustedKeys, describe_signing_key,
+    describe_signing_key_from_environment, generate_signing_key,
+};
 pub use sort::{
     MAX_SORT_KEYS, SortDirection, SortKey, parse_sort_keys, sort_by_record_keys, sort_records,
 };

@@ -44,6 +44,12 @@ axum = "0.8.9"
 base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.7", features = ["derive"] }
+# Signs and verifies audit checkpoints. Pure Rust, and it shares `sha2` 0.11
+# with the rest of the tree. `fast` is off: its precomputed tables speed up
+# signing, which happens once per write, at the cost of binary size, and
+# `rand_core` is off because keys come from `getrandom` directly. `zeroize`
+# stays on so a loaded signing key is wiped when it is dropped.
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
 form_urlencoded = "1.2.2"
 getrandom = "0.4.3"
 hmac = "0.13.0"

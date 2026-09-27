@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use yaml_serde::{Mapping, Value};
 
 use crate::{
-    AnchorReport, Assignment, AuditAction, AuditAnchor, AuditChange, AuditEntry, AuditHead,
-    AuditSource, AuditVerification, SearchQuery,
+    AnchorReport, AnchorWrite, Assignment, AuditAction, AuditChange, AuditEntry, AuditHead,
+    AuditSource, AuditVerification, SearchQuery, TrustedKeys,
     access::{
         AccessAction, AccessDecision, AccessIdentity, Authentication, COLLECTION_ACCESS_EXTENSION,
         CollectionAccessPolicy, IssuedToken, RECORD_ACCESS_FIELD, RecordAccess, RecordVisibility,
@@ -4716,8 +4716,9 @@ impl Database {
     ///
     /// For adopting the anchor on a database that predates it, and for
     /// repairing one a crash left behind. Refuses when the stored anchor
-    /// already disagrees with the journal.
-    pub fn audit_anchor_write(&self) -> Result<AuditAnchor> {
+    /// already disagrees with the journal. With `CR_AUDIT_SIGNING_KEY` set it
+    /// signs the head as well, which is also how signing is adopted.
+    pub fn audit_anchor_write(&self) -> Result<AnchorWrite> {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
@@ -4726,11 +4727,23 @@ impl Database {
     }
 
     pub fn audit_verify(&self, expected_head: Option<&str>) -> Result<AuditVerification> {
+        self.audit_verify_trusting(expected_head, None)
+    }
+
+    /// Verify the journal, and with `trusted` keys its signed checkpoint too.
+    ///
+    /// The keys must come from outside the database: a flag, the environment,
+    /// or a request. See [`TrustedKeys`] for why nothing inside it can name one.
+    pub fn audit_verify_trusting(
+        &self,
+        expected_head: Option<&str>,
+        trusted: Option<&TrustedKeys>,
+    ) -> Result<AuditVerification> {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         self.authorize_owner(&AccessResource::Database)?;
-        audit.verify(expected_head)
+        audit.verify_trusting(expected_head, trusted)
     }
 
     pub fn audit_baseline(&self) -> Result<usize> {

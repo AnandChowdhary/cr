@@ -347,6 +347,34 @@ curl 'http://127.0.0.1:3000/api/v1/check?limit=20'
 
 It answers `200` whether or not it found anything — the findings are the resource, so a broken database is not an HTTP error. The `summary` object sits beside the page rather than inside it, so a client reading one page can still tell a clean database from a broken one. Decide from `summary.errors`, which is what the CLI's exit status is computed from.
 
+`GET /api/v1/audit/verify` and `GET /api/v1/check` judge the [signed
+checkpoint](audit.md#sign-checkpoints) against the public keys in repeatable
+`trusted_key` parameters, and against the server's `CR_AUDIT_TRUSTED_KEYS`
+when a request gives none. A request may only give keys inline; a value that is
+not an `ed25519:` key is `422 validation_failed`, because a caller must not be
+able to name a file for the server to read. A verification that fails the
+signature check is `409 signature_mismatch`, with a message that names
+sequences, hashes, and key IDs and never a path:
+
+```sh
+curl 'http://127.0.0.1:3000/api/v1/audit/verify?trusted_key=ed25519:wJ_mDPbr-ScbnvgC2v5ufoxJabn94Z892fBDmyGt7gk'
+```
+
+```json
+{
+  "entries": 42,
+  "records_checked": 17,
+  "head": { "sequence": 42, "hash": "sha256:9f2c…" },
+  "anchor": { "state": "matched", "sequence": 42 },
+  "signature": { "state": "matched", "sequence": 42, "key_id": "sha256:58e7…" }
+}
+```
+
+`signature.state` is `matched`, `behind` (with `head`), `empty` for a journal
+with no events, or `unverified` when a signed checkpoint exists and no trusted
+key was given. The field is omitted when there is neither, so an unsigned
+database verifies to the same response it always did.
+
 ## Health and readiness
 
 Two public routes answer a probe, and they answer different questions.

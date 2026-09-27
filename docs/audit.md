@@ -57,6 +57,10 @@ The audit journal is tamper-evident, not magically tamper-proof if an attacker c
 cr audit verify --expected-head 'sha256:YOUR_SAVED_HASH'
 ```
 
+[Sign checkpoints](#sign-checkpoints) makes that automatic: every write
+signs the new head with a key kept outside the database, and a verifier
+holding only the public key checks it.
+
 ### Reads, writes, and the saved walk
 
 Commands other than `audit verify` and `check` need the journal too: reading
@@ -174,6 +178,154 @@ example `commit-msg` hook. [Commit as the agent, on the human's
 behalf](agents.md#commit-as-the-agent-on-the-humans-behalf) describes it with
 the rest of the Git convention for agent-made commits.
 
+## Sign checkpoints
+
+The anchor is worth what your Git history is worth. Someone who can rewrite
+`.cr/audit/` can rewrite the newest event's actor or message, recompute its
+hash, re-derive `.cr-audit-head.json` to match, and `cr audit verify` goes
+quiet. A signed checkpoint is the same statement as the anchor, made with an
+Ed25519 key that never enters the database, and checked against a public key
+that comes from outside it too. Rewriting every file under the database root
+does not produce a signature, so that forgery fails.
+
+### Create a key
+
+```sh
+cr audit key generate ~/.config/cr/audit-signing.key
+# Wrote a private audit signing key to /home/you/.config/cr/audit-signing.key; keep it outside the database and point CR_AUDIT_SIGNING_KEY at it where writes should be signed
+# Key ID: sha256:58e7e510…
+# Public key, for --trusted-key and CR_AUDIT_TRUSTED_KEYS:
+# ed25519:wJ_mDPbr-ScbnvgC2v5ufoxJabn94Z892fBDmyGt7gk
+```
+
+The private key is created readable and writable by you alone (mode `0600` on
+Unix) and is never overwritten: generating onto an existing file fails. `cr`
+warns if the path is inside a database, because a key stored in the tree it
+signs can be read by exactly the person the signature exists to stop. The
+public key is not secret; `cr audit key show` prints it again later, from a
+path or from `CR_AUDIT_SIGNING_KEY`, and `--json` gives both commands'
+output as an object.
+
+### Sign every write
+
+Point `CR_AUDIT_SIGNING_KEY` at the key and sign the current head once:
+
+```sh
+export CR_AUDIT_SIGNING_KEY=~/.config/cr/audit-signing.key
+cr audit anchor --write
+# Anchored and signed sequence 42 at sha256:9f2c… with key sha256:58e7…; commit .cr-audit-head.json and .cr-audit-head.sig.json
+git add .cr-audit-head.json .cr-audit-head.sig.json
+git commit -m 'Sign the audit head'
+```
+
+From then on every command that records an event — `create`, `update`,
+`link`, `unlink`, `delete`, `save`, `sync`, `audit baseline`, and a `cr serve`
+launched with the variable set — writes `.cr-audit-head.sig.json` right after
+the anchor. A database whose first write is made with the key set is signed
+from its first event without that first step.
+
+```json
+{
+  "version": 1,
+  "database": "sha256:e722b7c3…",
+  "sequence": 42,
+  "hash": "sha256:9f2c…",
+  "timestamp": "2026-03-04T11:22:33.123456789Z",
+  "key_id": "sha256:58e7e510…",
+  "signature": "ed25519:DIGM_NE_…"
+}
+```
+
+`sequence`, `hash`, and `timestamp` are the anchor's. `database` is the hash of
+the journal's first event, which names the database: a checkpoint copied from
+another database, even one signed with the same key, is refused as made for a
+different database. Like the anchor, the file is a pure function of the
+journal and the key, since Ed25519 signatures are deterministic. Commit it with
+the anchor.
+
+### Verify against a trusted key
+
+```sh
+cr audit verify --trusted-key ed25519:wJ_mDPbr-ScbnvgC2v5ufoxJabn94Z892fBDmyGt7gk
+# Verified 42 audit events and 17 records; head sha256:9f2c…
+# Verified the signed checkpoint at sequence 42 under trusted key sha256:58e7e510…
+```
+
+`--trusted-key` takes a public key or the path of a file with one key per line,
+where blank lines and `#` comments are skipped and anything after the key is a
+label. Repeat it to trust several keys; any one of them may have signed. With no
+flag, `CR_AUDIT_TRUSTED_KEYS` holds the same values separated by commas, which
+is the natural setting for CI. `cr check --trusted-key` judges the checkpoint as
+well, and `GET /api/v1/audit/verify` and `GET /api/v1/check` take repeatable
+`trusted_key` parameters.
+
+With a trusted key, verification fails with `signature_mismatch` when there is
+no signed checkpoint, when it was made with a key you did not name, when it has
+been edited and no longer verifies, when it was made for a different database,
+and when the journal no longer holds the event it signed — the forged head
+above. Without a trusted key nothing about the signature is judged, and
+`verify` only notes that a checkpoint is present.
+
+**Trust only keys from outside the database.** A trusted-keys file committed
+inside the database proves nothing against someone who can rewrite the
+database: they replace the key and sign with their own. `cr` warns when a key
+file you name is inside the database it verifies. Keep the public key in CI
+configuration, a separate repository, or anywhere the database's writers
+cannot change.
+
+### Lagging signatures
+
+A crash between the anchor write and the signature write, or a write by
+somebody who does not hold the key, leaves the checkpoint behind the head:
+
+```text
+notice: the signed audit checkpoint is behind at sequence 40 of 42; key sha256:58e7… signed it and the journal still agrees with it, so this is a lagging signature rather than altered history, and later events are not signed yet
+```
+
+That is not tampering, for the reason a lagging anchor is not. Everything up
+to sequence 40 is still pinned by the signature, and the events after it are
+not signed yet. `cr check` reports it as an `audit_signature_behind` warning.
+The key holder's next write signs the head again, and so does
+`cr audit anchor --write`. That makes a key held only by CI a workable setup:
+people write without it, and a job with the key re-signs after each merge.
+
+### What a signing write refuses
+
+A write with the key extends a signed history; it never starts one over a
+history it has not verified. It signs only when the stored checkpoint verifies
+under a key it trusts — its own, and any in `CR_AUDIT_TRUSTED_KEYS` — and the
+journal still agrees with it. So:
+
+- when a trusted checkpoint disagrees with the journal, the write is refused
+  with `signature_mismatch` before anything is written, rather than signing
+  on top of a forgery;
+- when there is no checkpoint, or one under a key it does not trust, the write
+  goes ahead and signs nothing. Adopting signing is the explicit
+  `cr audit anchor --write`. Before running it on a database that was signed
+  before, look at `git log -p -- .cr-audit-head.sig.json`: a checkpoint that
+  vanished is one somebody removed.
+
+When several people sign with their own keys, each lists the others' public
+keys in `CR_AUDIT_TRUSTED_KEYS`. To rotate a key, set `CR_AUDIT_SIGNING_KEY` to
+the new key and `CR_AUDIT_TRUSTED_KEYS` to the old public key, run
+`cr audit anchor --write` so the old checkpoint is verified before the new key
+signs, commit, and give verifiers the new public key.
+
+### What a signature does not prove
+
+- **Freshness.** Someone who kept an older signed checkpoint can cut the
+  journal back to it and restore that file, and it verifies. The sequence
+  going down in the Git history of `.cr-audit-head.sig.json` is what shows
+  it, as does comparing with `--expected-head`. Trusted timestamps and
+  transparency logs, which would, are not implemented yet.
+- **Events past the signed position.** A lagging checkpoint pins nothing after
+  its sequence, and the key holder's next write signs over whatever was
+  appended in between without judging who wrote it.
+- **Which of several databases.** A key that signs several databases verifies
+  any of them, so replacing one wholesale with a copy of another is not a
+  signature failure. Use a key per database, or compare the `database` field
+  with the first event you expect.
+
 ## Baseline existing records
 
 For records that existed before audit logging was introduced, establish their starting state once:
@@ -217,7 +369,8 @@ It reports:
 - **unreadable records** — Markdown that cannot be parsed, and anything behind a symbolic link;
 - **audit reconciliation problems** — records with no audit history, audited records whose file has gone, files whose content does not match the audited state, a journal whose chain cannot be replayed, and a stored change set that does not match the approval recorded beside it;
 - **interrupted sync runs** — a `cr sync run` that stopped partway, leaving part of an import applied and its checkpoint behind;
-- **audit anchor problems** — a `.cr-audit-head.json` that does not agree with the journal (an error), one that lags behind it (a warning), and a journal with events that nothing anchors at all (a warning).
+- **audit anchor problems** — a `.cr-audit-head.json` that does not agree with the journal (an error), one that lags behind it (a warning), and a journal with events that nothing anchors at all (a warning);
+- **signed checkpoint problems**, only when you pass `--trusted-key` or set `CR_AUDIT_TRUSTED_KEYS` — a `.cr-audit-head.sig.json` that does not verify under the trusted keys or does not agree with the journal (`audit_signature_mismatch`, an error), one that lags behind it (`audit_signature_behind`, a warning), and no signed checkpoint at all (`audit_signature_missing`, an error, since naming a key says the database is signed).
 
 Every finding names a record as `collection/id`, or a sync by name. A file that cannot be a record is named by its filename inside its collection, because that is the only way to say which file to remove. None of them ever prints a filesystem path.
 
@@ -241,6 +394,7 @@ cr check --collection deals           # one collection; links, journal and syncs
 cr check --json                       # the complete report, including the summary
 cr check --fail-on warning            # unsaved direct edits fail too
 cr check --fail-on never              # report without ever failing
+cr check --trusted-key ed25519:…      # judge the signed checkpoint too
 ```
 
 | Exit | Meaning |
