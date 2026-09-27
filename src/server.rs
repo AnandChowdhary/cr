@@ -46,7 +46,7 @@ use crate::{
     SchemaViolation, SearchQuery, SearchTarget, SortDirection, TOKEN_PREFIX, USERS_COLLECTION,
     User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
     audit::AuditChange, database::relation_references, error::is_missing, paths,
-    sort_by_record_field, sort_records_by_field,
+    sort_by_record_field, sort_records_by_field, views::validate_view_name,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -1370,7 +1370,10 @@ struct HtmlRelationForm {
     target: String,
 }
 
-#[derive(Debug, Deserialize)]
+/// "Save as view", exactly as the browser sent it: the name and title typed
+/// into it, the layout and grouping chosen in it, and the page's filters, sort
+/// and columns from its hidden fields. A refused save is rendered back from this.
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HtmlSaveViewForm {
     #[serde(rename = "_csrf")]
@@ -2381,28 +2384,24 @@ static FAVICON_PATH: LazyLock<String> =
 ///
 /// The second is a mutating form whose two possible answers are not yet shapes
 /// htmx can act on. A boosted form needs both: a success it can turn into a
-/// navigation, and a refusal it can show. The record create and edit form now
-/// has both — `204` with `HX-Location` (see `mutation_redirect`) and the
-/// re-rendered form itself (see `reject_record_form`) — and is therefore boosted
-/// like the rest of the page. The remaining three keep the attribute, each for a
-/// reason of its own:
+/// navigation, and a refusal it can show. Two forms have both — `204` with
+/// `HX-Location` (see `mutation_redirect`) and the re-rendered form itself,
+/// marked `CR-Form-Invalid` — and are therefore boosted like the rest of the
+/// page: the record create and edit form (see `reject_record_form`) and "Save
+/// as view" (see `reject_save_view_form`). The remaining ones keep the
+/// attribute, each for a reason of its own:
 ///
 /// * The **delete** form — now the one on the confirmation page, not a form on
 ///   the record page — answers a refusal with a rendered error document. A
 ///   version that no longer matches is a `412`, and htmx will not swap a failed
 ///   `POST`, so boosting it would turn a lost race into a button that visibly
-///   does nothing. This is the save-as-view reason below, and it replaces the
-///   older one: the form used to stay native because its confirmation was an
-///   `onsubmit` handler that htmx's submit listener does not consult, so a boost
-///   would have deleted a record after a declined confirmation. That handler is
-///   gone. The confirmation is a page the server renders, which is asked of a
-///   browser with no JavaScript too; see `delete_confirmation_url`.
-/// * The **save-as-view** form answers a refusal — a name already taken, a
-///   Kanban layout with no grouping field — with a rendered error page, which is
-///   a whole document and not a form. Boosting it would turn those refusals into
-///   a button that visibly does nothing. It is a different form with different
-///   fields, so giving it this phase's treatment is its own change rather than a
-///   side effect of this one.
+///   does nothing. That reason replaces an older one: the form used to stay
+///   native because its confirmation was an `onsubmit` handler that htmx's
+///   submit listener does not consult, so a boost would have deleted a record
+///   after a declined confirmation. That handler is gone. The confirmation is a
+///   page the server renders, which is asked of a browser with no JavaScript
+///   too; see `delete_confirmation_url`. The saved-view editor and the view
+///   delete form stay native for the same first reason: a refusal is a page.
 /// * The **Kanban move** form has no fields to preserve and its drag-and-drop
 ///   equivalent in `cr.js` submits a form it builds itself with `form.submit()`,
 ///   which fires no submit event and so is never boosted. Leaving the rendered
@@ -3739,15 +3738,22 @@ async fn save_view_form(
     Path(view_name): Path<String>,
     RawForm(raw): RawForm,
 ) -> Response {
+    // As on the record form, a body that is not the form this server rendered
+    // says nothing about what was typed, so it keeps the error page. Every
+    // refusal after this point is answered with the form itself.
+    let form: HtmlSaveViewForm = match parse_html_form(&raw) {
+        Ok(form) => form,
+        Err(error) => return html_error(error),
+    };
+    let submitted = form.clone();
     let result: ApiResult<Response> = async {
-        let form: HtmlSaveViewForm = parse_html_form(&raw)?;
         verify_csrf(&state, &form.csrf)?;
         let name = form.name.trim().to_owned();
         if name.is_empty() {
-            return Err(ApiError::bad_request(
-                "invalid_form",
-                "view name cannot be empty",
-            ));
+            return Err(
+                ApiError::bad_request("invalid_form", "view name cannot be empty")
+                    .with_field(VIEW_NAME_CONTROL),
+            );
         }
         let title = (!form.title.trim().is_empty()).then(|| form.title.trim().to_owned());
         let filter_group = submitted_filter_group(
@@ -3766,7 +3772,10 @@ async fn save_view_form(
             (None, _) | (Some(_), ViewSortDirection::Asc) => SortDirection::Asc,
             (Some(_), ViewSortDirection::Desc) => SortDirection::Desc,
         };
-        let requested_view = view_name;
+        let requested_view = view_name.clone();
+        // Two layers of refusal: the outer one is reading the source view, and
+        // the inner one is a refusal of what was submitted, classified where it
+        // is known which control it is about.
         let saved = run_database(&state, &headers, move |database| {
             let source = database.view(&requested_view)?;
             let mut filter_groups = source.filter_groups.clone();
@@ -3787,38 +3796,140 @@ async fn save_view_form(
                 .map(str::to_owned);
             let group_by = match layout {
                 ViewLayout::Table => None,
-                ViewLayout::Kanban => Some(
-                    submitted_group_by
-                        .or_else(|| {
-                            (source.layout == ViewLayout::Kanban)
-                                .then(|| source.group_by.clone())
-                                .flatten()
-                        })
-                        .context(DomainError::Invalid(
-                            "Kanban layout must provide group_by".to_owned(),
-                        ))?,
-                ),
+                ViewLayout::Kanban => match submitted_group_by.or_else(|| {
+                    (source.layout == ViewLayout::Kanban)
+                        .then(|| source.group_by.clone())
+                        .flatten()
+                }) {
+                    Some(group_by) => Some(group_by),
+                    None => {
+                        return Ok(Err(ApiError::from_domain(
+                            DomainError::Invalid("Kanban layout must provide group_by".to_owned())
+                                .into(),
+                        )
+                        .with_field(GROUP_BY_CONTROL)));
+                    }
+                },
             };
-            database.create_view_with_options(
-                &name,
-                title.as_deref(),
-                &source.collection,
-                source.filters.clone(),
-                source.where_expr.clone(),
-                filter_groups,
-                columns,
-                source.page_size,
-                layout,
-                group_by,
-                sort_by,
-                sort_direction,
-            )
+            Ok(database
+                .create_view_with_options(
+                    &name,
+                    title.as_deref(),
+                    &source.collection,
+                    source.filters.clone(),
+                    source.where_expr.clone(),
+                    filter_groups,
+                    columns,
+                    source.page_size,
+                    layout,
+                    group_by,
+                    sort_by,
+                    sort_direction,
+                )
+                .map_err(|error| refused_view_name(ApiError::from_domain(error), &name)))
         })
-        .await?;
-        Ok(see_other(&notice_url(&saved.name, "View saved")))
+        .await??;
+        Ok(mutation_redirect(
+            &Representation::requested(&headers),
+            &notice_url(&saved.name, "View saved"),
+        ))
     }
     .await;
-    result.unwrap_or_else(html_error)
+    match result {
+        Ok(response) => response,
+        Err(error) => reject_save_view_form(&state, &headers, &view_name, submitted, error).await,
+    }
+}
+
+/// Put a refused save beside the view name when the name is what was refused.
+///
+/// Classified by the stable domain code and never by the message: a name
+/// already taken is `already_exists`, the one conflict creating a view can
+/// report. A name no view may have — a path separator, `.`, a route the server
+/// reserves — is a validation failure like any other, so it is recognised by
+/// the name itself failing the check that `create_view_with_options` makes
+/// before it validates anything else.
+fn refused_view_name(error: ApiError, name: &str) -> ApiError {
+    let taken = error.code == DomainError::AlreadyExists(String::new()).code();
+    let unusable = error.code == DomainError::Invalid(String::new()).code()
+        && validate_view_name(name).is_err();
+    if taken || unusable {
+        return error.with_field(VIEW_NAME_CONTROL);
+    }
+    error
+}
+
+/// Answer a refused "Save as view" with the form, holding what was sent.
+///
+/// The record form's contract on a smaller form. It used to be the generic
+/// error page, which lost the filters, sort and columns the reader had
+/// assembled along with the name they typed. Now the name and title come back
+/// as typed, the layout and grouping as chosen, and the page's state in the
+/// hidden fields it was submitted from, with the reason at the top and, for a
+/// name that is taken or unusable or a Kanban layout with nothing to group by,
+/// beside that control. The status is the status of the refusal — `409`,
+/// `422`, `400`, `403` — which is what the rest of the server answers for it.
+///
+/// htmx asked for the form alone and swaps it into the popover it came from,
+/// which stays open. A plain post is given the same form on a page of its own
+/// rather than the view it was saved from, whose rows the form has no business
+/// re-reading; see `render_refused_save_view`.
+async fn reject_save_view_form(
+    state: &AppState,
+    headers: &HeaderMap,
+    view_name: &str,
+    submitted: HtmlSaveViewForm,
+    error: ApiError,
+) -> Response {
+    // As for the record form: an internal failure keeps the error page, and so
+    // does a source view that cannot be read, since the form is about it.
+    if error.status.is_server_error() {
+        return html_error(error);
+    }
+    let error_field = error.field.clone();
+    let requested_view = view_name.to_owned();
+    let loaded = async {
+        let context = run_database(state, headers, move |database| {
+            let view = database.view(&requested_view)?;
+            // Every readable record, to offer its fields for grouping, as the
+            // saved-view editor does.
+            let records = database.list(&view.collection, &[])?;
+            let schema = collection_schema(database, &view.collection)?;
+            let navigation = database.views()?;
+            Ok((view, records, schema, navigation))
+        })
+        .await?;
+        Ok::<_, ApiError>((context, ui_context(state, headers).await?))
+    }
+    .await;
+    let ((view, records, schema, navigation), ui) = match loaded {
+        Ok(context) => context,
+        Err(secondary) => {
+            secondary.publish();
+            return html_error(error);
+        }
+    };
+    let published = error.publish();
+    let status = published.status;
+    let fields = error_field
+        .map(|field| BTreeMap::from([(field, vec![published.message.clone()])]))
+        .unwrap_or_default();
+    let rejection = SaveViewRejection {
+        error: published,
+        fields,
+        submitted,
+    };
+    let markup = render_refused_save_view(
+        &Representation::requested(headers),
+        &view,
+        &view_available_columns(&view, &records, schema.as_ref()),
+        &state.csrf_token,
+        &rejection,
+        &navigation,
+        ui.as_ref(),
+        state.max_page_size,
+    );
+    rejected_form_response(status, markup)
 }
 
 /// Everything the saved-view editor shows besides the draft in its controls.
@@ -6980,7 +7091,7 @@ fn render_browse_location(
 ///
 /// Both forms stay native (`UNBOOSTED`): a refusal — a stale token, the pin
 /// limit — answers with an error document, which htmx will not swap into a
-/// failed `POST`, the same reason the save-as-view form is native.
+/// failed `POST`, the same reason the view delete form is native.
 fn render_pin_control(here: &str, pinned: Option<&UiPin>, csrf_token: &str) -> Markup {
     html! {
         @match pinned {
@@ -8978,6 +9089,11 @@ fn view_results(
     }
 }
 
+/// The names of the two "Save as view" controls a refusal can be about, which
+/// are the form field names the browser submits, as the record form's are.
+const VIEW_NAME_CONTROL: &str = "name";
+const GROUP_BY_CONTROL: &str = "group_by";
+
 fn render_save_view_control(
     view: &ViewDefinition,
     query: &ViewQuery,
@@ -8985,52 +9101,190 @@ fn render_save_view_control(
     available_columns: &[String],
     csrf_token: &str,
 ) -> Markup {
-    let action = format!("/{}/save-view", encode_segment(&view.name));
     html! {
         details class="relative" {
             summary class="cr-button cursor-pointer list-none" {
                 "Save as view"
             }
             div class="cr-popover absolute right-0 z-20 mt-2 w-80 p-4" {
-                form method="post" action=(action) hx-boost=(UNBOOSTED) class="space-y-3" {
-                    input type="hidden" name="_csrf" value=(csrf_token);
-                    (view_save_state(query, columns, OutOfBand::No))
-                    div {
-                        h2 class="text-sm font-bold text-gray-900" { "Save current view" }
-                        p class="mt-1 text-xs leading-5 text-gray-500" { "Preserves applied filters, all/any matching, layout, columns, and sorting. Search text remains shareable in the URL." }
-                    }
-                    label class="block" {
-                        span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "View name" }
-                        input required name="name" placeholder="enterprise-deals" autocomplete="off" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
-                    }
-                    label class="block" {
-                        span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Title (optional)" }
-                        input name="title" placeholder=(format!("{} copy", view.title)) autocomplete="off" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
-                    }
-                    div class="grid gap-3 sm:grid-cols-2" {
-                        label class="block" {
-                            span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Layout" }
-                            select name="layout" aria-label="Layout" data-view-layout="true" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
-                                option value="table" selected[view.layout == ViewLayout::Table] { "Table" }
-                                option value="kanban" selected[view.layout == ViewLayout::Kanban] { "Kanban" }
-                            }
-                        }
-                        label class="block" {
-                            span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Group Kanban by" }
-                            select name="group_by" aria-label="Group Kanban by" data-view-group-by="true" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-400" {
-                                option value="" selected[view.group_by.is_none()] { "Choose a field…" }
-                                @for column in available_columns {
-                                    option value=(column) selected[view.group_by.as_deref() == Some(column.as_str())] { (humanize_field_name(column)) }
-                                }
-                            }
-                        }
-                    }
-                    p class="text-xs leading-5 text-gray-500" { "Kanban uses the chosen front matter field as lanes; moving a card updates that field through the audited database path." }
-                    button type="submit" class="cr-button cr-button-primary w-full" { "Save view" }
-                }
+                (render_save_view_form(view, query, columns, available_columns, csrf_token, None))
             }
         }
     }
+}
+
+/// The "Save as view" form: the page's state in hidden fields, then the name,
+/// title, layout and grouping, holding either the page as it was rendered or
+/// exactly what a refused submission sent.
+///
+/// Boosted, with the record form's contract: it answers success with `204` and
+/// `HX-Location` (`mutation_redirect`) and a refusal with this element again,
+/// marked `CR-Form-Invalid` (`reject_save_view_form`). It points `hx-target` at
+/// itself, which narrows the swap to the form, keeps the popover around it open,
+/// and names `SAVE_VIEW_FORM_REGION` in `HX-Target`. `hx-disabled-elt` is there
+/// for the reason it is on the record form: a second click is a second
+/// submission, which would be refused as a name already taken by the first.
+fn render_save_view_form(
+    view: &ViewDefinition,
+    query: &ViewQuery,
+    columns: &[String],
+    available_columns: &[String],
+    csrf_token: &str,
+    rejection: Option<&SaveViewRejection>,
+) -> Markup {
+    let action = format!("/{}/save-view", encode_segment(&view.name));
+    let submitted = rejection.map(|rejection| &rejection.submitted);
+    let layout = submitted
+        .and_then(|submitted| submitted.layout)
+        .unwrap_or(view.layout);
+    let group_by = match submitted {
+        Some(submitted) => submitted.group_by.as_deref(),
+        None => view.group_by.as_deref(),
+    };
+    // A field no record holds is still the one chosen, so it stays an option
+    // rather than silently becoming "Choose a field…".
+    let unlisted_group_by = group_by.filter(|field| {
+        !field.is_empty() && !available_columns.iter().any(|column| column == field)
+    });
+    let name_diagnostics = form_diagnostics(rejection, VIEW_NAME_CONTROL);
+    let group_by_diagnostics = form_diagnostics(rejection, GROUP_BY_CONTROL);
+    html! {
+        form id=(SAVE_VIEW_FORM_REGION) method="post" action=(action)
+            hx-target="this" hx-swap="outerHTML" hx-disabled-elt="find button[type=submit]" class="cr-save-view space-y-3" {
+            input type="hidden" name="_csrf" value=(csrf_token);
+            (view_save_state(query, columns, OutOfBand::No))
+            div {
+                h2 class="text-sm font-bold text-gray-900" { "Save current view" }
+                p class="mt-1 text-xs leading-5 text-gray-500" { "Preserves applied filters, all/any matching, layout, columns, and sorting. Search text remains shareable in the URL." }
+            }
+            @if let Some(rejection) = rejection {
+                (rejected_form_alert(
+                    "This view was not saved.",
+                    &rejection.error,
+                    "Nothing was written. The values below are exactly what you submitted.",
+                ))
+            }
+            // The two controls a refusal can be about are labelled by `for`
+            // rather than by wrapping, because the reason goes between the
+            // label and the control and a list cannot go inside a `<label>`.
+            div {
+                label for="cr-save-view-name" class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "View name" }
+                (render_field_diagnostics(name_diagnostics))
+                input id="cr-save-view-name" required name="name" value=[submitted.map(|submitted| submitted.name.as_str())] placeholder="enterprise-deals" autocomplete="off" aria-invalid=[(!name_diagnostics.is_empty()).then_some("true")] class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+            }
+            label class="block" {
+                span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Title (optional)" }
+                input name="title" value=[submitted.map(|submitted| submitted.title.as_str())] placeholder=(format!("{} copy", view.title)) autocomplete="off" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
+            }
+            div class="grid gap-3 sm:grid-cols-2" {
+                label class="block" {
+                    span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Layout" }
+                    select name="layout" aria-label="Layout" data-view-layout="true" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
+                        option value="table" selected[layout == ViewLayout::Table] { "Table" }
+                        option value="kanban" selected[layout == ViewLayout::Kanban] { "Kanban" }
+                    }
+                }
+                div {
+                    label for="cr-save-view-group-by" class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Group Kanban by" }
+                    (render_field_diagnostics(group_by_diagnostics))
+                    select id="cr-save-view-group-by" name="group_by" aria-label="Group Kanban by" data-view-group-by="true" aria-invalid=[(!group_by_diagnostics.is_empty()).then_some("true")] class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-400" {
+                        option value="" selected[group_by.is_none_or(str::is_empty)] { "Choose a field…" }
+                        @for column in available_columns.iter().map(String::as_str).chain(unlisted_group_by) {
+                            option value=(column) selected[group_by == Some(column)] { (humanize_field_name(column)) }
+                        }
+                    }
+                }
+            }
+            p class="text-xs leading-5 text-gray-500" { "Kanban uses the chosen front matter field as lanes; moving a card updates that field through the audited database path." }
+            button type="submit" class="cr-button cr-button-primary w-full" { "Save view" }
+        }
+    }
+}
+
+/// A refused "Save as view", as the form alone or as a page around it.
+///
+/// htmx names `SAVE_VIEW_FORM_REGION` and gets the form, byte for byte what the
+/// page below embeds. A plain post — a browser with JavaScript off — is given
+/// the form on a page of its own rather than the view it was saved from: that
+/// page is its rows, which the form has no reason to re-read and could not
+/// reproduce, since the search text and the page it was on are deliberately
+/// not part of what is saved. Cancel goes back to the view with the submitted
+/// filters, sort and columns applied, which is the page the reader left.
+#[allow(clippy::too_many_arguments)]
+fn render_refused_save_view(
+    representation: &Representation,
+    view: &ViewDefinition,
+    available_columns: &[String],
+    csrf_token: &str,
+    rejection: &SaveViewRejection,
+    navigation: &[ViewDefinition],
+    ui: Option<&UiContext>,
+    max_page_size: usize,
+) -> Markup {
+    let submitted = &rejection.submitted;
+    let query = ViewQuery {
+        filter_match: submitted.filter_match,
+        filter_field: submitted.filter_field.clone(),
+        filter_operator: submitted.filter_operator.clone(),
+        filter_value: submitted.filter_value.clone(),
+        sort_field: submitted.sort_field.clone(),
+        sort_direction: submitted.sort_direction,
+        columns: if submitted.column.is_empty() {
+            ViewColumnsMode::Default
+        } else {
+            ViewColumnsMode::Custom
+        },
+        column: submitted.column.clone(),
+        ..ViewQuery::default()
+    };
+    let form = render_save_view_form(
+        view,
+        &query,
+        &submitted.column,
+        available_columns,
+        csrf_token,
+        Some(rejection),
+    );
+    // Not wrapped by `fragment`, for the record form's reason: a refusal pushes
+    // no URL, so there is no new state for a title to name.
+    if representation.wants(SAVE_VIEW_FORM_REGION) {
+        return form;
+    }
+    let view_url = format!("/{}", encode_segment(&view.name));
+    let back = format!(
+        "{view_url}?{}",
+        view_query_string(
+            &query,
+            view.page_size.min(max_page_size),
+            ViewPosition::Start
+        )
+    );
+    page_or_content(
+        representation,
+        "Save as view",
+        &view_url,
+        navigation,
+        html! {
+            (page_bar(
+                &[
+                    ("/".to_owned(), None, "Views"),
+                    (view_url.clone(), Some(view_icon(view)), &view.title),
+                ],
+                None,
+                "Save as view",
+                html! {},
+                html! {
+                    a href=(back) class="cr-button" { "Cancel" }
+                },
+            ))
+            // The popover's width, which is what the form is laid out for.
+            div class="cr-popover mx-auto max-w-80 p-4" {
+                (form)
+            }
+        },
+        ui,
+        csrf_token,
+    )
 }
 
 /// The page's current filters, sort and columns as the hidden inputs of "Save
@@ -9039,10 +9293,18 @@ fn view_save_state(query: &ViewQuery, columns: &[String], out_of_band: OutOfBand
     html! {
         div id=(VIEW_SAVE_STATE_ID) hidden hx-swap-oob=[out_of_band.attribute()] {
             input type="hidden" name="filter_match" value=(match query.filter_match { ViewFilterMatch::All => "all", ViewFilterMatch::Any => "any" });
-            @for (index, (field, value)) in query.filter_field.iter().zip(&query.filter_value).enumerate() {
-                input type="hidden" name="filter_field" value=(field);
-                input type="hidden" name="filter_operator" value=(query.filter_operator.get(index).copied().unwrap_or_default().as_str());
-                input type="hidden" name="filter_value" value=(value);
+            // Every row, rather than the pairs a zip would keep. A page only
+            // ever has pairs, but a refused save is rendered back from what was
+            // submitted, and dropping a condition sent without its value would
+            // let the corrected resubmission save fewer than were asked for.
+            @for index in 0..query.filter_field.len().max(query.filter_value.len()) {
+                @if let Some(field) = query.filter_field.get(index) {
+                    input type="hidden" name="filter_field" value=(field);
+                    input type="hidden" name="filter_operator" value=(query.filter_operator.get(index).copied().unwrap_or_default().as_str());
+                }
+                @if let Some(value) = query.filter_value.get(index) {
+                    input type="hidden" name="filter_value" value=(value);
+                }
             }
             @if let Some(field) = query.sort_field.as_deref() {
                 input type="hidden" name="sort_field" value=(field);
@@ -9475,19 +9737,20 @@ fn render_view_editor(
                 },
                 html! {},
             ))
-            // Native rather than boosted, as "Save as view" is: a refusal is
-            // this page again with an alert, which htmx would not swap into a
-            // boosted `POST`.
+            // Native rather than boosted: a refusal is this page again with an
+            // alert, which htmx would not swap into a boosted `POST` because
+            // it does not carry `CR-Form-Invalid`. "Save as view" shows what
+            // boosting it would take.
             form method="post" action=(view_edit_path(view)) hx-boost=(UNBOOSTED)
                 data-filter-builder="true" data-max-filters=(MAX_VIEW_FILTERS) data-view-editor="true"
                 class="cr-view-editor" {
                 input type="hidden" name="_csrf" value=(csrf_token);
                 @if let Some(error) = error {
-                    div role="alert" class="cr-form-alert rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" {
-                        p class="font-semibold" { "The view was not saved." }
-                        p class="mt-1 whitespace-pre-line" { (&error.message) }
-                        p class="mt-2 text-xs text-red-700" { "Its definition is unchanged. The form below holds what you submitted. Request ID " (&error.request_id) }
-                    }
+                    (rejected_form_alert(
+                        "The view was not saved.",
+                        error,
+                        "Its definition is unchanged. The form below holds what you submitted.",
+                    ))
                 }
                 section class="cr-filter-section" {
                     div class="cr-filter-section-head" {
@@ -10985,7 +11248,7 @@ const FRONT_MATTER_CONTROL: &str = "front_matter";
 const ADDITIONAL_ATTRIBUTES_CONTROL: &str = "_additional_attributes";
 
 /// A submission the server refused, ready to be rendered back as the form.
-struct RecordFormRejection {
+struct FormRejection<Form> {
     /// The refusal after logging and redaction. It carries the message a caller
     /// may see and the request ID that message was logged under, which is the
     /// same boundary the error page goes through: a form is not a reason to
@@ -10996,15 +11259,35 @@ struct RecordFormRejection {
     /// the form.
     fields: BTreeMap<String, Vec<String>>,
     /// Exactly what the browser sent.
-    submitted: HtmlDocumentForm,
+    submitted: Form,
 }
 
+type RecordFormRejection = FormRejection<HtmlDocumentForm>;
+
+type SaveViewRejection = FormRejection<HtmlSaveViewForm>;
+
 /// The diagnostics about one control, or nothing when this is not a re-render.
-fn form_diagnostics<'a>(rejection: Option<&'a RecordFormRejection>, control: &str) -> &'a [String] {
+fn form_diagnostics<'a, Form>(
+    rejection: Option<&'a FormRejection<Form>>,
+    control: &str,
+) -> &'a [String] {
     rejection
         .and_then(|rejection| rejection.fields.get(control))
         .map(Vec::as_slice)
         .unwrap_or_default()
+}
+
+/// The alert a refused form opens with: what did not happen, the reason, and
+/// the request ID the refusal was logged under, which is what somebody quotes
+/// when they ask why.
+fn rejected_form_alert(headline: &str, error: &PublicError, outcome: &str) -> Markup {
+    html! {
+        div role="alert" class="cr-form-alert rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" {
+            p class="font-semibold" { (headline) }
+            p class="mt-1 whitespace-pre-line" { (&error.message) }
+            p class="mt-2 text-xs text-red-700" { (outcome) " Request ID " (&error.request_id) }
+        }
+    }
 }
 
 /// The first line of the alert on a refused form, which says what happened to
@@ -11662,13 +11945,11 @@ fn render_record_form(
                 DocumentFormMode::Yaml => {}
             }
             @if let Some(rejection) = rejection {
-                div role="alert" class="cr-form-alert rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" {
-                    p class="font-semibold" { (rejected_form_headline(editing)) }
-                    p class="mt-1 whitespace-pre-line" { (&rejection.error.message) }
-                    p class="mt-2 text-xs text-red-700" {
-                        "Nothing was written and no audit event was recorded. The values below are exactly what you submitted. Request ID " (&rejection.error.request_id)
-                    }
-                }
+                (rejected_form_alert(
+                    rejected_form_headline(editing),
+                    &rejection.error,
+                    "Nothing was written and no audit event was recorded. The values below are exactly what you submitted.",
+                ))
             }
             fieldset disabled[!permissions.update] class="contents" {
             div class="cr-form-section" {
@@ -12433,7 +12714,7 @@ const VIEW_EDIT_LINK_ID: &str = "cr-view-edit";
 
 /// The DOM id of the record create and edit form.
 ///
-/// The third region, and the only one that is a `<form>` rather than a container:
+/// The third region, and the first that is a `<form>` rather than a container:
 /// a refused submission is answered with this element and nothing else, so the
 /// values the browser sent come back in the controls they were typed into while
 /// the breadcrumb, the heading and the record's audit history beside it are left
@@ -12441,6 +12722,13 @@ const VIEW_EDIT_LINK_ID: &str = "cr-view-edit";
 /// the `HX-Target` of every submission and is why only the two routes that render
 /// the form can ever be asked for it.
 const RECORD_FORM_REGION: &str = "cr-record-form";
+
+/// The DOM id of the "Save as view" form, a region for the record form's
+/// reason: a refused save is answered with this element alone, swapped into
+/// the popover it was submitted from, and only the route it posts to answers
+/// with it alone. It holds `VIEW_SAVE_STATE_ID`, so a refused form goes on
+/// receiving the state every later results swap patches.
+const SAVE_VIEW_FORM_REGION: &str = "cr-save-view-form";
 
 /// The DOM id of the view index's rows, the part of the index with numbers in
 /// it.
@@ -14418,11 +14706,12 @@ fn html_result(result: ApiResult<Markup>) -> Response {
 /// override `hx-target`, and htmx keeps calling those requests boosted, so
 /// "boosted" alone stopped meaning "whole page" the moment they did.
 ///
-/// A refused form does not come here at all; `reject_record_form` answers it
-/// with the form and the values that were typed into it. What is left for this
-/// page is a request that names something that does not exist, a principal who
-/// may not do what was asked, a body that is not a form this server rendered,
-/// and an internal failure — none of which has a form to go back to.
+/// A refused form does not come here at all; `reject_record_form` and
+/// `reject_save_view_form` answer it with the form and the values that were
+/// typed into it. What is left for this page is a request that names something
+/// that does not exist, a principal who may not do what was asked, a body that
+/// is not a form this server rendered, and an internal failure — none of which
+/// has a form to go back to.
 fn html_error(error: ApiError) -> Response {
     let error = error.publish();
     let status = error.status;

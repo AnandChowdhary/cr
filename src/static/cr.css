@@ -1224,6 +1224,9 @@ a.cr-field-open:hover { color: var(--cr-accent); }
    control itself is marked `aria-invalid`. */
 .cr-field-invalid .cr-field-label { color: var(--cr-danger); }
 .cr-app .cr-field .cr-input[aria-invalid=true] { border-color: var(--cr-danger); background-color: var(--cr-invalid-soft); }
+/* "Save as view" builds its controls from utilities rather than `cr-input`, so
+   the control a refused save is about is marked here, the same way. */
+.cr-app .cr-save-view :is(input, select)[aria-invalid=true] { border-color: var(--cr-danger); background-color: var(--cr-invalid-soft); }
 
 .cr-form-more { margin-top: 18px; }
 .cr-form-more summary { width: fit-content; cursor: pointer; color: var(--cr-gray-600); font-size: 0.75rem; font-weight: 600; }

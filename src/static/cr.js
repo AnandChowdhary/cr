@@ -626,8 +626,9 @@ window.addEventListener('beforeunload', (event) => {
 // now says why instead of nothing happening.
 //
 // A failed write is not retried as a page load, which would either resend it
-// or drop it. The only write htmx makes is the record form, whose fields are
-// still on screen, so the reader is told and the form counts as unsaved again.
+// or drop it. The only writes htmx makes are the record form and "Save as
+// view", whose fields are still on screen, so the reader is told, and the
+// record form counts as unsaved again.
 const loadInstead = (detail) => {
   const path = detail.pathInfo?.finalRequestPath;
   if (path) window.location.assign(new URL(path, window.location.href).href);
