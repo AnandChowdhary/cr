@@ -316,6 +316,46 @@ pub(crate) fn remove_file(root: &Path, relative: &Path, label: &str) -> Result<(
         .with_context(|| format!("could not sync the directory holding {label}"))
 }
 
+/// Remove the directory `relative` beneath `root` when it is empty, refusing
+/// to traverse a symbolic link. Reports whether it was removed: a directory
+/// that still holds anything, or that is already gone, is left alone.
+pub(crate) fn remove_empty_directory(root: &Path, relative: &Path, label: &str) -> Result<bool> {
+    let (parent, name) = split_parent(relative)?;
+    let Some(directory) = open_directory_optional(root, parent, label)? else {
+        return Ok(false);
+    };
+    match directory.child_kind(name) {
+        Ok(EntryKind::Directory) => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(anyhow!(error).context(format!("could not inspect {label}"))),
+    }
+    match directory.remove_child_directory(name) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(anyhow!(error).context(format!("could not remove {label}"))),
+    }
+    directory
+        .sync()
+        .with_context(|| format!("could not sync the directory holding {label}"))?;
+    Ok(true)
+}
+
+/// Whether `name` is one this module stages a write under before publishing
+/// it. A crash between the two can leave one behind, so a listing that
+/// treats every file as meaningful has to recognize and skip them.
+pub(crate) fn is_temporary_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with(TEMPORARY_PREFIX))
+}
+
 /// Open, creating if needed, a lock file beneath `root` without following a
 /// symbolic link and without truncating existing content.
 pub(crate) fn open_lock_file(root: &Path, relative: &Path, label: &str) -> Result<File> {
@@ -752,6 +792,20 @@ mod unix {
                 .map(|_| ())
         }
 
+        pub(super) fn remove_child_directory(&self, name: &OsStr) -> io::Result<()> {
+            let terminated = terminated(name)?;
+            // SAFETY: `terminated` outlives the call and `self.descriptor` is a
+            // valid open directory descriptor.
+            checked(unsafe {
+                libc::unlinkat(
+                    self.descriptor.as_raw_fd(),
+                    terminated.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            })
+            .map(|_| ())
+        }
+
         pub(super) fn sync(&self) -> io::Result<()> {
             // SAFETY: `self.descriptor` is a valid open directory descriptor.
             checked(unsafe { libc::fsync(self.descriptor.as_raw_fd()) }).map(|_| ())
@@ -872,6 +926,13 @@ mod portable {
 
         pub(super) fn unlink_child(&self, name: &OsStr) -> io::Result<()> {
             std::fs::remove_file(self.checked_child(name)?)
+        }
+
+        pub(super) fn remove_child_directory(&self, name: &OsStr) -> io::Result<()> {
+            match kind_of(&self.path.join(name))? {
+                EntryKind::Directory => std::fs::remove_dir(self.path.join(name)),
+                _ => Err(io::Error::other("entry is not a directory")),
+            }
         }
 
         pub(super) fn sync(&self) -> io::Result<()> {

@@ -148,6 +148,10 @@ The exception is [`cr check`](audit.md#check-the-whole-database), which reports 
 same problem as an `invalid_record_name` finding and keeps scanning. It is the
 command to reach for when everything else refuses.
 
+A collection can instead store each record as a folder: a Markdown entry such
+as `SKILL.md` and the scripts, references, and assets beside it. See
+[Bundle records](working-with-records.md#bundle-records).
+
 ## Next steps
 
 - [Working with records](working-with-records.md) covers creating, reading,

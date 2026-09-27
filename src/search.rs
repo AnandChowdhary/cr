@@ -103,6 +103,7 @@ mod tests {
                 .into(),
             attributes,
             body: "Priority account [VIP].".into(),
+            files: Vec::new(),
         }
     }
 

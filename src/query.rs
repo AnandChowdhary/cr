@@ -684,6 +684,7 @@ mod tests {
             version: String::new(),
             attributes: yaml_serde::from_str::<Mapping>(front_matter).unwrap(),
             body: String::new(),
+            files: Vec::new(),
         }
     }
 

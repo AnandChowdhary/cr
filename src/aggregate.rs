@@ -429,6 +429,7 @@ mod tests {
             version: String::new(),
             attributes: yaml_serde::from_str::<Mapping>(front_matter).unwrap(),
             body: String::new(),
+            files: Vec::new(),
         })
         .collect()
     }
@@ -482,6 +483,7 @@ mod tests {
                     attributes: yaml_serde::from_str::<Mapping>("value: 4611686018427387904\n")
                         .unwrap(),
                     body: String::new(),
+                    files: Vec::new(),
                 })
                 .collect();
             Aggregation::new::<&str>(None, &["value"], &[], &[], &[])

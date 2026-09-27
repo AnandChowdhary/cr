@@ -280,6 +280,7 @@ fn record(collection: &str, id: &str, attributes: Mapping) -> Record {
         version: String::new(),
         attributes,
         body: String::new(),
+        files: Vec::new(),
     }
 }
 

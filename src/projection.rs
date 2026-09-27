@@ -203,6 +203,7 @@ mod tests {
             )
             .unwrap(),
             body: "Line one\nLine two\n".to_owned(),
+            files: Vec::new(),
         }
     }
 

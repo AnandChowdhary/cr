@@ -83,6 +83,10 @@ tags:
 Account notes go here.
 ```
 
+A collection can instead store each record as a folder — a Markdown entry such
+as `SKILL.md` beside the scripts, references, and assets it uses — and every
+file in it is versioned and audited with the record.
+
 - **Change it however you like.** `cr create` and `cr update`, the REST API,
   and the browser forms make the same validated, audited write. Edit the file
   in your editor instead, and `cr status` shows the change until `cr save`
@@ -144,7 +148,7 @@ detail.
 
 - [Installation](docs/installation.md) — supported platforms, verified downloads, building from source, and updating.
 - [Getting started](docs/getting-started.md) — create a database, set your identity, and learn what a record is.
-- [Working with records](docs/working-with-records.md) — create, read, update, link, delete, filter, and search records, and edit the files directly.
+- [Working with records](docs/working-with-records.md) — create, read, update, link, delete, filter, and search records, edit the files directly, and store records as folders of files, such as Agent Skills.
 - [Examples](docs/examples.md) — a CRM and an applicant tracking system, step by step.
 
 **Model and protect your data**

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsStr,
     fs,
     path::{Component, Path, PathBuf},
@@ -28,7 +28,12 @@ use crate::{
     audit::{
         AuditEncryptionTransition, AuditFilter, AuditHistory, AuditIdempotency,
         AuditIdempotencyResult, AuditLog, AuditMutation, AuditedRecordStates, ChangePreview,
-        JournalCache, JournalVerification, ReconciledMutation, RecordActivity, record_hash,
+        FileTransition, JournalCache, JournalVerification, ReconciledMutation, RecordActivity,
+        record_hash,
+    },
+    bundle::{
+        BundleFiles, BundlePlan, CollectionConfig, FileChange, RecordLayout, Staged, content_hash,
+        edit_files, list_bundle, read_bundle, record_version,
     },
     check::{CheckReport, CheckScope},
     encryption::{
@@ -85,6 +90,14 @@ struct Config {
     data_dir: PathBuf,
     #[serde(default)]
     audit: AuditConfig,
+    /// How individual collections store their records. A collection not
+    /// named here stores each record as one Markdown file.
+    ///
+    /// Because the configuration refuses unknown keys, a `cr` that predates a
+    /// setting here refuses to open the database rather than reading a
+    /// bundle collection as an empty one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    collections: BTreeMap<String, CollectionConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -115,6 +128,7 @@ impl Default for Config {
             version: CURRENT_FORMAT_VERSION,
             data_dir: PathBuf::from("records"),
             audit: AuditConfig::default(),
+            collections: BTreeMap::new(),
         }
     }
 }
@@ -253,6 +267,8 @@ impl MutationOutcome {
 pub struct Database {
     root: PathBuf,
     config: Config,
+    /// Which collections store records as bundles, validated from `config`.
+    layout: RecordLayout,
     actor: String,
     principal: String,
     impersonated_by: Option<AccessIdentity>,
@@ -274,6 +290,10 @@ pub struct CollectionModel {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<serde_json::Value>,
+    /// The entry file's name when the collection stores each record as a
+    /// folder of files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
 }
 
 impl CollectionModel {
@@ -363,6 +383,52 @@ pub struct Record {
     pub version: String,
     pub attributes: Mapping,
     pub body: String,
+    /// A bundle record's supporting files, in path order. Empty for a record
+    /// stored as one Markdown file.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<RecordFile>,
+}
+
+/// One supporting file of a bundle record.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecordFile {
+    /// The file's path inside the record's folder, `/`-separated.
+    pub path: String,
+    /// `sha256:` and the plain SHA-256 of its bytes.
+    pub hash: String,
+}
+
+/// A record exactly as it is stored: its Markdown, a bundle's supporting
+/// files, and the version that covers them both.
+struct StoredRecord {
+    raw: String,
+    files: BundleFiles,
+    version: String,
+}
+
+/// Whether a read of a bundle record holds the audit lock.
+///
+/// Several files cannot change at once, so a read that does not hold the lock
+/// can find a bundle write partway through: a file staged beside its target,
+/// a file listed and then removed, a folder whose entry is not written yet.
+/// Such a read, a [`Self::Snapshot`], skips the staged file and the removed
+/// one and treats a folder without its entry as no record, so a reader never
+/// fails on a writer's intermediate state. Under the lock no write is in
+/// progress, so a [`Self::Locked`] read refuses all three: they are a direct
+/// edit to report, not a write to wait out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Reading {
+    Snapshot,
+    Locked,
+}
+
+impl Reading {
+    fn staged(self) -> Staged {
+        match self {
+            Self::Snapshot => Staged::Skip,
+            Self::Locked => Staged::Refuse,
+        }
+    }
 }
 
 /// A record that refers to another, and the relations it does so through.
@@ -558,6 +624,7 @@ impl Database {
         let database = Self {
             root,
             config: Config::default(),
+            layout: RecordLayout::default(),
             actor: String::new(),
             principal: String::new(),
             impersonated_by: None,
@@ -618,9 +685,11 @@ impl Database {
         }
 
         let config = load_config(&root)?;
+        let layout = RecordLayout::from_config(&config.collections)?;
         let database = Self {
             root,
             config,
+            layout,
             actor: String::new(),
             principal: String::new(),
             impersonated_by: None,
@@ -661,6 +730,11 @@ impl Database {
     /// The configured records directory, relative to the root.
     pub(crate) fn records_dir(&self) -> &Path {
         &self.config.data_dir
+    }
+
+    /// Which collections store records as bundles.
+    pub(crate) fn layout(&self) -> &RecordLayout {
+        &self.layout
     }
 
     /// Report every integrity problem in the database without changing it.
@@ -938,7 +1012,7 @@ impl Database {
         let Some(request) = request else {
             return Ok(None);
         };
-        let Some(value) = audit.idempotency_result(
+        let Some((result, files)) = audit.idempotency_result(
             &self.principal,
             request.operation,
             &request.collection,
@@ -949,7 +1023,6 @@ impl Database {
         else {
             return Ok(None);
         };
-        let result = value;
         validate_record_version(&result.version)
             .context("the committed idempotency result has an invalid version")?;
         let stored = Document::parse(&result.markdown)
@@ -961,6 +1034,7 @@ impl Database {
             result.path,
             document,
             result.version,
+            &files,
         )))
     }
 
@@ -1327,6 +1401,7 @@ impl Database {
             &self.principal,
             user.attributes()?,
             "",
+            &[],
             CreateRequest::new(MutationMode::Apply, None),
         )?
         .record()
@@ -1398,6 +1473,7 @@ impl Database {
             id,
             user.attributes()?,
             "",
+            &[],
             CreateRequest::user_registration(
                 AccessRequest::new(AccessAction::ManageAccess, AccessResource::Database),
                 options,
@@ -1514,6 +1590,7 @@ impl Database {
                 after_document: Some(&document),
                 before_bytes: None,
                 after_bytes: Some(rendered.as_bytes()),
+                files: None,
                 source: self.source.clone(),
                 message: self.audit_message.as_deref(),
                 access: decision.as_ref(),
@@ -1600,6 +1677,7 @@ impl Database {
             after_document: Some(&after),
             before_bytes: Some(before_raw.as_bytes()),
             after_bytes: Some(rendered.as_bytes()),
+            files: None,
             source: self.source.clone(),
             message: self.audit_message.as_deref(),
             access: decision.as_ref(),
@@ -1614,6 +1692,7 @@ impl Database {
             path,
             after,
             record_hash(rendered.as_bytes()),
+            &BundleFiles::new(),
         ))
     }
 
@@ -1698,6 +1777,7 @@ impl Database {
             path,
             document,
             record_hash(rendered.as_bytes()),
+            &BundleFiles::new(),
         ))
     }
 
@@ -1748,6 +1828,7 @@ impl Database {
                 document.attributes = user.attributes()?;
                 Ok(())
             },
+            &[],
             MutationMode::Apply,
             access,
             None,
@@ -1792,6 +1873,7 @@ impl Database {
                 document.attributes = user.attributes()?;
                 Ok(())
             },
+            &[],
             MutationMode::Apply,
             access,
             None,
@@ -1846,6 +1928,7 @@ impl Database {
                     document.attributes = user.attributes()?;
                     Ok(())
                 },
+                &[],
                 MutationMode::Apply,
                 AccessRequest::owner(AccessResource::Database),
                 None,
@@ -1906,6 +1989,7 @@ impl Database {
                 document.attributes = user.attributes()?;
                 Ok(())
             },
+            &[],
             MutationMode::Apply,
             AccessRequest::owner(AccessResource::Database),
             None,
@@ -2094,6 +2178,7 @@ impl Database {
                 access.visibility = visibility;
                 access.insert_into(&mut document.attributes)
             },
+            &[],
             MutationMode::Apply,
             AccessRequest::owner(AccessResource::record(collection, id)),
             None,
@@ -2126,6 +2211,7 @@ impl Database {
                 access.owner = owner;
                 access.insert_into(&mut document.attributes)
             },
+            &[],
             MutationMode::Apply,
             AccessRequest::owner(AccessResource::record(collection, id)),
             None,
@@ -2195,9 +2281,21 @@ impl Database {
         assignments: &[Assignment],
         body: &str,
     ) -> Result<Record> {
+        self.create_with_files(collection, id, assignments, body, &[])
+    }
+
+    /// [`Self::create`] for a bundle record, with its supporting files.
+    pub fn create_with_files(
+        &self,
+        collection: &str,
+        id: &str,
+        assignments: &[Assignment],
+        body: &str,
+        files: &[FileChange],
+    ) -> Result<Record> {
         let mut attributes = Mapping::new();
         apply_all(&mut attributes, assignments)?;
-        self.create_record(collection, id, attributes, body)
+        self.create_record_with_files(collection, id, attributes, body, files)
     }
 
     /// Compute what `create` would record, without creating anything.
@@ -2208,9 +2306,22 @@ impl Database {
         assignments: &[Assignment],
         body: &str,
     ) -> Result<ChangePreview> {
+        self.preview_create_with_files(collection, id, assignments, body, &[])
+    }
+
+    /// Compute what `create_with_files` would record, without creating
+    /// anything.
+    pub fn preview_create_with_files(
+        &self,
+        collection: &str,
+        id: &str,
+        assignments: &[Assignment],
+        body: &str,
+        files: &[FileChange],
+    ) -> Result<ChangePreview> {
         let mut attributes = Mapping::new();
         apply_all(&mut attributes, assignments)?;
-        self.preview_create_record(collection, id, attributes, body)
+        self.preview_create_record_with_files(collection, id, attributes, body, files)
     }
 
     pub fn create_record(
@@ -2220,22 +2331,42 @@ impl Database {
         attributes: Mapping,
         body: &str,
     ) -> Result<Record> {
+        self.create_record_with_files(collection, id, attributes, body, &[])
+    }
+
+    /// [`Self::create_record`] for a bundle record, with its supporting files.
+    /// A [`FileChange::Remove`] is refused: a new record has nothing to remove.
+    pub fn create_record_with_files(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: Mapping,
+        body: &str,
+        files: &[FileChange],
+    ) -> Result<Record> {
         if collection == USERS_COLLECTION {
             return Err(invalid(
                 "the users collection is managed through 'cr user' and 'cr access'",
             ));
         }
         let idempotency = self.idempotency_request("create", collection, id, || {
-            Ok(json!({
+            let mut input = json!({
                 "attributes": canonical_yaml_value(&Value::Mapping(attributes.clone()))?,
                 "body": body,
-            }))
+            });
+            // Only present when used, so a retry of a create recorded before
+            // bundles existed still hashes to the request it was.
+            if !files.is_empty() {
+                input["files"] = file_changes_request(files);
+            }
+            Ok(input)
         })?;
         self.run_create(
             collection,
             id,
             attributes,
             body,
+            files,
             CreateRequest::new(
                 MutationMode::Apply,
                 Some(AccessRequest::new(
@@ -2268,6 +2399,7 @@ impl Database {
             id,
             attributes,
             body,
+            &[],
             CreateRequest::new(
                 MutationMode::Apply,
                 Some(AccessRequest::new(
@@ -2288,6 +2420,19 @@ impl Database {
         attributes: Mapping,
         body: &str,
     ) -> Result<ChangePreview> {
+        self.preview_create_record_with_files(collection, id, attributes, body, &[])
+    }
+
+    /// Compute what `create_record_with_files` would record, without creating
+    /// anything.
+    pub fn preview_create_record_with_files(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: Mapping,
+        body: &str,
+        files: &[FileChange],
+    ) -> Result<ChangePreview> {
         if collection == USERS_COLLECTION {
             return Err(invalid(
                 "the users collection is managed through 'cr user' and 'cr access'",
@@ -2298,6 +2443,7 @@ impl Database {
             id,
             attributes,
             body,
+            files,
             CreateRequest::new(
                 MutationMode::Preview,
                 Some(AccessRequest::new(
@@ -2315,6 +2461,7 @@ impl Database {
         id: &str,
         mut attributes: Mapping,
         body: &str,
+        files: &[FileChange],
         request: CreateRequest,
     ) -> Result<MutationOutcome> {
         let CreateRequest {
@@ -2326,6 +2473,17 @@ impl Database {
         } = request;
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
+        let bundle_entry = self.bundle_entry_for(collection, files)?;
+        if files
+            .iter()
+            .any(|change| matches!(change, FileChange::Remove { .. }))
+        {
+            return Err(invalid("a new record has no files to remove"));
+        }
+        let after_files = match bundle_entry {
+            Some(entry) => edit_files(&BundleFiles::new(), files, entry, &label)?,
+            None => BundleFiles::new(),
+        };
         let audit = self.audit();
         let _lock = audit.lock()?;
         if mode == MutationMode::Apply {
@@ -2359,7 +2517,16 @@ impl Database {
         if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
             return Ok(MutationOutcome::Applied(record));
         }
-        if paths::entry_kind(&self.root, &path, &label)?.is_some() {
+        // A bundle folder holding files without its entry is refused as what
+        // it is rather than written over; any other occupied name, a link
+        // included, is simply taken.
+        let exists = match self.layout.entry(collection) {
+            Some(_) => self
+                .read_stored_optional(collection, id, Reading::Locked)?
+                .is_some(),
+            None => self.record_exists(collection, id, Reading::Locked)?,
+        };
+        if exists {
             return Err(DomainError::record_exists(collection, id).into());
         }
         // Only a user's ID needs the journal this early, to refuse reusing a
@@ -2401,13 +2568,15 @@ impl Database {
             id,
             path.clone(),
             document.clone(),
-            record_hash(rendered.as_bytes()),
+            record_version(rendered.as_bytes(), &after_files),
+            &after_files,
         );
         let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
         let admission = match admission {
             Some(admission) => admission,
             None => audit.admit()?,
         };
+        let no_files = BundleFiles::new();
         let event = audit.prepare_admitted(
             AuditMutation {
                 action: AuditAction::Create,
@@ -2417,6 +2586,10 @@ impl Database {
                 after_document: Some(&stored),
                 before_bytes: None,
                 after_bytes: Some(rendered.as_bytes()),
+                files: bundle_entry.map(|_| FileTransition {
+                    before: &no_files,
+                    after: &after_files,
+                }),
                 source: self.source.clone(),
                 message: self.audit_message.as_deref(),
                 access: decision.as_ref(),
@@ -2428,6 +2601,16 @@ impl Database {
             return Ok(MutationOutcome::Previewed(
                 self.reveal_preview(event.into_preview())?,
             ));
+        }
+        if let Some(entry) = bundle_entry {
+            let plan = BundlePlan::new(
+                self.bundle_directory(collection, id),
+                entry,
+                (None, &no_files),
+                (Some(rendered.as_bytes()), &after_files),
+            );
+            audit.commit_bundle(event, plan, &written_contents(rendered.as_bytes(), files))?;
+            return Ok(MutationOutcome::Applied(record));
         }
         audit.commit(event, &path, || {
             paths::write_new(&self.root, &path, rendered.as_bytes(), &label).map_err(|error| {
@@ -2468,15 +2651,20 @@ impl Database {
     ) -> Result<Record> {
         self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
         let path = self.record_path(collection, id)?;
-        let raw = self.read_record(collection, id, &path)?;
-        let document =
-            self.parse_logical_record_with_audited_cache(collection, id, &raw, audited_states)?;
+        let stored = self.read_stored(collection, id, Reading::Snapshot)?;
+        let document = self.parse_logical_record_with_audited_cache(
+            collection,
+            id,
+            &stored.raw,
+            audited_states,
+        )?;
         Ok(record_from_document(
             collection,
             id,
             path,
             document,
-            record_hash(raw.as_bytes()),
+            stored.version,
+            &stored.files,
         ))
     }
 
@@ -2488,8 +2676,8 @@ impl Database {
     ) -> Result<Record> {
         self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
         let path = self.record_path(collection, id)?;
-        let raw = self.read_record(collection, id, &path)?;
-        let stored = parse_record(collection, id, &raw)?;
+        let record = self.read_stored(collection, id, Reading::Snapshot)?;
+        let stored = parse_record(collection, id, &record.raw)?;
         let document = match audited_states {
             Some(states) => {
                 self.reveal_document_with_audited_states(collection, id, &stored, Some(states))?
@@ -2501,16 +2689,61 @@ impl Database {
             id,
             path,
             document,
-            record_hash(raw.as_bytes()),
+            record.version,
+            &record.files,
         ))
     }
 
     pub fn get_optional(&self, collection: &str, id: &str) -> Result<Option<Record>> {
-        let path = self.record_path(collection, id)?;
-        match paths::entry_kind(&self.root, &path, &record_label(collection, id))? {
-            Some(_) => self.get(collection, id).map(Some),
-            None => Ok(None),
+        match self.record_exists(collection, id, Reading::Snapshot)? {
+            true => self.get(collection, id).map(Some),
+            false => Ok(None),
         }
+    }
+
+    /// Read one supporting file of a bundle record, with the version of the
+    /// record it belongs to.
+    ///
+    /// The file takes the record's access control: reading it needs exactly
+    /// the permission reading the record does.
+    pub fn read_file(&self, collection: &str, id: &str, path: &str) -> Result<(Vec<u8>, String)> {
+        self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
+        crate::bundle::validate_file_path(path)?;
+        let label = record_label(collection, id);
+        let Some(entry) = self.layout.entry(collection) else {
+            return Err(anyhow::Error::new(DomainError::NotFound(format!(
+                "{} does not exist; collection '{collection}' stores each record as one Markdown file",
+                crate::bundle::file_label(&label, path)
+            ))));
+        };
+        let stored = self.read_stored(collection, id, Reading::Snapshot)?;
+        if path == entry || !stored.files.contains_key(path) {
+            return Err(anyhow::Error::new(DomainError::NotFound(format!(
+                "{} does not exist",
+                crate::bundle::file_label(&label, path)
+            ))));
+        }
+        let relative = self.bundle_directory(collection, id).join(path);
+        let file_label = crate::bundle::file_label(&label, path);
+        let contents = paths::read(&self.root, &relative, &file_label).map_err(|error| {
+            // Removed, or turned into a folder, by a write since the version
+            // was read: say so rather than describe the half-written folder.
+            if is_missing(&error)
+                || !crate::bundle::is_regular_file(&self.root, &relative, &file_label)
+            {
+                conflict(format!("{label} changed while it was being read; retry"))
+            } else {
+                error
+            }
+        })?;
+        // Read after the version was computed, so a file changed in between
+        // is refused rather than served under a version it does not have.
+        if Some(&content_hash(&contents)) != stored.files.get(path).map(|file| &file.hash) {
+            return Err(conflict(format!(
+                "{label} changed while it was being read; retry"
+            )));
+        }
+        Ok((contents, stored.version))
     }
 
     pub fn read_raw(&self, collection: &str, id: &str) -> Result<String> {
@@ -2520,9 +2753,11 @@ impl Database {
     /// Read the exact document bytes and the version derived from that same read.
     pub fn read_raw_versioned(&self, collection: &str, id: &str) -> Result<(String, String)> {
         self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
-        let path = self.record_path(collection, id)?;
-        let stored_raw = self.read_record(collection, id, &path)?;
-        let version = record_hash(stored_raw.as_bytes());
+        let StoredRecord {
+            raw: stored_raw,
+            version,
+            ..
+        } = self.read_stored(collection, id, Reading::Snapshot)?;
         let policy = self.encryption_policy(collection)?;
         let stored = parse_record(collection, id, &stored_raw)?;
         let mut audited_states = None;
@@ -2557,18 +2792,16 @@ impl Database {
         expected_audit_sequence: u64,
     ) -> Result<()> {
         let precondition = expected.map(RecordPrecondition::version).transpose()?;
-        let path = self.record_path(collection, id)?;
-        let label = record_label(collection, id);
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         assert_audit_sequence(&audit, expected_audit_sequence)?;
         self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
         if let Some(precondition) = precondition {
-            let raw = self.read_record_for_mutation(collection, id, &path, Some(&precondition))?;
-            return precondition.assert_matches(collection, id, &record_hash(raw.as_bytes()));
+            let stored = self.read_stored_for_mutation(collection, id, Some(&precondition))?;
+            return precondition.assert_matches(collection, id, &stored.version);
         }
-        if paths::entry_kind(&self.root, &path, &label)?.is_none() {
+        if !self.record_exists(collection, id, Reading::Locked)? {
             return Ok(());
         }
         Err(precondition_failed(format!(
@@ -2591,7 +2824,6 @@ impl Database {
         expected_audit_sequence: u64,
     ) -> Result<bool> {
         let precondition = RecordPrecondition::version(expected_version.to_owned())?;
-        let path = self.record_path(collection, id)?;
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
@@ -2602,9 +2834,9 @@ impl Database {
             ));
         }
         self.authorize(AccessAction::Read, &AccessResource::record(collection, id))?;
-        let raw = self.read_record_for_mutation(collection, id, &path, Some(&precondition))?;
-        precondition.assert_matches(collection, id, &record_hash(raw.as_bytes()))?;
-        let stored = parse_record(collection, id, &raw)?;
+        let record = self.read_stored_for_mutation(collection, id, Some(&precondition))?;
+        precondition.assert_matches(collection, id, &record.version)?;
+        let stored = parse_record(collection, id, &record.raw)?;
         let logical = self.reveal_document_with_audited_states(
             collection,
             id,
@@ -2641,10 +2873,13 @@ impl Database {
             // kind decides whether it is usable as one — in that order, as in
             // `record_files` and `cr check`, so a `.md` name that cannot be an
             // ID is refused rather than quietly listed.
-            let CollectionEntry::Record(id) = collection_entry(collection, &entry.name)? else {
+            let CollectionEntry::Record(id) =
+                self.layout
+                    .collection_entry(collection, &entry.name, entry.kind)?
+            else {
                 continue;
             };
-            if !entry.kind.is_file() {
+            if !self.layout.stores_record_as(collection, entry.kind) {
                 continue;
             }
             identifiers.push(id);
@@ -2660,23 +2895,29 @@ impl Database {
                     Ok(false) => return None,
                     Err(error) => return Some(Err(error)),
                 }
-                Some((|| {
-                    let path = directory.join(format!("{id}.md"));
-                    let raw = self.read_record(collection, &id, &path)?;
+                (|| {
+                    // A bundle folder with nothing in it is not a record.
+                    let Some(stored) =
+                        self.read_stored_optional(collection, &id, Reading::Snapshot)?
+                    else {
+                        return Ok(None);
+                    };
                     let document = self.parse_logical_record_with_audited_cache(
                         collection,
                         &id,
-                        &raw,
+                        &stored.raw,
                         audited_states,
                     )?;
-                    Ok(record_from_document(
+                    Ok(Some(record_from_document(
                         collection,
                         &id,
-                        path,
+                        self.record_path(collection, &id)?,
                         document,
-                        record_hash(raw.as_bytes()),
-                    ))
-                })())
+                        stored.version,
+                        &stored.files,
+                    )))
+                })()
+                .transpose()
             })
             .filter(|record: &Result<Record>| {
                 record
@@ -2834,6 +3075,7 @@ impl Database {
                     "invalid access annotations for collection '{name}'"
                 ))
             })?;
+            self.refuse_encrypted_bundles(&name, &schema)?;
             models.insert(name, Some(schema));
         }
 
@@ -2869,7 +3111,11 @@ impl Database {
 
         Ok(models
             .into_iter()
-            .map(|(name, schema)| CollectionModel { name, schema })
+            .map(|(name, schema)| CollectionModel {
+                entry: self.layout.entry(&name).map(str::to_owned),
+                name,
+                schema,
+            })
             .collect())
     }
 
@@ -3310,6 +3556,7 @@ impl Database {
         if existing.as_ref() == Some(&schema) {
             return Ok(false);
         }
+        self.refuse_encrypted_bundles(collection, &schema)?;
 
         jsonschema::meta::validate(&schema).map_err(|error| {
             anyhow!("{error}").context(DomainError::Invalid(format!(
@@ -3337,43 +3584,49 @@ impl Database {
     }
 
     fn collection_has_record_files(&self, collection: &str) -> Result<bool> {
-        let directory = self.config.data_dir.join(collection);
-        let label = collection_label(collection);
-        let entries = paths::list_directory(&self.root, &directory, &label)?.unwrap_or_default();
-        for entry in entries {
-            let CollectionEntry::Record(id) = collection_entry(collection, &entry.name)? else {
-                continue;
-            };
-            if !entry.kind.is_file() {
-                return Err(paths::refuse_entry(
-                    &record_label(collection, &id),
-                    entry.kind,
-                ));
-            }
-            return Ok(true);
-        }
-        Ok(false)
+        Ok(!self
+            .collection_record_ids(collection, Reading::Locked)?
+            .is_empty())
     }
 
     fn collection_has_readable_record(&self, collection: &str) -> Result<bool> {
-        let directory = self.config.data_dir.join(collection);
-        let label = collection_label(collection);
-        let entries = paths::list_directory(&self.root, &directory, &label)?.unwrap_or_default();
-        for entry in entries {
-            let CollectionEntry::Record(id) = collection_entry(collection, &entry.name)? else {
-                continue;
-            };
-            if !entry.kind.is_file() {
-                return Err(paths::refuse_entry(
-                    &record_label(collection, &id),
-                    entry.kind,
-                ));
-            }
+        for id in self.collection_record_ids(collection, Reading::Snapshot)? {
             if self.can_access(AccessAction::Read, &AccessResource::record(collection, &id))? {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// Every record ID stored in `collection`, sorted, without reading any
+    /// record, refusing an entry that claims to be a record and cannot be.
+    fn collection_record_ids(&self, collection: &str, reading: Reading) -> Result<Vec<String>> {
+        let directory = self.config.data_dir.join(collection);
+        let label = collection_label(collection);
+        let entries = paths::list_directory(&self.root, &directory, &label)?.unwrap_or_default();
+        let mut identifiers = Vec::new();
+        for entry in entries {
+            let CollectionEntry::Record(id) =
+                self.layout
+                    .collection_entry(collection, &entry.name, entry.kind)?
+            else {
+                continue;
+            };
+            if !self.layout.stores_record_as(collection, entry.kind) {
+                return Err(paths::refuse_entry(
+                    &record_label(collection, &id),
+                    entry.kind,
+                ));
+            }
+            if self.layout.entry(collection).is_some()
+                && !self.record_exists(collection, &id, reading)?
+            {
+                continue;
+            }
+            identifiers.push(id);
+        }
+        identifiers.sort();
+        Ok(identifiers)
     }
 
     /// Parse `unset` paths and refuse an update no mutation should attempt:
@@ -3437,6 +3690,30 @@ impl Database {
         body: Option<&str>,
         precondition: Option<&RecordPrecondition>,
     ) -> Result<Record> {
+        self.update_with_files_conditionally(
+            collection,
+            id,
+            assignments,
+            unset,
+            body,
+            &[],
+            precondition,
+        )
+    }
+
+    /// [`Self::update_conditionally`] that also adds, replaces, and removes a
+    /// bundle record's supporting files, in the same audit event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_with_files_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        assignments: &[Assignment],
+        unset: &[String],
+        body: Option<&str>,
+        files: &[FileChange],
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
         let unset = self.validate_update(collection, assignments, unset)?;
         let user_fields = validate_users_field_update(collection, assignments, &unset, body)?;
         let idempotency = self.idempotency_request("update", collection, id, || {
@@ -3453,12 +3730,16 @@ impl Database {
             if !unset.is_empty() {
                 input["unset"] = json!(unset.iter().map(|(raw, _)| raw).collect::<Vec<_>>());
             }
+            if !files.is_empty() {
+                input["files"] = file_changes_request(files);
+            }
             Ok(input)
         })?;
         self.run_update(
             collection,
             id,
             update_with(assignments, &unset, body),
+            files,
             MutationMode::Apply,
             if let Some(includes_name) = user_fields {
                 AccessRequest::user_fields(id, includes_name)
@@ -3492,12 +3773,36 @@ impl Database {
         body: Option<&str>,
         precondition: Option<&RecordPrecondition>,
     ) -> Result<ChangePreview> {
+        self.preview_update_with_files_conditionally(
+            collection,
+            id,
+            assignments,
+            unset,
+            body,
+            &[],
+            precondition,
+        )
+    }
+
+    /// Preview [`Self::update_with_files_conditionally`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn preview_update_with_files_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        assignments: &[Assignment],
+        unset: &[String],
+        body: Option<&str>,
+        files: &[FileChange],
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
         let unset = self.validate_update(collection, assignments, unset)?;
         let user_fields = validate_users_field_update(collection, assignments, &unset, body)?;
         self.run_update(
             collection,
             id,
             update_with(assignments, &unset, body),
+            files,
             MutationMode::Preview,
             if let Some(includes_name) = user_fields {
                 AccessRequest::user_fields(id, includes_name)
@@ -3531,21 +3836,50 @@ impl Database {
         body: Option<&str>,
         precondition: Option<&RecordPrecondition>,
     ) -> Result<Record> {
+        self.patch_with_files_conditionally(
+            collection,
+            id,
+            attributes,
+            remove,
+            body,
+            &[],
+            precondition,
+        )
+    }
+
+    /// [`Self::patch_conditionally`] that also adds, replaces, and removes a
+    /// bundle record's supporting files, in the same audit event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn patch_with_files_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        remove: &[String],
+        body: Option<&str>,
+        files: &[FileChange],
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<Record> {
         self.run_patch(
             collection,
             id,
             attributes,
             remove,
             body,
+            files,
             MutationMode::Apply,
             precondition,
             self.idempotency_request("patch", collection, id, || {
-                Ok(json!({
+                let mut input = json!({
                     "attributes": canonical_yaml_value(&Value::Mapping(attributes.clone()))?,
                     "remove": remove,
                     "body": body,
                     "precondition": precondition.map(RecordPrecondition::idempotency_value),
-                }))
+                });
+                if !files.is_empty() {
+                    input["files"] = file_changes_request(files);
+                }
+                Ok(input)
             })?,
         )?
         .record()
@@ -3573,12 +3907,36 @@ impl Database {
         body: Option<&str>,
         precondition: Option<&RecordPrecondition>,
     ) -> Result<ChangePreview> {
+        self.preview_patch_with_files_conditionally(
+            collection,
+            id,
+            attributes,
+            remove,
+            body,
+            &[],
+            precondition,
+        )
+    }
+
+    /// Preview [`Self::patch_with_files_conditionally`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn preview_patch_with_files_conditionally(
+        &self,
+        collection: &str,
+        id: &str,
+        attributes: &Mapping,
+        remove: &[String],
+        body: Option<&str>,
+        files: &[FileChange],
+        precondition: Option<&RecordPrecondition>,
+    ) -> Result<ChangePreview> {
         self.run_patch(
             collection,
             id,
             attributes,
             remove,
             body,
+            files,
             MutationMode::Preview,
             precondition,
             None,
@@ -3594,6 +3952,7 @@ impl Database {
         attributes: &Mapping,
         remove: &[String],
         body: Option<&str>,
+        files: &[FileChange],
         mode: MutationMode,
         precondition: Option<&RecordPrecondition>,
         idempotency: Option<IdempotencyRequest>,
@@ -3613,8 +3972,10 @@ impl Database {
             )));
         }
         let user_fields = validate_users_field_patch(collection, attributes, remove, body)?;
-        if attributes.is_empty() && remove.is_empty() && body.is_none() {
-            return Err(invalid("patch must change front matter or Markdown"));
+        if attributes.is_empty() && remove.is_empty() && body.is_none() && files.is_empty() {
+            return Err(invalid(
+                "patch must change front matter, Markdown, or files",
+            ));
         }
         let remove = remove
             .iter()
@@ -3635,6 +3996,7 @@ impl Database {
                 }
                 Ok(())
             },
+            files,
             mode,
             if let Some(includes_name) = user_fields {
                 AccessRequest::user_fields(id, includes_name)
@@ -3685,6 +4047,7 @@ impl Database {
                 document.body = body.to_owned();
                 Ok(())
             },
+            &[],
             MutationMode::Apply,
             AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
             precondition,
@@ -3711,6 +4074,7 @@ impl Database {
                 document.body = body.to_owned();
                 Ok(())
             },
+            &[],
             MutationMode::Preview,
             AccessRequest::new(AccessAction::Update, AccessResource::record(collection, id)),
             precondition,
@@ -3725,6 +4089,7 @@ impl Database {
         collection: &str,
         id: &str,
         mutate: impl FnOnce(&mut Document) -> Result<()>,
+        files: &[FileChange],
         mode: MutationMode,
         access: AccessRequest,
         precondition: Option<&RecordPrecondition>,
@@ -3732,6 +4097,7 @@ impl Database {
     ) -> Result<MutationOutcome> {
         let path = self.record_path(collection, id)?;
         let label = record_label(collection, id);
+        let bundle_entry = self.bundle_entry_for(collection, files)?;
         let audit = self.audit();
         let _lock = audit.lock()?;
         if mode == MutationMode::Apply {
@@ -3755,11 +4121,19 @@ impl Database {
         if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
             return Ok(MutationOutcome::Applied(record));
         }
-        let before_raw = self.read_record_for_mutation(collection, id, &path, precondition)?;
+        let StoredRecord {
+            raw: before_raw,
+            files: before_files,
+            version: before_version,
+        } = self.read_stored_for_mutation(collection, id, precondition)?;
         if let Some(precondition) = precondition {
-            precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
+            precondition.assert_matches(collection, id, &before_version)?;
         }
         let before_stored = parse_record(collection, id, &before_raw)?;
+        let after_files = match bundle_entry {
+            Some(entry) => edit_files(&before_files, files, entry, &label)?,
+            None => BundleFiles::new(),
+        };
         // The one walk of the journal this write makes. What it reads of the
         // audited state from here on, and the event it prepares, all come
         // from it.
@@ -3807,7 +4181,8 @@ impl Database {
             id,
             path.clone(),
             document.clone(),
-            record_hash(rendered.as_bytes()),
+            record_version(rendered.as_bytes(), &after_files),
+            &after_files,
         );
         let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
         let event = audit.prepare_admitted(
@@ -3819,6 +4194,10 @@ impl Database {
                 after_document: Some(&after_stored),
                 before_bytes: Some(before_raw.as_bytes()),
                 after_bytes: Some(rendered.as_bytes()),
+                files: bundle_entry.map(|_| FileTransition {
+                    before: &before_files,
+                    after: &after_files,
+                }),
                 source: self.source.clone(),
                 message: self.audit_message.as_deref(),
                 access: decision.as_ref(),
@@ -3831,10 +4210,45 @@ impl Database {
                 self.reveal_preview(event.into_preview())?,
             ));
         }
-        audit.commit(event, &path, || {
-            paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
-        })?;
+        self.commit_replacement(
+            &audit,
+            event,
+            collection,
+            id,
+            (before_raw.as_bytes(), &before_files),
+            (rendered.as_bytes(), &after_files),
+            files,
+        )?;
         Ok(MutationOutcome::Applied(record))
+    }
+
+    /// Publish a record's new Markdown, and for a bundle its supporting
+    /// files, and append the prepared event.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_replacement(
+        &self,
+        audit: &AuditLog<'_>,
+        event: crate::audit::PreparedEntry,
+        collection: &str,
+        id: &str,
+        before: (&[u8], &BundleFiles),
+        after: (&[u8], &BundleFiles),
+        files: &[FileChange],
+    ) -> Result<()> {
+        let path = self.record_path(collection, id)?;
+        let Some(entry) = self.layout.entry(collection) else {
+            let label = record_label(collection, id);
+            return audit.commit(event, &path, || {
+                paths::write_replace(&self.root, &path, after.0, &label)
+            });
+        };
+        let plan = BundlePlan::new(
+            self.bundle_directory(collection, id),
+            entry,
+            (Some(before.0), before.1),
+            (Some(after.0), after.1),
+        );
+        audit.commit_bundle(event, plan, &written_contents(after.0, files))
     }
 
     pub fn link(
@@ -3973,11 +4387,10 @@ impl Database {
         // event all come from it.
         let mut admission = None;
         if change == RelationChange::Add {
-            let target_path = self.record_path(target_collection, target_id)?;
-            let target_raw = self
-                .read_record(target_collection, target_id, &target_path)
+            let target_record = self
+                .read_stored(target_collection, target_id, Reading::Locked)
                 .map_err(|error| {
-                    if is_missing(&error) {
+                    if matches!(DomainError::of(&error), Some(DomainError::NotFound(_))) {
                         error.context(DomainError::NotFound(format!(
                             "relation target {target_collection}/{target_id} does not exist"
                         )))
@@ -3986,26 +4399,29 @@ impl Database {
                     }
                 })?;
             let states = admission.insert(audit.admit()?).states();
-            let target = parse_record(target_collection, target_id, &target_raw)?;
+            let target = parse_record(target_collection, target_id, &target_record.raw)?;
             self.reveal_document_with_audited_states(
                 target_collection,
                 target_id,
                 &target,
                 Some(states),
             )?;
-            AuditLog::assert_current_in(
+            AuditLog::assert_version_in(
                 states,
                 target_collection,
                 target_id,
-                target_raw.as_bytes(),
+                &target_record.version,
             )?;
         }
 
         let path = self.record_path(collection, id)?;
-        let label = record_label(collection, id);
-        let before_raw = self.read_record_for_mutation(collection, id, &path, precondition)?;
+        let StoredRecord {
+            raw: before_raw,
+            files: before_files,
+            version: before_version,
+        } = self.read_stored_for_mutation(collection, id, precondition)?;
         if let Some(precondition) = precondition {
-            precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
+            precondition.assert_matches(collection, id, &before_version)?;
         }
         let before_stored = parse_record(collection, id, &before_raw)?;
         let admission = match admission {
@@ -4045,7 +4461,8 @@ impl Database {
             id,
             path.clone(),
             document.clone(),
-            record_hash(rendered.as_bytes()),
+            record_version(rendered.as_bytes(), &before_files),
+            &before_files,
         );
         let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
         let event = audit.prepare_admitted(
@@ -4057,6 +4474,10 @@ impl Database {
                 after_document: Some(&after_stored),
                 before_bytes: Some(before_raw.as_bytes()),
                 after_bytes: Some(rendered.as_bytes()),
+                files: self.layout.entry(collection).map(|_| FileTransition {
+                    before: &before_files,
+                    after: &before_files,
+                }),
                 source: self.source.clone(),
                 message: self.audit_message.as_deref(),
                 access: decision.as_ref(),
@@ -4069,9 +4490,15 @@ impl Database {
                 self.reveal_preview(event.into_preview())?,
             ));
         }
-        audit.commit(event, &path, || {
-            paths::write_replace(&self.root, &path, rendered.as_bytes(), &label)
-        })?;
+        self.commit_replacement(
+            &audit,
+            event,
+            collection,
+            id,
+            (before_raw.as_bytes(), &before_files),
+            (rendered.as_bytes(), &before_files),
+            &[],
+        )?;
         Ok(MutationOutcome::Applied(record))
     }
 
@@ -4281,9 +4708,13 @@ impl Database {
         if let Some(record) = self.replay_idempotent_record(&audit, idempotency.as_ref())? {
             return Ok(MutationOutcome::Applied(record));
         }
-        let before_raw = self.read_record_for_mutation(collection, id, &path, precondition)?;
+        let StoredRecord {
+            raw: before_raw,
+            files: before_files,
+            version: before_version,
+        } = self.read_stored_for_mutation(collection, id, precondition)?;
         if let Some(precondition) = precondition {
-            precondition.assert_matches(collection, id, &record_hash(before_raw.as_bytes()))?;
+            precondition.assert_matches(collection, id, &before_version)?;
         }
         let stored_document = parse_record(collection, id, &before_raw)?;
         // The one walk of the journal this write makes. What it reads of the
@@ -4316,9 +4747,11 @@ impl Database {
             id,
             path.clone(),
             document.clone(),
-            record_hash(before_raw.as_bytes()),
+            before_version,
+            &before_files,
         );
         let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &before_raw)?;
+        let no_files = BundleFiles::new();
         let event = audit.prepare_admitted(
             AuditMutation {
                 action: AuditAction::Delete,
@@ -4328,6 +4761,10 @@ impl Database {
                 after_document: None,
                 before_bytes: Some(before_raw.as_bytes()),
                 after_bytes: None,
+                files: self.layout.entry(collection).map(|_| FileTransition {
+                    before: &before_files,
+                    after: &no_files,
+                }),
                 source: self.source.clone(),
                 message: self.audit_message.as_deref(),
                 access: decision.as_ref(),
@@ -4339,6 +4776,16 @@ impl Database {
             return Ok(MutationOutcome::Previewed(
                 self.reveal_preview(event.into_preview())?,
             ));
+        }
+        if let Some(entry) = self.layout.entry(collection) {
+            let plan = BundlePlan::new(
+                self.bundle_directory(collection, id),
+                entry,
+                (Some(before_raw.as_bytes()), &before_files),
+                (None, &no_files),
+            );
+            audit.commit_bundle(event, plan, &HashMap::new())?;
+            return Ok(MutationOutcome::Applied(record));
         }
         audit.commit(event, &path, || {
             paths::remove_file(&self.root, &path, &label)
@@ -4452,10 +4899,12 @@ impl Database {
                 .and_then(|state| state.document.as_ref())
                 .map(Document::from_audit_value)
                 .transpose()?;
-            let after_raw = match change.status {
-                WorkingChangeKind::Deleted => None,
+            let (after_raw, after_files) = match change.status {
+                WorkingChangeKind::Deleted => (None, BundleFiles::new()),
                 WorkingChangeKind::Added | WorkingChangeKind::Modified => {
-                    Some(self.read_record(&change.collection, &change.id, &change.path)?)
+                    let stored =
+                        self.read_stored(&change.collection, &change.id, Reading::Locked)?;
+                    (Some(stored.raw), stored.files)
                 }
             };
             let after = after_raw
@@ -4525,7 +4974,15 @@ impl Database {
                 }
             };
             let decision = self.authorize(access_action, &resource)?;
-            prepared.push((change, before, after, after_raw, action, decision));
+            prepared.push((
+                change,
+                before,
+                after,
+                after_raw,
+                after_files,
+                action,
+                decision,
+            ));
         }
 
         let mut previews = Vec::with_capacity(prepared.len());
@@ -4534,7 +4991,7 @@ impl Database {
         // metadata. Prove every selected event is displayable before accepting
         // the first one, so `save --all` can never commit a prefix and then
         // return an error while formatting its response.
-        for (change, before, after, after_raw, action, decision) in &prepared {
+        for (change, before, after, after_raw, after_files, action, decision) in &prepared {
             let event = audit.prepare_reconciled_in(
                 ReconciledMutation {
                     action: action.clone(),
@@ -4544,6 +5001,7 @@ impl Database {
                     after_document: after.as_ref(),
                     before_hash: change.audited_hash.as_deref(),
                     after_bytes: after_raw.as_deref().map(str::as_bytes),
+                    after_files: Some(after_files),
                     had_history: snapshot
                         .states
                         .contains_key(&(change.collection.clone(), change.id.clone())),
@@ -4565,7 +5023,7 @@ impl Database {
         }
 
         let mut entries = Vec::with_capacity(prepared.len());
-        for ((change, before, after, after_raw, action, decision), changes) in
+        for ((change, before, after, after_raw, after_files, action, decision), changes) in
             prepared.into_iter().zip(projected_changes)
         {
             let event = audit.prepare_reconciled_in(
@@ -4577,6 +5035,7 @@ impl Database {
                     after_document: after.as_ref(),
                     before_hash: change.audited_hash.as_deref(),
                     after_bytes: after_raw.as_deref().map(str::as_bytes),
+                    after_files: Some(&after_files),
                     had_history: snapshot
                         .states
                         .contains_key(&(change.collection.clone(), change.id.clone())),
@@ -4834,7 +5293,8 @@ impl Database {
             if states.contains_key(&(collection.clone(), id.clone())) {
                 continue;
             }
-            let raw = self.read_record(&collection, &id, &path)?;
+            let StoredRecord { raw, files, .. } =
+                self.read_stored(&collection, &id, Reading::Locked)?;
             let document = parse_record(&collection, &id, &raw)?;
             let logical = self.reveal_document_with_audited_states(
                 &collection,
@@ -4851,6 +5311,10 @@ impl Database {
                 after_document: Some(&document),
                 before_bytes: None,
                 after_bytes: Some(raw.as_bytes()),
+                files: Some(FileTransition {
+                    before: &BundleFiles::new(),
+                    after: &files,
+                }),
                 source: self.source.clone(),
                 message: self.audit_message.as_deref(),
                 access: decision.as_ref(),
@@ -4874,9 +5338,14 @@ impl Database {
         states: &crate::audit::AuditedRecordStates,
     ) -> Result<Vec<WorkingChange>> {
         let mut current = BTreeMap::new();
+        let audit = self.audit();
         for (collection, id, path) in self.record_files()? {
-            let contents = paths::read(&self.root, &path, &record_label(&collection, &id))?;
-            current.insert((collection, id), (path, record_hash(&contents)));
+            // Covers a bundle's supporting files, and gives a folder without
+            // its entry a version no audited state has, so it is listed.
+            let Some(version) = audit.record_version_on_disk(&collection, &id)? else {
+                continue;
+            };
+            current.insert((collection, id), (path, version));
         }
         let references: BTreeSet<_> = states
             .keys()
@@ -4923,10 +5392,122 @@ impl Database {
         validate_component(collection, "collection")?;
         validate_component(id, "id")?;
         Ok(self
-            .config
-            .data_dir
-            .join(collection)
-            .join(format!("{id}.md")))
+            .layout
+            .record_path(&self.config.data_dir, collection, id))
+    }
+
+    /// A bundle record's folder, relative to the database root.
+    fn bundle_directory(&self, collection: &str, id: &str) -> PathBuf {
+        self.config.data_dir.join(collection).join(id)
+    }
+
+    /// Read a record exactly as stored, `None` when it does not exist.
+    ///
+    /// For a bundle this reads and hashes every supporting file. What it makes
+    /// of a folder in the middle of a write depends on `reading`: see
+    /// [`Reading`].
+    fn read_stored_optional(
+        &self,
+        collection: &str,
+        id: &str,
+        reading: Reading,
+    ) -> Result<Option<StoredRecord>> {
+        let path = self.record_path(collection, id)?;
+        let label = record_label(collection, id);
+        let Some(entry) = self.layout.entry(collection) else {
+            let Some(raw) = paths::read_to_string_optional(&self.root, &path, &label)? else {
+                return Ok(None);
+            };
+            let version = record_hash(raw.as_bytes());
+            return Ok(Some(StoredRecord {
+                raw,
+                files: BundleFiles::new(),
+                version,
+            }));
+        };
+        let Some(bundle) = read_bundle(
+            &self.root,
+            &self.bundle_directory(collection, id),
+            entry,
+            &label,
+            reading.staged(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(bytes) = bundle.entry else {
+            if reading == Reading::Snapshot {
+                return Ok(None);
+            }
+            return Err(conflict(format!(
+                "{label} has supporting files but no '{entry}'; restore it, or remove the folder"
+            )));
+        };
+        let version = record_version(&bytes, &bundle.files);
+        let raw = String::from_utf8(bytes)
+            .with_context(|| DomainError::Invalid(format!("{label} is not valid UTF-8")))?;
+        Ok(Some(StoredRecord {
+            raw,
+            files: bundle.files,
+            version,
+        }))
+    }
+
+    /// [`Self::read_stored_optional`] for a record that must exist. A missing
+    /// record is a typed not-found failure that keeps the location it was
+    /// looked for underneath, for the CLI and the server log.
+    fn read_stored(&self, collection: &str, id: &str, reading: Reading) -> Result<StoredRecord> {
+        if self.layout.entry(collection).is_none() {
+            let path = self.record_path(collection, id)?;
+            let raw = self.read_record(collection, id, &path)?;
+            let version = record_hash(raw.as_bytes());
+            return Ok(StoredRecord {
+                raw,
+                files: BundleFiles::new(),
+                version,
+            });
+        }
+        self.read_stored_optional(collection, id, reading)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "could not read {} at {}: the folder holds no entry",
+                    record_label(collection, id),
+                    self.root
+                        .join(self.bundle_directory(collection, id))
+                        .display()
+                )
+                .context(DomainError::record_not_found(collection, id))
+            })
+    }
+
+    /// Whether a record exists, without reading it: a file, or a bundle
+    /// folder holding its entry or, under the lock, anything at all.
+    fn record_exists(&self, collection: &str, id: &str, reading: Reading) -> Result<bool> {
+        let path = self.record_path(collection, id)?;
+        let label = record_label(collection, id);
+        match self.layout.entry(collection) {
+            Some(entry) => Ok(list_bundle(
+                &self.root,
+                &self.bundle_directory(collection, id),
+                entry,
+                &label,
+                reading.staged(),
+            )?
+            .is_some_and(|listing| listing.has_entry || reading == Reading::Locked)),
+            None => Ok(paths::entry_kind(&self.root, &path, &label)?.is_some()),
+        }
+    }
+
+    /// Refuse supporting-file changes for a collection that stores each
+    /// record as one Markdown file, and return the entry name otherwise.
+    fn bundle_entry_for(&self, collection: &str, files: &[FileChange]) -> Result<Option<&str>> {
+        let entry = self.layout.entry(collection);
+        if entry.is_none() && !files.is_empty() {
+            return Err(invalid(format!(
+                "collection '{collection}' stores each record as one Markdown file, so its records cannot hold other files; declare it with 'layout: bundle' under 'collections' in .cr/config.yaml"
+            )));
+        }
+        Ok(entry)
     }
 
     /// Read a record's exact bytes through verified path components,
@@ -4945,24 +5526,24 @@ impl Database {
     /// write into an ordinary not-found response. `If-Match` is false when no
     /// current representation exists, so an expected version maps that state
     /// to the same typed precondition failure as a changed representation.
-    fn read_record_for_mutation(
+    fn read_stored_for_mutation(
         &self,
         collection: &str,
         id: &str,
-        path: &Path,
         precondition: Option<&RecordPrecondition>,
-    ) -> Result<String> {
-        self.read_record(collection, id, path).map_err(|error| {
-            if precondition.is_some()
-                && matches!(DomainError::of(&error), Some(DomainError::NotFound(_)))
-            {
-                precondition_failed(format!(
-                    "record {collection}/{id} changed since the expected version"
-                ))
-            } else {
-                error
-            }
-        })
+    ) -> Result<StoredRecord> {
+        self.read_stored(collection, id, Reading::Locked)
+            .map_err(|error| {
+                if precondition.is_some()
+                    && matches!(DomainError::of(&error), Some(DomainError::NotFound(_)))
+                {
+                    precondition_failed(format!(
+                        "record {collection}/{id} changed since the expected version"
+                    ))
+                } else {
+                    error
+                }
+            })
     }
 
     fn validate(&self, collection: &str, attributes: &Mapping) -> Result<()> {
@@ -5072,7 +5653,25 @@ impl Database {
             .with_context(unusable)?;
         EncryptionPolicy::from_schema(Some(&schema)).with_context(unusable)?;
         CollectionAccessPolicy::from_schema(Some(&schema)).with_context(unusable)?;
+        self.refuse_encrypted_bundles(collection, &schema)?;
         Ok(Some(schema))
+    }
+
+    /// Refuse encrypted storage in a collection that stores bundles.
+    ///
+    /// Supporting files are stored and audited byte for byte, so encrypting
+    /// only the entry would leave a record whose schema promises
+    /// confidentiality holding plaintext beside it. The combination is
+    /// refused until files can be encrypted too.
+    fn refuse_encrypted_bundles(&self, collection: &str, schema: &JsonValue) -> Result<()> {
+        if self.layout.entry(collection).is_some()
+            && !EncryptionPolicy::from_schema(Some(schema))?.is_empty()
+        {
+            return Err(invalid(format!(
+                "collection '{collection}' stores records as folders of files, which cannot use encrypted storage"
+            )));
+        }
+        Ok(())
     }
 
     fn record_access_policy(&self, collection: &str) -> Result<Option<CollectionAccessPolicy>> {
@@ -5084,12 +5683,11 @@ impl Database {
         collection: &str,
         id: &str,
     ) -> Result<Option<RecordAccess>> {
-        let path = self.record_path(collection, id)?;
-        if paths::entry_kind(&self.root, &path, &record_label(collection, id))?.is_none() {
+        if !self.record_exists(collection, id, Reading::Snapshot)? {
             return Ok(None);
         }
-        let raw = self.read_record(collection, id, &path)?;
-        let stored = parse_record(collection, id, &raw)?;
+        let record = self.read_stored(collection, id, Reading::Snapshot)?;
+        let stored = parse_record(collection, id, &record.raw)?;
         RecordAccess::from_attributes_optional(&stored.attributes)
     }
 
@@ -5117,7 +5715,13 @@ impl Database {
             return Ok(context);
         }
         for (collection, id, path) in self.record_files()? {
-            let raw = self.read_record(&collection, &id, &path)?;
+            // Only Markdown can hold an envelope. A bundle folder without its
+            // entry has none; `cr status` reports the folder itself.
+            let Some(raw) =
+                paths::read_to_string_optional(&self.root, &path, &record_label(&collection, &id))?
+            else {
+                continue;
+            };
             let document = parse_record(&collection, &id, &raw)?;
             if document_has_encrypted_storage(&document) {
                 return Err(conflict(
@@ -5163,16 +5767,13 @@ impl Database {
         body: &str,
         version: &str,
     ) -> Result<bool> {
-        let path = self.record_path(collection, id)?;
-        let Some(raw) =
-            paths::read_to_string_optional(&self.root, &path, &record_label(collection, id))?
-        else {
+        let Some(stored) = self.read_stored_optional(collection, id, Reading::Snapshot)? else {
             return Ok(false);
         };
-        if record_hash(raw.as_bytes()) != version {
+        if stored.version != version {
             return Ok(false);
         }
-        let logical = self.parse_logical_record(collection, id, &raw)?;
+        let logical = self.parse_logical_record(collection, id, &stored.raw)?;
         Ok(&logical.attributes == attributes && logical.body == body)
     }
 
@@ -5456,28 +6057,16 @@ impl Database {
         Ok(())
     }
 
+    /// Every record in the database, as collection, ID, and the path of its
+    /// Markdown, in collection and then ID order.
     fn record_files(&self) -> Result<Vec<(String, String, PathBuf)>> {
         let mut records = Vec::new();
         for collection_name in self.collection_names()? {
-            let directory = self.config.data_dir.join(&collection_name);
-            let label = collection_label(&collection_name);
-            let entries =
-                paths::list_directory(&self.root, &directory, &label)?.unwrap_or_default();
-            for entry in entries {
-                let CollectionEntry::Record(id) = collection_entry(&collection_name, &entry.name)?
-                else {
-                    continue;
-                };
-                if !entry.kind.is_file() {
-                    return Err(paths::refuse_entry(
-                        &record_label(&collection_name, &id),
-                        entry.kind,
-                    ));
-                }
-                records.push((collection_name.clone(), id, directory.join(&entry.name)));
+            for id in self.collection_record_ids(&collection_name, Reading::Locked)? {
+                let path = self.record_path(&collection_name, &id)?;
+                records.push((collection_name.clone(), id, path));
             }
         }
-        records.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
         Ok(records)
     }
 
@@ -5508,6 +6097,7 @@ impl Database {
             &self.actor,
             &self.attribution,
         )
+        .with_layout(&self.layout)
         .with_journal_cache(self.journal.as_deref())
     }
 
@@ -5589,6 +6179,7 @@ fn load_config(root: &Path) -> Result<Config> {
             "audit.full_walk_after_events must be greater than zero",
         ));
     }
+    RecordLayout::from_config(&config.collections)?;
     Ok(config)
 }
 
@@ -5864,6 +6455,7 @@ fn record_from_document(
     path: PathBuf,
     document: Document,
     version: String,
+    files: &BundleFiles,
 ) -> Record {
     Record {
         collection: collection.to_owned(),
@@ -5872,7 +6464,44 @@ fn record_from_document(
         version,
         attributes: document.attributes,
         body: document.body,
+        files: files
+            .iter()
+            .map(|(path, file)| RecordFile {
+                path: path.clone(),
+                hash: file.hash.clone(),
+            })
+            .collect(),
     }
+}
+
+/// How requested file changes enter an idempotency request: each path's new
+/// content hash, or `null` for a removal. The hash commits to the exact bytes
+/// without copying them into the envelope.
+fn file_changes_request(files: &[FileChange]) -> JsonValue {
+    JsonValue::Object(
+        files
+            .iter()
+            .map(|change| {
+                let value = match change {
+                    FileChange::Write { contents, .. } => JsonValue::String(content_hash(contents)),
+                    FileChange::Remove { .. } => JsonValue::Null,
+                };
+                (change.path().to_owned(), value)
+            })
+            .collect(),
+    )
+}
+
+/// The bytes a bundle write publishes, by content hash: the entry's and every
+/// written file's.
+fn written_contents(entry: &[u8], files: &[FileChange]) -> HashMap<String, Vec<u8>> {
+    std::iter::once(entry)
+        .chain(files.iter().filter_map(|change| match change {
+            FileChange::Write { contents, .. } => Some(contents.as_slice()),
+            FileChange::Remove { .. } => None,
+        }))
+        .map(|contents| (content_hash(contents), contents.to_vec()))
+        .collect()
 }
 
 fn validate_record_version(version: &str) -> Result<()> {

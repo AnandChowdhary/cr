@@ -45,6 +45,14 @@ within a journal. Every new mutation performs the same replay before it writes,
 so an inconsistent older event refuses the write at the guilty sequence with
 `audit_integrity_failed`.
 
+A [bundle record](working-with-records.md#bundle-records)'s event also lists
+its changed supporting files under `files`, and verification holds them to the
+same standard: every before-hash must match the replayed file, and every text
+diff must produce the after-hash the event claims. An event that touches a
+record with supporting files is written at version 4, and so is every event
+after the first one; a `cr` that predates bundles refuses such a journal
+instead of reporting it verified.
+
 Print the current audit checkpoint:
 
 ```sh
@@ -339,7 +347,9 @@ cr --actor 'migration@example.com' audit baseline
 Audit events retain historical field values and deleted record bodies, and now
 also any recorded intent text. Every version 3 event with a present record
 retains the complete exact post-state in `after_snapshot`, not only the changed
-fields. Everything written to the journal is permanent: removing it would break
+fields. A bundle record's text files are retained as diffs, so the journal
+holds every version of them; binary files are retained only as hashes.
+Everything written to the journal is permanent: removing it would break
 verification for that event and every event after it. Protect `.cr/audit/` at
 least as carefully as `records/`, particularly for personal CRM and recruiting
 data, and treat
