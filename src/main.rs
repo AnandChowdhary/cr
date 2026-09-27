@@ -537,6 +537,14 @@ enum Command {
         /// Largest accepted JSON request body in bytes.
         #[arg(long, default_value_t = 8 * 1024 * 1024)]
         max_body_bytes: usize,
+
+        /// Require a principal token (`cr access token issue`) on every request.
+        ///
+        /// Each request then acts as the principal its token authenticates,
+        /// and its events record that token. There is no owner console, so the
+        /// server may bind beyond loopback.
+        #[arg(long)]
+        require_token: bool,
     },
 
     /// Create and inspect saved web views.
@@ -1070,6 +1078,76 @@ enum AccessCommand {
         id: String,
         principal: String,
     },
+
+    /// Issue, list, or revoke the tokens that authenticate a principal to `cr serve`.
+    Token {
+        #[command(subcommand)]
+        command: AccessTokenCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AccessTokenCommand {
+    /// Issue a token for a registered principal and print it once.
+    Issue {
+        user: String,
+
+        /// A note saying what the token is for, such as the harness that holds it.
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Stop authenticating after this long, in days or hours: `90d`, `12h`.
+        #[arg(long, value_name = "DURATION", value_parser = parse_token_lifetime)]
+        expires_in: Option<time::Duration>,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List tokens without their secrets, for one principal or all of them.
+    List {
+        user: Option<String>,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Revoke one token so that it no longer authenticates.
+    Revoke { user: String, id: String },
+}
+
+/// Tokens authenticate requests to the server, not reads of the files beneath
+/// it. Anybody who can open the database directory can bypass both, so a
+/// token-only server is a boundary only when its account alone can.
+#[cfg(unix)]
+fn warn_if_database_is_shared(root: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if let Ok(metadata) = std::fs::metadata(root)
+        && metadata.permissions().mode() & 0o077 != 0
+    {
+        eprintln!(
+            "warning: other accounts can open {}; tokens authenticate only requests made through this server, so restrict the directory to the account running it (chmod 700)",
+            root.display()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_database_is_shared(_root: &std::path::Path) {}
+
+/// A token lifetime: a positive whole number of days (`90d`) or hours (`12h`).
+fn parse_token_lifetime(value: &str) -> std::result::Result<time::Duration, String> {
+    let error = || format!("'{value}' is not a lifetime such as 90d or 12h");
+    let (count, unit) = value.split_at(value.len().saturating_sub(1));
+    let count: i64 = count.parse().map_err(|_| error())?;
+    if count <= 0 {
+        return Err(error());
+    }
+    match unit {
+        "d" => Ok(time::Duration::days(count)),
+        "h" => Ok(time::Duration::hours(count)),
+        _ => Err(error()),
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1759,11 +1837,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             bind,
             max_page_size,
             max_body_bytes,
+            require_token,
         } => {
             let api_token = std::env::var("CR_API_TOKEN")
                 .ok()
                 .filter(|value| !value.is_empty());
-            if !bind.ip().is_loopback() && api_token.is_none() {
+            if require_token {
+                if !bind.ip().is_loopback() {
+                    eprintln!(
+                        "warning: tokens travel in plain HTTP; terminate TLS in front of a server bound beyond loopback"
+                    );
+                }
+                warn_if_database_is_shared(database.root());
+            } else if !bind.ip().is_loopback() && api_token.is_none() {
                 eprintln!(
                     "warning: serving on a non-loopback address without CR_API_TOKEN authentication"
                 );
@@ -1773,6 +1859,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 max_page_size,
                 max_body_bytes,
                 api_token,
+                require_token,
             };
             // Dropped, not `shutdown_timeout`: dropping waits for every
             // database operation already running on the blocking pool, which
@@ -2315,6 +2402,75 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 database.set_record_owner(&collection, &id, &principal)?;
                 println!("Transferred record:{collection}/{id} ownership to {principal}");
             }
+            AccessCommand::Token { command } => match command {
+                AccessTokenCommand::Issue {
+                    user,
+                    label,
+                    expires_in,
+                    json,
+                } => {
+                    let (issued, _) = database.issue_token(&user, label, expires_in)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "principal": user,
+                                "id": issued.stored.id,
+                                "label": issued.stored.label,
+                                "created": issued.stored.created,
+                                "expires": issued.stored.expires,
+                                "token": issued.token.as_str(),
+                            }))?
+                        );
+                    } else {
+                        eprintln!(
+                            "Issued token {} for {user}{}. It is shown once and cannot be recovered:",
+                            issued.stored.id,
+                            issued
+                                .stored
+                                .expires
+                                .as_deref()
+                                .map(|expires| format!(", expiring {expires}"))
+                                .unwrap_or_default()
+                        );
+                        println!("{}", issued.token.as_str());
+                    }
+                }
+                AccessTokenCommand::List { user, json } => {
+                    let tokens = database.tokens(user.as_deref())?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&tokens)?);
+                    } else if tokens.is_empty() {
+                        println!("No tokens");
+                    } else {
+                        for token in tokens {
+                            println!(
+                                "{}\t{}\t{}\t{}{}",
+                                token.principal,
+                                token.id,
+                                token.created,
+                                token
+                                    .expires
+                                    .as_deref()
+                                    .map(|expires| format!(
+                                        "{}expires {expires}",
+                                        if token.expired { "expired, " } else { "" }
+                                    ))
+                                    .unwrap_or_else(|| "no expiry".to_owned()),
+                                token
+                                    .label
+                                    .as_deref()
+                                    .map(|label| format!("\t{label}"))
+                                    .unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+                AccessTokenCommand::Revoke { user, id } => {
+                    database.revoke_token(&user, &id)?;
+                    println!("Revoked token {id} from {user}");
+                }
+            },
         },
         Command::Update {
             collection,
@@ -2611,14 +2767,28 @@ fn run(cli: Cli) -> Result<ExitCode> {
                             .as_ref()
                             .map(|agent| format!(" agent={}", agent.id))
                             .unwrap_or_default();
+                        let authentication = entry
+                            .payload
+                            .access
+                            .as_ref()
+                            .and_then(|access| access.authentication.as_ref())
+                            .map(|authentication| {
+                                format!(
+                                    " {}={}",
+                                    authentication.method.label(),
+                                    authentication.credential.as_deref().unwrap_or("-")
+                                )
+                            })
+                            .unwrap_or_default();
                         println!(
-                            "{} {} {} {} {}{}",
+                            "{} {} {} {} {}{}{}",
                             entry.payload.sequence,
                             entry.payload.timestamp,
                             entry.payload.action,
                             entry.payload.record.reference(),
                             entry.hash,
-                            agent
+                            agent,
+                            authentication
                         );
                     }
                 }

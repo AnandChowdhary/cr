@@ -188,12 +188,83 @@ audited versions before delegation is accepted. `--as` is rejected for
 `serve`: one delegated command must not silently become a long-lived identity
 boundary.
 
+## Authenticate principals to a server with tokens
+
+Everything above takes the caller's word for who it is. A principal token is
+the exception: a secret an owner issues for one registered user, which
+`cr serve` checks before it acts.
+
+```sh
+cr access token issue nightly@example.com --label 'nightly harness' --expires-in 90d
+# crt_1f0c9a7b3e2d4c65_… — shown once; store it where the harness can read it
+cr access token list
+cr access token revoke nightly@example.com 1f0c9a7b3e2d4c65
+```
+
+The token is printed once and never stored. The user record keeps its ID,
+label, creation and expiry times, and a SHA-256 verifier under a CR-managed
+`tokens` field, so issuing and revoking are ordinary audited policy changes
+like grants, and ordinary `update` and `PATCH` cannot write the field. Only a
+database owner may issue, list, or revoke tokens: a token is the ability to act
+as its principal, so letting an access manager mint one would let it mint any
+identity. A principal holds at most 32 tokens, `--expires-in` takes days
+(`90d`) or hours (`12h`), and a disabled or deleted principal's tokens stop
+authenticating with it.
+
+Send the token as a bearer token. The request then acts as that principal,
+with its own grants, and every event it writes records how it was
+authenticated beside the principal:
+
+```json
+"access": {
+  "principal": "nightly@example.com",
+  "authentication": { "method": "token", "credential": "1f0c9a7b3e2d4c65" },
+  ...
+}
+```
+
+`cr audit log` prints the credential as `token=1f0c9a7b3e2d4c65`, and the web
+audit timeline says "authenticated by token". An event without
+`authentication` is what every event was before tokens: the principal is
+whoever the process said it was.
+
+The server looks the token up in the audited policy rather than the Markdown
+file, and requires the file to still match it. A verifier written into a user
+file by hand authenticates nothing, and a principal whose file has drifted is
+refused until `cr user restore` puts it back. A token that fails for any
+reason — unknown, revoked, expired, wrong secret, inactive principal — is
+answered `401` and never falls back to the owner console, so revoking a token
+cannot turn it into more access than it had. `X-CR-Actor` may still restyle
+how the token's principal is displayed, but not name another one, and the
+console's perspective cookie is ignored.
+
+By default the server accepts tokens beside its console. `--require-token`
+makes them the only way in:
+
+```sh
+cr serve --require-token --bind 0.0.0.0:3000
+```
+
+Every request except `/health` and `/static` must then present a principal
+token, `CR_API_TOKEN` is refused, and there is no perspective switcher, so the
+server no longer has to be launched by an owner and may bind beyond loopback.
+The file browser is never available to a token, even an owner's: it reads and
+writes files outside the database, and a secret that travels should not be
+able to rewrite the host. `cr serve` does not terminate TLS, so put it behind a
+proxy that does before tokens cross a network.
+
 ## What access control does not protect against
 
 The local identity is still an assertion supplied by the process, so this is
 strong CR gating, not a sandbox: somebody who can read or edit the backing
 Markdown can bypass CR. The RBAC perspective console therefore requires an
 owner to launch it and refuses non-loopback binds. It is an administrative
-preview, not a per-user login system. A future managed mode can make
-enforcement non-bypassable by keeping the backing directory private and
-authenticating CLI clients through a daemon or server.
+preview, not a per-user login system.
+
+Tokens authenticate requests made through `cr serve`, not access to the files
+beneath it. `--require-token` is a boundary only when the account running the
+server is the only one that can open the database directory, which is why the
+server warns when group or other accounts can; the CLI run by that account, or
+anyone who can become it, is still trusted. Making the CLI a client of the
+server, authenticating local callers by operating-system account, and a
+browser login are the remaining parts of that boundary, tracked in `TODO.md`.

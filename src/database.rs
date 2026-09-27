@@ -18,13 +18,13 @@ use crate::{
     AnchorReport, Assignment, AuditAction, AuditAnchor, AuditChange, AuditEntry, AuditHead,
     AuditSource, AuditVerification, SearchQuery,
     access::{
-        AccessAction, AccessDecision, AccessIdentity, COLLECTION_ACCESS_EXTENSION,
-        CollectionAccessPolicy, RECORD_ACCESS_FIELD, RecordAccess, RecordVisibility,
-        Resource as AccessResource, Role, USERS_COLLECTION, User, UserDeleteOptions,
-        UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus, UserUpdate, display_name,
-        principal_id, users_schema,
+        AccessAction, AccessDecision, AccessIdentity, Authentication, COLLECTION_ACCESS_EXTENSION,
+        CollectionAccessPolicy, IssuedToken, RECORD_ACCESS_FIELD, RecordAccess, RecordVisibility,
+        Resource as AccessResource, Role, TokenSummary, USERS_COLLECTION, User, UserDeleteOptions,
+        UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus, UserToken, UserUpdate,
+        display_name, principal_id, users_schema,
     },
-    attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
+    attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent, AuthenticationMethod},
     audit::{
         AuditEncryptionTransition, AuditFilter, AuditHistory, AuditIdempotency,
         AuditIdempotencyResult, AuditLog, AuditMutation, AuditedRecordStates, ChangePreview,
@@ -256,6 +256,9 @@ pub struct Database {
     actor: String,
     principal: String,
     impersonated_by: Option<AccessIdentity>,
+    /// Set only by [`Self::authenticate_token`], and cleared by anything that
+    /// changes the principal, so it never outlives the check it records.
+    authentication: Option<Authentication>,
     source: AuditSource,
     audit_message: Option<String>,
     attribution: Attribution,
@@ -635,6 +638,7 @@ impl Database {
             actor: String::new(),
             principal: String::new(),
             impersonated_by: None,
+            authentication: None,
             source: AuditSource::Cli,
             audit_message: None,
             attribution: Attribution::from_environment()?,
@@ -733,6 +737,7 @@ impl Database {
             actor: String::new(),
             principal: String::new(),
             impersonated_by: None,
+            authentication: None,
             source: AuditSource::Cli,
             audit_message: None,
             attribution: Attribution::from_environment()?,
@@ -790,6 +795,9 @@ impl Database {
                 "access control is enabled, so --actor cannot impersonate principal '{principal}'"
             )));
         }
+        if principal != self.principal {
+            self.authentication = None;
+        }
         self.actor = actor;
         self.principal = principal;
         self.impersonated_by = None;
@@ -823,6 +831,8 @@ impl Database {
             principal: self.principal.clone(),
             display: self.actor.clone(),
         });
+        // What was authenticated is the operator, not the principal selected.
+        database.authentication = None;
         database.principal = principal.to_owned();
         database.actor = format!(
             "{} <{}>",
@@ -901,6 +911,8 @@ impl Database {
             principal: self.principal.clone(),
             display: self.actor.clone(),
         });
+        // What was authenticated is the operator, not the principal selected.
+        database.authentication = None;
         database.principal = principal.to_owned();
         database.actor = format!(
             "{} <{}>",
@@ -985,7 +997,7 @@ impl Database {
             return Ok(None);
         };
         let input = input()?;
-        let envelope = json!({
+        let mut envelope = json!({
             "version": 1,
             "operation": operation,
             "record": { "collection": collection, "id": id },
@@ -998,6 +1010,12 @@ impl Database {
             "intent": self.attribution.intent,
             "impersonated_by": self.impersonated_by,
         });
+        // Inserted only when present, so every request without it keeps the
+        // exact envelope, and so the digest, an earlier `cr` stored for it.
+        if let Some(authentication) = &self.authentication {
+            envelope["authentication"] = serde_json::to_value(authentication)
+                .context("could not serialize request authentication")?;
+        }
         let serialized =
             serde_json::to_vec(&envelope).context("could not serialize idempotency request")?;
         Ok(Some(IdempotencyRequest {
@@ -1202,6 +1220,7 @@ impl Database {
         decision
             .map(|mut decision| {
                 decision.impersonated_by = self.impersonated_by.clone();
+                decision.authentication = self.authentication.clone();
                 decision
             })
             .map(Some)
@@ -1251,6 +1270,7 @@ impl Database {
         let mut decision =
             AccessDecision::self_service(&self.principal, &self.actor, resource, &policy_hash);
         decision.impersonated_by = self.impersonated_by.clone();
+        decision.authentication = self.authentication.clone();
         Ok(Some(decision))
     }
 
@@ -1397,6 +1417,7 @@ impl Database {
                 resource: AccessResource::Database,
                 role: Role::Owner,
             }],
+            tokens: Vec::new(),
         };
         self.run_create(
             USERS_COLLECTION,
@@ -1467,6 +1488,7 @@ impl Database {
             status: UserStatus::Active,
             profile,
             access: Vec::new(),
+            tokens: Vec::new(),
         };
         self.run_create(
             USERS_COLLECTION,
@@ -1535,6 +1557,7 @@ impl Database {
             status: UserStatus::Active,
             profile,
             access: Vec::new(),
+            tokens: Vec::new(),
         };
         let attributes = requested.attributes()?;
         let requested = User::from_attributes(&attributes)?;
@@ -1872,6 +1895,202 @@ impl Database {
             None,
         )?
         .record()
+    }
+
+    /// Issue a token that authenticates as the registered principal `id`.
+    ///
+    /// Owner-only: a token is the ability to act as its principal, so minting
+    /// one for an owner is minting ownership, and an access manager who could
+    /// mint tokens could mint itself any identity. The verifier is written by
+    /// an ordinary audited update of the user record, so issuing is a policy
+    /// version like a grant is; the secret is returned once and kept nowhere.
+    pub fn issue_token(
+        &self,
+        id: &str,
+        label: Option<String>,
+        lifetime: Option<time::Duration>,
+    ) -> Result<(IssuedToken, Record)> {
+        if !self.access_enabled()? {
+            return Err(conflict("access control is not initialized"));
+        }
+        self.authorize_owner(&AccessResource::Database)?;
+        if self.user_unchecked_optional(id)?.is_none() {
+            return Err(DomainError::record_not_found(USERS_COLLECTION, id).into());
+        }
+        if lifetime.is_some_and(|lifetime| !lifetime.is_positive()) {
+            return Err(invalid("a token lifetime must be positive"));
+        }
+        let created = time::OffsetDateTime::now_utc();
+        let expires = lifetime
+            .map(|lifetime| {
+                created
+                    .checked_add(lifetime)
+                    .ok_or_else(|| invalid("a token lifetime is too long"))
+            })
+            .transpose()?;
+        let issued = UserToken::issue(label, created, expires)?;
+        let stored = issued.stored.clone();
+        let record = self
+            .run_update(
+                USERS_COLLECTION,
+                id,
+                move |document| {
+                    let mut user = User::from_attributes(&document.attributes)?;
+                    if user.status != UserStatus::Active {
+                        return Err(conflict(format!("user '{id}' is not active")));
+                    }
+                    user.add_token(stored)?;
+                    document.attributes = user.attributes()?;
+                    Ok(())
+                },
+                MutationMode::Apply,
+                AccessRequest::owner(AccessResource::Database),
+                None,
+                None,
+            )?
+            .record()?;
+        Ok((issued, record))
+    }
+
+    /// The tokens one principal holds, or every principal's, without their
+    /// verifiers. Owner-only, like issuing them.
+    pub fn tokens(&self, id: Option<&str>) -> Result<Vec<TokenSummary>> {
+        if !self.access_enabled()? {
+            return Err(conflict("access control is not initialized"));
+        }
+        self.authorize_owner(&AccessResource::Database)?;
+        let ids = match id {
+            Some(id) => vec![id.to_owned()],
+            None => self.user_ids_unchecked()?,
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let mut tokens = Vec::new();
+        for user_id in ids {
+            let Some((user, _)) = self.user_unchecked_optional(&user_id)? else {
+                if id.is_some() {
+                    return Err(DomainError::record_not_found(USERS_COLLECTION, &user_id).into());
+                }
+                continue;
+            };
+            tokens.extend(user.tokens.iter().map(|token| token.summary(&user_id, now)));
+        }
+        Ok(tokens)
+    }
+
+    /// Revoke one of a principal's tokens. Owner-only; the revocation is an
+    /// audited policy version, and the next request presenting the token is
+    /// refused.
+    pub fn revoke_token(&self, id: &str, token_id: &str) -> Result<Record> {
+        if !self.access_enabled()? {
+            return Err(conflict("access control is not initialized"));
+        }
+        self.authorize_owner(&AccessResource::Database)?;
+        if self.user_unchecked_optional(id)?.is_none() {
+            return Err(DomainError::record_not_found(USERS_COLLECTION, id).into());
+        }
+        let token_id = token_id.to_owned();
+        self.run_update(
+            USERS_COLLECTION,
+            id,
+            move |document| {
+                let mut user = User::from_attributes(&document.attributes)?;
+                if !user.revoke_token(&token_id) {
+                    return Err(DomainError::NotFound(format!(
+                        "user '{id}' has no token '{token_id}'"
+                    ))
+                    .into());
+                }
+                document.attributes = user.attributes()?;
+                Ok(())
+            },
+            MutationMode::Apply,
+            AccessRequest::owner(AccessResource::Database),
+            None,
+            None,
+        )?
+        .record()
+    }
+
+    /// Authenticate a principal token, returning this database acting as the
+    /// token's principal with the check attached to every decision it makes.
+    ///
+    /// `Ok(None)` is every way a token can fail to authenticate — malformed,
+    /// unknown, wrong secret, expired, a disabled or deleted principal — and
+    /// they are deliberately one answer, so a caller learns nothing about
+    /// which part was wrong. `Err` is a database that cannot answer at all,
+    /// such as a journal that does not verify, which must not read as a bad
+    /// token.
+    ///
+    /// The token is found in the audited policy, never in the working file,
+    /// and the working file must still equal it: a verifier added to a user
+    /// record by editing the Markdown directly authenticates nothing, because
+    /// no audit event issued it.
+    pub fn authenticate_token(&self, token: &str) -> Result<Option<Self>> {
+        let Some(token_id) = crate::access::token_id(token) else {
+            return Ok(None);
+        };
+        if !self.access_enabled()? {
+            return Ok(None);
+        }
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let states = audit.record_states()?;
+        let now = time::OffsetDateTime::now_utc();
+        let mut found = None;
+        for ((collection, principal), state) in states.iter() {
+            if collection != USERS_COLLECTION {
+                continue;
+            }
+            let Some(document) = &state.document else {
+                continue;
+            };
+            let holds_token = document
+                .pointer("/attributes/tokens")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|tokens| {
+                    tokens.iter().any(|stored| {
+                        stored.get("id").and_then(JsonValue::as_str) == Some(token_id)
+                    })
+                });
+            if !holds_token {
+                continue;
+            }
+            let user = User::from_attributes(&Document::from_audit_value(document)?.attributes)?;
+            found = Some((principal.clone(), user));
+            break;
+        }
+        let Some((principal, user)) = found else {
+            return Ok(None);
+        };
+        let Some(stored) = user.tokens.iter().find(|stored| stored.id == token_id) else {
+            return Ok(None);
+        };
+        if !stored.verifies(token) || stored.expired_at(now) || user.status != UserStatus::Active {
+            return Ok(None);
+        }
+        let path = self.record_path(USERS_COLLECTION, &principal)?;
+        let raw = self.read_record(USERS_COLLECTION, &principal, &path)?;
+        AuditLog::assert_current_in(&states, USERS_COLLECTION, &principal, raw.as_bytes())?;
+
+        let mut database = self.clone();
+        database.impersonated_by = None;
+        database.actor = format!(
+            "{} <{}>",
+            user.name,
+            user.email.as_deref().unwrap_or(&principal)
+        );
+        database.principal = principal;
+        database.authentication = Some(Authentication {
+            method: AuthenticationMethod::Token,
+            credential: Some(token_id.to_owned()),
+        });
+        Ok(Some(database))
+    }
+
+    /// How a server authenticated this database's principal, if it did.
+    pub fn authentication(&self) -> Option<&Authentication> {
+        self.authentication.as_ref()
     }
 
     /// Change whether every active registered principal may read one

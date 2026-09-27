@@ -10,11 +10,18 @@
 use std::{fmt, str::FromStr};
 
 use anyhow::{Result, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value as JsonValue, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use yaml_serde::{Mapping, Value};
 
-use crate::{error::invalid, value::Assignment};
+use crate::{
+    attribution::AuthenticationMethod,
+    audit::digest,
+    error::{conflict, invalid},
+    value::Assignment,
+};
 
 /// The collection CR reserves for authenticated principals and their grants.
 pub const USERS_COLLECTION: &str = "users";
@@ -24,6 +31,20 @@ pub const COLLECTION_ACCESS_EXTENSION: &str = "x-cr-access";
 
 /// Front matter reserved for CR's per-record access policy.
 pub const RECORD_ACCESS_FIELD: &str = "$cr_access";
+
+/// Every principal token starts with this, so a secret scanner can name one
+/// and a server can tell a token that failed from a shared `CR_API_TOKEN`.
+pub const TOKEN_PREFIX: &str = "crt_";
+
+/// Tokens one principal may hold at a time. Authentication searches every
+/// active token of every user, and a registry is small, but a bound keeps a
+/// scripted loop from making that search, and the user record, unbounded.
+pub const MAX_USER_TOKENS: usize = 32;
+
+const TOKEN_HASH_DOMAIN: &[u8] = b"cr:access:token:v1\0";
+const TOKEN_ID_BYTES: usize = 8;
+const TOKEN_SECRET_BYTES: usize = 32;
+const MAX_TOKEN_LABEL_CHARS: usize = 200;
 
 /// The access behavior selected for an ordinary collection.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -163,6 +184,12 @@ pub struct User {
     pub profile: Mapping,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<AccessGrant>,
+    /// Verifiers for the tokens that authenticate as this principal.
+    ///
+    /// Like `access`, CR-owned: only `cr access token` changes them, so every
+    /// issue and revocation is an ordinary audited policy version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<UserToken>,
 }
 
 impl User {
@@ -343,7 +370,42 @@ impl User {
                 )));
             }
         }
+        if self.tokens.len() > MAX_USER_TOKENS {
+            return Err(invalid(format!(
+                "user has more than {MAX_USER_TOKENS} tokens"
+            )));
+        }
+        for (index, token) in self.tokens.iter().enumerate() {
+            token.validate()?;
+            if self.tokens[..index]
+                .iter()
+                .any(|earlier| earlier.id == token.id)
+            {
+                return Err(invalid(format!(
+                    "user has more than one token with ID '{}'",
+                    token.id
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// Add a token, refusing one past the per-principal bound.
+    pub(crate) fn add_token(&mut self, token: UserToken) -> Result<()> {
+        if self.tokens.len() >= MAX_USER_TOKENS {
+            return Err(conflict(format!(
+                "user already holds {MAX_USER_TOKENS} tokens; revoke one first"
+            )));
+        }
+        self.tokens.push(token);
+        Ok(())
+    }
+
+    /// Remove one token by ID, reporting whether it was present.
+    pub(crate) fn revoke_token(&mut self, id: &str) -> bool {
+        let before = self.tokens.len();
+        self.tokens.retain(|token| token.id != id);
+        self.tokens.len() != before
     }
 
     pub fn grant(&mut self, resource: Resource, role: Role) {
@@ -499,6 +561,211 @@ impl fmt::Display for UserStatus {
 pub struct AccessGrant {
     pub resource: Resource,
     pub role: Role,
+}
+
+/// The stored verifier for one principal token.
+///
+/// The token itself is shown once, when it is issued, and never stored. What
+/// is kept is a domain-separated SHA-256 of it: the secret carries 256 random
+/// bits, so a fast hash is the right verifier and is safe to leave readable to
+/// whoever may read the user record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserToken {
+    /// Public identifier, embedded in the token and recorded in every event
+    /// the token authenticates.
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub hash: String,
+    /// When it was issued, as an RFC 3339 UTC timestamp.
+    pub created: String,
+    /// When it stops authenticating, as an RFC 3339 UTC timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
+}
+
+/// What may be shown about a token after it was issued: everything but its
+/// verifier, which is useless to a reader and is nobody's business.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TokenSummary {
+    pub principal: String,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub created: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
+    pub expired: bool,
+}
+
+/// A newly issued token: the secret to hand over once, and what is stored.
+#[derive(Debug)]
+pub struct IssuedToken {
+    pub token: zeroize::Zeroizing<String>,
+    pub stored: UserToken,
+}
+
+impl UserToken {
+    /// Generate a token and its stored verifier.
+    pub(crate) fn issue(
+        label: Option<String>,
+        created: OffsetDateTime,
+        expires: Option<OffsetDateTime>,
+    ) -> Result<IssuedToken> {
+        let label = label.map(|label| label.trim().to_owned());
+        let mut id = [0_u8; TOKEN_ID_BYTES];
+        let mut secret = zeroize::Zeroizing::new([0_u8; TOKEN_SECRET_BYTES]);
+        getrandom::fill(&mut id)
+            .and_then(|()| getrandom::fill(secret.as_mut_slice()))
+            .map_err(|_| conflict("secure randomness is unavailable"))?;
+        let id = id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let token = zeroize::Zeroizing::new(format!(
+            "{TOKEN_PREFIX}{id}_{}",
+            URL_SAFE_NO_PAD.encode(secret.as_slice())
+        ));
+        let stored = Self {
+            id,
+            label,
+            hash: token_hash(&token),
+            created: rfc3339(created)?,
+            expires: expires.map(rfc3339).transpose()?,
+        };
+        stored.validate()?;
+        Ok(IssuedToken { token, stored })
+    }
+
+    /// Whether `token` is the secret this verifier was made from.
+    ///
+    /// The comparison runs over every byte whatever the first difference, so
+    /// its time does not say how much of a guess was right.
+    pub(crate) fn verifies(&self, token: &str) -> bool {
+        let expected = self.hash.as_bytes();
+        let actual = token_hash(token);
+        let actual = actual.as_bytes();
+        expected.len() == actual.len()
+            && expected
+                .iter()
+                .zip(actual)
+                .fold(0_u8, |difference, (left, right)| {
+                    difference | (left ^ right)
+                })
+                == 0
+    }
+
+    pub fn summary(&self, principal: &str, now: OffsetDateTime) -> TokenSummary {
+        TokenSummary {
+            principal: principal.to_owned(),
+            id: self.id.clone(),
+            label: self.label.clone(),
+            created: self.created.clone(),
+            expires: self.expires.clone(),
+            expired: self.expired_at(now),
+        }
+    }
+
+    /// Whether this token no longer authenticates at `now`.
+    pub fn expired_at(&self, now: OffsetDateTime) -> bool {
+        self.expires
+            .as_deref()
+            .and_then(|expires| OffsetDateTime::parse(expires, &Rfc3339).ok())
+            .is_some_and(|expires| expires <= now)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.id.len() != TOKEN_ID_BYTES * 2
+            || !self
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid(format!(
+                "token ID '{}' must be {} lowercase hexadecimal characters",
+                self.id,
+                TOKEN_ID_BYTES * 2
+            )));
+        }
+        if let Some(label) = &self.label
+            && (label.is_empty()
+                || label.chars().count() > MAX_TOKEN_LABEL_CHARS
+                || label.chars().any(char::is_control))
+        {
+            return Err(invalid(format!(
+                "token label must be 1 to {MAX_TOKEN_LABEL_CHARS} characters without control characters"
+            )));
+        }
+        let hash_is_valid = self.hash.strip_prefix("sha256:").is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+        if !hash_is_valid {
+            return Err(invalid(format!(
+                "token '{}' must store a sha256: verifier",
+                self.id
+            )));
+        }
+        let created = OffsetDateTime::parse(&self.created, &Rfc3339).map_err(|_| {
+            invalid(format!(
+                "token '{}' has an invalid created timestamp",
+                self.id
+            ))
+        })?;
+        if let Some(expires) = &self.expires {
+            let expires = OffsetDateTime::parse(expires, &Rfc3339).map_err(|_| {
+                invalid(format!(
+                    "token '{}' has an invalid expires timestamp",
+                    self.id
+                ))
+            })?;
+            if expires <= created {
+                return Err(invalid(format!(
+                    "token '{}' must expire after it was created",
+                    self.id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The public ID inside a principal token, or `None` for anything that does
+/// not have a token's shape.
+pub fn token_id(token: &str) -> Option<&str> {
+    let (id, secret) = token.strip_prefix(TOKEN_PREFIX)?.split_once('_')?;
+    (id.len() == TOKEN_ID_BYTES * 2
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && !secret.is_empty())
+    .then_some(id)
+}
+
+fn token_hash(token: &str) -> String {
+    digest(TOKEN_HASH_DOMAIN, token.as_bytes())
+}
+
+fn rfc3339(moment: OffsetDateTime) -> Result<String> {
+    moment
+        .to_offset(time::UtcOffset::UTC)
+        .replace_nanosecond(0)
+        .map_err(|error| invalid(format!("invalid timestamp: {error}")))?
+        .format(&Rfc3339)
+        .map_err(|error| invalid(format!("invalid timestamp: {error}")))
+}
+
+/// How the principal of an allowed mutation was established, when a server
+/// checked it rather than taking the caller's word.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Authentication {
+    pub method: AuthenticationMethod,
+    /// The public ID of the credential that passed, such as a token ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 /// RBAC roles exposed by the CLI and stored in user records.
@@ -739,6 +1006,10 @@ pub struct AccessDecision {
     pub display: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impersonated_by: Option<AccessIdentity>,
+    /// How a server authenticated `principal`. Absent when the principal is
+    /// the process's own assertion, as it was for every event before tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<Authentication>,
     pub action: AccessAction,
     pub resource: Resource,
     pub role: Role,
@@ -782,6 +1053,7 @@ impl AccessDecision {
             principal: principal.to_owned(),
             display: display.to_owned(),
             impersonated_by: None,
+            authentication: None,
             action,
             resource: resource.clone(),
             role: grant.role,
@@ -810,6 +1082,7 @@ impl AccessDecision {
             principal: principal.to_owned(),
             display: display.to_owned(),
             impersonated_by: None,
+            authentication: None,
             action,
             resource: resource.clone(),
             role,
@@ -830,6 +1103,7 @@ impl AccessDecision {
             principal: principal.to_owned(),
             display: display.to_owned(),
             impersonated_by: None,
+            authentication: None,
             action: AccessAction::Update,
             granted_at: resource.clone(),
             resource,
@@ -905,6 +1179,22 @@ pub fn users_schema() -> JsonValue {
                         "role": { "enum": ["viewer", "editor", "access_manager", "owner"] }
                     }
                 }
+            },
+            "tokens": {
+                "type": "array",
+                "maxItems": MAX_USER_TOKENS,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id", "hash", "created"],
+                    "properties": {
+                        "id": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+                        "label": { "type": "string", "minLength": 1 },
+                        "hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                        "created": { "type": "string" },
+                        "expires": { "type": "string" }
+                    }
+                }
             }
         }
     })
@@ -925,9 +1215,11 @@ fn validate_part(value: &str, label: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use time::{Duration, OffsetDateTime};
+
     use super::{
-        AccessAction, AccessGrant, RecordAccess, RecordVisibility, Resource, Role, User, UserKind,
-        UserStatus, principal_id,
+        AccessAction, AccessGrant, MAX_USER_TOKENS, RecordAccess, RecordVisibility, Resource, Role,
+        TOKEN_PREFIX, User, UserKind, UserStatus, UserToken, principal_id, token_id,
     };
 
     fn user(access: Vec<AccessGrant>) -> User {
@@ -938,6 +1230,7 @@ mod tests {
             status: UserStatus::Active,
             profile: Default::default(),
             access,
+            tokens: Vec::new(),
         }
     }
 
@@ -1071,5 +1364,117 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn an_issued_token_verifies_only_its_own_secret() {
+        let created = OffsetDateTime::now_utc();
+        let issued = UserToken::issue(Some("nightly".into()), created, None).unwrap();
+        let token = issued.token.as_str();
+        assert!(token.starts_with(TOKEN_PREFIX));
+        assert_eq!(token_id(token), Some(issued.stored.id.as_str()));
+        assert!(issued.stored.hash.starts_with("sha256:"));
+        assert!(!issued.stored.hash.contains(token));
+        assert!(issued.stored.verifies(token));
+
+        let (prefix, secret) = token.rsplit_once('_').unwrap();
+        let mut forged = secret.to_owned();
+        let last = forged.pop().unwrap();
+        forged.push(if last == 'A' { 'B' } else { 'A' });
+        assert!(!issued.stored.verifies(&format!("{prefix}_{forged}")));
+        assert!(!issued.stored.verifies(""));
+
+        let other = UserToken::issue(None, created, None).unwrap();
+        assert_ne!(other.stored.id, issued.stored.id);
+        assert!(!issued.stored.verifies(&other.token));
+    }
+
+    #[test]
+    fn token_ids_are_read_only_from_a_tokens_shape() {
+        assert_eq!(
+            token_id("crt_0123456789abcdef_secret"),
+            Some("0123456789abcdef")
+        );
+        for malformed in [
+            "",
+            "secret",
+            "crt_",
+            "crt_0123456789abcdef",
+            "crt_0123456789abcdef_",
+            "crt_0123456789ABCDEF_secret",
+            "crt_0123456789abcde_secret",
+            "Bearer crt_0123456789abcdef_secret",
+        ] {
+            assert_eq!(token_id(malformed), None, "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn a_token_expires_at_its_expiry_and_not_before() {
+        let created = OffsetDateTime::now_utc();
+        let expires = created + Duration::hours(1);
+        let issued = UserToken::issue(None, created, Some(expires)).unwrap();
+        assert!(!issued.stored.expired_at(created));
+        assert!(issued.stored.expired_at(expires));
+        assert!(issued.stored.expired_at(expires + Duration::seconds(1)));
+        assert!(UserToken::issue(None, created, Some(created - Duration::hours(1))).is_err());
+        let summary = issued.stored.summary("ada@example.com", expires);
+        assert!(summary.expired);
+        assert_eq!(summary.principal, "ada@example.com");
+    }
+
+    #[test]
+    fn stored_tokens_are_validated_with_the_user() {
+        let issued = UserToken::issue(None, OffsetDateTime::now_utc(), None).unwrap();
+        let mut ada = user(Vec::new());
+        ada.add_token(issued.stored.clone()).unwrap();
+        assert!(ada.validate().is_ok());
+
+        let mut duplicate = ada.clone();
+        duplicate.tokens.push(issued.stored.clone());
+        assert!(duplicate.validate().is_err());
+
+        for broken in [
+            UserToken {
+                id: "not-hex".into(),
+                ..issued.stored.clone()
+            },
+            UserToken {
+                hash: "md5:abc".into(),
+                ..issued.stored.clone()
+            },
+            UserToken {
+                created: "yesterday".into(),
+                ..issued.stored.clone()
+            },
+            UserToken {
+                label: Some("two\nlines".into()),
+                ..issued.stored.clone()
+            },
+        ] {
+            let mut ada = user(Vec::new());
+            ada.tokens.push(broken);
+            assert!(ada.validate().is_err());
+        }
+
+        let mut full = user(Vec::new());
+        for _ in 0..MAX_USER_TOKENS {
+            full.add_token(
+                UserToken::issue(None, OffsetDateTime::now_utc(), None)
+                    .unwrap()
+                    .stored,
+            )
+            .unwrap();
+        }
+        assert!(
+            full.add_token(
+                UserToken::issue(None, OffsetDateTime::now_utc(), None)
+                    .unwrap()
+                    .stored
+            )
+            .is_err()
+        );
+        assert!(full.revoke_token(&full.tokens[0].id.clone()));
+        assert!(!full.revoke_token("0000000000000000"));
     }
 }

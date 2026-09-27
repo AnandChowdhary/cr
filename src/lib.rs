@@ -19,17 +19,18 @@ mod value;
 mod views;
 
 pub use access::{
-    AccessAction, AccessDecision, AccessDecisionBasis, AccessGrant, AccessIdentity,
-    COLLECTION_ACCESS_EXTENSION, CollectionAccessMode, CollectionAccessPolicy, RECORD_ACCESS_FIELD,
-    RecordAccess, RecordVisibility, Resource as AccessResource, Role, USERS_COLLECTION, User,
-    UserDeleteOptions, UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus,
+    AccessAction, AccessDecision, AccessDecisionBasis, AccessGrant, AccessIdentity, Authentication,
+    COLLECTION_ACCESS_EXTENSION, CollectionAccessMode, CollectionAccessPolicy, IssuedToken,
+    MAX_USER_TOKENS, RECORD_ACCESS_FIELD, RecordAccess, RecordVisibility,
+    Resource as AccessResource, Role, TOKEN_PREFIX, TokenSummary, USERS_COLLECTION, User,
+    UserDeleteOptions, UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus, UserToken,
     UserUpdate, principal_id,
 };
 pub use aggregate::{Aggregation, Summary};
 pub use attribution::{
     AgentEvidence, Attribution, AttributionOverrides, AuditAgent, AuditAuthorization, AuditIntent,
-    AuditIntentPart, AuthorizationMode, IntentAuthor, parse_agent, parse_authorization,
-    parse_intent,
+    AuditIntentPart, AuthenticationMethod, AuthorizationMode, IntentAuthor, parse_agent,
+    parse_authorization, parse_intent,
 };
 pub use audit::{
     AnchorReport, AnchorStatus, AuditAction, AuditAnchor, AuditChange, AuditEntry, AuditFilter,
