@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io::{Read, Write},
+    fs::{File, TryLockError},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 #[cfg(unix)]
@@ -27,7 +27,7 @@ use crate::{
     audit::record_hash,
     database::validate_component,
     encryption::{protect_sync_stream, protected_sync_stream_is_well_formed, reveal_sync_stream},
-    error::{conflict, is_missing},
+    error::{DomainError, adapter_failed, conflict, invalid, is_already_exists, is_missing},
     frontmatter::Document,
     paths::{self, EntryKind},
 };
@@ -345,7 +345,16 @@ impl Database {
             &sync_path(name),
             serialized.as_bytes(),
             &sync_label(name),
-        )?;
+        )
+        .map_err(|error| {
+            if is_already_exists(&error) {
+                error.context(DomainError::AlreadyExists(format!(
+                    "sync '{name}' already exists"
+                )))
+            } else {
+                error
+            }
+        })?;
         Ok(to_public(name, stored))
     }
 
@@ -354,13 +363,15 @@ impl Database {
         let serialized = paths::read_to_string(self.root(), &sync_path(name), &sync_label(name))
             .map_err(|error| {
                 if is_missing(&error) {
-                    error.context(format!("sync '{name}' does not exist"))
+                    error.context(DomainError::NotFound(format!(
+                        "sync '{name}' does not exist"
+                    )))
                 } else {
                     error
                 }
             })?;
         let stored: StoredSyncDefinition = yaml_serde::from_str(&serialized)
-            .with_context(|| format!("sync '{name}' is not valid YAML"))?;
+            .with_context(|| DomainError::Invalid(format!("sync '{name}' is not valid YAML")))?;
         validate_stored(name, &stored)?;
         Ok(to_public(name, stored))
     }
@@ -382,13 +393,20 @@ impl Database {
             {
                 continue;
             }
-            let name = entry_path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .context("sync filename is not valid UTF-8")?
-                .to_owned();
-            validate_component(&name, "sync")?;
-            names.push(name);
+            // Stored state the caller did not choose, so a conflict naming the
+            // file, exactly as for a record file whose name cannot be an ID.
+            let file_name = entry.name.to_string_lossy();
+            let Some(name) = entry_path.file_stem().and_then(|value| value.to_str()) else {
+                return Err(conflict(format!(
+                    "the sync directory contains a file named '{file_name}' whose name is not valid UTF-8"
+                )));
+            };
+            if validate_component(name, "sync").is_err() {
+                return Err(conflict(format!(
+                    "the sync directory contains a file named '{file_name}' whose name cannot be a sync"
+                )));
+            }
+            names.push(name.to_owned());
         }
         names.sort();
         names.into_iter().map(|name| self.sync(&name)).collect()
@@ -404,8 +422,14 @@ impl Database {
         else {
             return Ok(None);
         };
+        // `cr` writes the checkpoint; one that no longer parses is damaged
+        // stored state, like a run ledger, not a bad request.
         serde_json::from_str(&serialized)
-            .with_context(|| format!("sync state for '{name}' is not valid JSON"))
+            .with_context(|| {
+                DomainError::Conflict(format!(
+                    "the checkpoint for sync '{name}' is not valid JSON"
+                ))
+            })
             .map(Some)
     }
 
@@ -519,7 +543,7 @@ impl Database {
             .sync_all()
             .context("could not sync state input")?;
 
-        let program = resolve_program(self.root(), &definition.command[0])?;
+        let program = resolve_program(self.root(), name, &definition.command[0])?;
         let mut command = Command::new(program);
         command
             .args(&definition.command[1..])
@@ -549,7 +573,7 @@ impl Database {
         command.process_group(0);
         let mut child = command
             .spawn()
-            .with_context(|| format!("could not start sync '{name}'"))?;
+            .map_err(|error| start_failure(name, &definition.command[0], error))?;
         let stdout = child
             .stdout
             .take()
@@ -572,23 +596,26 @@ impl Database {
         }
         let output = output_reader
             .join()
-            .map_err(|_| anyhow::anyhow!("sync '{name}' output reader stopped unexpectedly"))?
+            .map_err(|_| anyhow!("sync '{name}' output reader stopped unexpectedly"))?
             .with_context(|| format!("could not read sync '{name}' output"))?;
         let status = status?;
         if output.len() as u64 > definition.max_output_bytes {
-            bail!(
+            return Err(adapter_failed(format!(
                 "sync '{name}' output exceeded {} bytes",
                 definition.max_output_bytes
-            );
+            )));
         }
         if !status.success() {
-            bail!("sync '{name}' exited unsuccessfully ({status})");
+            return Err(adapter_failed(format!(
+                "sync '{name}' exited unsuccessfully ({status})"
+            )));
         }
 
-        let serialized = zeroize::Zeroizing::new(
-            String::from_utf8(output)
-                .with_context(|| format!("sync '{name}' output is not valid UTF-8"))?,
-        );
+        // From here the process succeeded, and what it printed is judged as
+        // input: a stream the protocol or a schema refuses is invalid.
+        let serialized = zeroize::Zeroizing::new(String::from_utf8(output).with_context(|| {
+            DomainError::Invalid(format!("sync '{name}' output is not valid UTF-8"))
+        })?);
         let messages = parse_messages(name, &serialized, definition.max_operations)?;
         preflight_messages(self, &messages)?;
         let _application_lock = self.acquire_sync_application_lock()?;
@@ -601,7 +628,9 @@ impl Database {
             .any(|message| matches!(message, SyncMessage::Checkpoint { .. }))
             && self.sync_state(name)? != current_state
         {
-            bail!("sync '{name}' checkpoint changed while the command was running");
+            return Err(conflict(format!(
+                "sync '{name}' checkpoint changed while the command was running"
+            )));
         }
 
         // The ledger and the exact operation stream become durable before the
@@ -824,7 +853,9 @@ impl Database {
         audit.recover_pending()?;
         let (verification, audited_states) = audit.verify_with_record_states(None)?;
         if &verification.head != expected_head {
-            bail!("database audit head changed while the sync command was running");
+            return Err(conflict(
+                "database audit head changed while the sync command was running",
+            ));
         }
         let versions = message_targets(messages)
             .into_iter()
@@ -854,7 +885,9 @@ impl Database {
             };
             let record = self.get_with_audited_states(collection, id, &audited_states)?;
             if &record.version != expected {
-                bail!("database record changed while the sync command was running");
+                return Err(conflict(
+                    "database record changed while the sync command was running",
+                ));
             }
         }
         Ok(SyncApplicationSnapshot {
@@ -1045,8 +1078,11 @@ impl Database {
         else {
             return Ok(None);
         };
-        let stored: StoredSyncRun = serde_json::from_str(&serialized)
-            .with_context(|| format!("the run ledger for sync '{name}' is not valid JSON"))?;
+        let stored: StoredSyncRun = serde_json::from_str(&serialized).with_context(|| {
+            DomainError::Conflict(format!(
+                "the run ledger for sync '{name}' is not valid JSON"
+            ))
+        })?;
         validate_sync_run_ledger(name, &stored)?;
         Ok(Some(stored))
     }
@@ -1199,7 +1235,9 @@ impl Database {
     ) -> Result<bool> {
         let current = self.sync_state(name)?;
         if &current != expected {
-            bail!("sync '{name}' checkpoint changed while records were being applied");
+            return Err(conflict(format!(
+                "sync '{name}' checkpoint changed while records were being applied"
+            )));
         }
         if current.as_ref() == Some(state) {
             return Ok(false);
@@ -1212,7 +1250,7 @@ impl Database {
         match paths::entry_kind(self.root(), &path, &label)? {
             Some(EntryKind::File) => paths::write_replace(self.root(), &path, &serialized, &label)?,
             None => paths::write_new(self.root(), &path, &serialized, &label)?,
-            Some(_) => bail!("{label} is not a regular file"),
+            Some(kind) => return Err(paths::refuse_entry(&label, kind)),
         }
         Ok(true)
     }
@@ -1220,9 +1258,17 @@ impl Database {
     fn acquire_sync_lock(&self, name: &str) -> Result<File> {
         let path = Path::new(SYNC_LOCK_DIRECTORY).join(format!("{name}.lock"));
         let lock = paths::open_lock_file(self.root(), &path, "the sync lock")?;
-        lock.try_lock()
-            .with_context(|| format!("sync '{name}' is already running"))?;
-        Ok(lock)
+        match lock.try_lock() {
+            Ok(()) => Ok(lock),
+            // Only a lock another run holds is the expected refusal; failing to
+            // take the lock at all is an operating-system problem.
+            Err(TryLockError::WouldBlock) => {
+                Err(conflict(format!("sync '{name}' is already running")))
+            }
+            Err(TryLockError::Error(error)) => {
+                Err(anyhow!(error).context(format!("could not lock sync '{name}'")))
+            }
+        }
     }
 
     fn acquire_sync_application_lock(&self) -> Result<File> {
@@ -1468,8 +1514,14 @@ fn stored_target_version_map(
 ) -> Result<BTreeMap<(String, String), Option<String>>> {
     let mut versions = BTreeMap::new();
     for target in &stored.target_versions {
-        validate_component(&target.collection, "collection")?;
-        validate_component(&target.id, "id")?;
+        if validate_component(&target.collection, "collection").is_err()
+            || validate_component(&target.id, "id").is_err()
+        {
+            return Err(conflict(format!(
+                "sync '{}' run {} recorded an invalid target",
+                stored.sync, stored.run_id
+            )));
+        }
         if let Some(version) = &target.version {
             RecordPrecondition::version(version.clone()).map_err(|_| {
                 conflict(format!(
@@ -1524,43 +1576,59 @@ fn final_checkpoint(messages: &[SyncMessage]) -> Option<&JsonValue> {
     }
 }
 
+/// Refuse a definition that cannot run, whether it came from `sync create` or
+/// from a file somebody edited. Either way it is the definition that is
+/// invalid, the same classification a malformed saved view has.
 fn validate_stored(name: &str, sync: &StoredSyncDefinition) -> Result<()> {
     if sync.version != SYNC_FORMAT_VERSION {
-        bail!(
-            "sync '{name}' uses unsupported format version {} (expected {})",
-            sync.version,
-            SYNC_FORMAT_VERSION
-        );
+        return Err(invalid(format!(
+            "sync '{name}' uses unsupported format version {} (expected {SYNC_FORMAT_VERSION})",
+            sync.version
+        )));
     }
     if sync.command.is_empty() || sync.command[0].trim().is_empty() {
-        bail!("sync '{name}' command must contain a program");
+        return Err(invalid(format!(
+            "sync '{name}' command must contain a program"
+        )));
     }
     if sync.command.iter().any(|argument| argument.contains('\0')) {
-        bail!("sync '{name}' command cannot contain NUL bytes");
+        return Err(invalid(format!(
+            "sync '{name}' command cannot contain NUL bytes"
+        )));
     }
     if !(1..=MAX_TIMEOUT_SECONDS).contains(&sync.timeout_seconds) {
-        bail!("sync '{name}' timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}");
+        return Err(invalid(format!(
+            "sync '{name}' timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}"
+        )));
     }
     if !(1..=MAX_OUTPUT_BYTES).contains(&sync.max_output_bytes) {
-        bail!("sync '{name}' max_output_bytes must be between 1 and {MAX_OUTPUT_BYTES}");
+        return Err(invalid(format!(
+            "sync '{name}' max_output_bytes must be between 1 and {MAX_OUTPUT_BYTES}"
+        )));
     }
     if !(1..=MAX_OPERATIONS).contains(&sync.max_operations) {
-        bail!("sync '{name}' max_operations must be between 1 and {MAX_OPERATIONS}");
+        return Err(invalid(format!(
+            "sync '{name}' max_operations must be between 1 and {MAX_OPERATIONS}"
+        )));
     }
     if sync
         .actor
         .as_deref()
         .is_some_and(|actor| actor.trim().is_empty())
     {
-        bail!("sync '{name}' actor cannot be empty");
+        return Err(invalid(format!("sync '{name}' actor cannot be empty")));
     }
     if let Some(agent) = sync.agent.as_deref() {
         crate::attribution::parse_agent(agent, crate::AgentEvidence::Config)
-            .with_context(|| format!("sync '{name}' agent is not valid"))?;
+            .with_context(|| DomainError::Invalid(format!("sync '{name}' agent is not valid")))?;
     }
     Ok(())
 }
 
+/// Parse an adapter's stdout under the `cr-jsonl-v1` protocol.
+///
+/// Every refusal is [`DomainError::Invalid`]: the process succeeded, and the
+/// stream it printed is the input `cr` was asked to apply.
 fn parse_messages(name: &str, output: &str, max_operations: usize) -> Result<Vec<SyncMessage>> {
     let mut messages = Vec::new();
     let mut targets = BTreeSet::new();
@@ -1570,19 +1638,29 @@ fn parse_messages(name: &str, output: &str, max_operations: usize) -> Result<Vec
             continue;
         }
         if messages.len() == max_operations {
-            bail!("sync '{name}' produced more than {max_operations} messages");
+            return Err(invalid(format!(
+                "sync '{name}' produced more than {max_operations} messages"
+            )));
         }
-        let message: SyncMessage = serde_json::from_str(line)
-            .with_context(|| format!("sync '{name}' output line {} is invalid", index + 1))?;
+        let message: SyncMessage = serde_json::from_str(line).with_context(|| {
+            DomainError::Invalid(format!(
+                "sync '{name}' output line {} is invalid",
+                index + 1
+            ))
+        })?;
         if saw_checkpoint {
-            bail!("sync '{name}' checkpoint must be its final message");
+            return Err(invalid(format!(
+                "sync '{name}' checkpoint must be its final message"
+            )));
         }
         match &message {
             SyncMessage::Upsert { collection, id, .. } | SyncMessage::Delete { collection, id } => {
                 validate_component(collection, "collection")?;
                 validate_component(id, "id")?;
                 if !targets.insert((collection.clone(), id.clone())) {
-                    bail!("sync '{name}' produced multiple operations for {collection}/{id}");
+                    return Err(invalid(format!(
+                        "sync '{name}' produced multiple operations for {collection}/{id}"
+                    )));
                 }
             }
             SyncMessage::Checkpoint { .. } => saw_checkpoint = true,
@@ -1606,7 +1684,7 @@ fn preflight_messages(database: &Database, messages: &[SyncMessage]) -> Result<(
     Ok(())
 }
 
-fn resolve_program(root: &Path, program: &str) -> Result<PathBuf> {
+fn resolve_program(root: &Path, name: &str, program: &str) -> Result<PathBuf> {
     let path = Path::new(program);
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -1615,9 +1693,30 @@ fn resolve_program(root: &Path, program: &str) -> Result<PathBuf> {
         return root
             .join(path)
             .canonicalize()
-            .with_context(|| format!("could not resolve sync program '{program}'"));
+            .map_err(|error| start_failure(name, program, error));
     }
     Ok(PathBuf::from(program))
+}
+
+/// Explain why an adapter could not be started.
+///
+/// A missing or non-executable program is something the operator fixes in
+/// the definition or the environment, so it is the adapter's failure. The
+/// program stays in the chain beneath the classified message rather than in
+/// it, because a program is very often a filesystem path.
+fn start_failure(name: &str, program: &str, error: io::Error) -> anyhow::Error {
+    let reason = match error.kind() {
+        io::ErrorKind::NotFound => Some("was not found"),
+        io::ErrorKind::PermissionDenied => Some("could not be executed"),
+        _ => None,
+    };
+    let error = anyhow!(error).context(format!("could not start sync program '{program}'"));
+    match reason {
+        Some(reason) => error.context(DomainError::AdapterFailed(format!(
+            "sync '{name}' program {reason}"
+        ))),
+        None => error,
+    }
 }
 
 fn wait_for_sync(
@@ -1631,7 +1730,9 @@ fn wait_for_sync(
     loop {
         if output_exceeded.load(Ordering::Relaxed) {
             stop_child(child);
-            bail!("sync '{name}' output exceeded {max_output_bytes} bytes");
+            return Err(adapter_failed(format!(
+                "sync '{name}' output exceeded {max_output_bytes} bytes"
+            )));
         }
         if let Some(status) = child
             .try_wait()
@@ -1641,10 +1742,10 @@ fn wait_for_sync(
         }
         if started.elapsed() >= timeout {
             stop_child(child);
-            bail!(
+            return Err(adapter_failed(format!(
                 "sync '{name}' exceeded its {} second timeout",
                 timeout.as_secs()
-            );
+            )));
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -1697,7 +1798,7 @@ fn stop_child(child: &mut Child) {
 fn random_run_id() -> Result<String> {
     let mut bytes = [0_u8; 12];
     getrandom::fill(&mut bytes)
-        .map_err(|error| anyhow::anyhow!("could not generate sync run ID: {error}"))?;
+        .map_err(|error| anyhow!("could not generate sync run ID: {error}"))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
@@ -1809,6 +1910,36 @@ mod tests {
                 .to_string()
                 .contains("final message")
         );
+
+        for output in [duplicate, after_checkpoint, "not json\n"] {
+            let error = parse_messages("test", output, 10).unwrap_err();
+            assert_eq!(
+                DomainError::of(&error).map(DomainError::code),
+                Some("validation_failed"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_program_that_cannot_start_is_the_adapters_failure_without_being_named() {
+        let error = start_failure(
+            "daily",
+            "/opt/adapters/notion",
+            io::Error::from(io::ErrorKind::NotFound),
+        );
+        let domain = DomainError::of(&error).expect("a missing program is classified");
+        assert_eq!(domain.code(), "adapter_failed");
+        assert_eq!(domain.message(), "sync 'daily' program was not found");
+        assert!(format!("{error:#}").contains("/opt/adapters/notion"));
+
+        // Anything else is the operating system's problem, not the adapter's.
+        let error = start_failure(
+            "daily",
+            "notion",
+            io::Error::from(io::ErrorKind::OutOfMemory),
+        );
+        assert!(DomainError::of(&error).is_none());
     }
 
     #[test]

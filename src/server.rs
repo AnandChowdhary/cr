@@ -1639,6 +1639,9 @@ impl ApiError {
             DomainError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             DomainError::Forbidden(_) => StatusCode::FORBIDDEN,
             DomainError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            // The adapter is an upstream program `cr` runs, so its failure is
+            // on the server's side of the exchange rather than the caller's.
+            DomainError::AdapterFailed(_) => StatusCode::BAD_GATEWAY,
         };
         let code = domain.code();
         let message = domain.message().to_owned();
@@ -16417,6 +16420,24 @@ mod tests {
             assert_eq!(published.message, expected);
             assert!(!published.request_id.is_empty());
         }
+    }
+
+    /// An adapter failure is classified, so it keeps its own code, but it is a
+    /// 5xx like every failure that is not the caller's, so it is published
+    /// with the same generic message as an internal error.
+    #[test]
+    fn a_failed_sync_adapter_is_a_bad_gateway_with_a_generic_message() {
+        let error = ApiError::from_domain(leaky_cause().context(DomainError::AdapterFailed(
+            "sync 'daily' exited unsuccessfully (exit status: 23)".to_owned(),
+        )));
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.code, "adapter_failed");
+
+        let published = error.publish();
+        assert_eq!(published.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(published.code, "adapter_failed");
+        assert_eq!(published.message, INTERNAL_MESSAGE);
+        assert!(!published.request_id.is_empty());
     }
 
     #[test]

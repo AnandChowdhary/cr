@@ -153,6 +153,19 @@ cd /absolute/path/to/my-database
 
 Schedulers often start with a small environment and a different working directory. Use absolute paths and inject credentials through the scheduler's protected environment or a secret manager, never into `.cr/syncs/*.yaml`. Capture stdout/stderr in your normal job logs and alert on the nonzero exit status.
 
+A job that should react to *why* a run failed can pass the global `--json-errors`. The failure is then one `{"error":{"code":"...","message":"..."}}` object on stderr, and the code is stable:
+
+| Code | What happened | Usual response |
+| --- | --- | --- |
+| `adapter_failed` | The adapter could not be started, exited nonzero, ran past its timeout, or printed more than its output limit. Nothing was applied. | Retry later; fix the adapter or raise its limit if it keeps happening. |
+| `validation_failed` | The adapter succeeded but its output was refused — a malformed or non-UTF-8 line, a duplicate target, a checkpoint that is not last, too many messages, or a schema violation — or the sync definition or database configuration cannot be used. Nothing was applied. | Fix the adapter or the definition; retrying will not help. |
+| `conflict` | The database has unsaved direct edits or changed while the adapter ran, another run of the same sync is still going, an interrupted run has to be completed first, or a checkpoint or run ledger is damaged. | Review `cr status`, run `cr sync recover`, or retry after the other run. |
+| `precondition_failed` | A write landed while the run was applying records, so it stopped partway and left a run ledger. | Run `cr sync recover`. |
+| `not_found` | There is no sync with that name, or no database where the job looked. | Fix the job's configuration. |
+| `internal_error` | Anything unanticipated, such as an operating-system failure. The message carries the complete chain. | Investigate. |
+
+A classified message names the sync, never a filesystem path; without `--json-errors`, stderr keeps the complete chain, including the adapter program that could not start.
+
 List configured adapters at any time:
 
 ```sh
