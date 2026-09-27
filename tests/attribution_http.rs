@@ -511,7 +511,7 @@ fn the_openapi_document_describes_the_attribution_contract() {
     assert_eq!(agent["required"], json!(["id", "detected_from"]));
     assert_eq!(
         agent["properties"]["detected_from"]["enum"],
-        json!(["environment", "flag", "header", "config"])
+        json!(["environment", "hook", "flag", "header", "config"])
     );
     assert!(
         agent["properties"]["detected_from"]["description"]

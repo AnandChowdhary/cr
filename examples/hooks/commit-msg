@@ -1,0 +1,43 @@
+#!/bin/sh
+# Git commit-msg hook: record the cr audit head a commit was made at, as a
+# Cr-Audit-Head trailer. The convention it belongs to is described in
+# docs/agents.md, under "Commit as the agent, on the human's behalf".
+#
+# Install it in a repository that holds a cr database:
+#
+#   cp examples/hooks/commit-msg .git/hooks/commit-msg
+#   chmod +x .git/hooks/commit-msg
+#
+# Git runs hooks from the top of the working tree, which is where cr looks for
+# the database. For a database anywhere else, name it once:
+#
+#   git config cr.database path/to/database
+#
+# The trailer is exactly what `cr audit head` prints: the sequence and hash of
+# the newest audit event. commit-msg rather than prepare-commit-msg, because it
+# runs on the finished message, after the editor has closed: the head is read
+# as late as possible, and the trailer lands after the text instead of in the
+# empty template ahead of the subject line. Amending replaces the trailer
+# rather than adding a second one.
+#
+# Without cr, without a database, or with an empty journal, the message is left
+# as it is. The hook never stops a commit.
+
+message_file=$1
+
+command -v cr >/dev/null 2>&1 || exit 0
+
+database=$(git config --get cr.database) || database=
+if [ -n "$database" ]; then
+  head=$(cr --database "$database" audit head 2>/dev/null) || exit 0
+else
+  head=$(cr audit head 2>/dev/null) || exit 0
+fi
+
+case $head in
+  '' | '0 '*) exit 0 ;;
+esac
+
+git interpret-trailers --in-place --if-exists replace \
+  --trailer "Cr-Audit-Head: $head" "$message_file" 2>/dev/null
+exit 0

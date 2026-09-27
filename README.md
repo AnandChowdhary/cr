@@ -156,7 +156,7 @@ detail.
 
 **Automate and integrate**
 
-- [Agents and automation](docs/agents.md) — record which agent acted and why, approve a change set before it is written, and retry writes safely.
+- [Agents and automation](docs/agents.md) — record which agent acted and why, let a Claude Code hook fill that in, approve a change set before it is written, and retry writes safely.
 - [Sync adapters](docs/sync.md) — import data from any program that prints JSON Lines.
 - [Web UI](docs/web-ui.md) — `cr serve`, tables, Kanban boards, forms, and the file browser.
 - [REST API](docs/http-api.md) — authentication, CRUD, filtering, audit endpoints, and OpenAPI.

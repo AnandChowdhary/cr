@@ -179,6 +179,15 @@ stored_label_enum! {
     AgentEvidence {
         /// Observed in the process environment through a documented variable.
         Environment => "environment",
+        /// Supplied by a harness hook through `CR_HOOK_AGENT` and
+        /// `CR_HOOK_AUTHORIZATION`, rather than declared by the process that
+        /// ran `cr`.
+        ///
+        /// Like `environment`, this names the channel and not its author: any
+        /// process can set those variables. It exists so that a value a harness
+        /// filled in from its own state is not recorded as though the model had
+        /// typed it, and it never survives a declaration on top of it.
+        Hook => "hook",
         /// Declared by a command-line flag or a `CR_*` environment variable.
         Flag => "flag",
         /// Declared by an `X-CR-*` request header.
@@ -409,33 +418,55 @@ impl<'a> AttributionOverrides<'a> {
             && self.agent_model.is_none()
             && self.agent_session.is_none()
             && self.agent_turn.is_none()
-            && self.authorization.is_none()
-            && self.grant.is_none()
-            && self.approved_by.is_none()
-            && self.approved_at.is_none()
-            && self.approved_changes.is_none()
+            && !self.declares_authorization()
             && self.intent.is_none()
             && self.intent_request.is_none()
             && self.intent_rationale.is_none()
+    }
+
+    /// True when any part of the approval is declared here.
+    fn declares_authorization(&self) -> bool {
+        self.authorization.is_some()
+            || self.grant.is_some()
+            || self.approved_by.is_some()
+            || self.approved_at.is_some()
+            || self.approved_changes.is_some()
     }
 }
 
 impl Attribution {
     /// Resolve attribution from the process environment.
     ///
-    /// `CR_AGENT`, `CR_AUTHORIZATION`, and `CR_INTENT` are explicit
-    /// declarations and outrank the probe table below them. `CR_AGENT=none`
-    /// declares that no agent was involved and suppresses detection entirely.
-    /// That is an escape hatch, and it is also all it takes to defeat
-    /// detection: the local user owns the process and its environment.
+    /// Three layers, weakest first. The probe table observes a documented
+    /// agent variable. `CR_HOOK_AGENT` and `CR_HOOK_AUTHORIZATION` carry what
+    /// a harness hook filled in from its own state, such as the session and
+    /// permission mode a Claude Code `PreToolUse` hook receives, and replace
+    /// what the probe saw. `CR_AGENT`, `CR_AUTHORIZATION`, and `CR_INTENT` are
+    /// explicit declarations and outrank both.
+    ///
+    /// An explicit `CR_AGENT` discards the probe and the hook layer together,
+    /// so `CR_AGENT=none` still declares that no agent was involved and
+    /// suppresses detection entirely. That is an escape hatch, and it is also
+    /// all it takes to defeat detection: the local user owns the process and
+    /// its environment.
     pub fn from_environment() -> Result<Self> {
         let agent = environment("CR_AGENT");
         let authorization = environment("CR_AUTHORIZATION");
         let intent = environment("CR_INTENT");
-        let mut attribution = Self {
-            agent: if agent.is_some() { None } else { probe_agent() },
-            ..Self::default()
-        };
+        let mut attribution = Self::default();
+        if agent.is_none() {
+            attribution.agent = probe_agent();
+            let hook_agent = environment("CR_HOOK_AGENT");
+            let hook_authorization = environment("CR_HOOK_AUTHORIZATION");
+            attribution.apply(
+                &AttributionOverrides {
+                    agent: hook_agent.as_deref(),
+                    authorization: hook_authorization.as_deref(),
+                    ..AttributionOverrides::default()
+                },
+                AgentEvidence::Hook,
+            )?;
+        }
         attribution.apply(
             &AttributionOverrides {
                 agent: agent.as_deref(),
@@ -454,6 +485,17 @@ impl Attribution {
     /// that was merely observed promotes its `detected_from` to `evidence`,
     /// because once a caller has filled in part of the object, calling the whole
     /// of it "observed" would overstate what `cr` saw.
+    ///
+    /// A hook supplies the approval as well as the agent, and the two stay
+    /// together. Declaring a different agent, or none, replaces the hook's
+    /// whole layer, exactly as if the hook had not run: its grant described the
+    /// session it came from, not the agent now being declared. Declaring any
+    /// part of the approval over a hook-sourced agent records the declaring
+    /// source instead of `hook`; otherwise a caller could replace the one value
+    /// the hook exists to take out of its hands, the grant, and the event
+    /// would still credit the hook with it. So an agent still labelled `hook`
+    /// always means its authorization, if any, came from the hook too. Intent
+    /// is exempt, because no hook supplies it and every intent is authored.
     pub fn apply(
         &mut self,
         overrides: &AttributionOverrides<'_>,
@@ -462,8 +504,23 @@ impl Attribution {
         if overrides.is_empty() {
             return Ok(());
         }
-        self.apply_agent(overrides, evidence)?;
+        let replaces_hook = overrides.agent.is_some()
+            && evidence != AgentEvidence::Hook
+            && self
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.detected_from == AgentEvidence::Hook);
+        self.apply_agent(overrides, evidence.clone())?;
+        if replaces_hook {
+            self.authorization = None;
+        }
         self.apply_authorization(overrides)?;
+        if overrides.declares_authorization()
+            && let Some(agent) = self.agent.as_mut()
+            && agent.detected_from == AgentEvidence::Hook
+        {
+            agent.detected_from = evidence;
+        }
         self.apply_intent(overrides)?;
         Ok(())
     }
@@ -1078,6 +1135,207 @@ mod tests {
         assert_eq!(agent.detected_from, AgentEvidence::Flag);
     }
 
+    /// The attribution a Claude Code hook supplies, applied the way
+    /// `from_environment` applies `CR_HOOK_AGENT` and `CR_HOOK_AUTHORIZATION`.
+    fn hook_attribution() -> Attribution {
+        let mut attribution = Attribution::default();
+        attribution
+            .apply(
+                &AttributionOverrides {
+                    agent: Some(r#"{"id":"claude-code","session":"6d1baa69","turn":"550e8400"}"#),
+                    authorization: Some(r#"{"mode":"delegated","grant":"auto"}"#),
+                    ..overrides()
+                },
+                AgentEvidence::Hook,
+            )
+            .unwrap();
+        attribution
+    }
+
+    #[test]
+    fn a_hook_supplies_the_agent_and_the_approval_together() {
+        let attribution = hook_attribution();
+        let agent = attribution.agent.unwrap();
+        assert_eq!(agent.detected_from, AgentEvidence::Hook);
+        assert_eq!(agent.session.as_deref(), Some("6d1baa69"));
+        assert_eq!(agent.turn.as_deref(), Some("550e8400"));
+        let authorization = attribution.authorization.unwrap();
+        assert_eq!(authorization.mode, AuthorizationMode::Delegated);
+        assert_eq!(authorization.grant.as_deref(), Some("auto"));
+    }
+
+    /// `hook` exists to say the grant was not chosen by the caller, so a
+    /// caller who declares any part of the approval takes the label with it.
+    #[test]
+    fn declaring_any_approval_detail_over_a_hook_records_the_declaring_source() {
+        let declarations = [
+            AttributionOverrides {
+                authorization: Some("interactive"),
+                ..overrides()
+            },
+            AttributionOverrides {
+                grant: Some("acceptEdits"),
+                ..overrides()
+            },
+            AttributionOverrides {
+                approved_by: Some("Ada <ada@example.com>"),
+                ..overrides()
+            },
+            AttributionOverrides {
+                approved_at: Some("2026-09-01T09:17:55Z"),
+                ..overrides()
+            },
+            AttributionOverrides {
+                approved_changes: Some(
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                ),
+                ..overrides()
+            },
+        ];
+        for declaration in declarations {
+            let mut attribution = hook_attribution();
+            attribution
+                .apply(&declaration, AgentEvidence::Header)
+                .unwrap();
+            let agent = attribution.agent.unwrap();
+            assert_eq!(
+                agent.detected_from,
+                AgentEvidence::Header,
+                "{declaration:?}"
+            );
+            assert_eq!(agent.session.as_deref(), Some("6d1baa69"));
+        }
+
+        let mut attribution = hook_attribution();
+        attribution
+            .apply(
+                &AttributionOverrides {
+                    agent_model: Some("claude-opus-4-5"),
+                    ..overrides()
+                },
+                AgentEvidence::Flag,
+            )
+            .unwrap();
+        assert_eq!(
+            attribution.agent.unwrap().detected_from,
+            AgentEvidence::Flag
+        );
+    }
+
+    /// A declared agent, or `none`, replaces the hook's agent and its grant
+    /// together, leaving exactly what the declaration alone would record.
+    #[test]
+    fn declaring_an_agent_over_a_hook_replaces_its_whole_layer() {
+        let mut replaced = hook_attribution();
+        replaced
+            .apply(
+                &AttributionOverrides {
+                    agent: Some("cursor-agent"),
+                    ..overrides()
+                },
+                AgentEvidence::Flag,
+            )
+            .unwrap();
+        assert_eq!(replaced.agent.as_ref().unwrap().id, "cursor-agent");
+        assert!(replaced.authorization.is_none());
+
+        let mut cleared = hook_attribution();
+        cleared
+            .apply(
+                &AttributionOverrides {
+                    agent: Some("none"),
+                    ..overrides()
+                },
+                AgentEvidence::Flag,
+            )
+            .unwrap();
+        assert_eq!(cleared, Attribution::default());
+
+        let mut redeclared = hook_attribution();
+        redeclared
+            .apply(
+                &AttributionOverrides {
+                    agent: Some("claude-code"),
+                    authorization: Some("interactive"),
+                    ..overrides()
+                },
+                AgentEvidence::Flag,
+            )
+            .unwrap();
+        assert_eq!(redeclared.agent.unwrap().detected_from, AgentEvidence::Flag);
+        assert_eq!(
+            redeclared.authorization.unwrap().mode,
+            AuthorizationMode::Interactive
+        );
+
+        // Details alone need a mode, as they would with no hook at all.
+        let mut orphaned = hook_attribution();
+        let error = orphaned
+            .apply(
+                &AttributionOverrides {
+                    agent: Some("cursor-agent"),
+                    grant: Some("acceptEdits"),
+                    ..overrides()
+                },
+                AgentEvidence::Flag,
+            )
+            .unwrap_err();
+        assert!(message(&error).contains("without an authorization mode"));
+    }
+
+    /// No hook supplies intent, and every intent is authored by somebody, so
+    /// adding one says nothing about where the agent and the grant came from.
+    #[test]
+    fn declaring_intent_over_a_hook_keeps_the_hook_label() {
+        let mut attribution = hook_attribution();
+        attribution
+            .apply(
+                &AttributionOverrides {
+                    intent_rationale: Some("set status to closed-won"),
+                    ..overrides()
+                },
+                AgentEvidence::Flag,
+            )
+            .unwrap();
+        assert_eq!(
+            attribution.agent.unwrap().detected_from,
+            AgentEvidence::Hook
+        );
+        assert!(attribution.intent.unwrap().rationale.is_some());
+    }
+
+    /// The approval rule is specific to `hook`. An observed agent never
+    /// claimed anything about approval, so declaring one leaves it observed,
+    /// as it always has.
+    #[test]
+    fn declaring_an_approval_over_an_observed_agent_keeps_it_observed() {
+        let mut attribution = Attribution {
+            agent: Some(AuditAgent {
+                id: "claude-code".to_owned(),
+                version: None,
+                model: None,
+                session: None,
+                turn: None,
+                detected_from: AgentEvidence::Environment,
+                via: None,
+            }),
+            ..Attribution::default()
+        };
+        attribution
+            .apply(
+                &AttributionOverrides {
+                    authorization: Some("delegated"),
+                    ..overrides()
+                },
+                AgentEvidence::Flag,
+            )
+            .unwrap();
+        assert_eq!(
+            attribution.agent.unwrap().detected_from,
+            AgentEvidence::Environment
+        );
+    }
+
     #[test]
     fn agent_details_need_an_agent_identity() {
         let mut attribution = Attribution::default();
@@ -1302,6 +1560,14 @@ mod tests {
             serde_json::to_string(&evidence).unwrap(),
             r#""attestation""#
         );
+
+        // `hook` is known here. A build that predates it reads it exactly as
+        // this one reads `attestation`, which is what let it be added without
+        // an audit version bump.
+        let hook: AgentEvidence = serde_json::from_str(r#""hook""#).unwrap();
+        assert_eq!(hook, AgentEvidence::Hook);
+        assert!(hook.is_known());
+        assert_eq!(serde_json::to_string(&hook).unwrap(), r#""hook""#);
 
         let author: IntentAuthor = serde_json::from_str(r#""operator""#).unwrap();
         assert_eq!(author, IntentAuthor::Other("operator".to_owned()));

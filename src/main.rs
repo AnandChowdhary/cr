@@ -102,7 +102,8 @@ impl From<Record> for ListedRecord {
 /// itself: `cr` records it, never verifies it, and never lets it affect what an
 /// operation is allowed to do. `CR_AGENT`, `CR_AUTHORIZATION`, and `CR_INTENT`
 /// supply the same three values to every command, and `CR_AGENT=none` declares
-/// that no agent was involved.
+/// that no agent was involved. Beneath all of them, `CR_HOOK_AGENT` and
+/// `CR_HOOK_AUTHORIZATION` carry what a harness hook filled in.
 #[derive(Clone, Debug, Default, Args)]
 struct AttributionArgs {
     /// Software acting for the actor: 'none', an identifier such as claude-code, or a JSON object.

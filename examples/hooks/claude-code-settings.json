@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(cr *)",
+            "command": "\"$HOME/.claude/hooks/claude-code-attribution.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/hooks/claude-code-attribution.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

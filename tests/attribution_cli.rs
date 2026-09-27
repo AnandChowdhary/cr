@@ -581,6 +581,141 @@ fn an_explicit_declaration_outranks_the_environment() {
     assert_eq!(by_id("three")["agent"]["detected_from"], "flag");
 }
 
+/// What `examples/hooks/claude-code-attribution.sh` exports for one call.
+fn with_hook(command: &mut Command) -> &mut Command {
+    command
+        .env("CLAUDECODE", "1")
+        .env("CLAUDE_CODE_SESSION_ID", "6d1baa69")
+        .env(
+            "CR_HOOK_AGENT",
+            r#"{"id":"claude-code","session":"6d1baa69","turn":"550e8400"}"#,
+        )
+        .env(
+            "CR_HOOK_AUTHORIZATION",
+            r#"{"mode":"delegated","grant":"auto"}"#,
+        )
+}
+
+/// A harness hook's values sit above the probe and below every declaration.
+/// They are recorded as `hook` only while nobody has declared an agent or an
+/// approval on top of them; intent, which no hook supplies, does not count. A
+/// declared agent takes the hook's grant away with its agent.
+#[test]
+fn a_harness_hook_fills_in_what_nobody_declared_and_says_so() {
+    let database = TestDatabase::new("agent-hook");
+    let create = |id: &str| {
+        let mut command = database.command();
+        command.args(["create", "deals", id, "--set", "status=open"]);
+        command
+    };
+    run_success(with_hook(&mut create("hooked")));
+    run_success(with_hook(&mut create("reasoned")).args(["--intent-rationale", "open it"]));
+    run_success(with_hook(&mut create("approved")).args(["--authorization", "interactive"]));
+    run_success(with_hook(&mut create("granted")).env("CR_AUTHORIZATION", "delegated"));
+    run_success(with_hook(&mut create("modelled")).args(["--agent-model", "claude-opus-4-5"]));
+    run_success(with_hook(&mut create("declared")).env("CR_AGENT", "cursor-agent"));
+    run_success(with_hook(&mut create("suppressed")).env("CR_AGENT", "none"));
+    run_success(with_hook(&mut create("renamed")).args(["--agent", "cursor-agent"]));
+    run_success(with_hook(&mut create("disowned")).args(["--agent", "none"]));
+    run_success(database.command().args(["audit", "verify"]));
+
+    let entries: Value = serde_json::from_str(&run_success(
+        database.command().args(["audit", "log", "--json"]),
+    ))
+    .expect("audit log is JSON");
+    let by_id = |id: &str| {
+        entries
+            .as_array()
+            .expect("an array")
+            .iter()
+            .find(|entry| entry["record"]["id"] == id)
+            .expect("the event exists")
+            .clone()
+    };
+
+    let hooked = by_id("hooked");
+    assert_eq!(
+        hooked["agent"],
+        serde_json::json!({
+            "id": "claude-code",
+            "session": "6d1baa69",
+            "turn": "550e8400",
+            "detected_from": "hook"
+        })
+    );
+    assert_eq!(
+        hooked["authorization"],
+        serde_json::json!({"mode": "delegated", "grant": "auto"})
+    );
+    assert_eq!(by_id("reasoned")["agent"]["detected_from"], "hook");
+
+    let approved = by_id("approved");
+    assert_eq!(approved["agent"]["detected_from"], "flag");
+    assert_eq!(approved["agent"]["turn"], "550e8400");
+    assert_eq!(
+        approved["authorization"],
+        serde_json::json!({"mode": "interactive"})
+    );
+    assert_eq!(by_id("granted")["agent"]["detected_from"], "flag");
+    assert_eq!(by_id("modelled")["agent"]["detected_from"], "flag");
+
+    // An explicit agent, in the environment or as a flag, replaces the hook's
+    // layer wholesale, as it replaces detection: neither the hook's agent nor
+    // its grant survives, and `none` leaves an event no different from a
+    // human's.
+    for id in ["declared", "renamed"] {
+        let declared = by_id(id);
+        assert_eq!(
+            declared["agent"],
+            serde_json::json!({"id": "cursor-agent", "detected_from": "flag"}),
+            "{id}"
+        );
+        assert!(declared.get("authorization").is_none(), "{id}");
+    }
+    for id in ["suppressed", "disowned"] {
+        let suppressed = by_id(id);
+        assert!(suppressed.get("agent").is_none(), "{id}");
+        assert!(suppressed.get("authorization").is_none(), "{id}");
+    }
+
+    let identity = run_success(with_hook(&mut database.command()).arg("identity"));
+    assert!(
+        identity.contains("asserted, detected from hook"),
+        "{identity}"
+    );
+    assert!(
+        identity.contains("authorization: delegated grant=auto"),
+        "{identity}"
+    );
+}
+
+/// The hook channel is caller input like any other: strict, and unable to
+/// name how `cr` came to believe it.
+#[test]
+fn a_harness_hook_is_held_to_the_same_input_rules_as_a_declaration() {
+    let database = TestDatabase::new("agent-hook-invalid");
+    for (variable, value, expected) in [
+        (
+            "CR_HOOK_AUTHORIZATION",
+            "escalated",
+            "must be direct, interactive",
+        ),
+        (
+            "CR_HOOK_AGENT",
+            r#"{"id":"claude-code","detected_from":"environment"}"#,
+            "detected_from",
+        ),
+    ] {
+        let error = run_failure(
+            database
+                .command()
+                .env(variable, value)
+                .args(["create", "deals", "one"]),
+        );
+        assert!(error.contains(expected), "{variable}: {error}");
+    }
+}
+
 /// `cr identity` shows what would be recorded, including nothing at all.
 #[test]
 fn identity_reports_the_complete_attribution_that_would_be_recorded() {
