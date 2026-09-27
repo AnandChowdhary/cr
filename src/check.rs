@@ -38,7 +38,8 @@
 //!
 //! Everything else here — dangling links, malformed relation values, schema
 //! drift, unusable schemas, invalid record names, chain damage, approval
-//! mismatches, an audit anchor that disagrees with or lags the journal, and a
+//! mismatches, an audit anchor or (given trusted keys) a signed checkpoint
+//! that disagrees with or lags the journal, and a
 //! sync run that stopped halfway — is invisible to `status` entirely. The sync one is the sharpest case: an interrupted run leaves a
 //! committed prefix that genuinely agrees with the journal, so `status` reports
 //! clean and `audit verify` passes, and until now the only way to find it was
@@ -66,7 +67,10 @@ use crate::{
         CollectionAccessPolicy, RECORD_ACCESS_FIELD, RecordAccess, USERS_COLLECTION, User,
         users_schema,
     },
-    audit::{AnchorStatus, AuditedRecordState, AuditedRecordStates, record_hash},
+    audit::{
+        AnchorStatus, AuditedRecordState, AuditedRecordStates, SignatureJudgement, record_hash,
+        untrusted_signature,
+    },
     database::{
         CollectionEntry, Database, collection_directory_name, collection_entry, schema_attributes,
         validate_component,
@@ -74,6 +78,7 @@ use crate::{
     error::{DomainError, invalid},
     frontmatter::Document,
     paths::{self, EntryKind},
+    signing::TrustedKeys,
 };
 
 /// How serious a finding is.
@@ -143,6 +148,15 @@ pub enum FindingKind {
     AuditAnchorBehind,
     /// The journal has events and no audit anchor attests to its head.
     AuditAnchorMissing,
+    /// Trusted keys were given and the signed checkpoint does not verify
+    /// under them, or does not agree with the journal.
+    AuditSignatureMismatch,
+    /// Trusted keys were given and a trusted key signed an earlier event than
+    /// the current head.
+    AuditSignatureBehind,
+    /// Trusted keys were given and the journal has events that no signed
+    /// checkpoint attests to.
+    AuditSignatureMissing,
 }
 
 impl FindingKind {
@@ -165,6 +179,9 @@ impl FindingKind {
             Self::AuditAnchorMismatch => "audit_anchor_mismatch",
             Self::AuditAnchorBehind => "audit_anchor_behind",
             Self::AuditAnchorMissing => "audit_anchor_missing",
+            Self::AuditSignatureMismatch => "audit_signature_mismatch",
+            Self::AuditSignatureBehind => "audit_signature_behind",
+            Self::AuditSignatureMissing => "audit_signature_missing",
         }
     }
 
@@ -314,6 +331,9 @@ pub struct CheckReport {
 pub struct CheckScope {
     /// Limit the expensive per-record phase to one collection.
     pub collection: Option<String>,
+    /// Judge the signed checkpoint against these keys. Without them it is not
+    /// judged at all, exactly as `audit verify` does not judge it.
+    pub trusted_keys: Option<TrustedKeys>,
 }
 
 /// Everything one record contributed to the scan.
@@ -435,6 +455,9 @@ pub(crate) fn run(database: &Database, scope: &CheckScope) -> Result<CheckReport
     // half-applied import is not a property of one collection.
     report_interrupted_syncs(database, &mut findings)?;
     report_anchor(&audit, &mut findings);
+    if let Some(trusted) = &scope.trusted_keys {
+        report_signature(&audit, trusted, &mut findings);
+    }
 
     findings.sort_by(|left, right| {
         right
@@ -1332,6 +1355,54 @@ fn report_anchor(audit: &crate::audit::AuditLog<'_>, findings: &mut Vec<Finding>
             ),
             // The chain replayed a moment ago, so anything else here is an
             // environment failure rather than a finding about the database.
+            _ => return,
+        },
+    };
+    findings.push(finding);
+}
+
+/// Report how the signed checkpoint stands against the journal and the keys
+/// the caller trusts.
+///
+/// A mismatch and a missing checkpoint are [`Severity::Error`]s. The caller
+/// said which keys to trust, which is a statement that this database is
+/// signed, and a journal that no trusted key attests to is exactly what the
+/// signature exists to catch; the anchor's missing case is only a warning
+/// because an unsigned, unanchored database is the default rather than a
+/// claim somebody made. A lagging signature is a [`Severity::Warning`], as a
+/// lagging anchor is: writers without the key leave one behind by design,
+/// and it pins everything up to its own sequence. Silent on a chain that
+/// could not be replayed, for the reason [`report_anchor`] gives.
+fn report_signature(
+    audit: &crate::audit::AuditLog<'_>,
+    trusted: &TrustedKeys,
+    findings: &mut Vec<Finding>,
+) {
+    let finding = match audit.signature_report(trusted) {
+        Ok(SignatureJudgement::Empty | SignatureJudgement::Matched { .. }) => return,
+        Ok(SignatureJudgement::Untrusted { key_id }) => Finding::database(
+            FindingKind::AuditSignatureMismatch,
+            Severity::Error,
+            untrusted_signature(&key_id).to_string(),
+        ),
+        Ok(SignatureJudgement::Missing) => Finding::database(
+            FindingKind::AuditSignatureMissing,
+            Severity::Error,
+            "the journal has events and no signed audit checkpoint attests to them, although trusted keys were given; if this database was signed before, the checkpoint was removed",
+        ),
+        Ok(SignatureJudgement::Behind { sequence, head, .. }) => Finding::database(
+            FindingKind::AuditSignatureBehind,
+            Severity::Warning,
+            format!(
+                "the signed audit checkpoint attests to sequence {sequence} and the journal is at {head}; the journal still agrees with it, so this is a lagging signature rather than altered history"
+            ),
+        ),
+        Err(error) => match DomainError::of(&error) {
+            Some(DomainError::SignatureMismatch(message)) => Finding::database(
+                FindingKind::AuditSignatureMismatch,
+                Severity::Error,
+                message.clone(),
+            ),
             _ => return,
         },
     };

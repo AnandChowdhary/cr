@@ -31,10 +31,11 @@ use crate::{
     encryption::{EncryptionStorageMetadata, audit_document_encryption_metadata},
     error::{
         DomainError, anchor_mismatch, approval_mismatch, audit_integrity, conflict,
-        idempotency_conflict, invalid, is_already_exists,
+        idempotency_conflict, invalid, is_already_exists, signature_mismatch,
     },
     frontmatter::Document,
     paths::{self, EntryKind, LockState},
+    signing::{CHECKPOINT_VERSION, CheckpointSigner, SignedCheckpoint, TrustedKeys},
 };
 
 /// Exact manifest ownership immediately before and after one verified event.
@@ -101,6 +102,12 @@ const ANCHOR_LABEL: &str = "the audit anchor";
 /// The anchor is derived state with its own shape, so it versions on its own
 /// and a change here never touches an audit payload or a stored hash.
 const ANCHOR_VERSION: u32 = 1;
+/// Where the signed checkpoint lives: beside the anchor, and a separate file
+/// rather than new fields in it. The anchor reader refuses a version it does
+/// not know, so signing inside the anchor would have made every earlier `cr`
+/// report a signed database as a mismatch. An earlier `cr` ignores this file.
+const SIGNATURE_PATH: &str = ".cr-audit-head.sig.json";
+const SIGNATURE_LABEL: &str = "the signed audit checkpoint";
 
 const AUDIT_VERSION: u32 = 3;
 const MIN_AUDIT_VERSION: u32 = 1;
@@ -440,6 +447,11 @@ pub struct AuditVerification {
     pub head: AuditHead,
     /// How the anchor stored at the database root relates to that head.
     pub anchor: AnchorStatus,
+    /// How the signed checkpoint relates to that head. Omitted when there is
+    /// neither a trusted key nor a signed checkpoint, so an unsigned database
+    /// verifies to exactly the response it always did.
+    #[serde(skip_serializing_if = "SignatureStatus::is_absent")]
+    pub signature: SignatureStatus,
 }
 
 /// The audit head written to a file at the database root for Git to carry.
@@ -565,6 +577,127 @@ impl AnchorStatus {
             ),
         }
     }
+}
+
+/// How the signed checkpoint relates to the journal it sits beside.
+///
+/// A signed checkpoint is judged by position exactly as the anchor is, so the
+/// same stale-versus-tampered split holds: a signature over an earlier event
+/// the journal still agrees with is [`Self::Behind`], and every disagreement is
+/// a [`DomainError::SignatureMismatch`] returned instead of a status. Unlike
+/// the anchor, nothing is judged without trusted keys: a signature the caller
+/// has not said which key to trust for proves nothing, so it is only reported
+/// as present.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SignatureStatus {
+    /// No trusted key was given and no signed checkpoint is recorded.
+    Absent,
+    /// A signed checkpoint is recorded, and no trusted key was given to judge
+    /// it with, so it was not read.
+    Unverified,
+    /// Trusted keys were given and the journal holds no events to sign.
+    Empty,
+    /// A trusted key signed the current head.
+    Matched { sequence: u64, key_id: String },
+    /// A trusted key signed an earlier event the journal still agrees with.
+    ///
+    /// Not a failure, and the same reduced guarantee a lagging anchor gives:
+    /// events after `sequence` are signed by nobody yet.
+    Behind {
+        sequence: u64,
+        head: u64,
+        key_id: String,
+    },
+}
+
+impl SignatureStatus {
+    /// Whether there is nothing at all to say, which keeps the field out of
+    /// an unsigned database's verification response.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    /// A line worth printing beside a successful verification, or `None` when
+    /// signing has nothing to say.
+    pub fn summary(&self) -> Option<String> {
+        match self {
+            Self::Absent | Self::Empty => None,
+            Self::Unverified => Some(
+                "notice: a signed audit checkpoint is recorded but was not verified; pass --trusted-key or set CR_AUDIT_TRUSTED_KEYS to check it against a key held outside the database"
+                    .to_owned(),
+            ),
+            Self::Matched { sequence, key_id } => Some(format!(
+                "Verified the signed checkpoint at sequence {sequence} under trusted key {key_id}"
+            )),
+            Self::Behind {
+                sequence,
+                head,
+                key_id,
+            } => Some(format!(
+                "notice: the signed audit checkpoint is behind at sequence {sequence} of {head}; key {key_id} signed it and the journal still agrees with it, so this is a lagging signature rather than altered history, and later events are not signed yet"
+            )),
+        }
+    }
+}
+
+/// How a stored signed checkpoint stands, before a caller decides what each
+/// answer means for it.
+///
+/// Verification turns [`Self::Missing`] and [`Self::Untrusted`] into failures,
+/// `check` into findings, and a signer into "sign" or "do not sign": each of
+/// them needs the distinction, so it is not made here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SignatureJudgement {
+    /// No checkpoint is recorded and the journal holds no events.
+    Empty,
+    /// No checkpoint is recorded and the journal has events.
+    Missing,
+    /// A checkpoint is recorded under a key that is not trusted, so nothing
+    /// in it could be judged.
+    Untrusted { key_id: String },
+    /// A trusted key signed the current head.
+    Matched { sequence: u64, key_id: String },
+    /// A trusted key signed an earlier event the journal still agrees with.
+    Behind {
+        sequence: u64,
+        head: u64,
+        key_id: String,
+    },
+}
+
+impl SignatureJudgement {
+    /// The status a verification with trusted keys reports, failing where a
+    /// signature was required and none could be judged.
+    fn into_verified(self) -> Result<SignatureStatus> {
+        match self {
+            Self::Empty => Ok(SignatureStatus::Empty),
+            Self::Missing => Err(missing_signature()),
+            Self::Untrusted { key_id } => Err(untrusted_signature(&key_id)),
+            Self::Matched { sequence, key_id } => Ok(SignatureStatus::Matched { sequence, key_id }),
+            Self::Behind {
+                sequence,
+                head,
+                key_id,
+            } => Ok(SignatureStatus::Behind {
+                sequence,
+                head,
+                key_id,
+            }),
+        }
+    }
+}
+
+/// What `cr audit anchor --write` wrote.
+///
+/// The anchor's own fields at the top level, exactly as before signing
+/// existed, and the signed checkpoint beside them only when one was written.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AnchorWrite {
+    #[serde(flatten)]
+    pub anchor: AuditAnchor,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<SignedCheckpoint>,
 }
 
 /// Everything `cr audit anchor` reports.
@@ -1669,6 +1802,11 @@ impl<'a> AuditLog<'a> {
         if target != expected_target {
             bail!("audit target does not match its record identity");
         }
+        // The append decides again, and that answer is the one it acts on.
+        // Asking here as well means a write the append would refuse for its
+        // signing key or signed checkpoint is refused before the pending file
+        // and the record exist, rather than left for recovery to trip over.
+        self.append_signer(entry.parsed.sequence.saturating_sub(1))?;
         let pending = PendingMutation {
             target,
             before_hash: entry.parsed.before_hash.clone(),
@@ -2065,7 +2203,24 @@ impl<'a> AuditLog<'a> {
     /// Ordering matters. The chain is replayed first, so a damaged journal is
     /// reported as a damaged journal and never as an anchor problem.
     pub fn verify(&self, expected_head: Option<&str>) -> Result<AuditVerification> {
-        self.verify_with_record_hashes(expected_head)
+        self.verify_trusting(expected_head, None)
+    }
+
+    /// [`Self::verify`], and with `trusted` keys the signed checkpoint too.
+    ///
+    /// Without trusted keys this is exactly `verify`, and a signed checkpoint
+    /// is only reported as present. With them, a missing checkpoint, one
+    /// under a key they do not include, and one that does not agree with the
+    /// journal all fail with [`DomainError::SignatureMismatch`]. It is judged
+    /// after the chain replays and before the anchor, so a forged journal
+    /// whose anchor was rewritten to match fails on the one check its forger
+    /// could not redo, and says so.
+    pub fn verify_trusting(
+        &self,
+        expected_head: Option<&str>,
+        trusted: Option<&TrustedKeys>,
+    ) -> Result<AuditVerification> {
+        self.verify_with_record_states_trusting(expected_head, trusted)
             .map(|(verification, _)| verification)
     }
 
@@ -2094,9 +2249,24 @@ impl<'a> AuditLog<'a> {
         &self,
         expected_head: Option<&str>,
     ) -> Result<(AuditVerification, AuditedRecordStates)> {
+        self.verify_with_record_states_trusting(expected_head, None)
+    }
+
+    fn verify_with_record_states_trusting(
+        &self,
+        expected_head: Option<&str>,
+        trusted: Option<&TrustedKeys>,
+    ) -> Result<(AuditVerification, AuditedRecordStates)> {
         let (latest, state) = self.states(true)?;
         self.verify_legacy_representation_heads(&latest)?;
 
+        let signature = match trusted {
+            Some(trusted) => self
+                .judge_signature(self.load_signature()?.as_ref(), state.entries, trusted)?
+                .into_verified()?,
+            None if self.signature_present()? => SignatureStatus::Unverified,
+            None => SignatureStatus::Absent,
+        };
         let anchor = match expected_head {
             Some(expected) => {
                 if state.head_hash.as_deref() != Some(expected) {
@@ -2124,6 +2294,7 @@ impl<'a> AuditLog<'a> {
                     hash: state.head_hash,
                 },
                 anchor,
+                signature,
             },
             latest,
         ))
@@ -2195,14 +2366,249 @@ impl<'a> AuditLog<'a> {
     /// but they will not be handed a command that does it for them and reports
     /// success. Adopting the anchor on an existing database, and repairing one
     /// left behind by a crash, both go through here.
-    pub fn write_anchor(&self) -> Result<AuditAnchor> {
+    ///
+    /// With `CR_AUDIT_SIGNING_KEY` set it signs the head too, and the same
+    /// rule holds: it refuses while a checkpoint signed by a key it trusts
+    /// disagrees with the journal. This is also how signing is adopted on a
+    /// database that already has events, and re-adopted under a new key: a
+    /// checkpoint that is missing, or under a key the signer does not trust,
+    /// could not be judged, and writing a fresh one is the deliberate act the
+    /// automatic path never takes (see [`Self::append_signer`]).
+    pub fn write_anchor(&self) -> Result<AnchorWrite> {
         let state = self.verify_chain(|_, _| Ok(()))?;
         self.anchor_status(self.load_anchor()?.as_ref(), &state)?;
+        let signer = match CheckpointSigner::from_environment()? {
+            Some(signer) => {
+                self.signer_continuity(&signer, state.entries)?;
+                Some(signer)
+            }
+            None => None,
+        };
         let Some(anchor) = self.anchor_at(state.entries)? else {
             return Err(conflict("there are no audit events to anchor"));
         };
         self.store_anchor(&anchor)?;
-        Ok(anchor)
+        let signature = signer
+            .map(|signer| self.sign_checkpoint(&signer, &anchor))
+            .transpose()?;
+        Ok(AnchorWrite { anchor, signature })
+    }
+
+    /// Judge the signed checkpoint against a freshly replayed chain, for
+    /// `cr check`. Replays the chain itself, as [`Self::anchor_report`] does.
+    pub(crate) fn signature_report(&self, trusted: &TrustedKeys) -> Result<SignatureJudgement> {
+        let state = self.verify_chain(|_, _| Ok(()))?;
+        self.judge_signature(self.load_signature()?.as_ref(), state.entries, trusted)
+    }
+
+    /// Judge `stored` against a journal of `head` events that has already
+    /// been replayed, trusting only `trusted`.
+    ///
+    /// The cryptographic check comes first, so an edited file reads as an
+    /// altered checkpoint rather than as altered history. Then the checkpoint
+    /// is judged by position exactly as [`Self::anchor_status`] judges the
+    /// anchor, after one question the anchor never needed: whether it was
+    /// made for this database at all. A checkpoint copied from another
+    /// database names that database's first event, and says so, instead of
+    /// reading as a rewrite of this one's history.
+    fn judge_signature(
+        &self,
+        stored: Option<&SignedCheckpoint>,
+        head: u64,
+        trusted: &TrustedKeys,
+    ) -> Result<SignatureJudgement> {
+        let Some(stored) = stored else {
+            return Ok(if head == 0 {
+                SignatureJudgement::Empty
+            } else {
+                SignatureJudgement::Missing
+            });
+        };
+        let Some(key) = trusted.get(&stored.key_id) else {
+            return Ok(SignatureJudgement::Untrusted {
+                key_id: stored.key_id.clone(),
+            });
+        };
+        if !stored.verifies_under(key) {
+            return Err(signature_mismatch(format!(
+                "the signed audit checkpoint does not verify under key {}, so the position it states or its signature was altered",
+                stored.key_id
+            )));
+        }
+        if stored.sequence == 0 {
+            return Err(signature_mismatch(
+                "the signed audit checkpoint does not name an audit event",
+            ));
+        }
+        let Some(database) = self.first_event_hash()? else {
+            return Err(signature_mismatch(format!(
+                "the signed audit checkpoint attests to sequence {} but the journal has no events",
+                stored.sequence
+            )));
+        };
+        if stored.database != database {
+            return Err(signature_mismatch(format!(
+                "the signed audit checkpoint was made for a different database (its first event is {}, this journal's is {database})",
+                stored.database
+            )));
+        }
+        let Some(derived) = self.anchor_at(stored.sequence)? else {
+            return Err(signature_mismatch(format!(
+                "the signed audit checkpoint attests to sequence {} but the journal ends at sequence {head}",
+                stored.sequence
+            )));
+        };
+        if derived.hash != stored.hash {
+            return Err(signature_mismatch(format!(
+                "the audit event at sequence {} does not match the signed audit checkpoint (signed {}, actual {})",
+                stored.sequence, stored.hash, derived.hash
+            )));
+        }
+        if derived.timestamp != stored.timestamp {
+            return Err(signature_mismatch(format!(
+                "the signed audit checkpoint does not describe the audit event at sequence {} it names",
+                stored.sequence
+            )));
+        }
+        Ok(if stored.sequence == head {
+            SignatureJudgement::Matched {
+                sequence: stored.sequence,
+                key_id: stored.key_id.clone(),
+            }
+        } else {
+            SignatureJudgement::Behind {
+                sequence: stored.sequence,
+                head,
+                key_id: stored.key_id.clone(),
+            }
+        })
+    }
+
+    /// Whether `signer` may sign past a journal of `head` events: `true` when
+    /// the stored checkpoint lets it extend a history it can vouch for,
+    /// `false` when there is nothing it can judge, and a refusal when a
+    /// checkpoint it trusts disagrees with the journal.
+    ///
+    /// A signer trusts its own key and whatever `CR_AUDIT_TRUSTED_KEYS`
+    /// names, so a team whose members sign with their own keys can extend one
+    /// another's checkpoints. A journal with no events has no history to vouch
+    /// for, so its first event may always be signed.
+    fn signer_continuity(&self, signer: &CheckpointSigner, head: u64) -> Result<bool> {
+        let trusted = TrustedKeys::from_environment()?
+            .unwrap_or_default()
+            .with(signer.public().clone());
+        Ok(
+            match self.judge_signature(self.load_signature()?.as_ref(), head, &trusted)? {
+                SignatureJudgement::Empty
+                | SignatureJudgement::Matched { .. }
+                | SignatureJudgement::Behind { .. } => true,
+                SignatureJudgement::Missing | SignatureJudgement::Untrusted { .. } => false,
+            },
+        )
+    }
+
+    /// The key an append signs with: the configured one, when it can extend
+    /// the stored checkpoint, and otherwise none.
+    ///
+    /// This is the rule that keeps automation from laundering a forgery. Were
+    /// a write to sign whatever head it found, an attacker who rewrote the
+    /// head and deleted the checkpoint would have the key holder's next write
+    /// sign the forgery, since the new event's hash commits to the forged
+    /// one. So an append signs only when the stored checkpoint verifies under
+    /// a key the signer trusts and still agrees with the journal. With no
+    /// checkpoint, or one under a key it cannot judge, it signs nothing and
+    /// the checkpoint lags, which a verifier sees; the adoption that closes
+    /// that gap is the deliberate `cr audit anchor --write`. And when a
+    /// trusted checkpoint disagrees, the write is refused before anything is
+    /// written, as replay refuses a write on an inconsistent journal.
+    fn append_signer(&self, head: u64) -> Result<Option<CheckpointSigner>> {
+        let Some(signer) = CheckpointSigner::from_environment()? else {
+            return Ok(None);
+        };
+        Ok(self.signer_continuity(&signer, head)?.then_some(signer))
+    }
+
+    /// Sign the position `anchor` names and store the result beside it.
+    fn sign_checkpoint(
+        &self,
+        signer: &CheckpointSigner,
+        anchor: &AuditAnchor,
+    ) -> Result<SignedCheckpoint> {
+        let database = self
+            .first_event_hash()?
+            .context("a signed audit checkpoint needs a journal with events")?;
+        let checkpoint = SignedCheckpoint::sign(
+            signer,
+            &database,
+            anchor.sequence,
+            &anchor.hash,
+            &anchor.timestamp,
+        );
+        self.store_signature(&checkpoint)?;
+        Ok(checkpoint)
+    }
+
+    /// The stored hash of the journal's first event, reading only its line.
+    ///
+    /// Callers run this once the chain has been verified, as for
+    /// [`Self::anchor_at`], so the first line of the first segment is that
+    /// event.
+    fn first_event_hash(&self) -> Result<Option<String>> {
+        let Some(path) = self.listed_segment_paths()?.into_iter().next() else {
+            return Ok(None);
+        };
+        let file = paths::open_file(self.root, &path, SEGMENT_LABEL)?;
+        let mut line = Vec::new();
+        BufReader::new(file).read_until(b'\n', &mut line)?;
+        if line.pop() != Some(b'\n') {
+            return Ok(None);
+        }
+        Ok(Some(parse_line(&line)?.entry.hash))
+    }
+
+    /// Whether a signed checkpoint file exists, without reading it.
+    fn signature_present(&self) -> Result<bool> {
+        Ok(paths::entry_kind(self.root, Path::new(SIGNATURE_PATH), SIGNATURE_LABEL)?.is_some())
+    }
+
+    /// Read the signed checkpoint, classifying anything unreadable as a
+    /// mismatch for the reason [`Self::load_anchor`] gives.
+    fn load_signature(&self) -> Result<Option<SignedCheckpoint>> {
+        let Some(bytes) =
+            paths::read_optional(self.root, Path::new(SIGNATURE_PATH), SIGNATURE_LABEL)?
+        else {
+            return Ok(None);
+        };
+        let value: Value = serde_json::from_slice(&bytes).map_err(unreadable_signature)?;
+        match value.get("version").and_then(Value::as_u64) {
+            Some(version) if version == u64::from(CHECKPOINT_VERSION) => {}
+            Some(version) => {
+                return Err(signature_mismatch(format!(
+                    "the signed audit checkpoint has format version {version}, and this build understands version {CHECKPOINT_VERSION}"
+                )));
+            }
+            None => {
+                return Err(unreadable_signature(serde::de::Error::missing_field(
+                    "version",
+                )));
+            }
+        }
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(unreadable_signature)
+    }
+
+    /// Publish `checkpoint` at the database root, creating or replacing it.
+    fn store_signature(&self, checkpoint: &SignedCheckpoint) -> Result<()> {
+        let relative = Path::new(SIGNATURE_PATH);
+        let bytes = checkpoint.serialize()?;
+        match paths::entry_kind(self.root, relative, SIGNATURE_LABEL)? {
+            Some(EntryKind::File) => {
+                paths::write_replace(self.root, relative, &bytes, SIGNATURE_LABEL)
+            }
+            Some(kind) => Err(paths::refuse_entry(SIGNATURE_LABEL, kind)),
+            None => paths::write_new(self.root, relative, &bytes, SIGNATURE_LABEL),
+        }
     }
 
     /// Judge `stored` against a chain that has already been replayed.
@@ -2848,6 +3254,10 @@ impl<'a> AuditLog<'a> {
         if event_hash(entry.payload.as_bytes()) != entry.hash {
             bail!("audit event hash does not match its payload");
         }
+        // Decided before a byte is written, so an unusable signing key or a
+        // signed checkpoint that no longer agrees with the journal refuses
+        // the write rather than leaving a committed event behind it.
+        let signer = self.append_signer(snapshot.chain.entries)?;
         let result = AuditEntry {
             hash: entry.hash.clone(),
             payload: entry.parsed.clone(),
@@ -2889,12 +3299,17 @@ impl<'a> AuditLog<'a> {
         // already committed, and the message says so: a silently unmaintained
         // anchor is a security downgrade that nothing else would report, and
         // the caller's next command recovers the pending mutation cleanly.
-        self.store_anchor(&AuditAnchor::at(
-            entry.parsed.sequence,
-            &entry.hash,
-            &entry.parsed.timestamp,
-        ))
-        .context("the audit event was committed but the audit anchor could not be updated")?;
+        let anchor = AuditAnchor::at(entry.parsed.sequence, &entry.hash, &entry.parsed.timestamp);
+        self.store_anchor(&anchor)
+            .context("the audit event was committed but the audit anchor could not be updated")?;
+        // The signed checkpoint follows the anchor for the same reason the
+        // anchor follows the event, and a crash between the two leaves it one
+        // event behind, which reads as lagging exactly as the anchor does.
+        if let Some(signer) = signer {
+            self.sign_checkpoint(&signer, &anchor).context(
+                "the audit event was committed but the signed audit checkpoint could not be updated",
+            )?;
+        }
         snapshot.chain.entries = entry.parsed.sequence;
         snapshot.chain.head_hash = Some(entry.hash.clone());
         Ok(())
@@ -3140,6 +3555,27 @@ struct LoadedHead {
     entry: AuditEntry,
     segment_path: PathBuf,
     segment_entries: usize,
+}
+
+/// Classify a signed checkpoint whose bytes cannot be interpreted.
+fn unreadable_signature(error: serde_json::Error) -> anyhow::Error {
+    anyhow::Error::new(error).context(DomainError::SignatureMismatch(
+        "the signed audit checkpoint is not readable".to_owned(),
+    ))
+}
+
+/// Trusted keys were given and nothing is signed.
+fn missing_signature() -> anyhow::Error {
+    signature_mismatch(
+        "no signed audit checkpoint is recorded, so the journal cannot be checked against the trusted keys; if this database was signed before, the checkpoint was removed",
+    )
+}
+
+/// The checkpoint names a key the caller did not say to trust.
+pub(crate) fn untrusted_signature(key_id: &str) -> anyhow::Error {
+    signature_mismatch(format!(
+        "the signed audit checkpoint was made with key {key_id}, which is not a trusted key"
+    ))
 }
 
 /// Classify an anchor whose bytes cannot be interpreted, keeping the parse

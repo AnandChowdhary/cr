@@ -57,6 +57,8 @@ pub fn clear_attribution_environment(command: &mut Command) {
         "CR_HOOK_AUTHORIZATION",
         "CR_ENCRYPTION_ACTIVE_KEY",
         "CR_ENCRYPTION_KEYS",
+        "CR_AUDIT_SIGNING_KEY",
+        "CR_AUDIT_TRUSTED_KEYS",
         "CLAUDECODE",
         "CLAUDE_CODE_SESSION_ID",
         "CURSOR_AGENT",

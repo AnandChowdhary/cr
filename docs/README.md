@@ -15,7 +15,7 @@ The [README](../README.md) is the overview. These guides cover everything
 - [Schemas](schemas.md) — optional JSON Schema validation for each collection.
 - [Encryption](encryption.md) — encrypt chosen fields and bodies at rest.
 - [Access control](access-control.md) — users, roles, and private or shared records.
-- [Audit history and integrity](audit.md) — the journal, anchoring it in Git, and `cr check`.
+- [Audit history and integrity](audit.md) — the journal, anchoring it in Git, signing checkpoints, and `cr check`.
 
 **Automate and integrate**
 

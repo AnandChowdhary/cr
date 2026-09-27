@@ -152,7 +152,7 @@ detail.
 - [Schemas](docs/schemas.md) — optional JSON Schema validation for each collection.
 - [Encryption](docs/encryption.md) — encrypt chosen fields and bodies at rest.
 - [Access control](docs/access-control.md) — users, roles, and private or shared records.
-- [Audit history and integrity](docs/audit.md) — the journal, anchoring it in Git, and `cr check`.
+- [Audit history and integrity](docs/audit.md) — the journal, anchoring it in Git, signing checkpoints, and `cr check`.
 
 **Automate and integrate**
 

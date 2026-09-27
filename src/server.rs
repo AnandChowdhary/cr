@@ -43,7 +43,7 @@ use crate::{
     COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary, CollectionModel, CollectionPresentation,
     Database, DomainError, Filter, FilterExpression, FilterOperator, Finding, MAX_TRAVERSAL_DEPTH,
     Projection, RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SchemaReview,
-    SchemaViolation, SearchQuery, SearchTarget, SortDirection, SortKey, TOKEN_PREFIX,
+    SchemaViolation, SearchQuery, SearchTarget, SortDirection, SortKey, TOKEN_PREFIX, TrustedKeys,
     USERS_COLLECTION, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout,
     ViewPredicateMatch,
     audit::AuditChange,
@@ -667,6 +667,9 @@ struct BrowseFileQuery {
 #[serde(deny_unknown_fields)]
 struct CheckQuery {
     collection: Option<String>,
+    /// Public keys to judge the signed checkpoint with, inline only.
+    #[serde(default)]
+    trusted_key: Vec<String>,
     limit: Option<usize>,
     offset: Option<usize>,
 }
@@ -1532,6 +1535,25 @@ struct AuditLogParameters {
 #[serde(deny_unknown_fields)]
 struct AuditVerifyParameters {
     expected_head: Option<String>,
+    /// Public keys to judge the signed checkpoint with, inline only.
+    #[serde(default)]
+    trusted_key: Vec<String>,
+}
+
+/// The keys a request judges the signed checkpoint with.
+///
+/// The request's own `trusted_key` values when it gives any, and otherwise
+/// whatever `CR_AUDIT_TRUSTED_KEYS` told the server to trust, so a monitor
+/// polling the route checks the signature without knowing the key. A request
+/// may only give keys inline: naming a file would let a remote caller choose
+/// a path for the server to read. The environment is the operator's, so it
+/// may name files, and it is read per request, like the encryption keyring.
+fn request_trusted_keys(values: Vec<String>) -> anyhow::Result<Option<TrustedKeys>> {
+    if values.is_empty() {
+        TrustedKeys::from_environment()
+    } else {
+        TrustedKeys::parse_inline(values).map(Some)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1706,7 +1728,8 @@ impl ApiError {
             | DomainError::IdempotencyConflict(_)
             | DomainError::ApprovalMismatch(_)
             | DomainError::AuditIntegrity(_)
-            | DomainError::AnchorMismatch(_) => StatusCode::CONFLICT,
+            | DomainError::AnchorMismatch(_)
+            | DomainError::SignatureMismatch(_) => StatusCode::CONFLICT,
             DomainError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             DomainError::Forbidden(_) => StatusCode::FORBIDDEN,
             DomainError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -5490,6 +5513,7 @@ async fn check(
     let report = run_database(&state, &headers, move |database| {
         database.check(&CheckScope {
             collection: query.collection,
+            trusted_keys: request_trusted_keys(query.trusted_key)?,
         })
     })
     .await?;
@@ -5564,7 +5588,8 @@ async fn audit_verify(
 ) -> ApiResult<Json<crate::AuditVerification>> {
     let parameters: AuditVerifyParameters = parse_query(raw)?;
     let verification = run_database(&state, &headers, move |database| {
-        database.audit_verify(parameters.expected_head.as_deref())
+        let trusted = request_trusted_keys(parameters.trusted_key)?;
+        database.audit_verify_trusting(parameters.expected_head.as_deref(), trusted.as_ref())
     })
     .await?;
     Ok(Json(verification))
@@ -5990,7 +6015,8 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                     "invalid_record_name", "unreadable_record", "unaudited_record", "missing_record",
                     "record_content_mismatch", "audit_chain_broken", "approval_mismatch",
                     "interrupted_sync_run", "audit_anchor_mismatch", "audit_anchor_behind",
-                    "audit_anchor_missing"
+                    "audit_anchor_missing", "audit_signature_mismatch", "audit_signature_behind",
+                    "audit_signature_missing"
                 ] },
                 "collection": { "type": "string" },
                 "id": { "type": "string" },
@@ -6107,7 +6133,19 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "entries": { "type": "integer", "minimum": 0 },
                 "records_checked": { "type": "integer", "minimum": 0 },
                 "head": { "$ref": "#/components/schemas/AuditHead" },
-                "anchor": { "$ref": "#/components/schemas/AnchorStatus" }
+                "anchor": { "$ref": "#/components/schemas/AnchorStatus" },
+                "signature": { "$ref": "#/components/schemas/SignatureStatus" }
+            }
+        },
+        "SignatureStatus": {
+            "type": "object",
+            "required": ["state"],
+            "description": "How the signed checkpoint at the database root relates to the journal head. Absent when no trusted key was given and nothing is signed. With trusted keys, a missing, untrusted, or disagreeing checkpoint is not reported here: it fails the request with 409 signature_mismatch.",
+            "properties": {
+                "state": { "enum": ["unverified", "empty", "matched", "behind"], "description": "unverified means a signed checkpoint is recorded but no trusted key was given to judge it with. behind means a trusted key signed an earlier event the journal still agrees with, which is a reduced guarantee rather than altered history." },
+                "sequence": { "type": "integer", "minimum": 1, "description": "The audit sequence the signature attests to." },
+                "head": { "type": "integer", "minimum": 1, "description": "The current head sequence, present when the signature is behind." },
+                "key_id": { "type": "string", "description": "The fingerprint of the trusted key that signed." }
             }
         },
         "AnchorStatus": {
@@ -6484,6 +6522,7 @@ fn openapi_paths() -> JsonValue {
         "/api/v1/status": { "get": { "operationId": "getStatus", "parameters": page_parameters, "responses": ok("#/components/schemas/WorkingChangePage") } },
         "/api/v1/check": { "get": { "operationId": "getCheckReport", "description": "Report every integrity problem in the database. Read-only, and 200 even when problems were found.", "parameters": [
             { "name": "collection", "in": "query", "description": "Check one collection instead of the whole database.", "schema": { "type": "string" } },
+            trusted_key_parameter(),
             { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
             { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } }
         ], "responses": ok("#/components/schemas/CheckReport") } },
@@ -6498,9 +6537,19 @@ fn openapi_paths() -> JsonValue {
         ], "responses": ok("#/components/schemas/AuditPage") } },
         "/api/v1/audit/head": { "get": { "operationId": "getAuditHead", "responses": ok("#/components/schemas/AuditHead") } },
         "/api/v1/audit/verify": { "get": { "operationId": "verifyAudit", "parameters": [
-            { "name": "expected_head", "in": "query", "schema": { "type": "string" } }
+            { "name": "expected_head", "in": "query", "schema": { "type": "string" } },
+            trusted_key_parameter()
         ], "responses": ok("#/components/schemas/AuditVerification") } },
         "/api/v1/audit/baseline": { "post": { "operationId": "baselineAudit", "responses": ok("#/components/schemas/BaselineResponse") } }
+    })
+}
+
+/// The repeatable `trusted_key` parameter the verifying routes share.
+fn trusted_key_parameter() -> JsonValue {
+    json!({
+        "name": "trusted_key", "in": "query",
+        "description": "A public key, as ed25519: and 43 base64url characters, to verify the signed checkpoint with. Repeat it to trust several. Keys are given inline only; a key file cannot be named in a request. Without any, the server's CR_AUDIT_TRUSTED_KEYS applies, and without that the signed checkpoint is not judged.",
+        "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true
     })
 }
 
@@ -15865,6 +15914,13 @@ mod tests {
                 ),
                 StatusCode::CONFLICT,
                 "audit_integrity_failed",
+            ),
+            (
+                DomainError::SignatureMismatch(
+                    "the signed audit checkpoint was made for a different database".to_owned(),
+                ),
+                StatusCode::CONFLICT,
+                "signature_mismatch",
             ),
         ];
 
