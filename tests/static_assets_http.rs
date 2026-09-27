@@ -22,7 +22,7 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use cr::{
-    Assignment, Database, SortDirection, ViewLayout,
+    Assignment, Database, ViewLayout,
     server::{ServerConfig, router},
 };
 use http_body_util::BodyExt;
@@ -184,8 +184,7 @@ fn kanban_database(name: &str) -> (TempDir, Database) {
             50,
             ViewLayout::Kanban,
             Some("stage".into()),
-            None,
-            SortDirection::Asc,
+            Vec::new(),
         )
         .unwrap();
     (temporary, database)

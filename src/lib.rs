@@ -13,6 +13,7 @@ mod projection;
 mod query;
 mod search;
 pub mod server;
+mod sort;
 mod sync;
 mod traverse;
 mod value;
@@ -41,14 +42,16 @@ pub use check::{
 };
 pub use database::{
     Backlink, CollectionModel, Database, Record, RecordPrecondition, RecordSchemaViolation,
-    SchemaReview, SchemaViolation, SortDirection, WorkingChange, WorkingChangeKind,
-    sort_by_record_field, sort_records_by_field,
+    SchemaReview, SchemaViolation, WorkingChange, WorkingChangeKind,
 };
 pub use error::DomainError;
 pub use pins::Pin;
 pub use projection::Projection;
 pub use query::Filter;
 pub use search::{SearchQuery, SearchTarget};
+pub use sort::{
+    MAX_SORT_KEYS, SortDirection, SortKey, parse_sort_keys, sort_by_record_keys, sort_records,
+};
 pub use sync::{SyncAttribution, SyncDefinition, SyncRunLedger, SyncRunSummary};
 pub use traverse::{
     MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_RECORDS, Traversal, TraversalEdge, TraversalNode,

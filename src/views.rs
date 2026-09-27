@@ -5,13 +5,14 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 
 use crate::{
-    AccessResource, Assignment, Database, SortDirection,
+    AccessResource, Assignment, Database, SortDirection, SortKey,
     database::validate_component,
     error::{DomainError, invalid, is_already_exists, is_missing},
     paths,
+    sort::MAX_SORT_KEYS,
     value::parse_path,
 };
 
@@ -73,10 +74,30 @@ pub struct ViewDefinition {
     pub columns: Vec<String>,
     pub layout: ViewLayout,
     pub group_by: Option<String>,
-    pub sort_by: Option<String>,
-    pub sort_direction: SortDirection,
+    /// The order the view opens in, most significant key first. Empty
+    /// inherits the newest-first default.
+    #[serde(flatten, serialize_with = "serialize_view_sort")]
+    pub sort: Vec<SortKey>,
     pub page_size: usize,
     pub saved: bool,
+}
+
+/// A view's sort as `sort`, the keys as they are written, plus the `sort_by`
+/// and `sort_direction` of its first key, which is all a reader written
+/// before sorts had several keys knows to look for.
+fn serialize_view_sort<S: Serializer>(sort: &[SortKey], serializer: S) -> Result<S::Ok, S::Error> {
+    let first = sort.first();
+    let mut map = serializer.serialize_map(Some(3))?;
+    map.serialize_entry("sort_by", &first.map(|key| key.field.as_str()))?;
+    map.serialize_entry(
+        "sort_direction",
+        &first.map_or(SortDirection::Asc, |key| key.direction),
+    )?;
+    map.serialize_entry(
+        "sort",
+        &sort.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    )?;
+    map.end()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -201,12 +222,34 @@ struct StoredViewDefinition {
     layout: ViewLayout,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     group_by: Option<String>,
+    /// A one-key sort, written as it was before sorts had several keys, so
+    /// saving such a view changes nothing in a file that predates them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sort_by: Option<String>,
     #[serde(default, skip_serializing_if = "is_ascending")]
     sort_direction: SortDirection,
+    /// A sort of two or more keys, each written `FIELD[:asc|:desc]` as
+    /// `--sort` takes them. Never beside `sort_by`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sort: Vec<String>,
     #[serde(default = "default_page_size")]
     page_size: usize,
+}
+
+impl StoredViewDefinition {
+    /// Put `keys` in the shape a file stores them in: one key as `sort_by`
+    /// and `sort_direction`, several as `sort`.
+    fn set_sort(&mut self, keys: &[SortKey]) {
+        (self.sort_by, self.sort_direction, self.sort) = match keys {
+            [] => (None, SortDirection::Asc, Vec::new()),
+            [key] => (Some(key.field.clone()), key.direction, Vec::new()),
+            keys => (
+                None,
+                SortDirection::Asc,
+                keys.iter().map(ToString::to_string).collect(),
+            ),
+        };
+    }
 }
 
 impl Database {
@@ -254,8 +297,7 @@ impl Database {
             page_size,
             layout,
             group_by,
-            None,
-            SortDirection::Asc,
+            Vec::new(),
         )
     }
 
@@ -272,8 +314,7 @@ impl Database {
         page_size: usize,
         layout: ViewLayout,
         group_by: Option<String>,
-        sort_by: Option<String>,
-        sort_direction: SortDirection,
+        sort: Vec<SortKey>,
     ) -> Result<ViewDefinition> {
         self.authorize_owner(&AccessResource::Database)?;
         validate_view_name(name)?;
@@ -283,7 +324,7 @@ impl Database {
             return Err(invalid("view title cannot be empty"));
         }
 
-        let stored = StoredViewDefinition {
+        let mut stored = StoredViewDefinition {
             version: VIEW_FORMAT_VERSION,
             title: title.to_owned(),
             collection: collection.to_owned(),
@@ -293,11 +334,13 @@ impl Database {
             columns,
             layout,
             group_by,
-            sort_by,
-            sort_direction,
+            sort_by: None,
+            sort_direction: SortDirection::Asc,
+            sort: Vec::new(),
             page_size,
         };
-        validate_stored(name, &stored)?;
+        stored.set_sort(&sort);
+        let sort = validate_stored(name, &stored)?;
 
         let path = view_path(name);
         let serialized = yaml_serde::to_string(&stored).context("could not serialize view")?;
@@ -310,7 +353,7 @@ impl Database {
                 }
             },
         )?;
-        Ok(to_public(name, stored, true))
+        Ok(to_public(name, stored, sort, true))
     }
 
     /// Overwrite a saved view's definition in place.
@@ -332,8 +375,7 @@ impl Database {
         page_size: usize,
         layout: ViewLayout,
         group_by: Option<String>,
-        sort_by: Option<String>,
-        sort_direction: SortDirection,
+        sort: Vec<SortKey>,
     ) -> Result<ViewDefinition> {
         self.authorize_owner(&AccessResource::Database)?;
         let existing = self.read_view(name)?;
@@ -342,7 +384,7 @@ impl Database {
             return Err(invalid("view title cannot be empty"));
         }
 
-        let stored = StoredViewDefinition {
+        let mut stored = StoredViewDefinition {
             version: VIEW_FORMAT_VERSION,
             title: title.to_owned(),
             collection: existing.collection,
@@ -352,11 +394,13 @@ impl Database {
             columns,
             layout,
             group_by,
-            sort_by,
-            sort_direction,
+            sort_by: None,
+            sort_direction: SortDirection::Asc,
+            sort: Vec::new(),
             page_size,
         };
-        validate_stored(name, &stored)?;
+        stored.set_sort(&sort);
+        let sort = validate_stored(name, &stored)?;
 
         let serialized = yaml_serde::to_string(&stored).context("could not serialize view")?;
         paths::write_replace(
@@ -366,7 +410,7 @@ impl Database {
             &view_label(name),
         )
         .map_err(|error| missing_view(error, name))?;
-        Ok(to_public(name, stored, true))
+        Ok(to_public(name, stored, sort, true))
     }
 
     /// Delete a saved view's definition, returning what it was.
@@ -477,8 +521,8 @@ impl Database {
             };
         let stored: StoredViewDefinition = yaml_serde::from_str(&serialized)
             .with_context(|| DomainError::Invalid(format!("view '{name}' is not valid YAML")))?;
-        validate_stored(name, &stored)?;
-        Ok(Some(to_public(name, stored, true)))
+        let sort = validate_stored(name, &stored)?;
+        Ok(Some(to_public(name, stored, sort, true)))
     }
 }
 
@@ -513,7 +557,8 @@ pub(crate) fn validate_view_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_stored(name: &str, view: &StoredViewDefinition) -> Result<()> {
+/// Refuse a definition that is not valid, returning its sort.
+fn validate_stored(name: &str, view: &StoredViewDefinition) -> Result<Vec<SortKey>> {
     if view.version != VIEW_FORMAT_VERSION {
         return Err(invalid(format!(
             "view '{name}' uses unsupported format version {} (expected {VIEW_FORMAT_VERSION})",
@@ -573,27 +618,7 @@ fn validate_stored(name: &str, view: &StoredViewDefinition) -> Result<()> {
             DomainError::Invalid(format!("view '{name}' has invalid column '{column}'"))
         })?;
     }
-    match (view.sort_by.as_deref(), view.sort_direction) {
-        (None, SortDirection::Desc) => {
-            return Err(invalid(format!(
-                "view '{name}' sort_direction requires sort_by"
-            )));
-        }
-        (Some(field), _) if field.trim().is_empty() => {
-            return Err(invalid(format!("view '{name}' sort_by cannot be empty")));
-        }
-        (Some(field), _)
-            if !matches!(
-                field,
-                "$id" | "$collection" | "$path" | "$created_at" | "$updated_at"
-            ) =>
-        {
-            parse_path(field).with_context(|| {
-                DomainError::Invalid(format!("view '{name}' has invalid sort_by field '{field}'"))
-            })?;
-        }
-        _ => {}
-    }
+    let sort = stored_sort(name, view)?;
     match (view.layout, view.group_by.as_deref()) {
         (ViewLayout::Table, Some(_)) => {
             return Err(invalid(format!(
@@ -614,7 +639,60 @@ fn validate_stored(name: &str, view: &StoredViewDefinition) -> Result<()> {
         }
         (ViewLayout::Table, None) => {}
     }
-    Ok(())
+    Ok(sort)
+}
+
+/// A definition's sort, from `sort_by` and `sort_direction` or from `sort`,
+/// with every key's field checked.
+fn stored_sort(name: &str, view: &StoredViewDefinition) -> Result<Vec<SortKey>> {
+    let (label, sort) = match (view.sort_by.as_deref(), view.sort_direction, &view.sort[..]) {
+        (Some(_), _, [_, ..]) => {
+            return Err(invalid(format!(
+                "view '{name}' cannot have both sort_by and sort; list every key under sort"
+            )));
+        }
+        (None, SortDirection::Desc, _) => {
+            return Err(invalid(format!(
+                "view '{name}' sort_direction requires sort_by"
+            )));
+        }
+        (Some(field), direction, []) => ("sort_by", vec![SortKey::new(field, direction)]),
+        (None, _, keys) => (
+            "sort",
+            keys.iter()
+                .map(|key| {
+                    key.parse::<SortKey>().with_context(|| {
+                        DomainError::Invalid(format!("view '{name}' has invalid sort key '{key}'"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    };
+    if sort.len() > MAX_SORT_KEYS {
+        return Err(invalid(format!(
+            "view '{name}' can sort by at most {MAX_SORT_KEYS} keys"
+        )));
+    }
+    for (index, key) in sort.iter().enumerate() {
+        let field = key.field.as_str();
+        if field.trim().is_empty() {
+            return Err(invalid(format!("view '{name}' {label} cannot be empty")));
+        }
+        if !matches!(
+            field,
+            "$id" | "$collection" | "$path" | "$created_at" | "$updated_at"
+        ) {
+            parse_path(field).with_context(|| {
+                DomainError::Invalid(format!("view '{name}' has invalid {label} field '{field}'"))
+            })?;
+        }
+        if sort[..index].iter().any(|earlier| earlier.field == field) {
+            return Err(invalid(format!(
+                "view '{name}' sorts by '{field}' more than once"
+            )));
+        }
+    }
+    Ok(sort)
 }
 
 fn automatic_view(collection: &str, presentation: CollectionPresentation) -> ViewDefinition {
@@ -630,14 +708,18 @@ fn automatic_view(collection: &str, presentation: CollectionPresentation) -> Vie
         columns: Vec::new(),
         layout: ViewLayout::Table,
         group_by: None,
-        sort_by: None,
-        sort_direction: SortDirection::Asc,
+        sort: Vec::new(),
         page_size: DEFAULT_VIEW_PAGE_SIZE,
         saved: false,
     }
 }
 
-fn to_public(name: &str, stored: StoredViewDefinition, saved: bool) -> ViewDefinition {
+fn to_public(
+    name: &str,
+    stored: StoredViewDefinition,
+    sort: Vec<SortKey>,
+    saved: bool,
+) -> ViewDefinition {
     ViewDefinition {
         name: name.to_owned(),
         version: stored.version,
@@ -650,8 +732,7 @@ fn to_public(name: &str, stored: StoredViewDefinition, saved: bool) -> ViewDefin
         columns: stored.columns,
         layout: stored.layout,
         group_by: stored.group_by,
-        sort_by: stored.sort_by,
-        sort_direction: stored.sort_direction,
+        sort,
         page_size: stored.page_size,
         saved,
     }
@@ -697,8 +778,7 @@ mod tests {
         assert!(views[0].saved);
         assert_eq!(views[0].layout, ViewLayout::Table);
         assert_eq!(views[0].group_by, None);
-        assert_eq!(views[0].sort_by, None);
-        assert_eq!(views[0].sort_direction, SortDirection::Asc);
+        assert!(views[0].sort.is_empty());
         assert_eq!(database.view("deals").unwrap(), views[0]);
     }
 
@@ -721,14 +801,12 @@ mod tests {
                 200,
                 ViewLayout::Kanban,
                 Some("stage".into()),
-                Some("value".into()),
-                SortDirection::Desc,
+                vec![SortKey::new("value", SortDirection::Desc)],
             )
             .unwrap();
         assert_eq!(kanban.layout, ViewLayout::Kanban);
         assert_eq!(kanban.group_by.as_deref(), Some("stage"));
-        assert_eq!(kanban.sort_by.as_deref(), Some("value"));
-        assert_eq!(kanban.sort_direction, SortDirection::Desc);
+        assert_eq!(kanban.sort, [SortKey::new("value", SortDirection::Desc)]);
         assert_eq!(kanban.where_expr, ["value>=10000"]);
         assert_eq!(kanban.filter_groups.len(), 1);
         assert_eq!(kanban.filter_groups[0].match_mode, ViewPredicateMatch::Any);
@@ -752,8 +830,122 @@ mod tests {
         assert_eq!(legacy.group_by, None);
         assert!(legacy.where_expr.is_empty());
         assert!(legacy.filter_groups.is_empty());
-        assert_eq!(legacy.sort_by, None);
-        assert_eq!(legacy.sort_direction, SortDirection::Asc);
+        assert!(legacy.sort.is_empty());
+    }
+
+    #[test]
+    fn several_sort_keys_are_stored_as_a_list_and_one_in_the_older_shape() {
+        let temporary = tempdir().unwrap();
+        let database = Database::init(temporary.path().join("database")).unwrap();
+        let create = |name: &str, sort: Vec<SortKey>| {
+            database.create_view_with_options(
+                name,
+                None,
+                "deals",
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                25,
+                ViewLayout::Table,
+                None,
+                sort,
+            )
+        };
+        let keys = vec![
+            SortKey::new("stage", SortDirection::Asc),
+            SortKey::new("value", SortDirection::Desc),
+            SortKey::new("$updated_at", SortDirection::Desc),
+        ];
+        assert_eq!(create("ranked", keys.clone()).unwrap().sort, keys);
+        let stored = fs::read_to_string(database.root().join(".cr/views/ranked.yaml")).unwrap();
+        assert!(
+            stored.contains("sort:\n- stage\n- value:desc\n- $updated_at:desc\n"),
+            "{stored}"
+        );
+        assert!(!stored.contains("sort_by"));
+        assert!(!stored.contains("sort_direction"));
+        assert_eq!(database.view("ranked").unwrap().sort, keys);
+
+        // Older readers of the JSON find the first key where they always did.
+        let json = serde_json::to_value(database.view("ranked").unwrap()).unwrap();
+        assert_eq!(json["sort_by"], "stage");
+        assert_eq!(json["sort_direction"], "asc");
+        assert_eq!(
+            json["sort"],
+            serde_json::json!(["stage", "value:desc", "$updated_at:desc"])
+        );
+
+        create("single", vec![SortKey::new("value", SortDirection::Desc)]).unwrap();
+        let stored = fs::read_to_string(database.root().join(".cr/views/single.yaml")).unwrap();
+        assert!(stored.contains("sort_by: value\nsort_direction: desc\n"));
+        assert!(!stored.contains("sort:"));
+
+        for (sort, refusal) in [
+            (
+                vec![
+                    SortKey::new("value", SortDirection::Asc),
+                    SortKey::new("value", SortDirection::Desc),
+                ],
+                "sorts by 'value' more than once",
+            ),
+            (
+                ["a", "b", "c", "d", "e", "f"]
+                    .into_iter()
+                    .map(|field| SortKey::new(field, SortDirection::Asc))
+                    .collect(),
+                "at most 5 keys",
+            ),
+            (
+                vec![
+                    SortKey::new("stage", SortDirection::Asc),
+                    SortKey::new("owner..email", SortDirection::Asc),
+                ],
+                "invalid sort field 'owner..email'",
+            ),
+        ] {
+            let error = create("refused", sort).unwrap_err().to_string();
+            assert!(error.contains(refusal), "{error}");
+        }
+        assert!(!database.root().join(".cr/views/refused.yaml").exists());
+
+        // Hand-written files are held to the same rules, and a list of one
+        // key is as good as `sort_by`.
+        for (definition, outcome) in [
+            ("sort: [stage, 'value:desc']\n", Ok(keys[..2].to_vec())),
+            (
+                "sort: [value]\n",
+                Ok(vec![SortKey::new("value", SortDirection::Asc)]),
+            ),
+            ("sort: []\n", Ok(vec![])),
+            (
+                "sort_by: stage\nsort: [value]\n",
+                Err("cannot have both sort_by and sort"),
+            ),
+            ("sort_direction: desc\n", Err("requires sort_by")),
+            (
+                "sort_direction: desc\nsort: [value]\n",
+                Err("requires sort_by"),
+            ),
+            ("sort: [':desc']\n", Err("invalid sort key ':desc'")),
+            (
+                "sort: [stage, stage]\n",
+                Err("sorts by 'stage' more than once"),
+            ),
+        ] {
+            fs::write(
+                database.root().join(".cr/views/hand.yaml"),
+                format!("version: 1\ntitle: Hand\ncollection: deals\n{definition}"),
+            )
+            .unwrap();
+            match (database.view("hand"), outcome) {
+                (Ok(view), Ok(sort)) => assert_eq!(view.sort, sort, "{definition}"),
+                (Err(error), Err(refusal)) => {
+                    assert!(error.to_string().contains(refusal), "{definition}: {error}");
+                }
+                (view, outcome) => panic!("{definition}: {view:?} but expected {outcome:?}"),
+            }
+        }
     }
 
     #[test]
@@ -816,32 +1008,11 @@ mod tests {
                     50,
                     ViewLayout::Table,
                     None,
-                    Some("owner..email".into()),
-                    SortDirection::Asc,
+                    vec![SortKey::new("owner..email", SortDirection::Asc)],
                 )
                 .unwrap_err()
                 .to_string()
                 .contains("invalid sort_by")
-        );
-        assert!(
-            database
-                .create_view_with_options(
-                    "missing-sort",
-                    None,
-                    "deals",
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    50,
-                    ViewLayout::Table,
-                    None,
-                    None,
-                    SortDirection::Desc,
-                )
-                .unwrap_err()
-                .to_string()
-                .contains("requires sort_by")
         );
         assert!(
             database
@@ -859,8 +1030,7 @@ mod tests {
                     50,
                     ViewLayout::Table,
                     None,
-                    None,
-                    SortDirection::Asc,
+                    Vec::new(),
                 )
                 .unwrap_err()
                 .to_string()
@@ -946,8 +1116,7 @@ mod tests {
                 50,
                 ViewLayout::Kanban,
                 Some("stage".into()),
-                Some("value".into()),
-                SortDirection::Desc,
+                vec![SortKey::new("value", SortDirection::Desc)],
             )
             .unwrap();
         assert_eq!(replaced.title, "Won deals");
@@ -970,8 +1139,7 @@ mod tests {
             25,
             ViewLayout::Kanban,
             None,
-            None,
-            SortDirection::Asc,
+            Vec::new(),
         );
         assert!(
             refused
@@ -991,8 +1159,7 @@ mod tests {
                     25,
                     ViewLayout::Table,
                     None,
-                    None,
-                    SortDirection::Asc,
+                    Vec::new(),
                 )
                 .unwrap_err()
                 .to_string()
@@ -1013,8 +1180,7 @@ mod tests {
                     25,
                     ViewLayout::Table,
                     None,
-                    None,
-                    SortDirection::Asc,
+                    Vec::new(),
                 )
                 .unwrap_err(),
             database.delete_view("deals").unwrap_err(),

@@ -201,7 +201,7 @@ cr list contacts --where-expr 'contact.email is-not-empty'
 cr list deals --where 'stage=open' --sort value --desc --json
 ```
 
-Supported operators are `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `not-contains`, `starts-with`, `ends-with`, `is-empty`, and `is-not-empty`. Ordering compares numbers numerically and strings lexicographically, which gives the expected ordering for normalized ISO dates and times. Missing fields count as empty but do not match negative operators. Use `--sort FIELD` on `list` or `search`, and add `--desc` for descending order. Dotted front matter paths and the special keys `$id`, `$collection`, and `$path` are supported; missing values remain last and record ID breaks equal-value ties. Multi-field sorting and projections remain explicit roadmap work.
+Supported operators are `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `not-contains`, `starts-with`, `ends-with`, `is-empty`, and `is-not-empty`. Ordering compares numbers numerically and strings lexicographically, which gives the expected ordering for normalized ISO dates and times. Missing fields count as empty but do not match negative operators. [Sort results](#sort-results) orders what the filters leave, and [Choose the fields to return](#choose-the-fields-to-return) narrows each record to the fields you name.
 
 ### Boolean filters
 
@@ -242,6 +242,37 @@ it. A filter that does not parse is refused with the column of the problem:
 ```text
 error: expected a value after '=' at the end of the filter (column 8)
 ```
+
+### Sort results
+
+`--sort` orders `list`, `search`, and `backlinks`. A key is a dotted front
+matter path or `$id`, `$collection`, or `$path`, written `FIELD` or
+`FIELD:asc` for ascending and `FIELD:desc` for descending. Give several keys,
+most significant first, separated by commas or in repeated flags:
+
+```sh
+cr list deals --sort value --desc
+cr list deals --sort stage --sort value:desc
+cr list deals --sort 'stage,value:desc,owner.name' --json
+```
+
+Records are ordered by the first key, records that tie on it by the second,
+and so on. Within a key, numbers compare numerically and strings
+lexicographically, so normalized ISO dates and times sort in time order, and
+values of different types keep a fixed type order. A record without the field
+comes after every record with it, in either direction. Records that tie on
+every key are ordered by collection and then record ID, ascending, so the same
+sort gives the same order every time.
+
+`--desc` is the one-key spelling: `--sort value --desc` is
+`--sort value:desc`. With several keys, or with a key that already has a
+direction, it is refused, because it could mean the first key or all of them.
+Write the direction on each key instead. A sort takes at most five keys, each
+field once. A key written `-value` is refused with the spelling that works,
+because read as a field it would name one no record has. Only a final `:asc` or
+`:desc` is a direction, so `--sort og:title` sorts by the field `og:title`.
+Commas always separate keys, so a field whose name contains a comma cannot be
+a sort key.
 
 ### Choose the fields to return
 

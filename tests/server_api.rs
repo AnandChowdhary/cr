@@ -2245,6 +2245,164 @@ async fn rest_select_parameter_projects_records_on_every_read_route() {
 }
 
 #[tokio::test]
+async fn rest_sort_parameter_takes_ordered_keys_before_pagination() {
+    let (_temporary, database) = test_database("server-sort");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    database.create("companies", "acme", &[], "").unwrap();
+    // Ties on every field and gaps in each, as `tests/sort_cli.rs` has them.
+    for (id, fields) in [
+        ("a", &["stage=won", "value=5000", "owner=ada"][..]),
+        ("b", &["stage=open", "value=20000", "owner=ada"]),
+        ("c", &["stage=open", "value=5000"]),
+        ("d", &["stage=open", "value=20000", "owner=bo"]),
+        ("e", &["stage=won"]),
+        ("f", &["value=100"]),
+        ("g", &["stage=open", "value=5000", "owner=ada"]),
+    ] {
+        let fields = fields
+            .iter()
+            .map(|field| Assignment::from_str(field).unwrap())
+            .collect::<Vec<_>>();
+        database.create("deals", id, &fields, "").unwrap();
+        database
+            .link("deals", id, "company", "companies", "acme")
+            .unwrap();
+    }
+    let get = |uri: String| {
+        let app = app.clone();
+        async move { request(&app, Method::GET, &uri, None, &[]).await }
+    };
+    let ids = |response: &TestResponse| -> Vec<String> {
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+        response.json()["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                let path = record["path"].as_str().unwrap();
+                path.trim_start_matches("records/deals/")
+                    .trim_end_matches(".md")
+                    .to_owned()
+            })
+            .collect()
+    };
+    let list = "/api/v1/collections/deals/records";
+
+    // Repeated and comma-separated keys are the same sort, with mixed
+    // directions, ties broken by the next key and then the ID, and missing
+    // values last.
+    for sort in ["sort=stage&sort=value:desc", "sort=stage,value:desc"] {
+        assert_eq!(
+            ids(&get(format!("{list}?{sort}")).await),
+            ["b", "d", "c", "g", "a", "e", "f"],
+            "{sort}"
+        );
+    }
+    assert_eq!(
+        ids(&get(format!("{list}?sort=stage,value:desc,owner")).await),
+        ["b", "d", "g", "c", "a", "e", "f"]
+    );
+    assert_eq!(
+        ids(&get(format!("{list}?sort=stage:desc&sort=owner:desc")).await),
+        ["a", "e", "d", "b", "g", "c", "f"]
+    );
+
+    // Pagination cuts the sorted result, so a page boundary falls inside a
+    // tie exactly where the whole ordering puts it.
+    let page = get(format!("{list}?sort=stage,value:desc&limit=2&offset=1")).await;
+    assert_eq!(ids(&page), ["d", "c"]);
+    assert_eq!(page.json()["pagination"]["total"], 7);
+    assert_eq!(page.json()["pagination"]["next_offset"], 3);
+
+    // The single key keeps both of its spellings.
+    let descending = ["b", "d", "a", "c", "g", "f", "e"];
+    assert_eq!(
+        ids(&get(format!("{list}?sort=value&direction=desc")).await),
+        descending
+    );
+    assert_eq!(
+        ids(&get(format!("{list}?sort=value:desc")).await),
+        descending
+    );
+    assert_eq!(
+        ids(&get(format!("{list}?sort=value&direction=asc")).await),
+        ["f", "a", "c", "g", "b", "d", "e"]
+    );
+    // A direction with nothing to order is ignored, as it always was.
+    assert_eq!(
+        ids(&get(format!("{list}?direction=desc")).await),
+        ["a", "b", "c", "d", "e", "f", "g"]
+    );
+
+    // Search and backlinks take the same keys.
+    assert_eq!(
+        ids(&get("/api/v1/search?q=deals&target=path&sort=stage&sort=value:desc".to_owned()).await),
+        ["b", "d", "c", "g", "a", "e", "f"]
+    );
+    assert_eq!(
+        ids(&get(
+            "/api/v1/collections/companies/records/acme/backlinks?sort=stage:desc,owner:desc&limit=3"
+                .to_owned()
+        )
+        .await),
+        ["a", "e", "d"]
+    );
+
+    for (query, message) in [
+        (
+            "sort=stage&sort=value&direction=desc",
+            "direction applies only to a single sort key written without a direction; write FIELD:asc or FIELD:desc on each key instead",
+        ),
+        (
+            "sort=value:asc&direction=desc",
+            "direction applies only to a single sort key written without a direction; write FIELD:asc or FIELD:desc on each key instead",
+        ),
+        ("sort=a,b,c,d,e,f", "a sort can have at most 5 keys, not 6"),
+        (
+            "sort=value&sort=value:desc",
+            "sort field 'value' is given more than once",
+        ),
+        (
+            "sort=-value",
+            "sort key '-value' starts with '-'; write 'value:desc' to sort descending",
+        ),
+        (
+            "sort=stage,%24updated_at",
+            "sort field '$updated_at' comes from audit history and is only available in server-rendered views",
+        ),
+    ] {
+        let refused = get(format!("{list}?{query}")).await;
+        assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY, "{query}");
+        assert_eq!(refused.json()["error"]["code"], "validation_failed");
+        assert_eq!(refused.json()["error"]["message"], message, "{query}");
+    }
+
+    let openapi = get("/openapi.json".to_owned()).await.json();
+    for path in [
+        "/api/v1/collections/{collection}/records",
+        "/api/v1/search",
+        "/api/v1/collections/{collection}/records/{id}/backlinks",
+    ] {
+        let parameters = openapi["paths"][path]["get"]["parameters"]
+            .as_array()
+            .unwrap();
+        let sort = parameters
+            .iter()
+            .find(|parameter| parameter["name"] == "sort")
+            .unwrap();
+        assert_eq!(sort["schema"]["type"], "array", "{path}");
+        assert_eq!(sort["schema"]["maxItems"], cr::MAX_SORT_KEYS, "{path}");
+        assert_eq!(sort["explode"], true, "{path}");
+        assert!(sort["description"].as_str().unwrap().contains("FIELD:desc"));
+        assert!(
+            parameters
+                .iter()
+                .any(|parameter| parameter["name"] == "direction")
+        );
+    }
+}
+
+#[tokio::test]
 async fn rest_count_route_counts_groups_and_summarizes() {
     let (_temporary, database) = test_database("server-count");
     let app = router(database.clone(), ServerConfig::default()).unwrap();

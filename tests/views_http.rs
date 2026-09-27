@@ -381,8 +381,10 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
         preset.filter_groups[0].expressions,
         ["status=won", "value>=12000"]
     );
-    assert_eq!(preset.sort_by.as_deref(), Some("value"));
-    assert_eq!(preset.sort_direction, cr::SortDirection::Desc);
+    assert_eq!(
+        preset.sort,
+        [cr::SortKey::new("value", cr::SortDirection::Desc)]
+    );
     assert_eq!(preset.columns, ["name", "value"]);
 
     let browser_pipeline = request(
@@ -488,8 +490,7 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     assert_eq!(cleared_sort.status, StatusCode::SEE_OTHER);
     let unsorted = database.view("open-deals-unsorted").unwrap();
     assert_eq!(unsorted.filters, ["status=open"]);
-    assert_eq!(unsorted.sort_by, None);
-    assert_eq!(unsorted.sort_direction, cr::SortDirection::Asc);
+    assert!(unsorted.sort.is_empty());
 
     let invalid_csrf = request(
         &app,
@@ -869,8 +870,7 @@ async fn kanban_views_render_schema_ordered_lanes_and_move_cards_through_audited
             50,
             ViewLayout::Kanban,
             Some("stage".into()),
-            Some("score".into()),
-            cr::SortDirection::Asc,
+            vec![cr::SortKey::new("score", cr::SortDirection::Asc)],
         )
         .unwrap();
     let app = router(database.clone(), ServerConfig::default()).unwrap();
@@ -4481,6 +4481,280 @@ async fn unclassified_html_failures_stay_generic() {
 }
 
 /// Deals to edit views over: two open, one won, with values to compare.
+/// The record IDs of a view page's rows, in the order they are shown.
+fn row_ids(html: &str, view: &str) -> Vec<String> {
+    let marker = format!("href=\"/{view}/records/");
+    let mut ids = Vec::new();
+    for rest in html.split(&marker).skip(1) {
+        let id = rest.split_once('"').unwrap().0.to_owned();
+        if ids.last() != Some(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// The unescaped `href` of the element with `id`.
+fn link(html: &str, id: &str) -> String {
+    html.split_once(&format!("id=\"{id}\""))
+        .unwrap_or_else(|| panic!("no element has id {id}"))
+        .1
+        .split_once("href=\"")
+        .unwrap()
+        .1
+        .split_once('"')
+        .unwrap()
+        .0
+        .replace("&amp;", "&")
+}
+
+#[tokio::test]
+async fn a_view_sorted_by_several_keys_renders_pages_swaps_and_saves_them() {
+    let (_temporary, database) = test_database("views-multi-sort");
+    // Ties on every field and gaps in each: two open deals of 20000 and two of
+    // 5000, a won deal without a value, and a deal without a stage.
+    for (id, fields) in [
+        ("a", &["stage=won", "value=5000", "owner=ada"][..]),
+        ("b", &["stage=open", "value=20000", "owner=ada"]),
+        ("c", &["stage=open", "value=5000"]),
+        ("d", &["stage=open", "value=20000", "owner=bo"]),
+        ("e", &["stage=won"]),
+        ("f", &["value=100"]),
+        ("g", &["stage=open", "value=5000", "owner=ada"]),
+    ] {
+        let fields = fields
+            .iter()
+            .map(|field| Assignment::from_str(field).unwrap())
+            .collect::<Vec<_>>();
+        database.create("deals", id, &fields, "").unwrap();
+    }
+    let definition = "version: 1\ntitle: Ranked\ncollection: deals\ncolumns: [stage, value, owner]\nsort:\n- stage\n- value:desc\n";
+    fs::write(database.root().join(".cr/views/ranked.yaml"), definition).unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let get = |uri: String| {
+        let app = app.clone();
+        async move { request(&app, Method::GET, &uri, None, &[]).await }
+    };
+    let ranked = ["b", "d", "c", "g", "a", "e", "f"];
+    let keys = "sort_field=stage&sort_direction=asc&sort_field=value&sort_direction=desc";
+
+    let page = get("/ranked".to_owned()).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(row_ids(page.text(), "ranked"), ranked);
+    // The first key leads the headings; the rest are in the panel, each in a
+    // "Then by" row, with one more row to add another.
+    assert!(page.text().contains("aria-sort=\"ascending\""));
+    assert_eq!(page.text().matches("aria-sort=\"descending\"").count(), 0);
+    let second = page
+        .text()
+        .split_once("data-sort-key=\"2\"")
+        .unwrap()
+        .1
+        .split_once("data-sort-key=\"3\"")
+        .unwrap()
+        .0;
+    assert!(second.contains("aria-label=\"Then by, sort key 2\""));
+    assert!(second.contains("<option value=\"value\" selected>"));
+    assert!(second.contains("<option value=\"desc\" selected>"));
+    assert!(page.text().contains("aria-label=\"Then by, sort key 3\""));
+    assert!(!page.text().contains("aria-label=\"Then by, sort key 4\""));
+
+    // Every page carries both keys, and the pages cut the one ordering.
+    let mut uri = "/ranked?limit=2".to_owned();
+    let mut seen = Vec::new();
+    loop {
+        let page = get(uri.clone()).await;
+        assert_eq!(page.status, StatusCode::OK, "{uri}");
+        seen.extend(row_ids(page.text(), "ranked"));
+        if !page.text().contains("id=\"cr-page-next\"") {
+            break;
+        }
+        uri = link(page.text(), "cr-page-next");
+        assert!(uri.contains(keys), "{uri}");
+    }
+    assert_eq!(seen, ranked);
+
+    // A swap of the results carries the keys to "Save as view", which saves
+    // them as a list.
+    let swapped = request(
+        &app,
+        Method::GET,
+        &format!("/ranked?{keys}&limit=2&after=d"),
+        None,
+        &[
+            ("hx-request", "true"),
+            ("hx-boosted", "true"),
+            ("hx-target", "cr-view-table"),
+        ],
+    )
+    .await;
+    assert_eq!(row_ids(swapped.text(), "ranked"), ["c", "g"]);
+    let save_state = swapped
+        .text()
+        .split_once("id=\"cr-view-save-state\"")
+        .unwrap()
+        .1
+        .split_once("</div>")
+        .unwrap()
+        .0;
+    assert!(save_state.contains(concat!(
+        r#"<input type="hidden" name="sort_field" value="stage"><input type="hidden" name="sort_direction" value="asc">"#,
+        r#"<input type="hidden" name="sort_field" value="value"><input type="hidden" name="sort_direction" value="desc">"#,
+    )));
+    let token = csrf(page.text()).to_owned();
+    let saved = request(
+        &app,
+        Method::POST,
+        "/ranked/save-view",
+        Some(form(&[
+            ("_csrf", &token),
+            ("name", "ranked-copy"),
+            ("filter_match", "all"),
+            ("sort_field", "stage"),
+            ("sort_direction", "asc"),
+            ("sort_field", "value"),
+            ("sort_direction", "desc"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    let stored = fs::read_to_string(database.root().join(".cr/views/ranked-copy.yaml")).unwrap();
+    assert!(
+        stored.contains("sort:\n- stage\n- value:desc\n"),
+        "{stored}"
+    );
+    assert_eq!(
+        row_ids(get("/ranked-copy".to_owned()).await.text(), "ranked-copy"),
+        ranked
+    );
+
+    // A column heading replaces the whole sort with its one key.
+    let by_value = link(page.text(), "cr-sort-4");
+    assert!(by_value.contains("sort_field=value&sort_direction=asc&"));
+    assert!(!by_value.contains("sort_field=stage"));
+    assert_eq!(
+        row_ids(get(by_value).await.text(), "ranked"),
+        ["f", "a", "c", "g", "b", "d", "e"]
+    );
+
+    // The panel submits a row for every key and one more; the rows left at
+    // None are dropped, a field chosen twice keeps its first place, and a
+    // URL naming more keys than a sort may have is refused.
+    let applied = get(format!(
+        "/ranked?{keys}&sort_field=value&sort_direction=asc&sort_field=&sort_direction=asc"
+    ))
+    .await;
+    assert_eq!(applied.status, StatusCode::OK);
+    assert_eq!(row_ids(applied.text(), "ranked"), ranked);
+    let three = get(format!(
+        "/ranked?{keys}&sort_field=owner&sort_direction=asc"
+    ))
+    .await;
+    assert_eq!(
+        row_ids(three.text(), "ranked"),
+        ["b", "d", "g", "c", "a", "e", "f"]
+    );
+    let too_many = get(
+        "/ranked?sort_field=a&sort_field=b&sort_field=c&sort_field=d&sort_field=e&sort_field=f"
+            .to_owned(),
+    )
+    .await;
+    assert_eq!(too_many.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(too_many.text().contains("at most 5 keys"));
+
+    // A definition written before sorts had several keys renders exactly as
+    // the same sort asked for in the URL.
+    fs::write(
+        database.root().join(".cr/views/older.yaml"),
+        "version: 1\ntitle: Older\ncollection: deals\ncolumns: [stage, value, owner]\nsort_by: value\nsort_direction: desc\n",
+    )
+    .unwrap();
+    let older = get("/older?limit=3".to_owned()).await;
+    let asked = get("/older?sort_field=value&sort_direction=desc&limit=3".to_owned()).await;
+    assert_eq!(row_ids(older.text(), "older"), ["b", "d", "a"]);
+    assert_eq!(
+        row_ids(older.text(), "older"),
+        row_ids(asked.text(), "older")
+    );
+    assert_eq!(
+        link(older.text(), "cr-page-next"),
+        link(asked.text(), "cr-page-next")
+    );
+    assert!(link(older.text(), "cr-page-next").contains("sort_field=value&sort_direction=desc&"));
+
+    // The editor holds every key; saving it untouched keeps the list as it
+    // was written, and a field chosen twice is refused back to the form.
+    let editor = get("/ranked/edit".to_owned()).await;
+    assert_eq!(editor.status, StatusCode::OK);
+    assert!(editor.text().contains("aria-label=\"Then by, sort key 2\""));
+    let token = csrf(editor.text()).to_owned();
+    let edit = |sort: &'static [(&'static str, &'static str)]| {
+        let mut pairs = vec![
+            ("_csrf", token.as_str()),
+            ("title", "Ranked deals"),
+            ("filter_match", "all"),
+            ("layout", "table"),
+            ("page_size", "25"),
+            ("column", "stage"),
+            ("column", "value"),
+            ("column", "owner"),
+        ];
+        pairs.extend_from_slice(sort);
+        form(&pairs)
+    };
+    let kept = request(
+        &app,
+        Method::POST,
+        "/ranked/edit",
+        Some(edit(&[
+            ("sort_field", "stage"),
+            ("sort_direction", "asc"),
+            ("sort_field", "value"),
+            ("sort_direction", "desc"),
+            ("sort_field", ""),
+            ("sort_direction", "asc"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(kept.status, StatusCode::SEE_OTHER);
+    let stored = fs::read_to_string(database.root().join(".cr/views/ranked.yaml")).unwrap();
+    assert!(stored.contains("title: Ranked deals"));
+    assert!(
+        stored.contains("sort:\n- stage\n- value:desc\n"),
+        "{stored}"
+    );
+    let refused = request(
+        &app,
+        Method::POST,
+        "/ranked/edit",
+        Some(edit(&[
+            ("sort_field", "stage"),
+            ("sort_direction", "asc"),
+            ("sort_field", "stage"),
+            ("sort_direction", "desc"),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        refused
+            .text()
+            .contains("view 'ranked' sorts by 'stage' more than once")
+    );
+    assert!(
+        refused
+            .text()
+            .contains("aria-label=\"Then by, sort key 2\"")
+    );
+    assert_eq!(
+        fs::read_to_string(database.root().join(".cr/views/ranked.yaml")).unwrap(),
+        stored
+    );
+}
+
 fn database_for_view_editing(name: &str) -> (TempDir, Database) {
     let (temporary, database) = test_database(name);
     for (id, status, value) in [
@@ -4608,8 +4882,10 @@ async fn a_saved_view_is_edited_in_place_from_the_page_as_it_is_shown() {
         view.filter_groups[0].expressions,
         ["status=won", "value>=10000"]
     );
-    assert_eq!(view.sort_by.as_deref(), Some("value"));
-    assert_eq!(view.sort_direction, cr::SortDirection::Desc);
+    assert_eq!(
+        view.sort,
+        [cr::SortKey::new("value", cr::SortDirection::Desc)]
+    );
     assert_eq!(view.columns, ["value"]);
     assert_eq!(view.page_size, 50);
     let shown = request(&app, Method::GET, "/open-deals", None, &[]).await;
@@ -4649,8 +4925,7 @@ async fn editing_only_a_title_leaves_a_hand_written_definition_as_it_was() {
             25,
             ViewLayout::Table,
             None,
-            None,
-            cr::SortDirection::Asc,
+            Vec::new(),
         )
         .unwrap();
     let app = router(database.clone(), ServerConfig::default()).unwrap();
@@ -4708,7 +4983,7 @@ async fn editing_only_a_title_leaves_a_hand_written_definition_as_it_was() {
     assert_eq!(view.filters, ["status=open"]);
     assert_eq!(view.where_expr, ["value >= 10000"]);
     assert!(view.filter_groups.is_empty());
-    assert_eq!(view.sort_by, None);
+    assert!(view.sort.is_empty());
     assert!(view.columns.is_empty());
 }
 
@@ -4730,8 +5005,7 @@ async fn an_any_group_the_list_cannot_hold_is_kept_or_removed_whole() {
             25,
             ViewLayout::Table,
             None,
-            None,
-            cr::SortDirection::Asc,
+            Vec::new(),
         )
         .unwrap();
     let app = router(database.clone(), ServerConfig::default()).unwrap();
@@ -5256,7 +5530,10 @@ async fn a_kanban_layout_with_nothing_to_group_by_is_refused_beside_the_grouping
         ["status=won", "value>=12000"]
     );
     assert_eq!(board.filter_groups[0].match_mode, ViewPredicateMatch::Any);
-    assert_eq!(board.sort_by.as_deref(), Some("value"));
+    assert_eq!(
+        board.sort,
+        [cr::SortKey::new("value", cr::SortDirection::Desc)]
+    );
 }
 
 #[tokio::test]
@@ -5308,8 +5585,126 @@ async fn a_save_redirects_a_browser_and_relocates_htmx() {
             ["status=won", "value>=12000"],
             "{name}"
         );
-        assert_eq!(saved.sort_direction, cr::SortDirection::Desc, "{name}");
+        assert_eq!(
+            saved.sort,
+            [cr::SortKey::new("value", cr::SortDirection::Desc)],
+            "{name}"
+        );
     }
+}
+
+/// A sort of several keys is saved whole, and a refused save hands every key
+/// back, in order, so the corrected resubmission saves the sort on screen.
+#[tokio::test]
+async fn a_refused_save_keeps_every_sort_key_and_the_corrected_one_writes_them() {
+    let (_temporary, database) = save_view_database("save-view-sort-keys");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let keys = "sort_field=status&sort_direction=asc&sort_field=value&sort_direction=desc&sort_field=name&sort_direction=asc";
+    let page = request(
+        &app,
+        Method::GET,
+        &format!("/deals?filter_match=all&{keys}"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK);
+    let pairs = [
+        ("sort_field", "status"),
+        ("sort_direction", "asc"),
+        ("sort_field", "value"),
+        ("sort_direction", "desc"),
+        ("sort_field", "name"),
+        ("sort_direction", "asc"),
+    ];
+    let hidden = pairs
+        .iter()
+        .map(|(name, value)| format!(r#"<input type="hidden" name="{name}" value="{value}">"#))
+        .collect::<String>();
+    assert!(
+        save_view_state(page.text()).contains(&hidden),
+        "the page does not carry every key to the save form: {}",
+        save_view_state(page.text())
+    );
+    let token = csrf(page.text()).to_owned();
+    // Exactly what the form's hidden fields submit: the keys, and the columns
+    // the page picked.
+    let state = save_view_state(page.text())
+        .split("<input type=\"hidden\" name=\"")
+        .skip(1)
+        .map(|input| {
+            let (name, rest) = input.split_once("\" value=\"").unwrap();
+            (name.to_owned(), rest.split_once('"').unwrap().0.to_owned())
+        })
+        .collect::<Vec<_>>();
+    let submission = |name: &str| {
+        let mut body = vec![("_csrf", token.as_str())];
+        body.extend(
+            state
+                .iter()
+                .map(|(field, value)| (field.as_str(), value.as_str())),
+        );
+        body.extend([("name", name), ("layout", "table")]);
+        form(&body)
+    };
+    let before = view_files(&database);
+
+    for headers in [&[][..], &SAVE_VIEW_HTMX[..]] {
+        let refused = request(
+            &app,
+            Method::POST,
+            "/deals/save-view",
+            Some(submission("focus")),
+            headers,
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::CONFLICT);
+        assert_eq!(refused.header("cr-form-invalid"), "true");
+        assert_eq!(
+            save_view_state(refused.text()),
+            save_view_state(page.text())
+        );
+        assert!(save_view_state(refused.text()).contains(&hidden));
+    }
+    // Cancel on the page of its own goes back to the same sort.
+    let refused = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(submission("focus")),
+        &[],
+    )
+    .await;
+    let cancel = refused
+        .text()
+        .split_once(r#"<a href="/deals?"#)
+        .map(|(_, rest)| rest.split_once('"').unwrap().0.replace("&amp;", "&"))
+        .expect("the refused page links back to the view");
+    assert!(cancel.contains(keys), "{cancel}");
+    assert_eq!(view_files(&database), before, "a refused save wrote a view");
+
+    let saved = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(submission("ranked")),
+        &[],
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        database.view("ranked").unwrap().sort,
+        [
+            cr::SortKey::new("status", cr::SortDirection::Asc),
+            cr::SortKey::new("value", cr::SortDirection::Desc),
+            cr::SortKey::new("name", cr::SortDirection::Asc),
+        ]
+    );
+    let stored = fs::read_to_string(database.root().join(".cr/views/ranked.yaml")).unwrap();
+    assert!(
+        stored.contains("sort:\n- status\n- value:desc\n- name\n"),
+        "{stored}"
+    );
 }
 
 #[tokio::test]

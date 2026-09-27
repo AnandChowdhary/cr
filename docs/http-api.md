@@ -242,6 +242,21 @@ curl -G 'http://127.0.0.1:3000/api/v1/collections/deals/records' \
 A filter that does not parse is refused with `422 validation_failed` and a
 message naming the column.
 
+`sort` orders lists, search, and backlinks before they are paginated, with the
+keys `--sort` takes: `FIELD`, `FIELD:asc`, or `FIELD:desc`, comma-separated or
+in repeated parameters, most significant first. A record missing a key's field
+follows the records that have it in either direction, and collection and then
+record ID, ascending, order whatever every key leaves tied, so an `offset` names
+the same place on every request. `direction=desc` is the one-key spelling of
+`FIELD:desc` and still works with a single `sort`; with several keys, or a key
+that has its own direction, it is refused. More than five keys, a field named
+twice, and a key written `-FIELD` are refused with `422 validation_failed`:
+
+```sh
+curl 'http://127.0.0.1:3000/api/v1/collections/deals/records?sort=stage&sort=value:desc&limit=50'
+curl 'http://127.0.0.1:3000/api/v1/collections/deals/records?sort=stage,value:desc,owner.name'
+```
+
 `select` returns only the named fields, on lists, search, backlinks, a single
 record, and `traverse`. Each result becomes a flat object keyed by the
 selectors, and a single record keeps its `ETag`:
@@ -291,7 +306,7 @@ curl 'http://127.0.0.1:3000/api/v1/search?q=%5Ewon%24&collection=deals&target=fi
 
 Allowed targets are `document`, `front_matter`, `field`, `body`, and `path`. The default target is `document`. The default maximum page size is 200 and can be changed with `cr serve --max-page-size N`. Offsets are deterministic because records are ordered by collection and ID.
 
-REST list, search, and `cr list --sort-by` sort stored record data only. The server-rendered views' `$created_at` and `$updated_at` are audit-derived, so asking a plain record scan for them is refused by name rather than quietly replaying the whole journal per request.
+REST list, search, backlinks, and `cr list --sort` sort stored record data only. The server-rendered views' `$created_at` and `$updated_at` are audit-derived, so asking a plain record scan for them is refused by name rather than quietly replaying the whole journal per request.
 
 Audit-log pages deliberately return `total: null`: the journal reads only the requested newest window rather than loading the entire segmented history to count it. `has_more` and `next_offset` remain available.
 

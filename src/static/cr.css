@@ -1351,6 +1351,10 @@ a.cr-field-open:hover { color: var(--cr-accent); }
 
 .cr-sort-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .cr-sort-row > select { flex: 1 1 12rem; width: auto; }
+/* Each further key reads "Then by <field> <direction>", beneath the first. */
+.cr-sort-then { margin-top: 6px; }
+.cr-sort-then-label { flex: 0 0 auto; color: var(--cr-gray-500); font-size: 0.78rem; font-weight: 550; }
+.cr-sort-row > select.cr-sort-direction { flex: 0 1 9rem; }
 
 .cr-filter-columns > summary { cursor: pointer; list-style: none; margin-bottom: 0; }
 .cr-filter-columns > summary::-webkit-details-marker { display: none; }

@@ -9,7 +9,7 @@
 use std::str::FromStr;
 
 use cr::{
-    AccessResource, Assignment, Database, Role, SortDirection, UserKind, sort_records_by_field,
+    AccessResource, Assignment, Database, Role, SortDirection, SortKey, UserKind, sort_records,
 };
 
 const OWNER: &str = "Owner <owner@example.com>";
@@ -148,7 +148,8 @@ fn record_scans_refuse_to_sort_by_an_audit_derived_field() {
     let mut records = database.list("deals", &[]).unwrap();
 
     for field in ["$created_at", "$updated_at"] {
-        let error = sort_records_by_field(&mut records, field, SortDirection::Desc).unwrap_err();
+        let error =
+            sort_records(&mut records, &[SortKey::new(field, SortDirection::Desc)]).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains(field), "{message}");
         assert!(message.contains("server-rendered views"), "{message}");

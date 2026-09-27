@@ -13,9 +13,9 @@ use cr::{
     AuditFilter, CheckReport, CheckScope, CollectionAccessPolicy, CollectionPresentation,
     DEFAULT_VIEW_PAGE_SIZE, Database, DomainError, Filter, FilterExpression, JournalVerification,
     Projection, Record, RecordPrecondition, RecordVisibility, Role, SchemaReview, SearchQuery,
-    SearchTarget, SortDirection, SyncAttribution, UserDeleteOptions, UserEnsureOutcome, UserKind,
-    UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout, parse_threshold,
-    sort_by_record_field, sort_records_by_field,
+    SearchTarget, SortDirection, SortKey, SyncAttribution, UserDeleteOptions, UserEnsureOutcome,
+    UserKind, UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout, parse_sort_keys,
+    parse_threshold, sort_by_record_keys, sort_records,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -326,11 +326,13 @@ enum Command {
         #[arg(long = "select", value_name = "FIELDS")]
         select: Vec<String>,
 
-        /// Sort by a dotted field, $id, $collection, or $path. Missing fields stay last.
+        /// Sort by a dotted field, $id, $collection, or $path, as FIELD, FIELD:asc, or FIELD:desc.
+        /// Comma-separated or repeated for further keys, compared in order, up to 5.
+        /// Missing fields stay last, and collection and record ID break the remaining ties.
         #[arg(long, value_name = "FIELD")]
-        sort: Option<String>,
+        sort: Vec<String>,
 
-        /// Sort descending. Record ID remains the ascending deterministic tie-breaker.
+        /// Sort a single --sort key descending, the same as FIELD:desc.
         #[arg(long, requires = "sort")]
         desc: bool,
 
@@ -373,11 +375,13 @@ enum Command {
         #[arg(long = "select", value_name = "FIELDS")]
         select: Vec<String>,
 
-        /// Sort by a dotted field, $id, $collection, or $path. Missing fields stay last.
+        /// Sort by a dotted field, $id, $collection, or $path, as FIELD, FIELD:asc, or FIELD:desc.
+        /// Comma-separated or repeated for further keys, compared in order, up to 5.
+        /// Missing fields stay last, and collection and record ID break the remaining ties.
         #[arg(long, value_name = "FIELD")]
-        sort: Option<String>,
+        sort: Vec<String>,
 
-        /// Sort descending. Record ID remains the ascending deterministic tie-breaker.
+        /// Sort a single --sort key descending, the same as FIELD:desc.
         #[arg(long, requires = "sort")]
         desc: bool,
 
@@ -487,11 +491,13 @@ enum Command {
         #[arg(long = "select", value_name = "FIELDS")]
         select: Vec<String>,
 
-        /// Sort by a dotted field, $id, $collection, or $path. Missing fields stay last.
+        /// Sort by a dotted field, $id, $collection, or $path, as FIELD, FIELD:asc, or FIELD:desc.
+        /// Comma-separated or repeated for further keys, compared in order, up to 5.
+        /// Missing fields stay last, and collection and record ID break the remaining ties.
         #[arg(long, value_name = "FIELD")]
-        sort: Option<String>,
+        sort: Vec<String>,
 
-        /// Sort descending. Record ID remains the ascending deterministic tie-breaker.
+        /// Sort a single --sort key descending, the same as FIELD:desc.
         #[arg(long, requires = "sort")]
         desc: bool,
 
@@ -1253,12 +1259,13 @@ enum ViewCommand {
         #[arg(long, value_name = "FIELD")]
         group_by: Option<String>,
 
-        /// Default ordering field. Accepts dotted front matter, $id, $collection,
-        /// $path, or the audit-derived $created_at and $updated_at.
+        /// Default ordering, as FIELD, FIELD:asc, or FIELD:desc. Accepts dotted front
+        /// matter, $id, $collection, $path, or the audit-derived $created_at and
+        /// $updated_at. Comma-separated or repeated for further keys, up to 5.
         #[arg(long, value_name = "FIELD")]
-        sort_by: Option<String>,
+        sort_by: Vec<String>,
 
-        /// Default ordering direction for --sort-by.
+        /// Default ordering direction for a single --sort-by key.
         #[arg(long, value_enum, requires = "sort_by")]
         sort_direction: Option<ViewSortDirectionArgument>,
 
@@ -1684,6 +1691,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             json,
         } => {
             let projection = Projection::from_lists(&select)?;
+            let sort = sort_keys(&sort, desc)?;
             let mut records = database.list(&collection, &filters)?;
             records.retain(|record| {
                 expressions
@@ -1691,17 +1699,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     .all(|expression| expression.matches(&record.attributes))
                     && filter.as_ref().is_none_or(|filter| filter.matches(record))
             });
-            if let Some(field) = sort {
-                sort_records_by_field(
-                    &mut records,
-                    &field,
-                    if desc {
-                        SortDirection::Desc
-                    } else {
-                        SortDirection::Asc
-                    },
-                )?;
-            }
+            sort_records(&mut records, &sort)?;
             print_records(records, projection.as_ref(), json)?;
         }
         Command::Backlinks {
@@ -1718,6 +1716,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             json,
         } => {
             let projection = Projection::from_lists(&select)?;
+            let sort = sort_keys(&sort, desc)?;
             let mut backlinks = database.backlinks(
                 &collection,
                 &id,
@@ -1733,18 +1732,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         .as_ref()
                         .is_none_or(|filter| filter.matches(&backlink.record))
             });
-            if let Some(field) = sort {
-                sort_by_record_field(
-                    &mut backlinks,
-                    |backlink| &backlink.record,
-                    &field,
-                    if desc {
-                        SortDirection::Desc
-                    } else {
-                        SortDirection::Asc
-                    },
-                )?;
-            }
+            sort_by_record_keys(&mut backlinks, |backlink| &backlink.record, &sort)?;
             if let Some(projection) = &projection {
                 print_projected(
                     backlinks.iter().map(|backlink| &backlink.record),
@@ -1851,6 +1839,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 SearchTarget::Document
             };
             let projection = Projection::from_lists(&select)?;
+            let sort = sort_keys(&sort, desc)?;
             let query = SearchQuery::new(&pattern, target, regex, ignore_case)?;
             let mut records = database.search(collection.as_deref(), &filters, &query)?;
             records.retain(|record| {
@@ -1859,17 +1848,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     .all(|expression| expression.matches(&record.attributes))
                     && filter.as_ref().is_none_or(|filter| filter.matches(record))
             });
-            if let Some(field) = sort {
-                sort_records_by_field(
-                    &mut records,
-                    &field,
-                    if desc {
-                        SortDirection::Desc
-                    } else {
-                        SortDirection::Asc
-                    },
-                )?;
-            }
+            sort_records(&mut records, &sort)?;
             print_records(records, projection.as_ref(), json)?;
         }
         Command::Serve {
@@ -1933,10 +1912,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     page_size,
                     layout.into(),
                     group_by,
-                    sort_by,
-                    sort_direction
-                        .map(SortDirection::from)
-                        .unwrap_or(SortDirection::Asc),
+                    parse_sort_keys(
+                        &sort_by,
+                        sort_direction.map(SortDirection::from),
+                        "--sort-direction",
+                    )?,
                 )?;
                 println!("/{}", view.name);
             }
@@ -3119,6 +3099,12 @@ fn print_attribution(attribution: &cr::Attribution) {
             println!("intent {label} ({}): {body}", part.author.label());
         }
     }
+}
+
+/// `--sort` and `--desc` as the keys they ask for, refused before any record
+/// is read.
+fn sort_keys(sort: &[String], desc: bool) -> Result<Vec<SortKey>> {
+    parse_sort_keys(sort, desc.then_some(SortDirection::Desc), "--desc")
 }
 
 fn print_records(records: Vec<Record>, projection: Option<&Projection>, json: bool) -> Result<()> {
