@@ -131,6 +131,7 @@ fn stored_garbage_is_read_or_refused_with_a_classification() {
             "check",
             database.check(&CheckScope {
                 collection: Some("items".to_owned()),
+                ..CheckScope::default()
             }),
         );
         classified(&root, "audit verify", database.audit_verify(None));
