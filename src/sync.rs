@@ -29,7 +29,7 @@ use crate::{
     encryption::{protect_sync_stream, protected_sync_stream_is_well_formed, reveal_sync_stream},
     error::{DomainError, adapter_failed, conflict, invalid, is_already_exists, is_missing},
     frontmatter::Document,
-    paths::{self, EntryKind},
+    paths::{self, EntryKind, LockState},
 };
 
 /// Where sync definitions, checkpoints, and locks live beneath the root.
@@ -42,6 +42,8 @@ const SYNC_WORK_DIRECTORY: &str = ".cr/sync";
 const SYNC_DIRECTORY_LABEL: &str = "the sync directory";
 const SYNC_WORK_LABEL: &str = "the sync working directory";
 const SYNC_RUN_LABEL: &str = "the sync run ledger";
+const SYNC_RUN_DIRECTORY_LABEL: &str = "the sync run directory";
+const SYNC_APPLICATION_LOCK_LABEL: &str = "the sync application lock";
 const SYNC_FORMAT_VERSION: u32 = 1;
 const LEGACY_SYNC_RUN_FORMAT_VERSION: u32 = 2;
 const SYNC_RUN_FORMAT_VERSION: u32 = 3;
@@ -447,10 +449,58 @@ impl Database {
     /// so a damaged one says nothing about tampering — but its presence still
     /// means a run stopped in the middle, which is the fact worth reporting.
     pub(crate) fn interrupted_sync_runs(&self) -> Result<Vec<InterruptedSyncRun>> {
+        Ok(self
+            .sync_run_names()?
+            .into_iter()
+            .filter_map(|name| {
+                let run_id = match self.read_sync_run(&name) {
+                    Ok(Some(stored)) => Some(stored.run_id),
+                    // A ledger that vanished between the listing and the read
+                    // belongs to a run that just finished; report neither.
+                    Ok(None) => return None,
+                    Err(_) => None,
+                };
+                Some(InterruptedSyncRun { name, run_id })
+            })
+            .collect())
+    }
+
+    /// The first sync whose run is waiting to be completed, decided without
+    /// waiting for anything and without reading a ledger.
+    ///
+    /// [`Self::interrupted_sync_runs`] cannot tell an abandoned run from one
+    /// that is applying right now, because every run keeps its ledger on disk
+    /// while it applies. Each run writes and clears its ledger while holding
+    /// the sync application lock, so a ledger with nobody holding that lock is
+    /// one that only `cr sync recover` will complete. The application lock is
+    /// the one to take because everybody who takes it waits for it: holding
+    /// it for an instant delays a run by that instant. The per-sync lock is
+    /// taken without waiting, so holding it could make a run refuse to start.
+    ///
+    /// While any sync is applying, a ledger another sync abandoned is not
+    /// reported; the next look after that run finishes reports it.
+    pub(crate) fn waiting_sync_run(&self) -> Result<Option<String>> {
+        if self.sync_run_names()?.is_empty() {
+            return Ok(None);
+        }
+        match paths::try_lock_existing(
+            self.root(),
+            &sync_application_lock_path(),
+            SYNC_APPLICATION_LOCK_LABEL,
+        )? {
+            LockState::Held => Ok(None),
+            // Listed again under the lock: the run that owned the ledger may
+            // have finished between the two looks.
+            LockState::Free(_lock) => Ok(self.sync_run_names()?.into_iter().next()),
+        }
+    }
+
+    /// The name of every sync with a run ledger on disk, sorted.
+    fn sync_run_names(&self) -> Result<Vec<String>> {
         let entries = paths::list_directory(
             self.root(),
             Path::new(SYNC_RUN_DIRECTORY),
-            "the sync run directory",
+            SYNC_RUN_DIRECTORY_LABEL,
         )?
         .unwrap_or_default();
 
@@ -472,20 +522,7 @@ impl Database {
             names.push(name.to_owned());
         }
         names.sort();
-
-        Ok(names
-            .into_iter()
-            .filter_map(|name| {
-                let run_id = match self.read_sync_run(&name) {
-                    Ok(Some(stored)) => Some(stored.run_id),
-                    // A ledger that vanished between the listing and the read
-                    // belongs to a run that just finished; report neither.
-                    Ok(None) => return None,
-                    Err(_) => None,
-                };
-                Some(InterruptedSyncRun { name, run_id })
-            })
-            .collect())
+        Ok(names)
     }
 
     /// The interrupted run this sync has left behind, if any.
@@ -1272,12 +1309,19 @@ impl Database {
     }
 
     fn acquire_sync_application_lock(&self) -> Result<File> {
-        let path = Path::new(SYNC_LOCK_DIRECTORY).join("application.lock");
-        let lock = paths::open_lock_file(self.root(), &path, "the sync application lock")?;
+        let lock = paths::open_lock_file(
+            self.root(),
+            &sync_application_lock_path(),
+            SYNC_APPLICATION_LOCK_LABEL,
+        )?;
         lock.lock()
             .context("could not lock sync operation application")?;
         Ok(lock)
     }
+}
+
+fn sync_application_lock_path() -> PathBuf {
+    Path::new(SYNC_LOCK_DIRECTORY).join("application.lock")
 }
 
 fn sync_path(name: &str) -> PathBuf {

@@ -50,6 +50,7 @@ use crate::{
     database::relation_references,
     error::is_missing,
     parse_sort_keys, paths,
+    readiness::{self, JournalWarmUp},
     sort::{HistoryField, MAX_SORT_KEYS, sort_with_history},
     sort_by_record_keys, sort_records,
     views::validate_view_name,
@@ -141,6 +142,8 @@ struct AppState {
     api_token: Option<Arc<str>>,
     require_token: bool,
     csrf_token: Arc<str>,
+    /// The walk that fills the verified journal, which readiness reports on.
+    journal_warm_up: Arc<JournalWarmUp>,
 }
 
 /// Who a request is, as the authorization layer established it.
@@ -163,8 +166,9 @@ tokio::task_local! {
 
 /// The authenticated database for this request, when a token established one.
 ///
-/// Outside the authorization layer — `/health` and `/static` — there is no
-/// identity, which is the console's answer: neither route reads a database.
+/// Outside the authorization layer — `/health`, `/ready`, and `/static` —
+/// there is no identity, which is the console's answer: none of them reads a
+/// record.
 fn authenticated_database() -> Option<Database> {
     REQUEST_IDENTITY
         .try_with(|identity| match identity {
@@ -504,6 +508,24 @@ struct RecordPermissions {
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadinessResponse {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    checks: Vec<ReadinessCheckResponse>,
+    /// The ID a failure's log lines are under, as an error envelope carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadinessCheckResponse {
+    name: &'static str,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1783,6 +1805,15 @@ fn log_error(status: StatusCode, code: &str, request_id: &str, detail: &str) {
 }
 
 pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
+    application(database, config, Arc::default())
+}
+
+/// [`router`], with `journal_warm_up` as the walk its readiness reports on.
+fn application(
+    database: Database,
+    config: ServerConfig,
+    journal_warm_up: Arc<JournalWarmUp>,
+) -> Result<Router> {
     // Every request is derived from this one database, so they all resume the
     // same verified journal rather than each re-hashing it from the first
     // event. The startup check below is the walk that fills it.
@@ -1836,6 +1867,7 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         api_token: config.api_token.map(Arc::from),
         require_token: config.require_token,
         csrf_token: Arc::from(random_token()?),
+        journal_warm_up,
     };
     let protected = Router::new()
         .route("/openapi.json", get(openapi))
@@ -1940,6 +1972,9 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
 
     Ok(Router::new()
         .route("/health", get(health))
+        // Public like `/health`, because a probe cannot attach a bearer token,
+        // and answered in a fixed vocabulary for the same reason; see `ready`.
+        .route("/ready", get(ready))
         // Outside the authorization layer, for the same reason `/health` is: it
         // carries no database data, only bytes that are already in the binary
         // any caller is talking to. It also cannot be inside it. A browser
@@ -1980,7 +2015,8 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
     // cache every request will read.
     let database = database.with_journal_cache();
     let journal = database.clone();
-    let application = router(database, config)?;
+    let warm_up = Arc::<JournalWarmUp>::default();
+    let application = application(database, config, Arc::clone(&warm_up))?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("could not bind HTTP server to {bind}"))?;
@@ -1996,12 +2032,9 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
         .context("could not flush server address")?;
     // Verify the journal now, while nobody is waiting for it, so the first
     // page finds it verified instead of walking it. A request that arrives
-    // sooner waits on this walk rather than starting its own. A failure is
-    // left to the request that needs the journal, which walks it again and
-    // reports why, exactly as it would have without this.
-    tokio::task::spawn_blocking(move || {
-        let _ = journal.audit().record_states();
-    });
+    // sooner waits on this walk rather than starting its own, and `/ready`
+    // answers `journal_warming` until it returns.
+    warm_up.start(journal);
     let (drain, drain_requested) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(listener, application)
         .with_graceful_shutdown(async move {
@@ -2238,6 +2271,65 @@ fn vary_on(headers: &mut HeaderMap, name: &'static str) {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+/// Whether this server can answer requests that read the database, as
+/// `200 {"status":"ready"}` or `503` with every check that ran and the request
+/// ID.
+///
+/// Public like `/health`: a load balancer's probe cannot attach a bearer
+/// token. So the answer is a fixed vocabulary of check names and codes that
+/// never carries a path, a record, a sync, or a count, and why each check
+/// failed goes to the server log under the request ID, as any error's detail
+/// does. Each check is cheap and none waits for a lock; see `src/readiness.rs`.
+async fn ready(State(state): State<AppState>) -> Response {
+    let database = state.database.clone();
+    let warm_up = Arc::clone(&state.journal_warm_up);
+    let readiness =
+        match tokio::task::spawn_blocking(move || readiness::assess(&database, &warm_up)).await {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                return ApiError::internal(anyhow!(error).context("readiness task failed"))
+                    .into_response();
+            }
+        };
+    if readiness.ready() {
+        return Json(ReadinessResponse {
+            status: "ready",
+            checks: Vec::new(),
+            request_id: None,
+        })
+        .into_response();
+    }
+    let request_id = current_request_id();
+    let checks = readiness
+        .checks
+        .into_iter()
+        .map(|(check, failure)| {
+            if let Some(failure) = &failure {
+                log_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    failure.code,
+                    &request_id,
+                    &failure.detail,
+                );
+            }
+            ReadinessCheckResponse {
+                name: check.name(),
+                ok: failure.is_none(),
+                code: failure.map(|failure| failure.code),
+            }
+        })
+        .collect();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ReadinessResponse {
+            status: "not_ready",
+            checks,
+            request_id: Some(request_id),
+        }),
+    )
+        .into_response()
 }
 
 /// The UI's progressive-enhancement script, compiled into the binary.
@@ -6174,15 +6266,75 @@ fn openapi_paths() -> JsonValue {
         "/health": {
             "get": {
                 "operationId": "health",
+                "description": "Liveness: the server process is running and answering HTTP. It reads nothing from the database; `/ready` does.",
                 "security": [],
                 "responses": {
                     "200": {
-                        "description": "Server is ready",
+                        "description": "The server process is running",
                         "content": {
                             "application/json": {
                                 "schema": {
                                     "type": "object",
                                     "properties": { "status": { "const": "ok" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/ready": {
+            "get": {
+                "operationId": "ready",
+                "description": "Readiness: the database directory is reachable, its configuration loads, no interrupted mutation or sync run is waiting for recovery, and the server's verified audit journal still describes the journal on disk. Every check is cheap and none waits for a lock. A failure names the check and a stable code and nothing else; the reason is in the server log under the request ID.",
+                "security": [],
+                "responses": {
+                    "200": {
+                        "description": "Ready to serve requests that read the database",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["status"],
+                                    "properties": { "status": { "const": "ready" } }
+                                }
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "Not ready; every check that ran, in order",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["status", "checks", "request_id"],
+                                    "properties": {
+                                        "status": { "const": "not_ready" },
+                                        "request_id": { "type": "string", "description": "The ID the server log records each failure's reason under, also returned as X-Request-Id" },
+                                        "checks": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "required": ["name", "ok"],
+                                                "properties": {
+                                                    "name": { "enum": ["database", "config", "audit_recovery", "sync_recovery", "journal"] },
+                                                    "ok": { "type": "boolean" },
+                                                    "code": { "enum": [
+                                                        "database_unreachable",
+                                                        "config_invalid",
+                                                        "pending_mutation",
+                                                        "audit_recovery_unreadable",
+                                                        "interrupted_sync_run",
+                                                        "sync_recovery_unreadable",
+                                                        "journal_warming",
+                                                        "journal_unverified",
+                                                        "journal_changed",
+                                                        "journal_unreadable"
+                                                    ] }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

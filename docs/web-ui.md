@@ -56,6 +56,32 @@ One thing differs, and it is what keeps pages fast on a database with a long his
 To require a bearer token, see
 [Authentication and identity](http-api.md#authentication-and-identity).
 
+## Check that the server is ready
+
+Two public routes answer a probe, with no token even when one is required:
+
+```sh
+curl http://127.0.0.1:3000/health   # {"status":"ok"}: the process is running
+curl http://127.0.0.1:3000/ready    # {"status":"ready"}: the database can be used
+```
+
+Point a supervisor's liveness check, the one that restarts the process, at
+`/health`, and a load balancer's or orchestrator's readiness check at `/ready`.
+Right after `cr serve` starts, `/ready` answers `503` with `journal_warming`
+until the walk of the audit journal it starts on listening has returned, which
+is when a page stops having to wait for it. After that it answers `503` when
+the database directory has gone, the configuration no longer loads, a mutation
+or sync run was interrupted and waits for recovery, or the audit journal no
+longer continues from the head the server verified. The answer names the check
+and a stable code, and the server's standard error has the reason under the
+request ID; [Health and readiness](http-api.md#health-and-readiness) lists
+every code and what clears it.
+
+A probe is cheap on any history, never waits for a write or an import in
+progress, and repairs nothing. A server that is not ready and therefore gets
+no traffic also gets no request that would recover it, so clear the condition
+with the command the log line names, or restart the server.
+
 ## Stop the server
 
 Press Ctrl-C, or send `SIGTERM` as `kill`, systemd, Docker, and Kubernetes do;
@@ -67,6 +93,9 @@ status 0, writing two lines to standard error:
 cr shutdown signal=SIGTERM state=draining detail="no longer accepting connections; waiting for in-flight requests; a second signal stops without waiting"
 cr shutdown state=stopped detail="every in-flight request finished"
 ```
+
+From the first line on the listener is closed, so a probe of `/ready` or
+`/health` cannot connect and fails as a server that is not ready would.
 
 The wait has no time limit of its own. If it is taking too long, send either
 signal again: the server stops waiting, drops the connections it was still
@@ -86,7 +115,10 @@ partway: `SIGKILL`, a crash, a power cut, or `SIGHUP` from a closing terminal,
 which `cr serve` deliberately does not catch so that `nohup cr serve` keeps
 running. The write-ahead journal covers those: the next `cr` command, or the
 next `cr serve`, finishes or discards the interrupted mutation before it does
-anything else (see [the audit protocol](architecture.md#audit-protocol)).
+anything else (see [the audit protocol](architecture.md#audit-protocol)). A
+server that is still running when another `cr` process is interrupted answers
+`/ready` with `pending_mutation` until its next request that reads the journal
+does the same.
 
 On Windows, only Ctrl-C is handled.
 

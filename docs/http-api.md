@@ -20,8 +20,9 @@ curl http://127.0.0.1:3000/api/v1/identity \
   -H "Authorization: Bearer $CR_API_TOKEN"
 ```
 
-`GET /health` remains public so process supervisors can check readiness, and so
-is `GET /static/<name>` for the UI's embedded script: a `<script src>` tag has
+`GET /health` and `GET /ready` remain public so process supervisors and load
+balancers can [probe them](#health-and-readiness), and so is
+`GET /static/<name>` for the UI's embedded script: a `<script src>` tag has
 no way to send a bearer header, and the file is part of the binary rather than
 part of the database. For a database without RBAC, binding to a non-loopback address without a token prints
 a warning. An RBAC-enabled server refuses every non-loopback bind because its
@@ -55,8 +56,8 @@ The request then acts as that principal, and `/api/v1/identity` reports how:
 
 A principal token that does not authenticate is answered `401 unauthorized`,
 whatever else the server would accept. `cr serve --require-token` accepts
-nothing else: every request but `/health` and `/static` needs a principal
-token, and the server may then bind beyond loopback.
+nothing else: every request but `/health`, `/ready`, and `/static` needs a
+principal token, and the server may then bind beyond loopback.
 
 Set the audit actor for one request with `X-CR-Actor`:
 
@@ -345,6 +346,73 @@ curl 'http://127.0.0.1:3000/api/v1/check?limit=20'
 ```
 
 It answers `200` whether or not it found anything — the findings are the resource, so a broken database is not an HTTP error. The `summary` object sits beside the page rather than inside it, so a client reading one page can still tell a clean database from a broken one. Decide from `summary.errors`, which is what the CLI's exit status is computed from.
+
+## Health and readiness
+
+Two public routes answer a probe, and they answer different questions.
+
+`GET /health` is liveness: the process is running and answering HTTP. It reads
+nothing, always answers `200 {"status":"ok"}`, and is what a supervisor should
+restart the process on.
+
+`GET /ready` is readiness: whether the database behind the server can be used
+right now. It answers `200` when every check passes:
+
+```json
+{ "status": "ready" }
+```
+
+and `503` otherwise, listing every check that ran, in order, and the request ID
+its log lines are under:
+
+```json
+{
+  "status": "not_ready",
+  "checks": [
+    { "name": "database", "ok": true },
+    { "name": "config", "ok": true },
+    { "name": "audit_recovery", "ok": false, "code": "pending_mutation" },
+    { "name": "sync_recovery", "ok": true },
+    { "name": "journal", "ok": true }
+  ],
+  "request_id": "5d0e47a1c9b3f286"
+}
+```
+
+| Check | Code | Meaning, and what clears it |
+| --- | --- | --- |
+| `database` | `database_unreachable` | The root, `.cr/`, or the records directory cannot be opened, or `.cr/` or the records directory has become a symbolic link. When this fails it is the only check listed, because every other one reads beneath it. |
+| `config` | `config_invalid` | `.cr/config.yaml` no longer loads as `cr` would load it at startup: it does not parse, or names an unsupported version, an unknown key, an unsafe `data_dir`, or a zero limit. The running server keeps the configuration it started with; the next `cr` command, and the next start, would refuse. |
+| `audit_recovery` | `pending_mutation` | A mutation was interrupted — its process crashed or was killed — and is waiting for recovery. The next request that reads the audit journal, any `cr` command, or a restart finishes or discards it. |
+| `audit_recovery` | `audit_recovery_unreadable` | Whether one is waiting could not be determined. |
+| `sync_recovery` | `interrupted_sync_run` | A sync run stopped partway through applying its records. `cr sync recover <name> --check` describes it and `cr sync recover <name>` completes it; the log line names the sync. |
+| `sync_recovery` | `sync_recovery_unreadable` | Whether one is waiting could not be determined. |
+| `journal` | `journal_warming` | The server has not finished the verified walk of the audit journal it starts when it begins listening. Requests that read audited state wait for that walk, so it clears by itself. |
+| `journal` | `journal_unverified` | The last walk of the journal failed. The next request that reads the journal walks it again and logs why; `cr audit verify` says the same. |
+| `journal` | `journal_changed` | The newest event on disk is behind, or different from, the head this server verified: events it verified are gone or were rewritten. |
+| `journal` | `journal_unreadable` | The newest audit segment, or its last event, cannot be read. |
+
+Names and codes are stable, and they are all a probe is told: never a path, a
+record, a sync, or a count. Each failing check writes one line to the server's
+standard error under the request ID, with the reason:
+
+```text
+cr error request_id=5d0e47a1c9b3f286 status=503 code=pending_mutation method=GET path=/ready detail="an interrupted mutation is waiting for recovery; the next request that reads the audit journal, or any cr command, finishes or discards it"
+```
+
+Every check is cheap and none of them waits. The probe reads the configuration,
+lists two directories, and reads the newest audit segment, however long the
+history is; it never walks the journal from its first event, which is what
+`GET /api/v1/audit/verify` and `GET /api/v1/check` are for. It never waits for
+a lock either. Every mutation writes its pending file while it holds the audit
+lock, and every sync run keeps its ledger while it holds the sync application
+lock, so the probe only reports one when nobody holds the lock that owns it:
+a write or an import in progress is not a failure. Nor does readiness repair
+anything: it does not recover a pending mutation or sync run, and after the
+server's first walk it does not walk the journal again. A load balancer that
+stops sending traffic to a server that is not ready therefore also stops
+whatever request would have recovered it; clear the condition with the command
+in the table, or a restart.
 
 ## Generated OpenAPI
 

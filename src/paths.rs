@@ -321,6 +321,51 @@ pub(crate) fn open_lock_file(root: &Path, relative: &Path, label: &str) -> Resul
     Ok(lock)
 }
 
+/// Who holds a lock file, as [`try_lock_existing`] found it.
+pub(crate) enum LockState {
+    /// Another descriptor holds it, so some process is inside the section it
+    /// guards right now.
+    Held,
+    /// Nobody held it. The caller holds it until the file is dropped; `None`
+    /// when there is no lock file, which nobody can be holding either.
+    Free(Option<File>),
+}
+
+/// Take the lock file `relative` beneath `root` if nobody holds it, without
+/// waiting for it and without creating it or its directories.
+///
+/// For a caller that only needs to know whether a section is occupied and
+/// must not write anything to find out. Taking the lock rather than merely
+/// testing it is what the platforms offer; the caller should drop it at once.
+pub(crate) fn try_lock_existing(root: &Path, relative: &Path, label: &str) -> Result<LockState> {
+    let (parent, name) = split_parent(relative)?;
+    let Some(directory) = open_directory_optional(root, parent, label)? else {
+        return Ok(LockState::Free(None));
+    };
+    let lock = match directory.open_existing_child_file(name) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(LockState::Free(None));
+        }
+        Err(error) => return Err(lock_failure(&directory, name, error, label)),
+    };
+    if !lock
+        .metadata()
+        .with_context(|| format!("could not inspect {label}"))?
+        .file_type()
+        .is_file()
+    {
+        return Err(refuse_not_regular(label));
+    }
+    match lock.try_lock() {
+        Ok(()) => Ok(LockState::Free(Some(lock))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(LockState::Held),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(anyhow!(error).context(format!("could not lock {label}")))
+        }
+    }
+}
+
 /// Refuse an entry that exists but is not the regular file it must be,
 /// naming a symbolic link as such so the operator can find the cause.
 pub(crate) fn refuse_entry(label: &str, kind: EntryKind) -> anyhow::Error {
@@ -591,6 +636,10 @@ mod unix {
                 .map(File::from)
         }
 
+        pub(super) fn open_existing_child_file(&self, name: &OsStr) -> io::Result<File> {
+            self.open_child(name, libc::O_RDWR, 0).map(File::from)
+        }
+
         pub(super) fn child_kind(&self, name: &OsStr) -> io::Result<EntryKind> {
             let terminated = terminated(name)?;
             let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -755,6 +804,13 @@ mod portable {
                 .open(self.checked_child(name)?)
         }
 
+        pub(super) fn open_existing_child_file(&self, name: &OsStr) -> io::Result<File> {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(self.checked_child(name)?)
+        }
+
         pub(super) fn child_kind(&self, name: &OsStr) -> io::Result<EntryKind> {
             kind_of(&self.path.join(name))
         }
@@ -784,8 +840,9 @@ mod portable {
 #[cfg(test)]
 mod tests {
     use super::{
-        EntryKind, create_directory_all, list_directory, open_directory, read_to_string,
-        read_to_string_optional, remove_file, write_new, write_replace,
+        EntryKind, LockState, create_directory_all, list_directory, open_directory, open_lock_file,
+        read_to_string, read_to_string_optional, remove_file, try_lock_existing, write_new,
+        write_replace,
     };
     use crate::error::DomainError;
     use std::path::Path;
@@ -857,6 +914,59 @@ mod tests {
         create_directory_all(root, Path::new("destination"), "the destination").unwrap();
         assert!(write_replace(root, Path::new("destination"), b"x", "the destination").is_err());
         assert!(root.join("destination").is_dir());
+    }
+
+    #[test]
+    fn a_lock_probe_never_waits_and_never_creates() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let relative = Path::new("locks/the.lock");
+
+        // Nothing there: nobody can hold it, and asking creates nothing.
+        assert!(matches!(
+            try_lock_existing(root, relative, "the lock").unwrap(),
+            LockState::Free(None)
+        ));
+        assert!(!root.join("locks").exists());
+
+        let held = open_lock_file(root, relative, "the lock").unwrap();
+        held.lock().unwrap();
+        assert!(matches!(
+            try_lock_existing(root, relative, "the lock").unwrap(),
+            LockState::Held
+        ));
+        drop(held);
+
+        let probe = eventually(
+            || match try_lock_existing(root, relative, "the lock").unwrap() {
+                LockState::Free(Some(probe)) => Some(probe),
+                LockState::Free(None) => panic!("an existing lock file was not opened"),
+                LockState::Held => None,
+            },
+        );
+        // The probe holds it until dropped, as any other holder would.
+        let other = open_lock_file(root, relative, "the lock").unwrap();
+        assert!(other.try_lock().is_err());
+        drop(probe);
+        eventually(|| other.try_lock().ok());
+    }
+
+    /// Retry `attempt` until it succeeds. A lock belongs to an open file, and
+    /// a child another test thread is spawning shares every open file with
+    /// this process until it execs, so a lock just released can stay held for
+    /// that instant.
+    fn eventually<T>(mut attempt: impl FnMut() -> Option<T>) -> T {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(value) = attempt() {
+                return value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a released lock stayed held"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     #[test]

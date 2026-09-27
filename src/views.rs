@@ -39,6 +39,7 @@ const RESERVED_VIEW_NAMES: &[&str] = &[
     "health",
     "openapi.json",
     "perspective",
+    "ready",
     // The server's embedded UI assets live under `/static/<name>`, so a view
     // or collection of this name would keep its own root page but lose every
     // route below it to the asset handler. Reserving the name refuses that
@@ -970,6 +971,14 @@ mod tests {
         assert!(
             database
                 .create_view("browse", None, "deals", vec![], vec![], 50)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+        // The readiness probe's route, like `/health` beside it.
+        assert!(
+            database
+                .create_view("ready", None, "deals", vec![], vec![], 50)
                 .unwrap_err()
                 .to_string()
                 .contains("reserved")
