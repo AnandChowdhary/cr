@@ -646,6 +646,66 @@ file browser and pins stay console-only for every token, an owner's included,
 because they reach files outside the database and a token is a secret that
 travels.
 
+### Cloudflare Access
+
+`cr serve --cloudflare-access` is the second authenticated identity, for people
+rather than scripts. Cloudflare Access puts an RS256 JSON Web Token in
+`Cf-Access-Jwt-Assertion` on every request it forwards; `src/cloudflare_access.rs`
+verifies it and `Database::authenticate_email` turns its email into a user.
+
+Verification reads the header for exactly two things, `alg`, which must be
+`RS256` whatever else it names, and `kid`, then checks the signature with
+`ring` over the bytes that were sent before it reads a single claim. `crit`
+is refused, and `jku`, `x5u`, and `jwk` are ignored, so an assertion can
+never say where its key comes from: keys come only from
+`https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`, the team the
+operator named. `iss` must equal that origin exactly, `aud` must include the
+tag, `exp` must hold and `nbf` must if present, both with sixty seconds of
+leeway, and `email` must be present, which a service token's assertion is
+not. `sub` becomes the credential recorded. `Cf-Access-Authenticated-User-Email`
+and the `CF_Authorization` cookie are never read: they are the same claim
+without a signature, and a loopback port is reachable by everything on the
+host.
+
+The key set is fetched with `ureq` over rustls, the one outbound request `cr`
+makes, and cached. An unknown `kid` causes a fetch, which is how a rotation is
+picked up, but fetches are at least ten seconds apart, so made-up key IDs
+cannot turn the server into a client hammering Cloudflare, and a mutex makes
+concurrent misses share one. A set older than an hour is replaced by the next
+request; if that fails the held keys keep working, because a Cloudflare
+outage should not sign everybody out, but a key the next successful fetch
+omits stops verifying. When no key the assertion needs is held and the last
+fetch failed, the answer is `503`, not `401`: the fault is the server's. `serve`
+fetches once after it starts listening and prints the count, and readiness
+reports `cloudflare_access` from the cache alone, starting a fetch in the
+background when nothing is held.
+
+`authenticate_email` walks the replayed user states, not the files, and
+compares `email` ignoring the case of ASCII letters only, since Unicode case
+folding would equate addresses an identity provider keeps distinct. More than
+one match is a refusal whatever the other users' status, because picking one
+would decide a person's grants by record order; a single match must be active,
+and its file must equal the audited state, exactly as for a token. Only an
+owner can change `email`, which is what makes the mapping policy. The result
+shares `authenticated_as` with `authenticate_token`, so the two produce the
+same `Database`, differing only in `authentication`.
+
+In the server, `--cloudflare-access` removes the console exactly as
+`--require-token` does, and the two combine: a `crt_` bearer value is tried
+first when both are set, because a script behind Access carries its service
+token's assertion, which names nobody, beside the token that names it; with
+`--cloudflare-access` alone it is refused so that the organisation's login
+cannot be bypassed. Two things change because a browser now attaches the
+credential by itself. Form tokens become per principal — an HMAC of the
+principal ID keyed by the console's random token — since one shared token
+would let any signed-in person read it off their own page and forge a form for
+another. And an assertion-authenticated request with an unsafe method must be
+same-origin by `Sec-Fetch-Site`, or by an `Origin` naming the `Host` when the
+browser sends no fetch metadata, which also covers the JSON routes that take
+no body and so could otherwise be posted by a cross-site form. Refusals of HTML
+routes render a page, and responses vary on the assertion header as well as the
+cookie.
+
 ## Whole-database integrity checks
 
 `cr check` and `GET /api/v1/check` answer one question — is this database coherent? — and answer it exhaustively. Every other integrity-adjacent operation stops at the first problem, because each of them guards a write: `audit verify` returns one classified failure, and a mutation refuses rather than describes. That is wrong for a command an operator runs *because* something is already broken, so `check` collects findings instead of propagating them. A database with a damaged journal is still fully inspectable for dangling links and schema drift, and a record that cannot be parsed does not hide the record after it.
@@ -838,7 +898,7 @@ body decoding, and body limits—keep their own codes.
 
 Every request receives a correlation ID, returned as `X-Request-Id` and inside the error envelope. Before a response is rendered, the server writes the complete chain to standard error under that ID together with the method, path, status, and code; unexpected failures replace their message with a fixed generic one. Expected client errors keep their actionable wording. This holds the line that internal detail is a server-side artifact: the log is authoritative for diagnosis and the response is authoritative for what a caller may know.
 
-The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentication for HTML views, the OpenAPI document, and all `/api/v1` routes; `/health` and `/ready` remain public. `X-CR-Actor` is an audit attribution override with the same assertion-only trust boundary as CLI actor values, and `X-CR-Agent`, `X-CR-Authorization`, and `X-CR-Intent` extend that boundary unchanged to the three attribution objects. Each accepts the same compact or JSON form as its command-line option and is recorded as `detected_from: header`; because HTTP header values are visible ASCII, non-ASCII intent text must arrive as JSON escapes, and a header that is not decodable is refused with a message that names the header and nothing internal. `GET /api/v1/identity` returns the effective actor, principal, optional impersonating owner, token authentication, and attribution a request would record, which is how a client checks its wiring without writing anything. A principal token is the one bearer value that is not an assertion; see [principal tokens](#principal-tokens).
+The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentication for HTML views, the OpenAPI document, and all `/api/v1` routes; `/health` and `/ready` remain public. `X-CR-Actor` is an audit attribution override with the same assertion-only trust boundary as CLI actor values, and `X-CR-Agent`, `X-CR-Authorization`, and `X-CR-Intent` extend that boundary unchanged to the three attribution objects. Each accepts the same compact or JSON form as its command-line option and is recorded as `detected_from: header`; because HTTP header values are visible ASCII, non-ASCII intent text must arrive as JSON escapes, and a header that is not decodable is refused with a message that names the header and nothing internal. `GET /api/v1/identity` returns the effective actor, principal, optional impersonating owner, authentication, and attribution a request would record, which is how a client checks its wiring without writing anything. A principal token is the one bearer value that is not an assertion, and a Cloudflare Access assertion the one header; see [principal tokens](#principal-tokens) and [Cloudflare Access](#cloudflare-access).
 
 For RBAC, router construction proves the launching principal is a database
 owner against its audited policy and rejects a non-loopback bind before opening
@@ -850,9 +910,10 @@ through a CSRF-protected POST. The resulting HTTP-only, same-site cookie is a
 selection, not an authentication credential: any client admitted to this
 local console is intentionally allowed to choose any user. Responses vary on
 the cookie and are marked `no-store`. The server still does not implement TLS
-or rate limiting. Real network deployments should use `--require-token`, which
-replaces this console with [principal tokens](#principal-tokens), rather than
-exposing it.
+or rate limiting. Real network deployments should use `--require-token` or
+`--cloudflare-access`, which replace this console with
+[principal tokens](#principal-tokens) or [Cloudflare Access](#cloudflare-access),
+rather than exposing it.
 
 ### Readiness
 
@@ -947,7 +1008,7 @@ Mutating forms include a cryptographically random token generated when the serve
 ## Integrity boundaries
 
 - Collection names and IDs are single path components, preventing path traversal. `data_dir` must be a relative path of plain components.
-- Actor, agent, authorization, and intent values are asserted by the caller and bounded in length. The exception is `access.authentication`, which the server writes only after a principal token verified against the audited policy. Agent, authorization, and intent remain evidence only. In local RBAC mode the normalized actor is also the principal used by policy; the owner perspective console explicitly replaces both with the selected user and attaches the operator as `access.impersonated_by`. The documented process-controlled trust limitation remains explicit.
+- Actor, agent, authorization, and intent values are asserted by the caller and bounded in length. The exception is `access.authentication`, which the server writes only after a principal token verified against the audited policy, or a Cloudflare Access assertion verified against the team's keys named exactly one active user. Agent, authorization, and intent remain evidence only. In local RBAC mode the normalized actor is also the principal used by policy; the owner perspective console explicitly replaces both with the selected user and attaches the operator as `access.impersonated_by`. The documented process-controlled trust limitation remains explicit.
 - No directory between the root and a target may be a symbolic link. That covers `data_dir`, its intermediate directories, each collection directory, `.cr/`, and the audit, schema, view, and sync directories beneath it. A configured directory replaced by a link is refused rather than followed.
 - Markdown record paths must be regular files. Single-record CRUD, status, save, and audit verification reject symlinks and other special file types rather than trusting them by content hash; ordinary collection, schema, view, and sync listings continue to ignore non-file entries, and every name they do yield is reopened safely before it is read.
 - Creation never overwrites an existing record.

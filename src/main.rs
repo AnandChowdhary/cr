@@ -549,9 +549,27 @@ enum Command {
         ///
         /// Each request then acts as the principal its token authenticates,
         /// and its events record that token. There is no owner console, so the
-        /// server may bind beyond loopback.
+        /// server may bind beyond loopback. With --cloudflare-access, a request
+        /// may present either.
         #[arg(long)]
         require_token: bool,
+
+        /// Sign people in through Cloudflare Access for this team, such as
+        /// https://example.cloudflareaccess.com.
+        ///
+        /// Every request must then carry a Cloudflare Access assertion that
+        /// verifies against the team's keys and names the email of exactly one
+        /// active user, whom the request acts as; its events record the
+        /// assertion's subject. There is no owner console, so the server may
+        /// bind beyond loopback. Principal tokens are accepted only with
+        /// --require-token as well.
+        #[arg(long, value_name = "TEAM_DOMAIN", requires = "cloudflare_access_aud")]
+        cloudflare_access: Option<String>,
+
+        /// The Application Audience (AUD) tag of the Access application in
+        /// front of this server.
+        #[arg(long, value_name = "TAG", requires = "cloudflare_access")]
+        cloudflare_access_aud: Option<String>,
     },
 
     /// Create and inspect saved web views.
@@ -1126,9 +1144,10 @@ enum AccessTokenCommand {
     Revoke { user: String, id: String },
 }
 
-/// Tokens authenticate requests to the server, not reads of the files beneath
-/// it. Anybody who can open the database directory can bypass both, so a
-/// token-only server is a boundary only when its account alone can.
+/// Tokens and Cloudflare Access authenticate requests to the server, not
+/// reads of the files beneath it. Anybody who can open the database directory
+/// can bypass both, so an authenticating server is a boundary only when its
+/// account alone can.
 #[cfg(unix)]
 fn warn_if_database_is_shared(root: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1136,7 +1155,7 @@ fn warn_if_database_is_shared(root: &std::path::Path) {
         && metadata.permissions().mode() & 0o077 != 0
     {
         eprintln!(
-            "warning: other accounts can open {}; tokens authenticate only requests made through this server, so restrict the directory to the account running it (chmod 700)",
+            "warning: other accounts can open {}; the server authenticates only requests made through it, so restrict the directory to the account running it (chmod 700)",
             root.display()
         );
     }
@@ -1954,11 +1973,30 @@ fn run(cli: Cli) -> Result<ExitCode> {
             max_page_size,
             max_body_bytes,
             require_token,
+            cloudflare_access,
+            cloudflare_access_aud,
         } => {
             let api_token = std::env::var("CR_API_TOKEN")
                 .ok()
                 .filter(|value| !value.is_empty());
-            if require_token {
+            let cloudflare_access = match (cloudflare_access, cloudflare_access_aud) {
+                (Some(team), Some(audience)) => Some(std::sync::Arc::new(
+                    cr::cloudflare_access::CloudflareAccess::new(&team, &audience)
+                        .map_err(|error| usage_error(format!("{error:#}")))?,
+                )),
+                _ => None,
+            };
+            if cloudflare_access.is_some() {
+                if !bind.ip().is_loopback() {
+                    // The assertion is only as private as the path from
+                    // Cloudflare's edge: a tunnel keeps it on loopback, and a
+                    // listener anybody can reach lets them replay one they saw.
+                    eprintln!(
+                        "warning: Cloudflare Access assertions and tokens travel in plain HTTP; reach a server bound beyond loopback only through a tunnel or TLS"
+                    );
+                }
+                warn_if_database_is_shared(database.root());
+            } else if require_token {
                 if !bind.ip().is_loopback() {
                     eprintln!(
                         "warning: tokens travel in plain HTTP; terminate TLS in front of a server bound beyond loopback"
@@ -1976,6 +2014,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 max_body_bytes,
                 api_token,
                 require_token,
+                cloudflare_access,
             };
             // Dropped, not `shutdown_timeout`: dropping waits for every
             // database operation already running on the blocking pool, which

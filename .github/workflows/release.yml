@@ -248,6 +248,16 @@ jobs:
           rustup default stable
           rustc --version && cargo --version
 
+      # `ring`, which checks Cloudflare Access signatures and provides the TLS
+      # that fetches their keys, compiles C. For a musl target cc-rs looks for
+      # `x86_64-linux-musl-gcc` and then `musl-gcc`, which `musl-tools`
+      # provides; every other runner already has a C compiler for its target.
+      - name: Install the musl C compiler
+        if: endsWith(matrix.target, '-linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
       - name: Build
         run: cargo build --locked --release --target "$TARGET"
 

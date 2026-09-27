@@ -58,6 +58,7 @@ fn test_app(name: &str) -> (TempDir, Router, Database) {
             max_body_bytes: 8 * 1024 * 1024,
             api_token: None,
             require_token: false,
+            cloudflare_access: None,
         },
     )
     .unwrap();

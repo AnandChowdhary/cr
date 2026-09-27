@@ -3,6 +3,7 @@ mod aggregate;
 mod attribution;
 mod audit;
 mod check;
+pub mod cloudflare_access;
 mod database;
 mod encryption;
 mod error;

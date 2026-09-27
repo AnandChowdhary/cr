@@ -27,10 +27,10 @@ no way to send a bearer header, and the file is part of the binary rather than
 part of the database. For a database without RBAC, binding to a non-loopback address without a token prints
 a warning. An RBAC-enabled server refuses every non-loopback bind because its
 user switcher is an owner impersonation console, not a network authentication
-boundary, unless `--require-token` replaces that console with principal tokens. The built-in server does not terminate TLS; use a trusted reverse
+boundary, unless `--require-token` or `--cloudflare-access` replaces that console with authenticated principals. The built-in server does not terminate TLS; use a trusted reverse
 proxy for access across a network.
 
-The token mechanism is an HTTP bearer header. A normal browser address-bar request cannot attach that header, so the built-in HTML UI is currently intended for the default loopback-without-token setup or a trusted proxy that injects authentication. A browser login/session flow is tracked in `TODO.md`.
+The token mechanism is an HTTP bearer header. A normal browser address-bar request cannot attach that header, so the built-in HTML UI is intended for the default loopback-without-token setup, for [Cloudflare Access](#sign-in-through-cloudflare-access), or for another trusted proxy that injects authentication. A browser login/session flow of cr's own is tracked in `TODO.md`.
 
 `CR_API_TOKEN` is one shared secret, and whoever holds it acts as the owner who
 launched the server. Under access control, a caller can instead present a
@@ -58,6 +58,37 @@ A principal token that does not authenticate is answered `401 unauthorized`,
 whatever else the server would accept. `cr serve --require-token` accepts
 nothing else: every request but `/health`, `/ready`, and `/static` needs a
 principal token, and the server may then bind beyond loopback.
+
+### Sign in through Cloudflare Access
+
+Behind Cloudflare Access, `cr serve --cloudflare-access <team-domain>
+--cloudflare-access-aud <tag>` signs each request in as the user whose email
+the signed `Cf-Access-Jwt-Assertion` header names; [access
+control](access-control.md#sign-people-in-through-cloudflare-access) has the
+checks it makes. Cloudflare adds the header, so a browser and a `curl` through
+Access need nothing more, and `/api/v1/identity` reports who that is:
+
+```json
+{
+  "actor": "Ada Lovelace <ada@example.com>",
+  "principal": "ada@example.com",
+  "impersonated_by": null,
+  "authentication": { "method": "cloudflare-access", "credential": "7335d417-61da-459d-899c-0a01c76a2f94" },
+  ...
+}
+```
+
+| Answer | When |
+| --- | --- |
+| `401 unauthorized` | No assertion; one that does not verify, is for another team or application, has expired, or names no email (a service token); or an email that is not exactly one active user's. The message says which. Unsigned `Cf-Access-Authenticated-User-Email` headers and `CF_Authorization` cookies never count. |
+| `403 cross_site_request` | A browser said another site started a request that changes data: `Sec-Fetch-Site` other than `same-origin`, or an `Origin` that is not this host. |
+| `503 authentication_unavailable` | The team's signing keys could not be fetched, and the assertion's key is not already held. |
+
+A principal token is refused under `--cloudflare-access` alone. With
+`--require-token` as well, a request may present either, and a principal token
+wins when both arrive — which is what a script reaching the server through
+Access with a service token sends. HTML pages answer a refusal with a page
+rather than the JSON envelope, since a person following a link reads it.
 
 Set the audit actor for one request with `X-CR-Actor`:
 
@@ -378,7 +409,11 @@ database verifies to the same response it always did.
 
 ## Health and readiness
 
-Two public routes answer a probe, and they answer different questions.
+Two public routes answer a probe, and they answer different questions. Both
+stay public under `CR_API_TOKEN`, `--require-token`, and `--cloudflare-access`,
+so a deploy that restarts the server should check `/ready` — or `/health` for
+liveness alone — rather than a route that needs signing in, such as
+`/openapi.json`.
 
 `GET /health` is liveness: the process is running and answering HTTP. It reads
 nothing, always answers `200 {"status":"ok"}`, and is what a supervisor should
@@ -420,6 +455,8 @@ its log lines are under:
 | `journal` | `journal_unverified` | The last walk of the journal failed. The next request that reads the journal walks it again and logs why; `cr audit verify` says the same. |
 | `journal` | `journal_changed` | The newest event on disk is behind, or different from, the head this server verified: events it verified are gone or were rewritten. |
 | `journal` | `journal_unreadable` | The newest audit segment, or its last event, cannot be read. |
+| `cloudflare_access` | `cloudflare_access_keys_pending` | Only under `--cloudflare-access`: the team's signing keys have not been fetched yet. The server fetches them when it starts, and a probe starts the fetch if nothing has, so it clears by itself. |
+| `cloudflare_access` | `cloudflare_access_keys_unavailable` | The last fetch of the keys failed and none are held, so nobody can sign in. The log line says why — a mistyped team domain is a `404` — and the next sign-in or probe tries again, no more than once every ten seconds. |
 
 Names and codes are stable, and they are all a probe is told: never a path, a
 record, a sync, or a count. Each failing check writes one line to the server's
@@ -430,8 +467,8 @@ cr error request_id=5d0e47a1c9b3f286 status=503 code=pending_mutation method=GET
 ```
 
 Every check is cheap and none of them waits. The probe reads the configuration,
-lists two directories, and reads the newest audit segment, however long the
-history is; it never walks the journal from its first event, which is what
+lists two directories, reads the newest audit segment, however long the
+history is, and under `--cloudflare-access` asks whether signing keys are held; it never walks the journal from its first event, which is what
 `GET /api/v1/audit/verify` and `GET /api/v1/check` are for. It never waits for
 a lock either. Every mutation writes its pending file while it holds the audit
 lock, and every sync run keeps its ledger while it holds the sync application

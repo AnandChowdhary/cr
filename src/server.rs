@@ -25,7 +25,8 @@ use axum::{
         rejection::JsonRejection,
     },
     http::{
-        HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header, request::Parts,
+        HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, header,
+        request::Parts,
     },
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -44,14 +45,15 @@ use yaml_serde::{Mapping, Value as YamlValue};
 use crate::{
     AccessAction, AccessIdentity, AccessResource, AgentEvidence, Aggregation, Assignment,
     Attribution, AttributionOverrides, AuditAction, AuditAgent, AuditAuthorization, AuditEntry,
-    AuditFilter, AuditIntent, AuditIntentPart, AuditSource, Authentication, Backlink,
-    COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary, CollectionModel, CollectionPresentation,
-    Database, DomainError, Filter, FilterExpression, FilterOperator, Finding, MAX_TRAVERSAL_DEPTH,
-    Projection, RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SchemaReview,
-    SchemaViolation, SearchQuery, SearchTarget, SortDirection, SortKey, TOKEN_PREFIX, TrustedKeys,
-    USERS_COLLECTION, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout,
-    ViewPredicateMatch,
+    AuditFilter, AuditIntent, AuditIntentPart, AuditSource, Authentication, AuthenticationMethod,
+    Backlink, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary, CollectionModel,
+    CollectionPresentation, Database, DomainError, Filter, FilterExpression, FilterOperator,
+    Finding, MAX_TRAVERSAL_DEPTH, Projection, RECORD_ACCESS_FIELD, Record, RecordActivity,
+    RecordPrecondition, SchemaReview, SchemaViolation, SearchQuery, SearchTarget, SortDirection,
+    SortKey, TOKEN_PREFIX, TrustedKeys, USERS_COLLECTION, User, UserKind, UserStatus,
+    ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
     audit::AuditChange,
+    cloudflare_access::{self, AssertionError, CloudflareAccess},
     database::relation_references,
     error::is_missing,
     parse_sort_keys, paths,
@@ -123,6 +125,13 @@ pub struct ServerConfig {
     /// Refuse every protected request that does not present a principal
     /// token, rather than serving the launching owner's perspective console.
     pub require_token: bool,
+    /// Sign people in by the email in a verified Cloudflare Access assertion.
+    ///
+    /// Like `require_token`, this removes the owner console. With both, a
+    /// request may present either; with this alone, principal tokens are
+    /// refused, so everybody reaches the server through the organisation's
+    /// login.
+    pub cloudflare_access: Option<Arc<CloudflareAccess>>,
 }
 
 impl Default for ServerConfig {
@@ -135,6 +144,7 @@ impl Default for ServerConfig {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             api_token: None,
             require_token: false,
+            cloudflare_access: None,
         }
     }
 }
@@ -146,6 +156,9 @@ struct AppState {
     max_page_size: usize,
     api_token: Option<Arc<str>>,
     require_token: bool,
+    cloudflare_access: Option<Arc<CloudflareAccess>>,
+    /// The console's form token, and the key every authenticated principal's
+    /// own form token is derived from; see [`request_csrf_token`].
     csrf_token: Arc<str>,
     /// The walk that fills the verified journal, which readiness reports on.
     journal_warm_up: Arc<JournalWarmUp>,
@@ -158,18 +171,23 @@ struct AppState {
 /// each re-reading the `Authorization` header.
 #[derive(Clone)]
 enum RequestIdentity {
-    /// No principal token: the launching process's identity, and under access
-    /// control the owner console and its perspective cookie.
+    /// Nothing authenticated: the launching process's identity, and under
+    /// access control the owner console and its perspective cookie.
     Console,
-    /// A principal token authenticated this database's principal.
-    Token(Box<Database>),
+    /// A principal token or a Cloudflare Access assertion authenticated this
+    /// database's principal, whose pages carry `csrf` as their form token.
+    Authenticated {
+        database: Box<Database>,
+        csrf: Arc<str>,
+    },
 }
 
 tokio::task_local! {
     static REQUEST_IDENTITY: RequestIdentity;
 }
 
-/// The authenticated database for this request, when a token established one.
+/// The authenticated database for this request, when a principal token or a
+/// Cloudflare Access assertion established one.
 ///
 /// Outside the authorization layer — `/health`, `/ready`, and `/static` —
 /// there is no identity, which is the console's answer: none of them reads a
@@ -177,11 +195,40 @@ tokio::task_local! {
 fn authenticated_database() -> Option<Database> {
     REQUEST_IDENTITY
         .try_with(|identity| match identity {
-            RequestIdentity::Token(database) => Some(database.as_ref().clone()),
+            RequestIdentity::Authenticated { database, .. } => Some(database.as_ref().clone()),
             RequestIdentity::Console => None,
         })
         .ok()
         .flatten()
+}
+
+/// The form token this request's pages carry and its forms must send back.
+///
+/// The console has one operator, so one random token per server run is
+/// enough. Authenticated principals are different people sharing a server,
+/// and one of them could read a shared token out of their own page and forge
+/// a form for another, which matters once a browser attaches the credential
+/// by itself, as Cloudflare Access does. Each principal therefore gets its
+/// own: an HMAC of its ID under the console's token, which never leaves the
+/// server except as the console's own form token.
+fn request_csrf_token(state: &AppState) -> Arc<str> {
+    REQUEST_IDENTITY
+        .try_with(|identity| match identity {
+            RequestIdentity::Authenticated { csrf, .. } => Some(Arc::clone(csrf)),
+            RequestIdentity::Console => None,
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| Arc::clone(&state.csrf_token))
+}
+
+fn principal_csrf_token(key: &str, principal: &str) -> Arc<str> {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key.as_bytes())
+        .expect("HMAC accepts a key of any length");
+    mac.update(b"cr:csrf:principal:v1\0");
+    mac.update(principal.as_bytes());
+    Arc::from(hexadecimal(&mac.finalize().into_bytes()))
 }
 
 #[derive(Clone, Debug)]
@@ -244,8 +291,8 @@ struct UiContext {
     /// of the UI they would use to see it.
     pins_error: Option<String>,
     users: Vec<UiUser>,
-    /// Whether this is the owner console, which may view as another user. A
-    /// token-authenticated principal is who its token says and nobody else.
+    /// Whether this is the owner console, which may view as another user. An
+    /// authenticated principal is who its credential says and nobody else.
     can_switch_perspective: bool,
 }
 
@@ -1691,6 +1738,12 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, code, message)
     }
 
+    /// Keep `detail` for the server log, which is the only place it goes.
+    fn with_detail(mut self, detail: anyhow::Error) -> Self {
+        self.detail = Some(detail);
+        self
+    }
+
     /// Record which submitted field this failure is about. Called where the
     /// field is known — the parser that rejected a value, or the one route that
     /// can tell a taken record ID from any other conflict — because that is the
@@ -1856,26 +1909,36 @@ fn application(
         Err(error) if matches!(DomainError::of(&error), Some(DomainError::Conflict(_))) => false,
         Err(error) => return Err(error),
     };
-    if config.require_token {
+    // Either way of authenticating people replaces the owner console, and
+    // with it everything the console needs: an owner launching it, and
+    // loopback.
+    let console = !config.require_token && config.cloudflare_access.is_none();
+    if !console {
+        let flag = if config.require_token {
+            "--require-token"
+        } else {
+            "--cloudflare-access"
+        };
         if !access_controlled {
             bail!(
-                "--require-token authenticates registered principals, so it needs access control; run 'cr access init' first"
+                "{flag} authenticates registered principals, so it needs access control; run 'cr access init' first"
             );
         }
         if config.api_token.is_some() {
             bail!(
-                "--require-token cannot be combined with CR_API_TOKEN, which acts as the launching owner; issue that caller a principal token instead"
+                "{flag} cannot be combined with CR_API_TOKEN, which acts as the launching owner; issue that caller a principal token instead"
             );
         }
     } else if access_controlled && !config.bind.ip().is_loopback() {
         bail!(
-            "the RBAC perspective switcher is an owner-only local console and must bind to a loopback address; use --require-token to serve authenticated principals beyond it"
+            "the RBAC perspective switcher is an owner-only local console and must bind to a loopback address; use --require-token or --cloudflare-access to serve authenticated principals beyond it"
         );
     }
     // The console serves the launching process as an owner, so it has to be
-    // one. A server that requires tokens never acts as its launcher, which is
-    // what lets it run as a service account with no user record at all.
-    if access_controlled && !config.require_token {
+    // one. A server that authenticates its callers never acts as its
+    // launcher, which is what lets it run as a service account with no user
+    // record at all.
+    if access_controlled && console {
         database.impersonate_verified(database.principal())?;
     }
     if config.max_page_size == 0 {
@@ -1894,6 +1957,7 @@ fn application(
         max_page_size: config.max_page_size,
         api_token: config.api_token.map(Arc::from),
         require_token: config.require_token,
+        cloudflare_access: config.cloudflare_access,
         csrf_token: Arc::from(random_token()?),
         journal_warm_up,
     };
@@ -2044,6 +2108,7 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
     let database = database.with_journal_cache();
     let journal = database.clone();
     let warm_up = Arc::<JournalWarmUp>::default();
+    let cloudflare_access = config.cloudflare_access.clone();
     let application = application(database, config, Arc::clone(&warm_up))?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -2063,6 +2128,24 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
     // sooner waits on this walk rather than starting its own, and `/ready`
     // answers `journal_warming` until it returns.
     warm_up.start(journal);
+    // Likewise the Cloudflare Access keys, so the first sign-in does not wait
+    // for them, and a team domain that does not exist is reported now rather
+    // than by the first person who tries. Not fatal: Cloudflare may be
+    // unreachable for a moment, and the next sign-in or `/ready` probe tries
+    // again, while `/ready` says why it cannot.
+    if let Some(access) = cloudflare_access {
+        tokio::task::spawn_blocking(move || match access.refresh_keys() {
+            Ok(count) => println!(
+                "Cloudflare Access: {} for audience {}, {count} signing key{}",
+                access.issuer(),
+                access.audience(),
+                if count == 1 { "" } else { "s" }
+            ),
+            Err(error) => eprintln!(
+                "warning: {error:#}; nobody can sign in through Cloudflare Access until the keys can be fetched"
+            ),
+        });
+    }
     let (drain, drain_requested) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(listener, application)
         .with_graceful_shutdown(async move {
@@ -2194,10 +2277,11 @@ async fn request_context(request: Request<Body>, next: Next) -> Response {
 }
 
 async fn authorize(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
-    let identity = match request_identity(&state, request.headers()).await {
-        Ok(identity) => identity,
-        Err(error) => return error.into_response(),
-    };
+    let identity =
+        match request_identity(&state, request.method(), request.uri(), request.headers()).await {
+            Ok(identity) => identity,
+            Err(error) => return refusal(&state, request.uri().path(), error),
+        };
     let mut response = REQUEST_IDENTITY.scope(identity, next.run(request)).await;
     if state.access_controlled {
         response
@@ -2210,18 +2294,58 @@ async fn authorize(State(state): State<AppState>, request: Request<Body>, next: 
         // cache-poisoning bug, and this layer sees every route, so it is the
         // one place where clobbering would be silent.
         vary_on(response.headers_mut(), "Cookie");
+        if state.cloudflare_access.is_some() {
+            vary_on(response.headers_mut(), CLOUDFLARE_ACCESS_VARY);
+        }
     }
     response
 }
 
-/// Establish who a request is from its `Authorization` header.
+/// The assertion header as `Vary` names it.
+const CLOUDFLARE_ACCESS_VARY: &str = "Cf-Access-Jwt-Assertion";
+
+/// Answer a request the authorization layer refused.
+///
+/// In JSON, as every refusal always was, except to a browser that signs in
+/// through Cloudflare Access: somebody whose address no user holds reaches
+/// this by following a link, and should read a page rather than an envelope.
+fn refusal(state: &AppState, path: &str, error: ApiError) -> Response {
+    let unauthorized = error.status == StatusCode::UNAUTHORIZED;
+    let is_api = path == "/openapi.json" || path == "/api" || path.starts_with("/api/");
+    if state.cloudflare_access.is_none() || is_api {
+        return error.into_response();
+    }
+    let mut response = html_error(error);
+    if unauthorized {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"cr\""),
+        );
+    }
+    response
+}
+
+/// Establish who a request is from its credentials.
 ///
 /// A principal token either authenticates or is refused: it never falls back
 /// to the console, because a revoked token that quietly became the launching
 /// owner would turn revocation into escalation. `CR_API_TOKEN` keeps its
 /// meaning — the console, as the launching owner — and `--require-token`
 /// accepts nothing but a principal token.
-async fn request_identity(state: &AppState, headers: &HeaderMap) -> ApiResult<RequestIdentity> {
+///
+/// Under `--cloudflare-access` a request without a principal token must carry
+/// a Cloudflare Access assertion that verifies. The token is looked at first
+/// because a script behind Access carries both — an assertion for its service
+/// token, which names nobody, and the bearer token that names its principal —
+/// and presenting a token is the more deliberate act. With
+/// `--cloudflare-access` alone the token is refused instead, so an operator
+/// who chose the organisation's login gets nothing that bypasses it.
+async fn request_identity(
+    state: &AppState,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> ApiResult<RequestIdentity> {
     let unauthorized =
         |message: &str| ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", message.to_owned());
     let bearer = headers
@@ -2239,6 +2363,11 @@ async fn request_identity(state: &AppState, headers: &HeaderMap) -> ApiResult<Re
                 "principal tokens authenticate registered users, and access control is not initialized",
             ));
         }
+        if state.cloudflare_access.is_some() && !state.require_token {
+            return Err(unauthorized(
+                "this server signs people in through Cloudflare Access and accepts no principal tokens; start it with --require-token as well to accept both",
+            ));
+        }
         let database = state.database.clone();
         let presented = presented.to_owned();
         let authenticated =
@@ -2249,8 +2378,13 @@ async fn request_identity(state: &AppState, headers: &HeaderMap) -> ApiResult<Re
                 })?
                 .map_err(ApiError::from_domain)?;
         return authenticated
-            .map(|database| RequestIdentity::Token(Box::new(database)))
+            .map(|database| authenticated_identity(state, database))
             .ok_or_else(|| unauthorized("the principal token is not valid"));
+    }
+    if let Some(access) = &state.cloudflare_access {
+        let database = cloudflare_access_database(state, access, headers).await?;
+        refuse_cross_site(method, uri, headers)?;
+        return Ok(authenticated_identity(state, database));
     }
     if state.require_token {
         return Err(unauthorized("provide a principal token as a Bearer token"));
@@ -2259,6 +2393,135 @@ async fn request_identity(state: &AppState, headers: &HeaderMap) -> ApiResult<Re
         return Err(unauthorized("provide a valid Bearer token"));
     }
     Ok(RequestIdentity::Console)
+}
+
+fn authenticated_identity(state: &AppState, database: Database) -> RequestIdentity {
+    RequestIdentity::Authenticated {
+        csrf: principal_csrf_token(&state.csrf_token, database.principal()),
+        database: Box::new(database),
+    }
+}
+
+/// The database acting as the user a request's Cloudflare Access assertion
+/// signed in.
+///
+/// Only the signed assertion is read. `Cf-Access-Authenticated-User-Email`
+/// and the `CF_Authorization` cookie say the same thing unsigned, and
+/// anything that can reach the server's port can send them.
+async fn cloudflare_access_database(
+    state: &AppState,
+    access: &Arc<CloudflareAccess>,
+    headers: &HeaderMap,
+) -> ApiResult<Database> {
+    let unauthorized =
+        |message: String| ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", message);
+    let mut assertions = headers.get_all(cloudflare_access::ASSERTION_HEADER).iter();
+    let assertion = match (assertions.next(), assertions.next()) {
+        (Some(assertion), None) => assertion
+            .to_str()
+            .map_err(|_| unauthorized("the Cloudflare Access assertion is not valid".to_owned()))?
+            .to_owned(),
+        (Some(_), Some(_)) => {
+            return Err(unauthorized(
+                "a request carries one Cloudflare Access assertion, not several".to_owned(),
+            ));
+        }
+        (None, _) => {
+            return Err(unauthorized(
+                if state.require_token {
+                    "sign in through Cloudflare Access, or provide a principal token as a Bearer token"
+                } else {
+                    "sign in through Cloudflare Access"
+                }
+                .to_owned(),
+            ));
+        }
+    };
+    let access = Arc::clone(access);
+    let database = state.database.clone();
+    tokio::task::spawn_blocking(move || {
+        let verified = match access.verify(&assertion) {
+            Ok(verified) => verified,
+            Err(error @ AssertionError::Rejected(_)) => {
+                return Ok(Err(unauthorized(error.to_string())));
+            }
+            Err(AssertionError::KeysUnavailable(error)) => {
+                return Ok(Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication_unavailable",
+                    "Cloudflare Access signing keys could not be fetched",
+                )
+                .with_detail(error)));
+            }
+        };
+        let authentication = Authentication {
+            method: AuthenticationMethod::CloudflareAccess,
+            credential: verified.subject,
+        };
+        database
+            .authenticate_email(&verified.email, authentication)
+            .map(|database| {
+                database.ok_or_else(|| {
+                    unauthorized(format!(
+                        "Cloudflare Access signed you in as {}, and no single active cr user has that email; ask a database owner to register it",
+                        verified.email
+                    ))
+                })
+            })
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow!(error).context("database task failed")))?
+    .map_err(ApiError::from_domain)?
+}
+
+/// Refuse a state-changing request a browser says another site started.
+///
+/// A Cloudflare Access session is a cookie, which a browser attaches to a
+/// request whichever page makes it, and Access then signs the request as the
+/// person. So a form on another site, including another application on the
+/// same domain, could post to this server as whoever visits it. Form tokens
+/// cover cr's own forms, but not the JSON routes that take no body, and a
+/// principal token is not ambient in this way, which is why only an
+/// assertion-authenticated request is checked.
+///
+/// `Sec-Fetch-Site`, which a browser sets and a page cannot, answers the
+/// question directly. A browser that predates it still sends `Origin` on a
+/// POST, which must then name the host the request was sent to. A request
+/// with neither did not come from a browser that could have been tricked.
+fn refuse_cross_site(method: &Method, uri: &Uri, headers: &HeaderMap) -> ApiResult<()> {
+    if method.is_safe() {
+        return Ok(());
+    }
+    let refused = || {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "cross_site_request",
+            "a browser signed in through Cloudflare Access may change data only from cr's own pages",
+        )
+    };
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return if site.as_bytes() == b"same-origin" {
+            Ok(())
+        } else {
+            Err(refused())
+        };
+    }
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin = origin
+            .to_str()
+            .ok()
+            .and_then(|origin| origin.split_once("://"))
+            .map(|(_, authority)| authority);
+        let host = headers
+            .get(header::HOST)
+            .and_then(|host| host.to_str().ok())
+            .or_else(|| uri.authority().map(|authority| authority.as_str()));
+        return match (origin, host) {
+            (Some(origin), Some(host)) if origin.eq_ignore_ascii_case(host) => Ok(()),
+            _ => Err(refused()),
+        };
+    }
+    Ok(())
 }
 
 /// Compare two secrets in time that does not depend on where they differ.
@@ -2313,14 +2576,18 @@ async fn health() -> Json<HealthResponse> {
 async fn ready(State(state): State<AppState>) -> Response {
     let database = state.database.clone();
     let warm_up = Arc::clone(&state.journal_warm_up);
-    let readiness =
-        match tokio::task::spawn_blocking(move || readiness::assess(&database, &warm_up)).await {
-            Ok(readiness) => readiness,
-            Err(error) => {
-                return ApiError::internal(anyhow!(error).context("readiness task failed"))
-                    .into_response();
-            }
-        };
+    let cloudflare_access = state.cloudflare_access.clone();
+    let readiness = match tokio::task::spawn_blocking(move || {
+        readiness::assess(&database, &warm_up, cloudflare_access.as_ref())
+    })
+    .await
+    {
+        Ok(readiness) => readiness,
+        Err(error) => {
+            return ApiError::internal(anyhow!(error).context("readiness task failed"))
+                .into_response();
+        }
+    };
     if readiness.ready() {
         return Json(ReadinessResponse {
             status: "ready",
@@ -2596,7 +2863,7 @@ async fn switch_perspective(State(state): State<AppState>, RawForm(raw): RawForm
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
                 "forbidden",
-                "a token-authenticated request acts as its own principal and has no perspective to switch",
+                "an authenticated request acts as its own principal and has no perspective to switch",
             ));
         }
         let form: HtmlPerspectiveForm = parse_html_form(&raw)?;
@@ -2654,7 +2921,7 @@ async fn views_home(
             &views,
             &index,
             ui.as_ref(),
-            &state.csrf_token,
+            &request_csrf_token(&state),
         ))
     }
     .await;
@@ -2846,7 +3113,7 @@ async fn audit_view(
             &query,
             &navigation,
             ui.as_ref(),
-            &state.csrf_token,
+            &request_csrf_token(&state),
         ))
     }
     .await;
@@ -2875,7 +3142,7 @@ async fn users_view(State(state): State<AppState>, headers: HeaderMap) -> Respon
             &users,
             &navigation,
             ui.as_ref(),
-            &state.csrf_token,
+            &request_csrf_token(&state),
         ))
     }
     .await;
@@ -2936,7 +3203,7 @@ async fn browse_view(
             &documents,
             &navigation,
             ui.as_ref(),
-            &state.csrf_token,
+            &request_csrf_token(&state),
         ))
     }
     .await;
@@ -2947,10 +3214,11 @@ async fn browse_view(
 /// the routes exist only under RBAC, and only a database owner may use them,
 /// from the local console.
 ///
-/// A token-authenticated owner is refused even so. The browser reads and
-/// writes any file the server's account can, beyond the database, and a token
-/// is a secret that travels: a leaked owner token that could rewrite files on
-/// the host would be worth far more than the database it was issued for.
+/// An owner authenticated by a token or by Cloudflare Access is refused even
+/// so. The browser reads and writes any file the server's account can, beyond
+/// the database, and both credentials travel: a leaked owner token, or an
+/// owner's hijacked sign-in, that could rewrite files on the host would be
+/// worth far more than the database it was issued for.
 ///
 /// Returns the database root, where browsing starts and which the editor and
 /// the delete page compare a file against, and the sidebar's views.
@@ -2978,13 +3246,14 @@ async fn authorize_file_browser(
 }
 
 /// Keep the server's filesystem to the local console; see
-/// [`authorize_file_browser`] for why a token never reaches it.
+/// [`authorize_file_browser`] for why an authenticated principal never
+/// reaches it.
 fn refuse_token_file_access() -> ApiResult<()> {
     if authenticated_database().is_some() {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "forbidden",
-            "the file browser belongs to the local owner console; a token-authenticated principal cannot browse server files",
+            "the file browser belongs to the local owner console; an authenticated principal cannot browse server files",
         ));
     }
     Ok(())
@@ -3051,7 +3320,7 @@ async fn edit_file_view(
         if region.is_some() {
             let mut response = html_response(
                 StatusCode::OK,
-                render_file_editor(&editor, &root, &state.csrf_token),
+                render_file_editor(&editor, &root, &request_csrf_token(&state)),
             );
             response.headers_mut().insert(
                 HeaderName::from_static("hx-push-url"),
@@ -3068,7 +3337,7 @@ async fn edit_file_view(
                 &root,
                 &navigation,
                 ui.as_ref(),
-                &state.csrf_token,
+                &request_csrf_token(&state),
             ),
         ))
     }
@@ -3127,7 +3396,7 @@ async fn save_file_form(
                 &root,
                 &navigation,
                 ui.as_ref(),
-                &state.csrf_token,
+                &request_csrf_token(&state),
             ),
         ))
     }
@@ -3180,7 +3449,7 @@ async fn confirm_delete_file(
             &root,
             &navigation,
             ui.as_ref(),
-            &state.csrf_token,
+            &request_csrf_token(&state),
         ))
     }
     .await;
@@ -3832,7 +4101,7 @@ async fn view_records(
             &activity,
             &query,
             schema.as_ref(),
-            &state.csrf_token,
+            &request_csrf_token(&state),
             &navigation,
             ui.as_ref(),
             can_create,
@@ -4026,7 +4295,7 @@ async fn reject_save_view_form(
         &Representation::requested(headers),
         &view,
         &view_available_columns(&view, &records, schema.as_ref()),
-        &state.csrf_token,
+        &request_csrf_token(state),
         &rejection,
         &navigation,
         ui.as_ref(),
@@ -4109,7 +4378,7 @@ async fn edit_view_form(
             &context,
             &draft,
             ui.as_ref(),
-            &state.csrf_token,
+            &request_csrf_token(&state),
             None,
         ))
     }
@@ -4209,7 +4478,7 @@ async fn reject_view_edit(
             &context,
             &submitted_view_draft(form),
             ui.as_ref(),
-            &state.csrf_token,
+            &request_csrf_token(state),
             Some(&error),
         ),
     )
@@ -4231,7 +4500,7 @@ async fn confirm_delete_view(
             &view,
             &navigation,
             ui.as_ref(),
-            &state.csrf_token,
+            &request_csrf_token(&state),
         ))
     }
     .await;
@@ -4296,7 +4565,7 @@ async fn new_record_form(
             None,
             &[],
             schema.as_ref(),
-            &state.csrf_token,
+            &request_csrf_token(&state),
             None,
             &navigation,
             ui.as_ref(),
@@ -4367,7 +4636,7 @@ async fn edit_record_form(
             Some(&record),
             &audit_entries,
             schema.as_ref(),
-            &state.csrf_token,
+            &request_csrf_token(&state),
             None,
             &navigation,
             ui.as_ref(),
@@ -4677,7 +4946,7 @@ async fn reject_record_form(
         context.record.as_ref(),
         &context.audit_entries,
         context.schema.as_ref(),
-        &state.csrf_token,
+        &request_csrf_token(state),
         Some(&rejection),
         &context.navigation,
         context.ui.as_ref(),
@@ -4917,7 +5186,7 @@ async fn confirm_delete_record(
             schema.as_ref(),
             &navigation,
             ui.as_ref(),
-            &state.csrf_token,
+            &request_csrf_token(&state),
         ))
     }
     .await;
@@ -5610,11 +5879,30 @@ async fn audit_baseline(
 
 async fn openapi(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<JsonValue>> {
     let token_enabled = state.api_token.is_some() || state.require_token;
+    let cloudflare_access = state.cloudflare_access.is_some();
     let document = run_database(&state, &headers, move |database| {
-        openapi_document(database, token_enabled)
+        let mut document = openapi_document(database, token_enabled)?;
+        if cloudflare_access {
+            describe_cloudflare_access(&mut document);
+        }
+        Ok(document)
     })
     .await?;
     Ok(Json(document))
+}
+
+/// Declare the Cloudflare Access assertion as a way in, as an alternative to
+/// a bearer token when the server also accepts one.
+fn describe_cloudflare_access(document: &mut JsonValue) {
+    document["components"]["securitySchemes"]["cloudflareAccess"] = json!({
+        "type": "apiKey",
+        "in": "header",
+        "name": CLOUDFLARE_ACCESS_VARY,
+        "description": "The signed assertion Cloudflare Access adds to every request it lets through. The server verifies its RS256 signature, issuer, audience, and lifetime, acts as the one active user whose email matches its email claim, and records access.authentication {method: cloudflare-access, credential: <sub>} on every event it writes."
+    });
+    let mut security = document["security"].as_array().cloned().unwrap_or_default();
+    security.push(json!({ "cloudflareAccess": [] }));
+    document["security"] = JsonValue::Array(security);
 }
 
 pub fn openapi_document(database: &Database, token_enabled: bool) -> Result<JsonValue> {
@@ -5793,7 +6081,7 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
         },
         "Identity": {
             "type": "object", "required": ["actor", "principal", "impersonated_by"],
-            "description": "The effective principal and attribution this request would record. In the local RBAC console, impersonated_by identifies the owner operating the selected perspective. authentication is present when a principal token authenticated the principal.",
+            "description": "The effective principal and attribution this request would record. In the local RBAC console, impersonated_by identifies the owner operating the selected perspective. authentication is present when a principal token or a Cloudflare Access assertion authenticated the principal.",
             "properties": {
                 "actor": { "type": "string" },
                 "principal": { "type": "string" },
@@ -5816,8 +6104,8 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                             "type": "object",
                             "required": ["method"],
                             "properties": {
-                                "method": { "type": "string", "description": "How the principal was authenticated: token." },
-                                "credential": { "type": "string", "description": "The public ID of the credential that passed." }
+                                "method": { "type": "string", "description": "How the principal was authenticated: token or cloudflare-access." },
+                                "credential": { "type": "string", "description": "The public ID of the credential that passed: a principal token's ID, or the sub of a Cloudflare Access assertion." }
                             }
                         },
                         { "type": "null" }
@@ -7735,8 +8023,12 @@ fn render_audit_view(
 /// How a server authenticated an event's principal, in words: the method,
 /// and the public ID of the credential that passed.
 fn authentication_label(authentication: &Authentication) -> Markup {
+    let method = match &authentication.method {
+        AuthenticationMethod::CloudflareAccess => "Cloudflare Access",
+        method => method.label(),
+    };
     html! {
-        "authenticated by " (authentication.method.label())
+        "authenticated by " (method)
         @if let Some(credential) = &authentication.credential {
             " " code class="font-mono" { (credential) }
         }
@@ -14852,7 +15144,7 @@ fn parse_front_matter(serialized: &str) -> ApiResult<Mapping> {
 }
 
 fn verify_csrf(state: &AppState, provided: &str) -> ApiResult<()> {
-    if provided == state.csrf_token.as_ref() {
+    if secrets_match(provided, &request_csrf_token(state)) {
         Ok(())
     } else {
         Err(ApiError::new(
@@ -15116,7 +15408,7 @@ fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database
         .unwrap_or_else(|| state.database.clone());
     // For an authenticated principal the header can only restyle how that
     // same principal is displayed: `with_actor` refuses any other principal
-    // under access control, which a token requires.
+    // under access control, which authentication requires.
     if let Some(actor) = headers.get(ACTOR_HEADER) {
         let actor = actor.to_str().map_err(|_| {
             ApiError::bad_request("invalid_actor", "X-CR-Actor must be valid UTF-8")
@@ -15232,7 +15524,7 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
         .clone()
         .unwrap_or_else(|| state.database.clone());
     tokio::task::spawn_blocking(move || {
-        // The registry is the owner console's to list. A token-authenticated
+        // The registry is the owner console's to list. An authenticated
         // principal reads its own user record, which it always may, and is
         // offered no one else to be.
         let users = match &authenticated {

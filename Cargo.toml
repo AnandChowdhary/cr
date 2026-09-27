@@ -67,6 +67,11 @@ libc = "0.2.189"
 maud = { version = "0.27.0", features = ["axum"] }
 percent-encoding = "2.3.2"
 regex = "1.13.1"
+# Verifies the RS256 signature on a Cloudflare Access assertion. Already in the
+# tree as `ureq`'s TLS provider below, so checking a signature costs no second
+# RSA implementation; the pure-Rust `rsa` crate would also fail
+# `cargo audit --deny warnings` on RUSTSEC-2023-0071.
+ring = "0.17.14"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_html_form = "0.4.1"
 serde_json = { version = "1.0.151", features = ["raw_value"] }
@@ -74,6 +79,11 @@ sha2 = "0.11.0"
 tempfile = "3.27.0"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+# The one request `cr` makes on its own: `cr serve --cloudflare-access` fetches
+# the team's signing keys over HTTPS, and nothing else does. `rustls` with its
+# bundled web PKI roots, not the default `gzip` as well, since the key set is
+# a few kilobytes.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 yaml_serde = "0.10.7"
 zeroize = "1.9.0"
 

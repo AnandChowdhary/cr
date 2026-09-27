@@ -18,7 +18,11 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 
-use crate::{Database, audit::JournalProbe};
+use crate::{
+    Database,
+    audit::JournalProbe,
+    cloudflare_access::{CloudflareAccess, KeyStatus},
+};
 
 /// One readiness check, in the order they are reported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +32,8 @@ pub(crate) enum ReadinessCheck {
     AuditRecovery,
     SyncRecovery,
     Journal,
+    /// Only under `--cloudflare-access`.
+    CloudflareAccess,
 }
 
 impl ReadinessCheck {
@@ -39,6 +45,7 @@ impl ReadinessCheck {
             Self::AuditRecovery => "audit_recovery",
             Self::SyncRecovery => "sync_recovery",
             Self::Journal => "journal",
+            Self::CloudflareAccess => "cloudflare_access",
         }
     }
 }
@@ -142,7 +149,11 @@ impl Drop for WarmUpFinished<'_> {
 /// When the database directory itself cannot be reached, that is the only
 /// check reported: every other one reads beneath it, and would either fail for
 /// the same reason or, worse, pass because a file they look for is absent.
-pub(crate) fn assess(database: &Database, warm_up: &Arc<JournalWarmUp>) -> Readiness {
+pub(crate) fn assess(
+    database: &Database,
+    warm_up: &Arc<JournalWarmUp>,
+    cloudflare_access: Option<&Arc<CloudflareAccess>>,
+) -> Readiness {
     if let Err(error) = database.reachable() {
         return Readiness {
             checks: vec![(
@@ -180,15 +191,43 @@ pub(crate) fn assess(database: &Database, warm_up: &Arc<JournalWarmUp>) -> Readi
             &error,
         )),
     };
-    Readiness {
-        checks: vec![
-            (ReadinessCheck::Database, None),
-            (ReadinessCheck::Config, config),
-            (ReadinessCheck::AuditRecovery, audit_recovery),
-            (ReadinessCheck::SyncRecovery, sync_recovery),
-            (ReadinessCheck::Journal, journal(database, warm_up)),
-        ],
+    let mut checks = vec![
+        (ReadinessCheck::Database, None),
+        (ReadinessCheck::Config, config),
+        (ReadinessCheck::AuditRecovery, audit_recovery),
+        (ReadinessCheck::SyncRecovery, sync_recovery),
+        (ReadinessCheck::Journal, journal(database, warm_up)),
+    ];
+    if let Some(access) = cloudflare_access {
+        checks.push((ReadinessCheck::CloudflareAccess, signing_keys(access)));
     }
+    Readiness { checks }
+}
+
+/// Whether the server holds a Cloudflare Access signing key, without which
+/// nobody can sign in.
+///
+/// A server that holds none starts a fetch in the background, as a probe may
+/// start the journal's first walk, so a server whose startup fetch failed
+/// becomes ready once Cloudflare answers rather than when somebody first tries
+/// to sign in. The fetch is no more frequent for being probed: it keeps the
+/// minimum interval every other fetch does, and a probe never waits for it.
+fn signing_keys(access: &Arc<CloudflareAccess>) -> Option<ReadinessFailure> {
+    let status = access.key_status();
+    if status == KeyStatus::Held {
+        return None;
+    }
+    let access = Arc::clone(access);
+    tokio::task::spawn_blocking(move || access.refresh_keys_if_due());
+    Some(match status {
+        KeyStatus::Unavailable(failure) => {
+            ReadinessFailure::new("cloudflare_access_keys_unavailable", failure)
+        }
+        _ => ReadinessFailure::new(
+            "cloudflare_access_keys_pending",
+            "the Cloudflare Access signing keys have not been fetched yet",
+        ),
+    })
 }
 
 /// Whether the server holds a verified walk of the journal that the newest

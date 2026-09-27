@@ -309,6 +309,8 @@ stored_label_enum! {
     AuthenticationMethod {
         /// A principal token issued by `cr access token issue`.
         Token => "token",
+        /// A Cloudflare Access assertion, whose signed email named the user.
+        CloudflareAccess => "cloudflare-access",
     }
 }
 

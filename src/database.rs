@@ -1972,9 +1972,88 @@ impl Database {
         if !stored.verifies(token) || stored.expired_at(now) || user.status != UserStatus::Active {
             return Ok(None);
         }
+        let authentication = Authentication {
+            method: AuthenticationMethod::Token,
+            credential: Some(token_id.to_owned()),
+        };
+        self.authenticated_as(&states, principal, &user, authentication)
+            .map(Some)
+    }
+
+    /// Authenticate the person an identity provider has vouched for by
+    /// email, returning this database acting as the one active user whose
+    /// `email` it is, with `authentication` attached to every decision it
+    /// makes.
+    ///
+    /// The caller must have verified `email` itself — `cr serve` passes only
+    /// the email in a Cloudflare Access assertion whose signature it checked
+    /// — and `authentication` is recorded as it is given. Case is ignored for
+    /// ASCII letters and nothing else, so `Ada@Example.com` finds
+    /// `ada@example.com` but no two differently spelled non-ASCII addresses
+    /// are ever taken for one.
+    ///
+    /// `Ok(None)` when no user holds the email, when more than one does,
+    /// whatever their status, and when the one that does is not active. Two
+    /// users sharing an address is ambiguous, and choosing between them would
+    /// decide which grants a person gets by something other than the policy;
+    /// an owner resolves it by changing or clearing one of the emails, which
+    /// only an owner may do. As with [`Self::authenticate_token`], the user is
+    /// found in the audited policy, and the working file must still equal it.
+    pub fn authenticate_email(
+        &self,
+        email: &str,
+        authentication: Authentication,
+    ) -> Result<Option<Self>> {
+        if email.is_empty() || !self.access_enabled()? {
+            return Ok(None);
+        }
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        let states = audit.record_states()?;
+        let mut found = None;
+        for ((collection, principal), state) in states.iter() {
+            if collection != USERS_COLLECTION {
+                continue;
+            }
+            let Some(document) = &state.document else {
+                continue;
+            };
+            let holds_email = document
+                .pointer("/attributes/email")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|stored| stored.eq_ignore_ascii_case(email));
+            if !holds_email {
+                continue;
+            }
+            if found.is_some() {
+                return Ok(None);
+            }
+            found = Some((principal.clone(), document));
+        }
+        let Some((principal, document)) = found else {
+            return Ok(None);
+        };
+        let user = User::from_attributes(&Document::from_audit_value(document)?.attributes)?;
+        if user.status != UserStatus::Active {
+            return Ok(None);
+        }
+        self.authenticated_as(&states, principal, &user, authentication)
+            .map(Some)
+    }
+
+    /// This database acting as `principal`, whom a server has just
+    /// authenticated, provided its user file still equals the audited `user`.
+    fn authenticated_as(
+        &self,
+        states: &AuditedRecordStates,
+        principal: String,
+        user: &User,
+        authentication: Authentication,
+    ) -> Result<Self> {
         let path = self.record_path(USERS_COLLECTION, &principal)?;
         let raw = self.read_record(USERS_COLLECTION, &principal, &path)?;
-        AuditLog::assert_current_in(&states, USERS_COLLECTION, &principal, raw.as_bytes())?;
+        AuditLog::assert_current_in(states, USERS_COLLECTION, &principal, raw.as_bytes())?;
 
         let mut database = self.clone();
         database.impersonated_by = None;
@@ -1984,11 +2063,8 @@ impl Database {
             user.email.as_deref().unwrap_or(&principal)
         );
         database.principal = principal;
-        database.authentication = Some(Authentication {
-            method: AuthenticationMethod::Token,
-            credential: Some(token_id.to_owned()),
-        });
-        Ok(Some(database))
+        database.authentication = Some(authentication);
+        Ok(database)
     }
 
     /// How a server authenticated this database's principal, if it did.
