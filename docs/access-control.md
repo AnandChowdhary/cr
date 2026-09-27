@@ -245,9 +245,10 @@ makes them the only way in:
 cr serve --require-token --bind 0.0.0.0:3000
 ```
 
-Every request except `/health` and `/static` must then present a principal
-token, `CR_API_TOKEN` is refused, and there is no perspective switcher, so the
-server no longer has to be launched by an owner and may bind beyond loopback.
+Every request except `/health`, `/ready`, and `/static` must then present a
+principal token, `CR_API_TOKEN` is refused, and there is no perspective
+switcher, so the server no longer has to be launched by an owner and may bind
+beyond loopback.
 The file browser is never available to a token, even an owner's: it reads and
 writes files outside the database, and a secret that travels should not be
 able to rewrite the host. `cr serve` does not terminate TLS, so put it behind a

@@ -11,6 +11,7 @@ mod paths;
 mod pins;
 mod projection;
 mod query;
+mod readiness;
 mod search;
 pub mod server;
 mod sort;

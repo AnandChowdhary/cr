@@ -617,43 +617,7 @@ impl Database {
             .context(no_database()));
         }
 
-        // The configuration is a definition somebody wrote, so a file that
-        // cannot be used is invalid, like a malformed schema or saved view.
-        let config = match paths::read_to_string_optional(
-            &root,
-            Path::new(CONFIG_PATH),
-            "the database configuration",
-        )? {
-            Some(serialized) => yaml_serde::from_str(&serialized).with_context(|| {
-                DomainError::Invalid("the database configuration is not valid YAML".into())
-            })?,
-            None => Config::default(),
-        };
-
-        if config.version != CURRENT_FORMAT_VERSION {
-            return Err(invalid(format!(
-                "database format version {} is unsupported (expected {CURRENT_FORMAT_VERSION})",
-                config.version
-            )));
-        }
-        validate_relative_path(&config.data_dir, "data_dir")?;
-        // The configured records directory, and every directory above it, must
-        // be a real directory beneath the root rather than a redirection.
-        paths::open_directory_optional(&root, &config.data_dir, RECORDS_LABEL)?;
-        if config.audit.segment_max_events == 0 {
-            return Err(invalid(
-                "audit.segment_max_events must be greater than zero",
-            ));
-        }
-        if config.audit.segment_max_bytes == 0 {
-            return Err(invalid("audit.segment_max_bytes must be greater than zero"));
-        }
-        if config.audit.full_walk_after_events == 0 {
-            return Err(invalid(
-                "audit.full_walk_after_events must be greater than zero",
-            ));
-        }
-
+        let config = load_config(&root)?;
         let database = Self {
             root,
             config,
@@ -676,6 +640,22 @@ impl Database {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Whether the root, `.cr/`, and the configured records directory can
+    /// still be opened, each without following a symbolic link. A records
+    /// directory that does not exist yet is an empty database, not a fault.
+    pub(crate) fn reachable(&self) -> Result<()> {
+        paths::open_directory(&self.root, Path::new(DATABASE_DIRECTORY), DATABASE_LABEL)?;
+        paths::open_directory_optional(&self.root, &self.config.data_dir, RECORDS_LABEL)?;
+        Ok(())
+    }
+
+    /// Load the configuration on disk again, exactly as opening the database
+    /// would, and discard it. This process keeps the configuration it opened
+    /// with; this is whether the next one could open the database at all.
+    pub(crate) fn configuration_loads(&self) -> Result<()> {
+        load_config(&self.root).map(drop)
     }
 
     /// The configured records directory, relative to the root.
@@ -5476,6 +5456,48 @@ impl Database {
         self.principal = principal_id(&self.actor).unwrap_or_else(|_| "unknown".to_owned());
         self
     }
+}
+
+/// Read and validate the configuration beneath `root`. A database without
+/// one uses the defaults.
+fn load_config(root: &Path) -> Result<Config> {
+    // The configuration is a definition somebody wrote, so a file that
+    // cannot be used is invalid, like a malformed schema or saved view.
+    let config: Config = match paths::read_to_string_optional(
+        root,
+        Path::new(CONFIG_PATH),
+        "the database configuration",
+    )? {
+        Some(serialized) => yaml_serde::from_str(&serialized).with_context(|| {
+            DomainError::Invalid("the database configuration is not valid YAML".into())
+        })?,
+        None => Config::default(),
+    };
+
+    if config.version != CURRENT_FORMAT_VERSION {
+        return Err(invalid(format!(
+            "database format version {} is unsupported (expected {CURRENT_FORMAT_VERSION})",
+            config.version
+        )));
+    }
+    validate_relative_path(&config.data_dir, "data_dir")?;
+    // The configured records directory, and every directory above it, must
+    // be a real directory beneath the root rather than a redirection.
+    paths::open_directory_optional(root, &config.data_dir, RECORDS_LABEL)?;
+    if config.audit.segment_max_events == 0 {
+        return Err(invalid(
+            "audit.segment_max_events must be greater than zero",
+        ));
+    }
+    if config.audit.segment_max_bytes == 0 {
+        return Err(invalid("audit.segment_max_bytes must be greater than zero"));
+    }
+    if config.audit.full_walk_after_events == 0 {
+        return Err(invalid(
+            "audit.full_walk_after_events must be greater than zero",
+        ));
+    }
+    Ok(config)
 }
 
 fn default_actor(root: &Path) -> String {

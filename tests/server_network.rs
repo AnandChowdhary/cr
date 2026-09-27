@@ -412,6 +412,82 @@ fn error_responses_are_redacted_while_the_server_log_keeps_the_full_chain() {
     assert!(line.contains("os error"), "{line}");
 }
 
+/// `cr serve` is ready once the journal walk it starts on listening has
+/// returned, and a probe that fails tells the caller which check and nothing
+/// else, while the log keeps why under the request ID.
+#[test]
+fn readiness_answers_in_codes_while_the_server_log_keeps_the_reason() {
+    let temporary = tempfile::tempdir().unwrap();
+    let database = temporary.path().join("network-readiness");
+    run_success(Command::new(binary()).args(["init"]).arg(&database));
+    run_success(
+        Command::new(binary())
+            .arg("--database")
+            .arg(&database)
+            .args(["create", "deals", "acme", "--set", "status=open"]),
+    );
+
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+
+    let log_path = temporary.path().join("serve.log");
+    let child = Command::new(binary())
+        .args(["--database"])
+        .arg(&database)
+        .args(["serve", "--bind", &address.to_string()])
+        .env("CR_API_TOKEN", "network-secret")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(File::create(&log_path).unwrap()))
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard(child);
+    wait_until_ready(&mut server.0, address);
+
+    // Public, with no token, and ready once the startup walk has returned.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ready = loop {
+        let answer = http_request(address, "GET", "/ready", &[], None);
+        if answer.0 == 200 {
+            break answer;
+        }
+        assert_eq!(answer.0, 503, "{}", answer.1);
+        assert!(answer.1.contains("journal_warming"), "{}", answer.1);
+        assert!(Instant::now() < deadline, "never ready: {}", answer.1);
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(
+        serde_json::from_str::<Value>(&ready.1).unwrap(),
+        json!({ "status": "ready" })
+    );
+
+    std::fs::write(database.join(".cr/config.yaml"), "version: [\n").unwrap();
+    let (status, body) = http_request(address, "GET", "/ready", &[], None);
+    assert_eq!(status, 503, "{body}");
+    let payload: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["status"], "not_ready");
+    assert_eq!(
+        payload["checks"][1],
+        json!({ "name": "config", "ok": false, "code": "config_invalid" })
+    );
+    assert!(!body.contains(database.to_str().unwrap()), "{body}");
+    assert!(!body.contains("YAML"), "{body}");
+    let request_id = payload["request_id"].as_str().unwrap().to_owned();
+
+    let log = read_until(&log_path, &request_id);
+    let line = log
+        .lines()
+        .find(|line| line.contains(&request_id))
+        .unwrap_or_else(|| panic!("no log line for request {request_id}:\n{log}"));
+    assert!(line.contains("status=503"), "{line}");
+    assert!(line.contains("code=config_invalid"), "{line}");
+    assert!(line.contains("path=/ready"), "{line}");
+    assert!(
+        line.contains("the database configuration is not valid YAML"),
+        "{line}"
+    );
+}
+
 /// Read `path` until it contains `needle`, because the child process flushes
 /// its log independently of the request that produced it.
 fn read_until(path: &std::path::Path, needle: &str) -> String {

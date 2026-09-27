@@ -5,7 +5,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
     time::SystemTime,
 };
 
@@ -34,7 +34,7 @@ use crate::{
         idempotency_conflict, invalid, is_already_exists,
     },
     frontmatter::Document,
-    paths::{self, EntryKind},
+    paths::{self, EntryKind, LockState},
 };
 
 /// Exact manifest ownership immediately before and after one verified event.
@@ -903,14 +903,45 @@ impl JournalCache {
             Ok(verified) => verified,
             // A reader panicked part-way through extending it, so what is
             // there may be half an update. Start again from nothing.
-            Err(poisoned) => {
-                let mut verified = poisoned.into_inner();
-                *verified = None;
-                self.verified.clear_poison();
-                verified
-            }
+            Err(poisoned) => self.recover(poisoned.into_inner()),
         }
     }
+
+    /// [`Self::lock`] for a caller that must not wait: `None` while another
+    /// holds it.
+    fn try_lock(&self) -> Option<MutexGuard<'_, Option<VerifiedJournal>>> {
+        match self.verified.try_lock() {
+            Ok(verified) => Some(verified),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(poisoned)) => Some(self.recover(poisoned.into_inner())),
+        }
+    }
+
+    fn recover<'a>(
+        &self,
+        mut verified: MutexGuard<'a, Option<VerifiedJournal>>,
+    ) -> MutexGuard<'a, Option<VerifiedJournal>> {
+        *verified = None;
+        self.verified.clear_poison();
+        verified
+    }
+}
+
+/// What the walk a [`JournalCache`] holds says about the journal on disk, as
+/// [`AuditLog::probe_journal`] found it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JournalProbe {
+    /// Somebody is reading or extending the walk right now.
+    Busy,
+    /// There is no verified walk: none has finished, or the last one failed.
+    Unverified,
+    /// The newest event on disk is the walk's head or an event appended after
+    /// it.
+    Consistent,
+    /// The newest event on disk comes before the walk's head, or is a
+    /// different event at the same sequence: the journal lost or rewrote
+    /// events the walk verified.
+    Changed,
 }
 
 /// What a walk of the journal established, and where it stopped.
@@ -1720,6 +1751,31 @@ impl<'a> AuditLog<'a> {
         Ok(result)
     }
 
+    /// Whether a mutation that was interrupted is waiting for recovery,
+    /// decided without waiting for the audit lock and without recovering it.
+    ///
+    /// Every mutation writes the pending file while it holds the lock, so the
+    /// file alone does not mean an interruption: while the lock is held it
+    /// belongs to a writer that is committing now, or one that is about to
+    /// recover it. Only a pending file with nobody holding the lock is one that
+    /// waits for the next command to finish or discard it. Taking the lock for
+    /// that instant only delays a writer, which waits for it rather than
+    /// giving up.
+    pub(crate) fn interrupted_mutation(&self) -> Result<bool> {
+        let pending = Path::new(PENDING_PATH);
+        if paths::entry_kind(self.root, pending, PENDING_LABEL)?.is_none() {
+            return Ok(false);
+        }
+        match paths::try_lock_existing(self.root, Path::new(LOCK_PATH), LOCK_LABEL)? {
+            LockState::Held => Ok(false),
+            // Looked for again under the lock: the writer that owned the file
+            // may have finished between the two looks.
+            LockState::Free(_lock) => {
+                Ok(paths::entry_kind(self.root, pending, PENDING_LABEL)?.is_some())
+            }
+        }
+    }
+
     pub fn recover_pending(&self) -> Result<()> {
         let Some(serialized) =
             paths::read_optional(self.root, Path::new(PENDING_PATH), PENDING_LABEL)?
@@ -2335,6 +2391,63 @@ impl<'a> AuditLog<'a> {
             Ok(())
         })?;
         Ok(collections)
+    }
+
+    /// Compare the attached cache's verified walk with the newest event on
+    /// disk, without waiting for the cache, without verifying anything the
+    /// walk has not, and without creating the segment directory.
+    ///
+    /// Reads one segment, the newest, however long the journal is. An event
+    /// after the walk's head is not an inconsistency: another process
+    /// appended it, and the next reader verifies it. A newest event before
+    /// the head, or a different one at it, means events the walk verified are
+    /// gone. `Err` is a newest segment that cannot be read or whose last event
+    /// does not parse or match its own hash.
+    pub(crate) fn probe_journal(&self) -> Result<JournalProbe> {
+        let Some(journal) = self.journal else {
+            return Ok(JournalProbe::Unverified);
+        };
+        let (sequence, hash) = {
+            let Some(verified) = journal.try_lock() else {
+                return Ok(JournalProbe::Busy);
+            };
+            let Some(verified) = verified.as_ref() else {
+                return Ok(JournalProbe::Unverified);
+            };
+            (verified.walk.entries(), verified.walk.previous_hash.clone())
+        };
+        let consistent = match self.newest_event()? {
+            None => sequence == 0,
+            Some(newest) => {
+                newest.payload.sequence > sequence
+                    || (newest.payload.sequence == sequence && Some(newest.hash) == hash)
+            }
+        };
+        Ok(if consistent {
+            JournalProbe::Consistent
+        } else {
+            JournalProbe::Changed
+        })
+    }
+
+    /// The last event of the newest segment, checked against nothing but its
+    /// own hash.
+    fn newest_event(&self) -> Result<Option<AuditEntry>> {
+        let paths = self.listed_segment_paths()?;
+        let Some(path) = paths.last() else {
+            return Ok(None);
+        };
+        let contents = self.read_segment_bytes(path)?;
+        if contents.is_empty() {
+            bail!("audit segment {} is empty", path.display());
+        }
+        let Some(lines) = contents.strip_suffix(b"\n") else {
+            bail!("audit segment {} has a truncated tail", path.display());
+        };
+        let last = lines.rsplit(|byte| *byte == b'\n').next().unwrap_or(lines);
+        let stored = parse_line(last)
+            .with_context(|| format!("invalid audit event in {}", path.display()))?;
+        Ok(Some(stored.entry))
     }
 
     /// The verified journal as `journal` holds it, brought up to date first.
@@ -2990,6 +3103,12 @@ impl<'a> AuditLog<'a> {
 
     fn segment_paths(&self) -> Result<Vec<PathBuf>> {
         self.ensure_layout()?;
+        self.listed_segment_paths()
+    }
+
+    /// [`Self::segment_paths`] for a caller that must not write: a missing
+    /// segment directory lists no segments rather than being created.
+    fn listed_segment_paths(&self) -> Result<Vec<PathBuf>> {
         let directory = Path::new(SEGMENT_DIRECTORY);
         let entries = paths::list_directory(self.root, directory, SEGMENT_DIRECTORY_LABEL)?
             .unwrap_or_default();
