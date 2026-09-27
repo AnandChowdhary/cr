@@ -1034,6 +1034,44 @@ async fn each_signed_in_person_has_their_own_form_token_and_no_console() {
 }
 
 #[tokio::test]
+async fn a_signed_in_person_sees_who_they_are_and_can_sign_out() {
+    let (_temporary, database) = seeded_database("cloudflare-account");
+    let team = Signer::team();
+    let keys = KeyServer::start(&[&team]);
+    let app = router(database, signed_in(keys.access())).unwrap();
+
+    let assertion = team.assertion("Editor@Example.com");
+    let page = get(&app, "/", &[(ASSERTION, &assertion)]).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.text());
+    let html = page.text();
+    let card = html
+        .split_once("<div class=\"cr-account\" role=\"group\" aria-label=\"Signed in\">")
+        .unwrap()
+        .1
+        .split_once("</div>")
+        .unwrap()
+        .0;
+    // The user record's own spelling, not the assertion's.
+    assert!(card.contains(">E</span>"), "{card}");
+    assert!(card.contains(">Editor</p>"), "{card}");
+    assert!(card.contains(">editor@example.com</p>"), "{card}");
+    assert!(card.contains("editor · scoped · via Cloudflare"), "{card}");
+    assert!(
+        card.contains("title=\"editor · scoped · signed in with Cloudflare Access\""),
+        "{card}"
+    );
+    // Cloudflare ends the session; htmx must not try to swap its answer in.
+    assert!(
+        card.contains("href=\"/cdn-cgi/access/logout\" hx-boost=\"false\""),
+        "{card}"
+    );
+    // The narrow header opens the same card from the avatar.
+    assert!(html.contains("<details class=\"cr-account-menu\">"));
+    assert!(html.contains("aria-label=\"Signed in as Editor\""));
+    assert!(!html.contains("Markdown database"));
+}
+
+#[tokio::test]
 async fn a_browser_that_cannot_sign_in_is_shown_a_page() {
     let (_temporary, database) = seeded_database("cloudflare-page");
     let team = Signer::team();

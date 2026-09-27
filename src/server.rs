@@ -294,6 +294,135 @@ struct UiContext {
     /// Whether this is the owner console, which may view as another user. An
     /// authenticated principal is who its credential says and nobody else.
     can_switch_perspective: bool,
+    /// Who is signed in, for an authenticated principal.
+    account: Option<UiAccount>,
+}
+
+/// Who an authenticated request is, for the account card at the foot of the
+/// sidebar.
+///
+/// The console has none. Nobody signed in to it: its operator is whoever
+/// launched the server, and its perspective switcher already says whom it is
+/// viewing as.
+#[derive(Clone, Debug)]
+struct UiAccount {
+    /// The principal's ID, which picks the avatar's colour.
+    principal: String,
+    name: String,
+    /// The user's email, or its ID when it has none.
+    address: String,
+    role: String,
+    /// How the request was authenticated, in words.
+    method: String,
+    /// The same, short enough for the card's last line beside the role.
+    method_short: String,
+    /// Where signing out goes, for a method that has somewhere to go.
+    sign_out: Option<&'static str>,
+}
+
+impl UiAccount {
+    fn new(principal: &str, user: &User, authentication: Option<&Authentication>) -> Self {
+        let method = authentication.map(|authentication| &authentication.method);
+        let name = method.map_or("sign-in", authentication_method_name);
+        Self {
+            principal: principal.to_owned(),
+            name: user.name.clone(),
+            address: user.email.clone().unwrap_or_else(|| principal.to_owned()),
+            role: user_role_summary(&user.access),
+            method: name.to_owned(),
+            method_short: match method {
+                Some(AuthenticationMethod::CloudflareAccess) => "Cloudflare".to_owned(),
+                _ => name.to_owned(),
+            },
+            // Cloudflare Access ends its session at this path on every host it
+            // protects. A principal token has no session to end: whatever
+            // attaches it keeps attaching it.
+            sign_out: (method == Some(&AuthenticationMethod::CloudflareAccess))
+                .then_some("/cdn-cgi/access/logout"),
+        }
+    }
+}
+
+/// Up to two letters for a person's avatar: the first of their name's first
+/// and last words, or of `fallback` when the name is blank.
+fn initials(name: &str, fallback: &str) -> String {
+    let words = name.split_whitespace().collect::<Vec<_>>();
+    let letters = match words.as_slice() {
+        [] => vec![fallback.trim()],
+        [only] => vec![*only],
+        [first, .., last] => vec![*first, *last],
+    };
+    letters
+        .into_iter()
+        .filter_map(|word| word.chars().next())
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+/// How many avatar colours `cr.css` defines, as `.cr-avatar-0` onwards.
+const AVATAR_HUES: u32 = 8;
+
+/// Which avatar colour a person gets, picked from their principal ID so that
+/// the same person is the same colour on every page and in every list. The
+/// colour comes from a class rather than a `style` attribute, which the
+/// content security policy would refuse.
+fn avatar_class(key: &str) -> String {
+    // FNV-1a: stable across builds and platforms, unlike `std`'s hasher.
+    let hash = key
+        .trim()
+        .to_lowercase()
+        .bytes()
+        .fold(0x811c_9dc5_u32, |hash, byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+        });
+    format!("cr-avatar cr-avatar-{}", hash % AVATAR_HUES)
+}
+
+/// A person as the UI shows one wherever one appears: a tiny avatar of their
+/// initials, in their colour, beside their name. `key` is their principal ID,
+/// and `title` whatever the name leaves out, such as the ID or the recorded
+/// actor.
+fn user_chip(name: &str, key: &str, title: Option<&str>) -> Markup {
+    html! {
+        span class="cr-user" title=[title] {
+            span class=(avatar_class(key)) aria-hidden="true" { (initials(name, key)) }
+            span class="cr-user-name" { (name) }
+        }
+    }
+}
+
+/// An audit event's actor as a chip. The actor is what the event recorded,
+/// `Name <email>` for any principal CR knows, so it names the person as they
+/// were then, and is readable by anybody who may read the event, whatever
+/// they may read of the registry. The whole recorded string is the tooltip.
+fn actor_chip(actor: &str) -> Markup {
+    let key = crate::principal_id(actor).unwrap_or_else(|_| actor.to_lowercase());
+    user_chip(identity_name(actor), &key, Some(actor))
+}
+
+/// The names of the users `ids`, as far as this perspective may read them:
+/// through the registry, which access managers and owners may read, or the
+/// user's own record, which a `Database`-wide viewer may. A user it may read
+/// neither way is left out, and shown by ID.
+fn user_names<'a>(
+    database: &Database,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> BTreeMap<String, String> {
+    ids.into_iter()
+        .filter_map(|id| {
+            let name = match database.user(id) {
+                Ok(user) => user.name,
+                Err(_) => database
+                    .get(USERS_COLLECTION, id)
+                    .ok()?
+                    .attributes
+                    .get(YamlValue::String("name".to_owned()))?
+                    .as_str()?
+                    .to_owned(),
+            };
+            Some((id.to_owned(), name))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3164,8 +3293,8 @@ async fn audit_view(
             .checked_add(bounds.limit)
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| ApiError::unprocessable("pagination window is too large"))?;
-        let entries = run_database(&state, &headers, move |database| {
-            database.audit_recent(
+        let (entries, people) = run_database(&state, &headers, move |database| {
+            let entries = database.audit_recent(
                 requested,
                 AuditFilter {
                     collection: collection.as_deref(),
@@ -3173,7 +3302,15 @@ async fn audit_view(
                     agent: agent.as_deref(),
                     session: session.as_deref(),
                 },
-            )
+            )?;
+            let users = entries
+                .iter()
+                .map(|entry| &entry.payload.record)
+                .filter(|record| record.collection == USERS_COLLECTION)
+                .map(|record| record.id.as_str())
+                .collect::<BTreeSet<_>>();
+            let people = user_names(database, users);
+            Ok((entries, people))
         })
         .await?;
         let page = paginate_unknown_total(entries, bounds);
@@ -3182,6 +3319,7 @@ async fn audit_view(
         Ok(render_audit_view(
             &Representation::requested(&headers),
             &page,
+            &people,
             &query,
             &navigation,
             ui.as_ref(),
@@ -7444,8 +7582,7 @@ fn render_users_view(
                     table class="min-w-full divide-y divide-gray-200 text-left text-sm" {
                         thead {
                             tr {
-                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Principal" }
-                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Name" }
+                                th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "User" }
                                 th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Email" }
                                 th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Kind" }
                                 th scope="col" class="whitespace-nowrap px-4 py-3 font-semibold text-gray-700" { "Status" }
@@ -7467,8 +7604,10 @@ fn render_users_view(
                             } @else {
                                 @for (id, user) in users {
                                     tr {
-                                        td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold text-gray-900" { (id) }
-                                        td class="px-4 py-3 text-gray-700" { (&user.name) }
+                                        td class="px-4 py-3" {
+                                            span class="block font-medium text-gray-900" { (user_chip(&user.name, id, None)) }
+                                            span class="cr-user-id" { (id) }
+                                        }
                                         td class="px-4 py-3 text-gray-700" { (user.email.as_deref().unwrap_or("—")) }
                                         td class="whitespace-nowrap px-4 py-3 text-gray-700" { (user_kind_label(user.kind)) }
                                         td class="whitespace-nowrap px-4 py-3" {
@@ -8115,6 +8254,7 @@ fn user_kind_label(kind: UserKind) -> &'static str {
 fn render_audit_view(
     representation: &Representation,
     page: &Page<AuditEntry>,
+    people: &BTreeMap<String, String>,
     query: &AuditViewQuery,
     views: &[ViewDefinition],
     ui: Option<&UiContext>,
@@ -8164,7 +8304,7 @@ fn render_audit_view(
                     a href=(reset_url) class="cr-button" { "Reset" }
                 }
             }
-            (render_audit_entries(&page.data))
+            (render_audit_entries(&page.data, people))
             div class="cr-surface mt-4 flex flex-col gap-3 px-4 py-3 text-sm sm:flex-row sm:items-center sm:justify-between" {
                 p class="text-gray-600" { "Showing events " (first) "–" (last) " newest first" }
                 div class="flex items-center gap-2" {
@@ -8185,19 +8325,25 @@ fn render_audit_view(
 /// How a server authenticated an event's principal, in words: the method,
 /// and the public ID of the credential that passed.
 fn authentication_label(authentication: &Authentication) -> Markup {
-    let method = match &authentication.method {
-        AuthenticationMethod::CloudflareAccess => "Cloudflare Access",
-        method => method.label(),
-    };
     html! {
-        "authenticated by " (method)
+        "authenticated by " (authentication_method_name(&authentication.method))
         @if let Some(credential) = &authentication.credential {
             " " code class="font-mono" { (credential) }
         }
     }
 }
 
-fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
+/// An authentication method as a person reads it.
+fn authentication_method_name(method: &AuthenticationMethod) -> &str {
+    match method {
+        AuthenticationMethod::CloudflareAccess => "Cloudflare Access",
+        method => method.label(),
+    }
+}
+
+/// `people` names the users whose own records some of `entries` changed, so
+/// those events show the person rather than `users/<id>`.
+fn render_audit_entries(entries: &[AuditEntry], people: &BTreeMap<String, String>) -> Markup {
     html! {
         div class="cr-audit-list" {
             @if entries.is_empty() {
@@ -8214,18 +8360,25 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
                                     span class="cr-data" { "#" (entry.payload.sequence) }
                                     span class="cr-pill" { (audit_source_label(&entry.payload.source)) }
                                 }
-                                a href=(audit_filter_url(&entry.payload.record.collection, &entry.payload.record.id)) class="mt-3 block truncate font-mono text-sm font-semibold text-gray-900 hover:text-blue-700" {
-                                    (entry.payload.record.reference())
+                                @let record = &entry.payload.record;
+                                @if record.collection == USERS_COLLECTION {
+                                    a href=(audit_filter_url(&record.collection, &record.id)) class="mt-3 block truncate text-sm font-semibold text-gray-900 hover:text-blue-700" {
+                                        (user_chip(people.get(&record.id).map_or(&record.id, String::as_str), &record.id, Some(&record.reference())))
+                                    }
+                                } @else {
+                                    a href=(audit_filter_url(&record.collection, &record.id)) class="mt-3 block truncate font-mono text-sm font-semibold text-gray-900 hover:text-blue-700" {
+                                        (record.reference())
+                                    }
                                 }
                                 p class="mt-1 text-xs text-gray-500" {
-                                    "by " span class="font-medium text-gray-700" { (&entry.payload.actor) }
+                                    "by " span class="font-medium text-gray-700" { (actor_chip(&entry.payload.actor)) }
                                     @if let Some(operator) = entry
                                         .payload
                                         .access
                                         .as_ref()
                                         .and_then(|access| access.impersonated_by.as_ref())
                                     {
-                                        " · impersonated by " span class="font-medium text-gray-700" { (&operator.display) }
+                                        " · impersonated by " span class="font-medium text-gray-700" { (actor_chip(&operator.display)) }
                                     }
                                     @if let Some(authentication) = entry
                                         .payload
@@ -12173,10 +12326,20 @@ fn render_record_relations(
     let link_url = format!("{base}/relations");
     let unlink_url = format!("{base}/relations/remove");
     let other_end = |related: &RelatedRecord| {
+        // A user is a person, and shown as one: avatar and name.
+        let is_user = related.collection == USERS_COLLECTION;
+        let label = |name: &str| {
+            html! {
+                @if is_user { (user_chip(name, &related.id, Some(&related.id))) } @else { (name) }
+            }
+        };
         html! {
             @match (&related.name, &related.url) {
-                (Some(name), Some(url)) => a href=(url) class="cr-relation-target" { (name) },
-                (Some(name), None) => span class="cr-relation-target" { (name) },
+                (Some(name), Some(url)) => a href=(url) class="cr-relation-target" { (label(name)) },
+                (Some(name), None) => span class="cr-relation-target" { (label(name)) },
+                // Only the ID the relation states, since this perspective may
+                // not read the user's name; still marked as a person.
+                (None, _) if is_user => span class="cr-relation-missing" title="Missing, or not visible to this perspective" { (user_chip(&related.id, &related.id, None)) },
                 (None, _) => span class="cr-relation-missing" title="Missing, or not visible to this perspective" { (&related.collection) "/" (&related.id) },
             }
         }
@@ -12781,13 +12944,13 @@ fn render_record_activity(entries: &[AuditEntry]) -> Markup {
                             }
                         }
                         p class="cr-activity-meta" {
-                            span title=(&payload.actor) { (identity_name(&payload.actor)) }
+                            (actor_chip(&payload.actor))
                             @if let Some(operator) = payload
                                 .access
                                 .as_ref()
                                 .and_then(|access| access.impersonated_by.as_ref())
                             {
-                                " · impersonated by " span title=(&operator.display) { (identity_name(&operator.display)) }
+                                " · impersonated by " (actor_chip(&operator.display))
                             }
                             @if let Some(authentication) = payload
                                 .access
@@ -13017,6 +13180,45 @@ fn perspective_control(ui: &UiContext, csrf_token: &str, id: &str) -> Markup {
     }
 }
 
+/// Who is signed in, at the foot of the sidebar: an avatar, the name, the
+/// address, the role and how they signed in, and a way to sign out where there
+/// is one.
+fn account_card(account: &UiAccount) -> Markup {
+    html! {
+        div class="cr-account" role="group" aria-label="Signed in" {
+            span class=(format!("cr-account-avatar {}", avatar_class(&account.principal))) aria-hidden="true" {
+                (initials(&account.name, &account.address))
+            }
+            p class="cr-account-name" title=(&account.name) { (&account.name) }
+            @if let Some(sign_out) = account.sign_out {
+                // Unboosted: Cloudflare answers it, and then sends the browser
+                // to its own sign-in page.
+                a href=(sign_out) hx-boost=(UNBOOSTED) class="cr-account-sign-out" { "Sign out" }
+            }
+            p class="cr-account-address" title=(&account.address) { (&account.address) }
+            p class="cr-account-meta" title=(format!("{} · signed in with {}", account.role, account.method)) {
+                (&account.role) " · via " (&account.method_short)
+            }
+        }
+    }
+}
+
+/// The narrow header has no foot to put the card in, so the avatar opens it.
+/// A `<details>` needs no script, and a keyboard or a screen reader operates
+/// it as it would any disclosure.
+fn account_menu(account: &UiAccount) -> Markup {
+    html! {
+        details class="cr-account-menu" {
+            summary class=(format!("cr-account-avatar {}", avatar_class(&account.principal))) aria-label=(format!("Signed in as {}", account.name)) title=(format!("{} · {}", account.name, account.address)) {
+                (initials(&account.name, &account.address))
+            }
+            div class="cr-account-popover" {
+                (account_card(account))
+            }
+        }
+    }
+}
+
 /// Whether `current_path` is somewhere the sidebar reaches only through **All
 /// views**: the index itself, or a collection's automatic view and the records
 /// opened from it. Collections are listed on the index rather than in the
@@ -13100,9 +13302,13 @@ fn sidebar_navigation(
                 @if let Some(ui) = ui.filter(|ui| ui.can_switch_perspective) {
                     (perspective_control(ui, csrf_token, "cr-perspective-sidebar"))
                 }
-                div class="cr-sidebar-meta" {
-                    span { "Markdown database" }
-                    code { "cr serve" }
+                @if let Some(account) = ui.and_then(|ui| ui.account.as_ref()) {
+                    (account_card(account))
+                } @else {
+                    div class="cr-sidebar-meta" {
+                        span { "Markdown database" }
+                        code { "cr serve" }
+                    }
                 }
             }
         }
@@ -13171,6 +13377,9 @@ fn mobile_navigation(
                     div class="cr-mobile-utilities" {
                         a href="/audit" class="cr-nav-link" { "Audit" }
                         a href="/openapi.json" hx-boost=(UNBOOSTED) class="cr-nav-link" { "API" }
+                        @if let Some(account) = ui.and_then(|ui| ui.account.as_ref()) {
+                            (account_menu(account))
+                        }
                     }
                 }
             }
@@ -13647,11 +13856,10 @@ fn page_layout(
                                 div class="cr-perspective-banner" {
                                     div class="flex w-full flex-wrap items-center justify-between gap-2 px-4 py-2 text-xs sm:px-6" {
                                         span {
-                                            "Viewing as " strong { (&ui.selected_name) }
-                                            " (" code class="font-mono" { (&ui.selected) } ")"
+                                            "Viewing as " strong { (user_chip(&ui.selected_name, &ui.selected, Some(&ui.selected))) }
                                             @if ui.selected_status == UserStatus::Disabled { " · disabled" }
                                         }
-                                        span { "Impersonated by " (&ui.operator.display) }
+                                        span { "Impersonated by " (actor_chip(&ui.operator.display)) }
                                     }
                                 }
                             }
@@ -15729,6 +15937,9 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
             .ok_or_else(|| DomainError::record_not_found("users", &selected))?;
         let selected_name = selected_user.name.clone();
         let selected_status = selected_user.status;
+        let account = authenticated
+            .as_ref()
+            .map(|database| UiAccount::new(&selected, selected_user, database.authentication()));
         let can_switch_perspective = authenticated.is_none();
         let selected_database = match authenticated {
             Some(database) => database,
@@ -15778,6 +15989,7 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
                 pins_error: None,
                 users,
                 can_switch_perspective,
+                account,
             },
             pins_error,
         ))
@@ -16331,13 +16543,50 @@ fn collection_component_name(collection: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, INTERNAL_MESSAGE, ViewIndex};
+    use super::{ApiError, INTERNAL_MESSAGE, ViewIndex, avatar_class, initials};
     use crate::{
         Database, DomainError,
         audit::{reset_verify_chain_calls, verify_chain_calls},
     };
     use anyhow::anyhow;
     use axum::http::StatusCode;
+
+    #[test]
+    fn a_person_is_shown_by_the_initials_of_their_first_and_last_names() {
+        let initials = |name: &str| initials(name, "ada@example.com");
+        assert_eq!(initials("Ada Lovelace"), "AL");
+        assert_eq!(initials("Ada"), "A");
+        assert_eq!(initials("ada king lovelace"), "AL");
+        assert_eq!(initials("  Grace   Hopper "), "GH");
+        assert_eq!(initials("élodie ørsted"), "ÉØ");
+        assert_eq!(initials(""), "A");
+    }
+
+    #[test]
+    fn a_person_keeps_one_avatar_colour_however_their_id_is_spelled() {
+        assert_eq!(
+            avatar_class("ada@example.com"),
+            avatar_class(" Ada@Example.com ")
+        );
+        let colours = [
+            "ada@example.com",
+            "grace@example.com",
+            "alan@example.com",
+            "edsger@example.com",
+            "barbara@example.com",
+            "ken@example.com",
+        ]
+        .map(avatar_class)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        // Not a promise any two differ, only that the colours are spread.
+        assert!(colours.len() > 1);
+        assert!(
+            colours
+                .iter()
+                .all(|class| class.starts_with("cr-avatar cr-avatar-"))
+        );
+    }
 
     /// Every plaintext listing needs the journal replayed, and the index lists
     /// every collection. Replaying it once per collection made the index cost

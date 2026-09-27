@@ -545,10 +545,16 @@ async fn owner_switches_user_perspectives_and_the_ui_matches_each_policy() {
     )
     .await;
     assert_eq!(reader_view.status, StatusCode::OK);
+    // The person, avatar and name, with their ID in the tooltip.
     assert!(
         reader_view
             .text()
-            .contains("Viewing as <strong>Reader</strong>")
+            .contains("Viewing as <strong><span class=\"cr-user\" title=\"reader@example.com\">")
+    );
+    assert!(
+        reader_view
+            .text()
+            .contains("<span class=\"cr-user-name\">Reader</span></span></strong>")
     );
     assert!(reader_view.text().contains("public"));
     assert!(!reader_view.text().contains("secret"));
