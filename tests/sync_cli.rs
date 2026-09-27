@@ -30,6 +30,23 @@ fn json_output(database: &TestDatabase, arguments: &[&str]) -> Value {
     serde_json::from_str(&run_success(database.command().args(arguments))).unwrap()
 }
 
+/// The `--json-errors` envelope of a command that has to fail.
+fn json_error(database: &TestDatabase, arguments: &[&str]) -> Value {
+    envelope(&run_failure(
+        database.command().arg("--json-errors").args(arguments),
+    ))
+}
+
+fn envelope(stderr: &str) -> Value {
+    serde_json::from_str(stderr)
+        .unwrap_or_else(|error| panic!("stderr was not a JSON error envelope: {error}\n{stderr}"))
+}
+
+fn assert_error(envelope: &Value, code: &str, message: &str) {
+    assert_eq!(envelope["error"]["code"], code, "{envelope}");
+    assert_eq!(envelope["error"]["message"], message, "{envelope}");
+}
+
 #[test]
 fn sync_lifecycle_is_idempotent_checkpointed_and_audited() {
     let database = TestDatabase::new("sync-lifecycle");
@@ -254,8 +271,12 @@ fn sync_enforces_timeout_and_output_limits_without_committing_state() {
     let slow = write_script(&database, "slow", "#!/bin/sh\nsleep 2\n");
     create_sync(&database, "slow", &slow, &["--timeout-seconds", "1"]);
     let started = Instant::now();
-    let error = run_failure(database.command().args(["sync", "run", "slow"]));
-    assert!(error.contains("exceeded its 1 second timeout"));
+    let error = json_error(&database, &["sync", "run", "slow"]);
+    assert_error(
+        &error,
+        "adapter_failed",
+        "sync 'slow' exceeded its 1 second timeout",
+    );
     assert!(started.elapsed() < Duration::from_secs(2));
 
     let noisy = write_script(
@@ -264,8 +285,12 @@ fn sync_enforces_timeout_and_output_limits_without_committing_state() {
         "#!/bin/sh\nprintf '%s\\n' 'this output is definitely too large'\n",
     );
     create_sync(&database, "noisy", &noisy, &["--max-output-bytes", "8"]);
-    let error = run_failure(database.command().args(["sync", "run", "noisy"]));
-    assert!(error.contains("output exceeded 8 bytes"));
+    let error = json_error(&database, &["sync", "run", "noisy"]);
+    assert_error(
+        &error,
+        "adapter_failed",
+        "sync 'noisy' output exceeded 8 bytes",
+    );
     assert_eq!(
         json_output(&database, &["audit", "head", "--json"])["sequence"],
         0
@@ -308,8 +333,8 @@ printf '%s\n' '{"type":"checkpoint","state":{"completed":true}}'
     }
     assert!(marker.exists(), "first sync did not start in time");
 
-    let error = run_failure(database.command().args(["sync", "run", "overlap"]));
-    assert!(error.contains("already running"));
+    let error = json_error(&database, &["sync", "run", "overlap"]);
+    assert_error(&error, "conflict", "sync 'overlap' is already running");
     let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
@@ -339,7 +364,7 @@ printf '%s\n' '{"type":"upsert","collection":"items","id":"from-sync","front_mat
 
     let mut command = database.command();
     command
-        .args(["sync", "run", "stale"])
+        .args(["--json-errors", "sync", "run", "stale"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = command.spawn().unwrap();
@@ -359,9 +384,10 @@ printf '%s\n' '{"type":"upsert","collection":"items","id":"from-sync","front_mat
 
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("database audit head changed while the sync command was running")
+    assert_error(
+        &envelope(&String::from_utf8_lossy(&output.stderr)),
+        "conflict",
+        "database audit head changed while the sync command was running",
     );
     assert!(database.root.join("records/items/concurrent.md").exists());
     assert!(!database.root.join("records/items/from-sync.md").exists());
@@ -389,6 +415,224 @@ fn sync_definition_validation_rejects_unsafe_names_and_unknown_versions() {
     fs::write(&definition, contents.replace("version: 1", "version: 2")).unwrap();
     let error = run_failure(database.command().args(["sync", "show", "versioned"]));
     assert!(error.contains("unsupported format version 2"));
+}
+
+/// Every way a definition can be missing, taken, or unusable has a code a
+/// scheduler can branch on, and none of them is `internal_error`.
+#[test]
+fn sync_definition_failures_have_stable_json_error_codes() {
+    let database = TestDatabase::new("sync-definition-codes");
+    let script = write_script(&database, "empty", "#!/bin/sh\n");
+
+    for command in ["show", "run", "recover", "state"] {
+        assert_error(
+            &json_error(&database, &["sync", command, "missing"]),
+            "not_found",
+            "sync 'missing' does not exist",
+        );
+    }
+
+    create_sync(&database, "daily", &script, &[]);
+    assert_error(
+        &json_error(&database, &["sync", "create", "daily", "--", "sh", &script]),
+        "already_exists",
+        "sync 'daily' already exists",
+    );
+    assert_error(
+        &json_error(
+            &database,
+            &[
+                "sync",
+                "create",
+                "slow",
+                "--timeout-seconds",
+                "0",
+                "--",
+                "sh",
+                &script,
+            ],
+        ),
+        "validation_failed",
+        "sync 'slow' timeout_seconds must be between 1 and 604800",
+    );
+    assert!(!database.root.join(".cr/syncs/slow.yaml").exists());
+
+    // A definition edited by hand is judged by the same rules.
+    let definition = database.root.join(".cr/syncs/daily.yaml");
+    let original = fs::read_to_string(&definition).unwrap();
+    fs::write(&definition, "command: [\n").unwrap();
+    assert_error(
+        &json_error(&database, &["sync", "show", "daily"]),
+        "validation_failed",
+        "sync 'daily' is not valid YAML",
+    );
+    fs::write(
+        &definition,
+        original.replace("max_operations: 10000", "max_operations: 0"),
+    )
+    .unwrap();
+    assert_error(
+        &json_error(&database, &["sync", "run", "daily"]),
+        "validation_failed",
+        "sync 'daily' max_operations must be between 1 and 100000",
+    );
+    fs::write(&definition, &original).unwrap();
+
+    // A file whose name cannot be a sync is stored state nobody asked for, so
+    // it is refused as a conflict that names the file and not where it lives.
+    fs::write(database.root.join(".cr/syncs/..yaml"), &original).unwrap();
+    let error = json_error(&database, &["sync", "list"]);
+    assert_error(
+        &error,
+        "conflict",
+        "the sync directory contains a file named '..yaml' whose name cannot be a sync",
+    );
+}
+
+/// The adapter is a program `cr` runs, so a failure of that process is
+/// `adapter_failed`: not the caller's mistake, not a conflict in the database,
+/// and not a defect in `cr`. None of them applies anything.
+#[test]
+fn a_failed_adapter_process_is_adapter_failed_and_applies_nothing() {
+    let database = TestDatabase::new("sync-adapter-failed");
+    let failed = write_script(
+        &database,
+        "failed",
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"upsert","collection":"items","id":"discarded","front_matter":{}}'
+exit 23
+"#,
+    );
+    create_sync(&database, "failed", &failed, &[]);
+    assert_error(
+        &json_error(&database, &["sync", "run", "failed"]),
+        "adapter_failed",
+        "sync 'failed' exited unsuccessfully (exit status: 23)",
+    );
+
+    // A program that is missing or not executable cannot start. The message
+    // names the sync; the program, which is very often a path, stays in the
+    // chain a person reads.
+    for (name, program) in [
+        ("missing", "scripts/not-there.sh"),
+        ("unlisted", "cr-test-no-such-program"),
+        // Written without an execute bit, so only `sh` can run it.
+        ("unexecutable", failed.as_str()),
+    ] {
+        run_success(
+            database
+                .command()
+                .args(["sync", "create", name, "--", program]),
+        );
+    }
+    for (name, reason) in [
+        ("missing", "was not found"),
+        ("unlisted", "was not found"),
+        ("unexecutable", "could not be executed"),
+    ] {
+        assert_error(
+            &json_error(&database, &["sync", "run", name]),
+            "adapter_failed",
+            &format!("sync '{name}' program {reason}"),
+        );
+    }
+    let stderr = run_failure(database.command().args(["sync", "run", "missing"]));
+    assert!(stderr.contains("scripts/not-there.sh"), "{stderr}");
+
+    assert!(!database.root.join("records/items/discarded.md").exists());
+    assert_eq!(
+        json_output(&database, &["audit", "head", "--json"])["sequence"],
+        0
+    );
+}
+
+/// Once the process has succeeded, what it printed is input, and a stream the
+/// protocol refuses is invalid in the same way one a schema refuses is.
+#[test]
+fn output_the_protocol_refuses_is_a_validation_failure() {
+    let database = TestDatabase::new("sync-protocol-codes");
+    let delete = r#"{"type":"delete","collection":"notes","id":"one"}"#;
+    let other = r#"{"type":"delete","collection":"notes","id":"two"}"#;
+    let checkpoint = r#"{"type":"checkpoint","state":{"cursor":1}}"#;
+    for (name, lines, options, message) in [
+        (
+            "malformed",
+            vec!["not json"],
+            vec![],
+            "sync 'malformed' output line 1 is invalid",
+        ),
+        (
+            "duplicate",
+            vec![delete, delete],
+            vec![],
+            "sync 'duplicate' produced multiple operations for notes/one",
+        ),
+        (
+            "late",
+            vec![checkpoint, delete],
+            vec![],
+            "sync 'late' checkpoint must be its final message",
+        ),
+        (
+            "bounded",
+            vec![delete, other],
+            vec!["--max-operations", "1"],
+            "sync 'bounded' produced more than 1 messages",
+        ),
+    ] {
+        let mut contents = String::from("#!/bin/sh\n");
+        for line in lines {
+            contents.push_str(&format!("printf '%s\\n' '{line}'\n"));
+        }
+        let script = write_script(&database, name, &contents);
+        create_sync(&database, name, &script, &options);
+        assert_error(
+            &json_error(&database, &["sync", "run", name]),
+            "validation_failed",
+            message,
+        );
+        assert_eq!(
+            json_output(&database, &["sync", "state", name]),
+            Value::Null
+        );
+    }
+    assert_eq!(
+        json_output(&database, &["audit", "head", "--json"])["sequence"],
+        0
+    );
+}
+
+/// `cr` writes checkpoints and run ledgers itself, so one that no longer
+/// parses is damaged stored state: a conflict, like every other refusal of a
+/// run ledger, rather than a request the caller got wrong.
+#[test]
+fn a_damaged_checkpoint_or_run_ledger_is_a_conflict() {
+    let database = TestDatabase::new("sync-damaged-state");
+    let script = write_script(&database, "daily", "#!/bin/sh\n");
+    create_sync(&database, "daily", &script, &[]);
+
+    let checkpoint = database.root.join(".cr/sync/state/daily.json");
+    fs::write(&checkpoint, "{").unwrap();
+    assert_error(
+        &json_error(&database, &["sync", "state", "daily"]),
+        "conflict",
+        "the checkpoint for sync 'daily' is not valid JSON",
+    );
+    fs::remove_file(&checkpoint).unwrap();
+
+    fs::create_dir_all(database.root.join(".cr/sync/runs")).unwrap();
+    fs::write(database.root.join(".cr/sync/runs/daily.json"), "{").unwrap();
+    for arguments in [
+        &["sync", "run", "daily"][..],
+        &["sync", "recover", "daily"],
+        &["sync", "recover", "daily", "--check"],
+    ] {
+        assert_error(
+            &json_error(&database, arguments),
+            "conflict",
+            "the run ledger for sync 'daily' is not valid JSON",
+        );
+    }
 }
 
 /// Force a run to fail durably partway through applying its stream.
@@ -693,6 +937,9 @@ fn a_run_left_partly_applied_cannot_be_silently_restarted() {
     unblock_collection(&database, "blocked");
     let error = run_failure(database.command().args(["sync", "run", "partial"]));
     assert!(error.contains("has an interrupted run"), "{error}");
+    // A scheduler can tell this apart from a failed fetch without parsing it.
+    let error = json_error(&database, &["sync", "run", "partial"]);
+    assert_eq!(error["error"]["code"], "conflict");
     assert_eq!(
         json_output(&database, &["sync", "state", "partial"]),
         Value::Null

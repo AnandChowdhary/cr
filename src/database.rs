@@ -600,9 +600,14 @@ impl Database {
 
         // A dangling or hostile symbolic link named `.cr` must not be treated as
         // absent and then created through, so existence is judged without
-        // following links.
+        // following links. The root stays beneath the classified message, as
+        // every path does, so the message alone is safe to hand a remote caller.
         if paths::entry_kind(&root, Path::new(DATABASE_DIRECTORY), DATABASE_LABEL)?.is_some() {
-            bail!("a database already exists at {}", root.display());
+            return Err(
+                anyhow!("{} already contains {DATABASE_DIRECTORY}", root.display()).context(
+                    DomainError::AlreadyExists("a database already exists".to_owned()),
+                ),
+            );
         }
 
         for (relative, label) in [
@@ -642,10 +647,22 @@ impl Database {
     }
 
     pub fn discover(explicit_root: Option<&Path>) -> Result<Self> {
+        // A missing root and a root without `.cr` are the same answer to the
+        // caller. As in `init`, the root itself stays beneath the message.
+        let no_database = || DomainError::NotFound("no database found; run 'cr init' first".into());
         let root = match explicit_root {
-            Some(path) => path
-                .canonicalize()
-                .with_context(|| format!("could not resolve database root {}", path.display()))?,
+            Some(path) => path.canonicalize().map_err(|error| {
+                let missing = error.kind() == std::io::ErrorKind::NotFound;
+                let error = anyhow!(error).context(format!(
+                    "could not resolve database root {}",
+                    path.display()
+                ));
+                if missing {
+                    error.context(no_database())
+                } else {
+                    error
+                }
+            })?,
             None => {
                 let current =
                     std::env::current_dir().context("could not read current directory")?;
@@ -653,7 +670,11 @@ impl Database {
                     .ancestors()
                     .find(|path| path.join(DATABASE_DIRECTORY).is_dir())
                     .map(Path::to_path_buf)
-                    .context("no database found; run 'cr init' or pass --database <PATH>")?
+                    .ok_or_else(|| {
+                        DomainError::NotFound(
+                            "no database found; run 'cr init' or pass --database <PATH>".into(),
+                        )
+                    })?
             }
         };
 
@@ -662,41 +683,48 @@ impl Database {
         if paths::open_directory_optional(&root, Path::new(DATABASE_DIRECTORY), DATABASE_LABEL)?
             .is_none()
         {
-            bail!(
-                "no database found at {}; run 'cr init' first",
+            return Err(anyhow!(
+                "{} contains no {DATABASE_DIRECTORY} directory",
                 root.display()
-            );
+            )
+            .context(no_database()));
         }
 
+        // The configuration is a definition somebody wrote, so a file that
+        // cannot be used is invalid, like a malformed schema or saved view.
         let config = match paths::read_to_string_optional(
             &root,
             Path::new(CONFIG_PATH),
             "the database configuration",
         )? {
-            Some(serialized) => yaml_serde::from_str(&serialized)
-                .context("the database configuration is not valid YAML")?,
+            Some(serialized) => yaml_serde::from_str(&serialized).with_context(|| {
+                DomainError::Invalid("the database configuration is not valid YAML".into())
+            })?,
             None => Config::default(),
         };
 
         if config.version != CURRENT_FORMAT_VERSION {
-            bail!(
-                "database format version {} is unsupported (expected {})",
-                config.version,
-                CURRENT_FORMAT_VERSION
-            );
+            return Err(invalid(format!(
+                "database format version {} is unsupported (expected {CURRENT_FORMAT_VERSION})",
+                config.version
+            )));
         }
         validate_relative_path(&config.data_dir, "data_dir")?;
         // The configured records directory, and every directory above it, must
         // be a real directory beneath the root rather than a redirection.
         paths::open_directory_optional(&root, &config.data_dir, RECORDS_LABEL)?;
         if config.audit.segment_max_events == 0 {
-            bail!("audit.segment_max_events must be greater than zero");
+            return Err(invalid(
+                "audit.segment_max_events must be greater than zero",
+            ));
         }
         if config.audit.segment_max_bytes == 0 {
-            bail!("audit.segment_max_bytes must be greater than zero");
+            return Err(invalid("audit.segment_max_bytes must be greater than zero"));
         }
         if config.audit.full_walk_after_events == 0 {
-            bail!("audit.full_walk_after_events must be greater than zero");
+            return Err(invalid(
+                "audit.full_walk_after_events must be greater than zero",
+            ));
         }
 
         let database = Self {
@@ -6095,7 +6123,9 @@ fn validate_relative_path(path: &Path, label: &str) -> Result<()> {
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
     {
-        bail!("{label} must be a relative path without '.' or '..'");
+        return Err(invalid(format!(
+            "{label} must be a relative path without '.' or '..'"
+        )));
     }
     Ok(())
 }

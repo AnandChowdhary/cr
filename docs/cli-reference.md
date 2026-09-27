@@ -7,7 +7,8 @@ first event instead of resuming the walk the last write saved under
 Global `--json-errors` writes failures to stderr as
 `{"error":{"code":"...","message":"..."}}`; command-line syntax failures use
 `usage_error`, classified domain failures retain their stable code, and an
-unclassified failure uses `internal_error`.
+unclassified failure uses `internal_error`. The codes a scheduled sync can fail
+with are listed in [Run on a schedule](sync.md#run-on-a-schedule).
 
 ```text
 cr [--database PATH] [--actor IDENTITY] [--as PRINCIPAL] [--verify-audit] [--json-errors] COMMAND

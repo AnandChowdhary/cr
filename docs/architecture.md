@@ -728,11 +728,16 @@ Failures carry a typed `DomainError` classification attached to the `anyhow`
 chain rather than being recovered from message text. The domain layer names the
 meanings a caller can act on—not found, already exists, forbidden, conflicting
 durable or audited state, a failed record precondition, invalid input, approval
-mismatch, replay integrity failure, and anchor mismatch—and writes the
-caller-facing wording at the point of failure, so it
-names records, views, collections, and fields instead of paths. The HTTP layer
-maps each classification to one status and code and treats an unclassified
-failure as `500`/`internal_error`. By default the CLI keeps printing the
+mismatch, replay integrity failure, anchor mismatch, and a failed sync
+adapter—and writes the caller-facing wording at the point of failure, so it
+names records, views, collections, syncs, and fields instead of paths. The HTTP
+layer maps each classification to one status and code and treats an
+unclassified failure as `500`/`internal_error`. A failed adapter maps to
+`502`/`adapter_failed`: the adapter is an upstream program `cr` runs, so its
+failure is neither the caller's nor a defect in `cr`, and like every `5xx` its
+response carries the generic message. Opening and initializing a database and
+every sync failure a caller can act on are classified too, although only the
+CLI reaches them today. By default the CLI keeps printing the
 complete chain; global `--json-errors` instead emits the same stable domain code
 and authored message in a JSON envelope, uses `usage_error` for command-line
 parsing failures, and reserves `internal_error` for unclassified failures.

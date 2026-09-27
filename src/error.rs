@@ -72,6 +72,17 @@ pub enum DomainError {
     /// established. It never means "the anchor is merely behind", which is a
     /// success with a notice rather than a failure.
     AnchorMismatch(String),
+    /// A sync adapter could not be started, outran its time or output bound,
+    /// or exited unsuccessfully.
+    ///
+    /// The adapter is an external program `cr` runs on the caller's behalf,
+    /// so its failure is neither a bad request nor conflicting database state,
+    /// and it is not a defect in `cr` either. An unattended job needs to tell
+    /// "the upstream fetch failed, retry later" apart from all three. What the
+    /// adapter *printed* is still judged by [`Self::Invalid`]; this variant is
+    /// only about the process, and a run that fails this way has applied
+    /// nothing.
+    AdapterFailed(String),
 }
 
 impl DomainError {
@@ -94,6 +105,7 @@ impl DomainError {
             Self::ApprovalMismatch(_) => "approval_mismatch",
             Self::AuditIntegrity(_) => "audit_integrity_failed",
             Self::AnchorMismatch(_) => "anchor_mismatch",
+            Self::AdapterFailed(_) => "adapter_failed",
         }
     }
 
@@ -109,7 +121,8 @@ impl DomainError {
             | Self::Invalid(message)
             | Self::ApprovalMismatch(message)
             | Self::AuditIntegrity(message)
-            | Self::AnchorMismatch(message) => message,
+            | Self::AnchorMismatch(message)
+            | Self::AdapterFailed(message) => message,
         }
     }
 
@@ -230,6 +243,11 @@ pub(crate) fn anchor_mismatch(message: impl Display) -> anyhow::Error {
     anyhow::Error::new(DomainError::AnchorMismatch(message.to_string()))
 }
 
+/// Build a failed-sync-adapter failure for `bail!`-style returns.
+pub(crate) fn adapter_failed(message: impl Display) -> anyhow::Error {
+    anyhow::Error::new(DomainError::AdapterFailed(message.to_string()))
+}
+
 /// True when `error` was caused by a missing filesystem entry.
 pub(crate) fn is_missing(error: &anyhow::Error) -> bool {
     io_kind_matches(error, std::io::ErrorKind::NotFound)
@@ -251,8 +269,9 @@ fn io_kind_matches(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DomainError, anchor_mismatch, approval_mismatch, audit_integrity, conflict, forbidden,
-        idempotency_conflict, invalid, is_already_exists, is_missing, precondition_failed,
+        DomainError, adapter_failed, anchor_mismatch, approval_mismatch, audit_integrity, conflict,
+        forbidden, idempotency_conflict, invalid, is_already_exists, is_missing,
+        precondition_failed,
     };
     use anyhow::anyhow;
 
@@ -312,6 +331,11 @@ mod tests {
         assert_eq!(
             DomainError::of(&anchor_mismatch("anchor is not the head")).map(DomainError::code),
             Some("anchor_mismatch")
+        );
+        assert_eq!(
+            DomainError::of(&adapter_failed("sync 'daily' exited unsuccessfully"))
+                .map(DomainError::code),
+            Some("adapter_failed")
         );
     }
 

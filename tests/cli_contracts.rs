@@ -135,24 +135,26 @@ fn cli_expected_record_hash_is_obtainable_and_typed_when_stale() {
     assert_eq!(malformed["error"]["code"], "validation_failed");
 }
 
+/// An operating-system failure nobody anticipated keeps the fallback code and,
+/// unlike a classified failure, its complete chain.
 #[test]
 fn json_errors_give_unclassified_failures_a_stable_fallback() {
     let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path().join("existing");
-    run_success(Command::new(binary()).arg("init").arg(&root));
+    let blocker = temporary.path().join("blocker");
+    std::fs::write(&blocker, "not a directory\n").unwrap();
 
     let payload = json_error(
         Command::new(binary())
             .arg("--json-errors")
             .arg("init")
-            .arg(&root),
+            .arg(blocker.join("database")),
     );
     assert_eq!(payload["error"]["code"], "internal_error");
     assert!(
         payload["error"]["message"]
             .as_str()
             .expect("error message is a string")
-            .contains("a database already exists")
+            .contains("could not create database root")
     );
 }
 

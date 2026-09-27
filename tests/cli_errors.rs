@@ -1,8 +1,17 @@
 mod common;
 
-use std::fs;
+use std::{fs, process::Command};
 
-use common::{TestDatabase, run_failure, run_success};
+use common::{TestDatabase, binary, command_for, run_failure, run_success};
+use serde_json::Value;
+
+/// Run a failing command that was given `--json-errors` and return its error
+/// envelope.
+fn json_error(command: &mut Command) -> Value {
+    let stderr = run_failure(command);
+    serde_json::from_str(&stderr)
+        .unwrap_or_else(|error| panic!("stderr was not a JSON error envelope: {error}\n{stderr}"))
+}
 
 #[test]
 fn duplicate_create_never_overwrites_the_existing_record() {
@@ -62,8 +71,95 @@ fn an_explicit_directory_without_a_cr_marker_is_not_a_database() {
             .args(["list", "items"]),
     );
 
-    assert!(stderr.contains("no database found at"));
+    assert!(stderr.contains("no database found"));
+    // The location stays in the human-readable chain, beneath the message.
+    assert!(stderr.contains(&temporary.path().display().to_string()));
     assert!(!temporary.path().join(".cr").exists());
+}
+
+/// Opening and initializing are the first thing an unattended job does, so
+/// "there is no database here" and "there already is one" need codes it can
+/// branch on rather than `internal_error`. The messages never carry the root:
+/// the caller supplied it, and a classified message is the part of an error
+/// that is safe to return to a remote caller.
+#[test]
+fn opening_and_initializing_a_database_fail_with_stable_codes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("existing");
+    run_success(Command::new(binary()).arg("init").arg(&root));
+    fs::create_dir(temporary.path().join("unmarked")).unwrap();
+
+    let existing = json_error(
+        Command::new(binary())
+            .arg("--json-errors")
+            .arg("init")
+            .arg(&root),
+    );
+    assert_eq!(existing["error"]["code"], "already_exists");
+    assert_eq!(existing["error"]["message"], "a database already exists");
+
+    for missing in ["missing", "unmarked"] {
+        let envelope = json_error(command_for(&temporary.path().join(missing)).args([
+            "--json-errors",
+            "list",
+            "items",
+        ]));
+        assert_eq!(envelope["error"]["code"], "not_found", "{missing}");
+        assert_eq!(
+            envelope["error"]["message"],
+            "no database found; run 'cr init' first"
+        );
+    }
+
+    // Without --database the search walks up from the working directory.
+    let undiscovered = json_error(
+        Command::new(binary())
+            .current_dir(temporary.path().join("unmarked"))
+            .args(["--json-errors", "list", "items"]),
+    );
+    assert_eq!(undiscovered["error"]["code"], "not_found");
+    assert_eq!(
+        undiscovered["error"]["message"],
+        "no database found; run 'cr init' or pass --database <PATH>"
+    );
+}
+
+/// The configuration is a definition somebody wrote, so one that cannot be
+/// used is invalid, exactly as a malformed schema or saved view is.
+#[test]
+fn an_unusable_database_configuration_is_a_validation_failure() {
+    for (config, message) in [
+        (
+            "version: [\n",
+            "the database configuration is not valid YAML",
+        ),
+        (
+            "version: 99\ndata_dir: records\n",
+            "database format version 99 is unsupported (expected 1)",
+        ),
+        (
+            "version: 1\ndata_dir: ../outside\n",
+            "data_dir must be a relative path without '.' or '..'",
+        ),
+        (
+            "version: 1\ndata_dir: records\naudit:\n  segment_max_bytes: 0\n",
+            "audit.segment_max_bytes must be greater than zero",
+        ),
+        (
+            "version: 1\ndata_dir: records\naudit:\n  full_walk_after_events: 0\n",
+            "audit.full_walk_after_events must be greater than zero",
+        ),
+    ] {
+        let database = TestDatabase::new("unusable-config");
+        fs::write(database.root.join(".cr/config.yaml"), config).unwrap();
+        let envelope = json_error(
+            database
+                .command()
+                .args(["--json-errors", "list", "candidates"]),
+        );
+        assert_eq!(envelope["error"]["code"], "validation_failed", "{config}");
+        assert_eq!(envelope["error"]["message"], message);
+    }
 }
 
 #[test]
