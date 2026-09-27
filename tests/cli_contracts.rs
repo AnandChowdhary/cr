@@ -186,6 +186,97 @@ fn json_errors_include_command_line_usage_failures() {
     assert!(String::from_utf8(help.stdout).unwrap().contains("Usage:"));
 }
 
+/// The argument checks clap cannot express are the same mistake as the ones
+/// it can, caught later, so a script sees the same code and exit status for
+/// both. Without `--json-errors` the message is unchanged.
+#[test]
+fn argument_checks_clap_cannot_express_are_usage_errors() {
+    let database = TestDatabase::new("json-usage-errors");
+    run_success(database.command().args(["create", "items", "one"]));
+    let record = database.root().join("records/items/one.md");
+    let before = std::fs::read(&record).unwrap();
+
+    let clap_status =
+        failure(Command::new(binary()).args(["--json-errors", "--not-a-real-option"]))
+            .status
+            .code();
+    assert_eq!(clap_status, Some(2));
+
+    let secret = "must-not-appear";
+    let cases: [(Vec<&str>, &str); 8] = [
+        (
+            vec!["--as", "bob@example.com", "serve"],
+            "--as cannot be used to launch the long-lived server",
+        ),
+        (
+            vec!["--as", "bob@example.com", "init", "elsewhere"],
+            "--as cannot be used while initializing a database",
+        ),
+        (
+            vec!["update", "items", "one"],
+            "provide at least one --set, --set-env, --unset, or --body value",
+        ),
+        (
+            vec!["delete", "items", "one"],
+            "deleting a record requires --yes to confirm the destructive operation",
+        ),
+        (
+            vec!["audit", "log", "--limit", "0"],
+            "audit log limit must be greater than zero",
+        ),
+        (
+            vec!["user", "delete", "bob@example.com"],
+            "deleting a user requires --yes to confirm the destructive operation",
+        ),
+        (
+            vec![
+                "access",
+                "policy",
+                "set",
+                "database",
+                "--mode",
+                "record-owned",
+            ],
+            "record-owned access policy requires collection:NAME",
+        ),
+        (
+            vec![
+                "create",
+                "items",
+                "two",
+                "--set",
+                "token=a",
+                "--set-env",
+                "token=CR_USAGE_SECRET",
+            ],
+            "field 'token' is assigned more than once across --set and --set-env",
+        ),
+    ];
+    for (arguments, message) in cases {
+        let mut command = database.command();
+        command.env("CR_USAGE_SECRET", secret).args(&arguments);
+        let json = failure(command.arg("--json-errors"));
+        assert_eq!(json.status.code(), clap_status, "{arguments:?}");
+        assert!(json.stdout.is_empty(), "{arguments:?}");
+        let payload: Value = serde_json::from_slice(&json.stderr).unwrap();
+        assert_eq!(payload["error"]["code"], "usage_error", "{arguments:?}");
+        assert_eq!(payload["error"]["message"], message, "{arguments:?}");
+
+        let mut command = database.command();
+        command.env("CR_USAGE_SECRET", secret).args(&arguments);
+        let human = failure(&mut command);
+        assert_eq!(human.status.code(), clap_status, "{arguments:?}");
+        let stderr = String::from_utf8(human.stderr).unwrap();
+        assert_eq!(stderr, format!("error: {message}\n"));
+        assert!(!stderr.contains(secret));
+    }
+
+    assert_eq!(std::fs::read(&record).unwrap(), before);
+    assert!(!database.root().join("records/items/two.md").exists());
+    assert!(!database.root().join("records/users").exists());
+    run_success(database.command().args(["audit", "verify"]));
+}
+
 #[test]
 fn audit_filters_have_clear_names_and_compatible_aliases() {
     let database = TestDatabase::new("audit-filter-names");

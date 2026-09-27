@@ -339,6 +339,21 @@ fn empty_updates_and_missing_fields_return_errors() {
                 .args(["get", "candidates", "jane", "--field", "missing"]),
         );
     assert!(stderr.contains("field 'missing' does not exist"));
+    // The record has no such field: a lookup that found nothing, not a
+    // mistake in the command line and not a defect in `cr`.
+    let missing = json_error(database.command().args([
+        "--json-errors",
+        "get",
+        "candidates",
+        "jane",
+        "--field",
+        "missing",
+    ]));
+    assert_eq!(missing["error"]["code"], "not_found");
+    assert_eq!(
+        missing["error"]["message"],
+        "field 'missing' does not exist"
+    );
 }
 
 #[cfg(target_os = "linux")]

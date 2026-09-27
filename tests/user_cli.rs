@@ -284,7 +284,7 @@ fn delete_confirmation_unused_checks_and_tombstone_reuse_are_first_class_cli_con
         "--if-unused",
     ]));
     let error: Value = serde_json::from_str(&missing_confirmation).unwrap();
-    assert_eq!(error["error"]["code"], "validation_failed");
+    assert_eq!(error["error"]["code"], "usage_error");
     assert!(
         database
             .root()
