@@ -11,11 +11,12 @@ express did: `--as` with `init` or `serve`, an `update` with nothing to change,
 a `delete` or `user delete` without `--yes`, `audit log --limit 0`, a
 record-owned `access policy set` on anything but `collection:NAME`, or one
 field given to both `--set` and `--set-env`. A value parsing takes as text and
-the database then refuses — a field path, a `--select` list, a record hash, a
-`--fail-on` threshold — is `validation_failed` instead, as every value the
-database refuses is. Classified domain failures retain their stable code, and
-an unclassified failure uses `internal_error`. The codes a scheduled sync can
-fail with are listed in [Run on a schedule](sync.md#run-on-a-schedule).
+the database then refuses — a field path, a `--select` list, a `--sort` key
+and the `--desc` that goes with it, a record hash, a `--fail-on` threshold — is
+`validation_failed` instead, as every value the database refuses is.
+Classified domain failures retain their stable code, and an unclassified
+failure uses `internal_error`. The codes a scheduled sync can fail with are
+listed in [Run on a schedule](sync.md#run-on-a-schedule).
 
 A failed command exits 1, except a usage error, which exits 2 with or without
 `--json-errors`. `check` and `schema check` also exit 2 when they ran and found
@@ -32,13 +33,13 @@ cr create COLLECTION ID [--set KEY=YAML]... [--set-env KEY=ENV]...
                         [--preview [--json]]
 cr get COLLECTION ID [--json | --field KEY [--raw] | --select FIELDS [--json]]
 cr list COLLECTION [--where KEY=YAML]... [--where-expr EXPRESSION]...
-                   [--filter FILTER] [--select FIELDS]... [--sort FIELD [--desc]] [--json]
+                   [--filter FILTER] [--select FIELDS]... [SORT] [--json]
 cr count COLLECTION [--where KEY=YAML]... [--where-expr EXPRESSION]... [--filter FILTER]
                     [--by FIELD] [--sum FIELDS]... [--avg FIELDS]...
                     [--min FIELDS]... [--max FIELDS]... [--json]
 cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]...
                   [--where-expr EXPRESSION]... [--filter FILTER] [--select FIELDS]...
-                  [--sort FIELD [--desc]] [--json]
+                  [SORT] [--json]
                   [--front-matter | --field KEY | --body | --path]
                   [--ignore-case] [--regex]
 cr update COLLECTION ID [--set KEY=YAML]... [--set-env KEY=ENV]...
@@ -51,7 +52,7 @@ cr unlink SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
 cr backlinks COLLECTION ID [--from COLLECTION] [--relation NAME]
                            [--where KEY=YAML]... [--where-expr EXPRESSION]...
                            [--filter FILTER] [--select FIELDS]...
-                           [--sort FIELD [--desc]] [--json]
+                           [SORT] [--json]
 cr traverse COLLECTION ID [--relation NAME]... [--depth N]
                           [--json [--expand] [--select FIELDS]...]
 cr delete COLLECTION ID --yes [-m MESSAGE] [ATTRIBUTION]
@@ -93,7 +94,7 @@ cr user show [ID] [--json]
 
 cr view create NAME --collection COLLECTION [--where KEY=YAML]... [--column FIELD]...
                     [--layout table|kanban] [--group-by FIELD]
-                    [--sort-by FIELD] [--sort-direction asc|desc] [--page-size N]
+                    [--sort-by KEY]... [--sort-direction asc|desc] [--page-size N]
 cr view list [--json]
 cr view show NAME [--json]
 cr view delete NAME
@@ -120,6 +121,9 @@ cr audit head [--json]
 cr audit anchor [--write] [--json]
 cr audit baseline
 
+SORT = --sort KEY [--sort KEY]... | --sort FIELD --desc
+KEY  = FIELD | FIELD:asc | FIELD:desc, or several of them separated by commas
+
 ATTRIBUTION = [--agent AGENT] [--agent-version V] [--agent-model MODEL]
               [--agent-session SESSION] [--agent-turn TURN]
               [--authorization MODE] [--grant GRANT]
@@ -127,5 +131,10 @@ ATTRIBUTION = [--agent AGENT] [--agent-version V] [--agent-model MODEL]
               [--approved-changes SHA256]
               [--intent JSON] [--intent-request TEXT] [--intent-rationale TEXT]
 ```
+
+A sort takes at most five keys, most significant first, each field once.
+`--desc`, like `--sort-direction` on `cr view create`, gives the direction of
+a single key written without one, and is refused with several; see
+[Sort results](working-with-records.md#sort-results).
 
 Run `cr COMMAND --help` for complete command-specific help.

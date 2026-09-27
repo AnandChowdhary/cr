@@ -43,10 +43,16 @@ use crate::{
     COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary, CollectionModel, CollectionPresentation,
     Database, DomainError, Filter, FilterExpression, FilterOperator, Finding, MAX_TRAVERSAL_DEPTH,
     Projection, RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SchemaReview,
-    SchemaViolation, SearchQuery, SearchTarget, SortDirection, TOKEN_PREFIX, USERS_COLLECTION,
-    User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
-    audit::AuditChange, database::relation_references, error::is_missing, paths,
-    sort_by_record_field, sort_records_by_field, views::validate_view_name,
+    SchemaViolation, SearchQuery, SearchTarget, SortDirection, SortKey, TOKEN_PREFIX,
+    USERS_COLLECTION, User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout,
+    ViewPredicateMatch,
+    audit::AuditChange,
+    database::relation_references,
+    error::is_missing,
+    parse_sort_keys, paths,
+    sort::{HistoryField, MAX_SORT_KEYS, sort_with_history},
+    sort_by_record_keys, sort_records,
+    views::validate_view_name,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -655,9 +661,9 @@ struct BacklinkQuery {
     filter: Option<String>,
     #[serde(default)]
     select: Vec<String>,
-    sort: Option<String>,
     #[serde(default)]
-    direction: SortDirectionParameter,
+    sort: Vec<String>,
+    direction: Option<SortDirectionParameter>,
     limit: Option<usize>,
     offset: Option<usize>,
 }
@@ -710,9 +716,9 @@ struct ListQuery {
     filter: Option<String>,
     #[serde(default)]
     select: Vec<String>,
-    sort: Option<String>,
     #[serde(default)]
-    direction: SortDirectionParameter,
+    sort: Vec<String>,
+    direction: Option<SortDirectionParameter>,
     limit: Option<usize>,
     offset: Option<usize>,
 }
@@ -729,9 +735,14 @@ struct ViewQuery {
     filter_operator: Vec<ViewFilterOperator>,
     #[serde(default)]
     filter_value: Vec<String>,
-    sort_field: Option<String>,
+    /// The sort, most significant key first, as `sort_field` and
+    /// `sort_direction` pairs matched by position the way a filter's field,
+    /// operator and value are. None at all inherits the view's default; one
+    /// empty `sort_field` is the panel's "None", record ID order.
     #[serde(default)]
-    sort_direction: ViewSortDirection,
+    sort_field: Vec<String>,
+    #[serde(default)]
+    sort_direction: Vec<ViewSortDirection>,
     #[serde(default)]
     columns: ViewColumnsMode,
     #[serde(default)]
@@ -805,15 +816,6 @@ impl From<SortDirection> for ViewSortDirection {
         match direction {
             SortDirection::Asc => Self::Asc,
             SortDirection::Desc => Self::Desc,
-        }
-    }
-}
-
-impl ViewSortDirection {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Asc => "asc",
-            Self::Desc => "desc",
         }
     }
 }
@@ -1389,9 +1391,10 @@ struct HtmlSaveViewForm {
     filter_operator: Vec<ViewFilterOperator>,
     #[serde(default)]
     filter_value: Vec<String>,
-    sort_field: Option<String>,
     #[serde(default)]
-    sort_direction: ViewSortDirection,
+    sort_field: Vec<String>,
+    #[serde(default)]
+    sort_direction: Vec<ViewSortDirection>,
     #[serde(default)]
     column: Vec<String>,
     layout: Option<ViewLayout>,
@@ -1429,9 +1432,9 @@ struct HtmlViewEditForm {
     #[serde(default)]
     keep_group: Vec<String>,
     #[serde(default)]
-    sort_field: String,
+    sort_field: Vec<String>,
     #[serde(default)]
-    sort_direction: ViewSortDirection,
+    sort_direction: Vec<ViewSortDirection>,
     #[serde(default)]
     column: Vec<String>,
     /// The columns the view picked for itself when the editor opened, so
@@ -1479,9 +1482,9 @@ struct SearchParameters {
     filter: Option<String>,
     #[serde(default)]
     select: Vec<String>,
-    sort: Option<String>,
     #[serde(default)]
-    direction: SortDirectionParameter,
+    sort: Vec<String>,
+    direction: Option<SortDirectionParameter>,
     target: Option<SearchTargetParameter>,
     field: Option<String>,
     #[serde(default)]
@@ -3668,24 +3671,14 @@ async fn view_records(
         })
         .await?;
 
-        if query.sort_field.is_none() {
-            match view.sort_by.clone() {
-                Some(field) => {
-                    query.sort_field = Some(field);
-                    query.sort_direction = match view.sort_direction {
-                        SortDirection::Asc => ViewSortDirection::Asc,
-                        SortDirection::Desc => ViewSortDirection::Desc,
-                    };
-                }
-                // Newest first. Making the default explicit in the query keeps
-                // the header indicator, the sort control, and every generated
-                // link agreeing about what the page is actually ordered by.
-                None => {
-                    query.sort_field = Some(DEFAULT_VIEW_SORT_FIELD.to_owned());
-                    query.sort_direction = ViewSortDirection::Desc;
-                }
-            }
-        }
+        // Making the default explicit in the query keeps the header
+        // indicator, the sort controls, and every generated link agreeing
+        // about what the page is actually ordered by, and spelling the
+        // requested sort back out drops the rows the panel left at "None".
+        let sort = query
+            .requested_sort()
+            .unwrap_or_else(|| view_default_sort(&view));
+        query.set_sort(&sort);
 
         let available_columns = view_available_columns(&view, &records, schema.as_ref());
         let columns =
@@ -3762,16 +3755,7 @@ async fn save_view_form(
             &form.filter_operator,
             &form.filter_value,
         )?;
-        let sort_by = form
-            .sort_field
-            .as_deref()
-            .map(str::trim)
-            .filter(|field| !field.is_empty())
-            .map(str::to_owned);
-        let sort_direction = match (sort_by.as_ref(), form.sort_direction) {
-            (None, _) | (Some(_), ViewSortDirection::Asc) => SortDirection::Asc,
-            (Some(_), ViewSortDirection::Desc) => SortDirection::Desc,
-        };
+        let sort = submitted_sort(&form.sort_field, &form.sort_direction);
         let requested_view = view_name.clone();
         // Two layers of refusal: the outer one is reading the source view, and
         // the inner one is a refusal of what was submitted, classified where it
@@ -3823,8 +3807,7 @@ async fn save_view_form(
                     source.page_size,
                     layout,
                     group_by,
-                    sort_by,
-                    sort_direction,
+                    sort,
                 )
                 .map_err(|error| refused_view_name(ApiError::from_domain(error), &name)))
         })
@@ -4035,12 +4018,11 @@ async fn update_view_form(
             // What the reader left as it was stays as it was written, so a
             // new title does not rewrite a hand-written file's conditions,
             // sort or columns into the editor's equivalent spelling of them.
-            let (sort_by, sort_direction) =
-                if (edit.sort_field.as_str(), edit.sort_direction) == view_default_sort(&view) {
-                    (view.sort_by.clone(), view.sort_direction)
-                } else {
-                    (Some(edit.sort_field), edit.sort_direction.into())
-                };
+            let sort = if edit.sort == view_default_sort(&view) {
+                view.sort.clone()
+            } else {
+                edit.sort
+            };
             let (filters, where_expr, filter_groups) =
                 if edit.conditions == fold_view_conditions(&view, None) {
                     (view.filters, view.where_expr, view.filter_groups)
@@ -4062,8 +4044,7 @@ async fn update_view_form(
                 edit.page_size,
                 edit.layout,
                 edit.group_by,
-                sort_by,
-                sort_direction,
+                sort,
             )
         })
         .await?;
@@ -4933,8 +4914,7 @@ async fn list_records(
     let expressions = parse_filter_expressions(query.where_expr)?;
     let filter = parse_filter(query.filter)?;
     let projection = parse_projection(&query.select)?;
-    let sort = query.sort;
-    let direction = query.direction.into();
+    let sort = parse_sort(&query.sort, query.direction)?;
     let records = run_database(&state, &headers, move |database| {
         let mut records = database.list(&collection, &filters)?;
         records.retain(|record| {
@@ -4943,9 +4923,7 @@ async fn list_records(
                 .all(|expression| expression.matches(&record.attributes))
                 && filter.as_ref().is_none_or(|filter| filter.matches(record))
         });
-        if let Some(field) = sort {
-            sort_records_by_field(&mut records, &field, direction)?;
-        }
+        sort_records(&mut records, &sort)?;
         Ok(records)
     })
     .await?;
@@ -5243,8 +5221,8 @@ async fn list_backlinks(
     let expressions = parse_filter_expressions(query.where_expr)?;
     let filter = parse_filter(query.filter)?;
     let projection = parse_projection(&query.select)?;
-    let (from, relation, sort) = (query.from, query.relation, query.sort);
-    let direction = query.direction.into();
+    let sort = parse_sort(&query.sort, query.direction)?;
+    let (from, relation) = (query.from, query.relation);
     let backlinks = run_database(&state, &headers, move |database| {
         let mut backlinks = database.backlinks(
             &collection,
@@ -5261,14 +5239,7 @@ async fn list_backlinks(
                     .as_ref()
                     .is_none_or(|filter| filter.matches(&backlink.record))
         });
-        if let Some(field) = sort {
-            sort_by_record_field(
-                &mut backlinks,
-                |backlink| &backlink.record,
-                &field,
-                direction,
-            )?;
-        }
+        sort_by_record_keys(&mut backlinks, |backlink| &backlink.record, &sort)?;
         Ok(backlinks)
     })
     .await?;
@@ -5361,8 +5332,7 @@ async fn search_records(
     let expressions = parse_filter_expressions(parameters.where_expr)?;
     let filter = parse_filter(parameters.filter)?;
     let projection = parse_projection(&parameters.select)?;
-    let sort = parameters.sort;
-    let direction = parameters.direction.into();
+    let sort = parse_sort(&parameters.sort, parameters.direction)?;
     let target = search_target(parameters.target, parameters.field)?;
     let query = SearchQuery::new(
         &parameters.q,
@@ -5380,9 +5350,7 @@ async fn search_records(
                 .all(|expression| expression.matches(&record.attributes))
                 && filter.as_ref().is_none_or(|filter| filter.matches(record))
         });
-        if let Some(field) = sort {
-            sort_records_by_field(&mut records, &field, direction)?;
-        }
+        sort_records(&mut records, &sort)?;
         Ok(records)
     })
     .await?;
@@ -6187,6 +6155,17 @@ fn openapi_paths() -> JsonValue {
         "name": "id", "in": "path", "required": true,
         "schema": { "type": "string" }
     });
+    let sort_parameter = json!({
+        "name": "sort", "in": "query",
+        "description": format!("Sort keys, most significant first: a dotted front matter field or $id, $collection, or $path, as FIELD, FIELD:asc, or FIELD:desc. Comma-separated or repeated, at most {MAX_SORT_KEYS}, each field once. Missing fields remain last in either direction, and collection then record ID, ascending, break the remaining ties."),
+        "schema": { "type": "array", "items": { "type": "string" }, "maxItems": MAX_SORT_KEYS },
+        "style": "form", "explode": true
+    });
+    let direction_parameter = json!({
+        "name": "direction", "in": "query",
+        "description": "The direction of a sort with a single key written without one, the same as FIELD:desc. Refused with several keys.",
+        "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" }
+    });
     let page_parameters = vec![
         json!({ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "default": DEFAULT_PAGE_SIZE } }),
         json!({ "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0, "default": 0 } }),
@@ -6260,8 +6239,8 @@ fn openapi_paths() -> JsonValue {
                     json!({ "name": "where_expr", "in": "query", "description": "Typed expressions such as value>=10000, name contains Acme, or owner is-empty. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }),
                     json!({ "name": "filter", "in": "query", "description": "A filter with AND, OR, NOT, parentheses, comparisons, contains, starts-with, ends-with, in [...], exists, is null, and is-empty, such as stage in [open, won] AND (value >= 10000 OR owner is null). Combined with the other filters by AND.", "schema": { "type": "string" } }),
                     json!({ "name": "select", "in": "query", "description": "Return only these fields: dotted front matter paths, or $id, $collection, $path, $version, and $body. Comma-separated or repeated. Each result is then a flat object keyed by the selectors, without the fields a record does not have.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true }),
-                    json!({ "name": "sort", "in": "query", "description": "Dotted front matter field or $id, $collection, or $path. Missing fields remain last.", "schema": { "type": "string" } }),
-                    json!({ "name": "direction", "in": "query", "description": "Sort direction. Record ID remains the ascending deterministic tie-breaker.", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } }),
+                    sort_parameter.clone(),
+                    direction_parameter.clone(),
                     json!({ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } }),
                     json!({ "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } })],
                 "responses": ok("#/components/schemas/RecordPage")
@@ -6307,8 +6286,8 @@ fn openapi_paths() -> JsonValue {
                 { "name": "where_expr", "in": "query", "description": "Typed expressions on the source record. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "filter", "in": "query", "description": "A filter with AND, OR, NOT, parentheses, comparisons, contains, starts-with, ends-with, in [...], exists, is null, and is-empty, such as stage in [open, won] AND (value >= 10000 OR owner is null). Combined with the other filters by AND.", "schema": { "type": "string" } },
                 { "name": "select", "in": "query", "description": "Return only these fields: dotted front matter paths, or $id, $collection, $path, $version, and $body. Comma-separated or repeated. Each result is then a flat object keyed by the selectors, without the fields a record does not have.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
-                { "name": "sort", "in": "query", "description": "Dotted front matter field or $id, $collection, or $path. Missing fields remain last.", "schema": { "type": "string" } },
-                { "name": "direction", "in": "query", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } },
+                sort_parameter.clone(),
+                direction_parameter.clone(),
                 { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
                 { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } }
             ], "responses": ok("#/components/schemas/BacklinkPage") }
@@ -6340,8 +6319,8 @@ fn openapi_paths() -> JsonValue {
                 { "name": "where_expr", "in": "query", "description": "Typed expressions such as value>=10000, name contains Acme, or owner is-empty. Repeated expressions use AND.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
                 { "name": "filter", "in": "query", "description": "A filter with AND, OR, NOT, parentheses, comparisons, contains, starts-with, ends-with, in [...], exists, is null, and is-empty, such as stage in [open, won] AND (value >= 10000 OR owner is null). Combined with the other filters by AND.", "schema": { "type": "string" } },
                 { "name": "select", "in": "query", "description": "Return only these fields: dotted front matter paths, or $id, $collection, $path, $version, and $body. Comma-separated or repeated. Each result is then a flat object keyed by the selectors, without the fields a record does not have.", "schema": { "type": "array", "items": { "type": "string" } }, "style": "form", "explode": true },
-                { "name": "sort", "in": "query", "description": "Dotted front matter field or $id, $collection, or $path. Missing fields remain last.", "schema": { "type": "string" } },
-                { "name": "direction", "in": "query", "description": "Sort direction. Record ID remains the ascending deterministic tie-breaker.", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } },
+                sort_parameter,
+                direction_parameter,
                 { "name": "target", "in": "query", "schema": { "enum": ["document", "front_matter", "field", "body", "path"] } },
                 { "name": "field", "in": "query", "schema": { "type": "string" } },
                 { "name": "ignore_case", "in": "query", "schema": { "type": "boolean", "default": false } },
@@ -8098,28 +8077,12 @@ fn render_view_records(
                                         div class="cr-filter-section-head" {
                                             h2 id="cr-sort-heading" { "Sort" }
                                         }
-                                        div class="cr-sort-row" {
-                                            select name="sort_field" aria-label="Sort by" class="cr-input" {
-                                                option value="" selected[view_sort_field(query).is_none()] { "None (record ID order)" }
-                                                option value="$created_at" selected[view_sort_field(query) == Some("$created_at")] { "Created (default)" }
-                                                option value="$updated_at" selected[view_sort_field(query) == Some("$updated_at")] { "Updated" }
-                                                option value="$id" selected[view_sort_field(query) == Some("$id")] { "Record ID" }
-                                                @for field in &filter_fields {
-                                                    option value=(&field.key) selected[view_sort_field(query) == Some(field.key.as_str())] { (&field.label) }
-                                                }
-                                            }
-                                            div role="radiogroup" aria-label="Sort direction" class="cr-choice-row" {
-                                                label class="cr-choice-option" {
-                                                    input type="radio" name="sort_direction" value="asc" checked[query.sort_direction == ViewSortDirection::Asc];
-                                                    "Ascending"
-                                                }
-                                                label class="cr-choice-option" {
-                                                    input type="radio" name="sort_direction" value="desc" checked[query.sort_direction == ViewSortDirection::Desc];
-                                                    "Descending"
-                                                }
-                                            }
-                                        }
-                                        p class="cr-field-help" { "Missing values stay last in either direction, and record ID breaks ties." }
+                                        (render_sort_controls(
+                                            &view_sort_options(&filter_fields, "Created (default)"),
+                                            &view_sort(query),
+                                            SortPrimary::Panel,
+                                        ))
+                                        p class="cr-field-help" { "Each key orders what the one before it leaves tied. Missing values stay last in either direction, and record ID breaks the remaining ties." }
                                     }
                                     details class="cr-filter-section cr-filter-columns" open[query_columns_custom(query)] {
                                         summary class="cr-filter-section-head" {
@@ -9228,7 +9191,7 @@ fn render_refused_save_view(
         filter_operator: submitted.filter_operator.clone(),
         filter_value: submitted.filter_value.clone(),
         sort_field: submitted.sort_field.clone(),
-        sort_direction: submitted.sort_direction,
+        sort_direction: submitted.sort_direction.clone(),
         columns: if submitted.column.is_empty() {
             ViewColumnsMode::Default
         } else {
@@ -9306,10 +9269,18 @@ fn view_save_state(query: &ViewQuery, columns: &[String], out_of_band: OutOfBand
                     input type="hidden" name="filter_value" value=(value);
                 }
             }
-            @if let Some(field) = query.sort_field.as_deref() {
-                input type="hidden" name="sort_field" value=(field);
+            @match query.requested_sort() {
+                None => {}
+                Some(keys) if keys.is_empty() => {
+                    input type="hidden" name="sort_field" value="";
+                }
+                Some(keys) => {
+                    @for key in &keys {
+                        input type="hidden" name="sort_field" value=(key.field);
+                        input type="hidden" name="sort_direction" value=(key.direction.as_str());
+                    }
+                }
             }
-            input type="hidden" name="sort_direction" value=(query.sort_direction.as_str());
             @for column in columns {
                 input type="hidden" name="column" value=(column);
             }
@@ -9448,10 +9419,11 @@ fn expression_rows(expressions: &[String]) -> Vec<(String, ViewFilterOperator, S
 
 /// The order a view opens in when no URL chooses one: its own default, or
 /// newest first.
-fn view_default_sort(view: &ViewDefinition) -> (&str, ViewSortDirection) {
-    match view.sort_by.as_deref() {
-        Some(field) => (field, view.sort_direction.into()),
-        None => (DEFAULT_VIEW_SORT_FIELD, ViewSortDirection::Desc),
+fn view_default_sort(view: &ViewDefinition) -> Vec<SortKey> {
+    if view.sort.is_empty() {
+        vec![SortKey::new(DEFAULT_VIEW_SORT_FIELD, SortDirection::Desc)]
+    } else {
+        view.sort.clone()
     }
 }
 
@@ -9464,8 +9436,7 @@ struct ViewDraft {
     /// The `any` groups `FoldedConditions` keeps apart, each kept or removed
     /// whole with a checkbox.
     groups: Vec<ViewFilterGroup>,
-    sort_field: String,
-    sort_direction: ViewSortDirection,
+    sort: Vec<SortKey>,
     columns: Vec<String>,
     automatic_columns: Vec<String>,
     layout: ViewLayout,
@@ -9497,22 +9468,18 @@ fn opened_view_draft(
     } else {
         Vec::new()
     };
-    let (sort_field, sort_direction) = match query.sort_field.as_deref().map(str::trim) {
+    let sort = match query.requested_sort() {
         // The page's "None", which is record ID order.
-        Some("") => ("$id".to_owned(), ViewSortDirection::Asc),
-        Some(field) => (field.to_owned(), query.sort_direction),
-        None => {
-            let (field, direction) = view_default_sort(view);
-            (field.to_owned(), direction)
-        }
+        Some(keys) if keys.is_empty() => vec![SortKey::new("$id", SortDirection::Asc)],
+        Some(keys) => keys,
+        None => view_default_sort(view),
     };
     Ok(ViewDraft {
         title: view.title.clone(),
         filter_match: folded.filter_match,
         conditions: expression_rows(&folded.expressions),
         groups: folded.groups,
-        sort_field,
-        sort_direction,
+        sort,
         columns,
         automatic_columns,
         layout: view.layout,
@@ -9550,8 +9517,7 @@ fn submitted_view_draft(form: &HtmlViewEditForm) -> ViewDraft {
             .iter()
             .filter_map(|group| serde_json::from_str(group).ok())
             .collect(),
-        sort_field: form.sort_field.clone(),
-        sort_direction: form.sort_direction,
+        sort: submitted_sort(&form.sort_field, &form.sort_direction),
         columns: form.column.clone(),
         automatic_columns: form.automatic_column.clone(),
         layout: form.layout.unwrap_or_default(),
@@ -9568,8 +9534,7 @@ fn submitted_view_draft(form: &HtmlViewEditForm) -> ViewDraft {
 struct ViewEdit {
     title: String,
     conditions: FoldedConditions,
-    sort_field: String,
-    sort_direction: ViewSortDirection,
+    sort: Vec<SortKey>,
     columns: Vec<String>,
     /// The columns are the ones the view picked for itself when the editor
     /// opened, so it should go on picking them.
@@ -9603,8 +9568,8 @@ fn submitted_view_edit(form: &HtmlViewEditForm) -> ApiResult<ViewEdit> {
                 .map_err(|error| invalid(&format!("a kept filter group is not valid: {error}")))
         })
         .collect::<ApiResult<Vec<_>>>()?;
-    let sort_field = form.sort_field.trim();
-    if sort_field.is_empty() {
+    let sort = submitted_sort(&form.sort_field, &form.sort_direction);
+    if sort.is_empty() {
         return Err(invalid("choose a field to sort by"));
     }
     let layout = form.layout.unwrap_or_default();
@@ -9656,8 +9621,7 @@ fn submitted_view_edit(form: &HtmlViewEditForm) -> ApiResult<ViewEdit> {
             expressions,
             groups,
         },
-        sort_field: sort_field.to_owned(),
-        sort_direction: form.sort_direction,
+        sort,
         columns: form.column.clone(),
         automatic_columns,
         layout,
@@ -9690,22 +9654,7 @@ fn render_view_editor(
     if rows.is_empty() {
         rows.push((String::new(), ViewFilterOperator::default(), String::new()));
     }
-    let mut sort_options = vec![
-        ("$created_at".to_owned(), "Created".to_owned()),
-        ("$updated_at".to_owned(), "Updated".to_owned()),
-        ("$id".to_owned(), "Record ID".to_owned()),
-    ];
-    sort_options.extend(
-        filter_fields
-            .iter()
-            .map(|field| (field.key.clone(), field.label.clone())),
-    );
-    if !sort_options.iter().any(|(key, _)| *key == draft.sort_field) {
-        sort_options.push((
-            draft.sort_field.clone(),
-            format!("{} (custom)", draft.sort_field),
-        ));
-    }
+    let sort_options = view_sort_options(&filter_fields, "Created");
     let mut column_options = available
         .iter()
         .filter(|column| Some(column.as_str()) != title_field)
@@ -9807,23 +9756,7 @@ fn render_view_editor(
                     div class="cr-filter-section-head" {
                         h2 id="cr-view-sort-heading" { "Sort" }
                     }
-                    div class="cr-sort-row" {
-                        select name="sort_field" aria-labelledby="cr-view-sort-heading" class="cr-input" {
-                            @for (key, label) in &sort_options {
-                                option value=(key) selected[*key == draft.sort_field] { (label) }
-                            }
-                        }
-                        div role="radiogroup" aria-label="Sort direction" class="cr-choice-row" {
-                            label class="cr-choice-option" {
-                                input type="radio" name="sort_direction" value="asc" checked[draft.sort_direction == ViewSortDirection::Asc];
-                                "Ascending"
-                            }
-                            label class="cr-choice-option" {
-                                input type="radio" name="sort_direction" value="desc" checked[draft.sort_direction == ViewSortDirection::Desc];
-                                "Descending"
-                            }
-                        }
-                    }
+                    (render_sort_controls(&sort_options, &draft.sort, SortPrimary::Editor))
                 }
                 section class="cr-filter-section" {
                     div class="cr-filter-section-head" {
@@ -13691,12 +13624,176 @@ fn filter_expression_text(field: &str, operator: ViewFilterOperator, value: &str
     }
 }
 
-fn view_sort_field(query: &ViewQuery) -> Option<&str> {
+impl ViewQuery {
+    /// The sort the URL asks for, or `None` when it names none and the view's
+    /// default applies. An empty list is the panel's "None".
+    ///
+    /// The panel offers a field in every row, so a field chosen twice keeps
+    /// the place it was first chosen in rather than failing the page.
+    fn requested_sort(&self) -> Option<Vec<SortKey>> {
+        if self.sort_field.is_empty() {
+            return None;
+        }
+        let mut keys: Vec<SortKey> = Vec::new();
+        for key in submitted_sort(&self.sort_field, &self.sort_direction) {
+            if !keys.iter().any(|earlier| earlier.field == key.field) {
+                keys.push(key);
+            }
+        }
+        Some(keys)
+    }
+
+    /// Ask for exactly `keys`, with no keys meaning record ID order.
+    fn set_sort(&mut self, keys: &[SortKey]) {
+        if keys.is_empty() {
+            self.sort_field = vec![String::new()];
+            self.sort_direction = Vec::new();
+        } else {
+            self.sort_field = keys.iter().map(|key| key.field.clone()).collect();
+            self.sort_direction = keys.iter().map(|key| key.direction.into()).collect();
+        }
+    }
+}
+
+/// Submitted `sort_field`s paired with their `sort_direction`s by position,
+/// without the rows left at "None". A field without a direction is ascending.
+fn submitted_sort(fields: &[String], directions: &[ViewSortDirection]) -> Vec<SortKey> {
+    fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| (field.trim(), directions.get(index).copied()))
+        .filter(|(field, _)| !field.is_empty())
+        .map(|(field, direction)| SortKey::new(field, direction.unwrap_or_default().into()))
+        .collect()
+}
+
+/// The sort a normalized view query asks for.
+fn view_sort(query: &ViewQuery) -> Vec<SortKey> {
+    query.requested_sort().unwrap_or_default()
+}
+
+/// The most significant key a view page is ordered by: what its column
+/// headings, its day grouping and its cards' times follow.
+fn view_primary_sort(query: &ViewQuery) -> Option<(&str, ViewSortDirection)> {
     query
         .sort_field
-        .as_deref()
-        .map(str::trim)
-        .filter(|field| !field.is_empty())
+        .iter()
+        .enumerate()
+        .find_map(|(index, field)| {
+            let field = field.trim();
+            (!field.is_empty()).then(|| {
+                (
+                    field,
+                    query.sort_direction.get(index).copied().unwrap_or_default(),
+                )
+            })
+        })
+}
+
+fn view_sort_field(query: &ViewQuery) -> Option<&str> {
+    view_primary_sort(query).map(|(field, _)| field)
+}
+
+/// Every field a view can be sorted by, as `(field, label)`: the audit
+/// columns, the record ID, and the view's fields.
+fn view_sort_options(filter_fields: &[ViewFilterField], created: &str) -> Vec<(String, String)> {
+    let mut options = vec![
+        ("$created_at".to_owned(), created.to_owned()),
+        ("$updated_at".to_owned(), "Updated".to_owned()),
+        ("$id".to_owned(), "Record ID".to_owned()),
+    ];
+    options.extend(
+        filter_fields
+            .iter()
+            .map(|field| (field.key.clone(), field.label.clone())),
+    );
+    options
+}
+
+/// Which sort controls are being drawn, which decides how the first key's
+/// field is labelled and whether it can be left empty.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortPrimary {
+    /// The filter panel, where "None" is record ID order.
+    Panel,
+    /// The view editor, where a view always has a sort.
+    Editor,
+}
+
+/// A sort's controls: the first key as a field and a pair of direction
+/// radios, a "Then by" row for each further key, and one empty row to add
+/// another while there is room.
+///
+/// Every row submits one `sort_field` and one `sort_direction`, in order, so
+/// the server pairs them by position, and a row left at "None" is dropped.
+/// That is what lets a reader add, change and remove keys with JavaScript
+/// switched off. A key on a field `options` does not list — one a view file
+/// names, say — is offered as it is, so applying the panel does not quietly
+/// drop it.
+fn render_sort_controls(
+    options: &[(String, String)],
+    keys: &[SortKey],
+    primary: SortPrimary,
+) -> Markup {
+    let mut options = options.to_vec();
+    for key in keys {
+        if !options.iter().any(|(field, _)| *field == key.field) {
+            options.push((key.field.clone(), format!("{} (custom)", key.field)));
+        }
+    }
+    let first = keys.first();
+    let direction = first.map_or(SortDirection::Asc, |key| key.direction);
+    let selected = |key: Option<&SortKey>, field: &str| key.is_some_and(|key| key.field == field);
+    let rest = keys.iter().skip(1).map(Some);
+    let blank = (!keys.is_empty() && keys.len() < MAX_SORT_KEYS).then_some(None);
+    html! {
+        div class="cr-sort-row" {
+            @match primary {
+                SortPrimary::Panel => {
+                    select name="sort_field" aria-label="Sort by" class="cr-input" {
+                        option value="" selected[first.is_none()] { "None (record ID order)" }
+                        @for (field, label) in &options {
+                            option value=(field) selected[selected(first, field)] { (label) }
+                        }
+                    }
+                }
+                SortPrimary::Editor => {
+                    select name="sort_field" aria-labelledby="cr-view-sort-heading" class="cr-input" {
+                        @for (field, label) in &options {
+                            option value=(field) selected[selected(first, field)] { (label) }
+                        }
+                    }
+                }
+            }
+            div role="radiogroup" aria-label="Sort direction" class="cr-choice-row" {
+                label class="cr-choice-option" {
+                    input type="radio" name="sort_direction" value="asc" checked[direction == SortDirection::Asc];
+                    "Ascending"
+                }
+                label class="cr-choice-option" {
+                    input type="radio" name="sort_direction" value="desc" checked[direction == SortDirection::Desc];
+                    "Descending"
+                }
+            }
+        }
+        @for (index, key) in rest.chain(blank).enumerate() {
+            @let position = index + 2;
+            @let direction = key.map_or(SortDirection::Asc, |key| key.direction);
+            div class="cr-sort-row cr-sort-then" data-sort-key=(position) {
+                span class="cr-sort-then-label" aria-hidden="true" { "Then by" }
+                select name="sort_field" aria-label=(format!("Then by, sort key {position}")) class="cr-input" {
+                    option value="" selected[key.is_none()] { "None" }
+                    @for (field, label) in &options {
+                        option value=(field) selected[selected(key, field)] { (label) }
+                    }
+                }
+                select name="sort_direction" aria-label=(format!("Direction of sort key {position}")) class="cr-input cr-sort-direction" {
+                    option value="asc" selected[direction == SortDirection::Asc] { "Ascending" }
+                    option value="desc" selected[direction == SortDirection::Desc] { "Descending" }
+                }
+            }
+        }
+    }
 }
 
 /// The audit-derived columns every table shows between the ID and the fields.
@@ -13791,42 +13888,22 @@ fn compact_timestamp(value: &str) -> String {
 /// read to answer "what exists?". Record ID order answers neither.
 const DEFAULT_VIEW_SORT_FIELD: &str = "$created_at";
 
+/// Order a view's records by its query's sort, which, unlike a record scan,
+/// may name the audit-derived `$created_at` and `$updated_at`: the activity
+/// map the page already holds gives their journal sequence numbers.
 fn sort_view_records(
     records: &mut [Record],
     query: &ViewQuery,
     activity: &BTreeMap<String, RecordActivity>,
 ) -> ApiResult<()> {
-    let Some(field) = view_sort_field(query) else {
-        return Ok(());
+    let sequence = |record: &Record, field: HistoryField| {
+        activity.get(&record.id).map(|activity| match field {
+            HistoryField::Created => activity.created_sequence,
+            HistoryField::Updated => activity.updated_sequence,
+        })
     };
-    // Audit-derived fields are not on the record, so they sort here rather
-    // than in the shared record comparator. Sequence numbers are the journal's
-    // exact total order; formatted instants can tie or, with fractional
-    // seconds, compare in the wrong order as text.
-    let sequence = match field {
-        "$created_at" => |activity: &RecordActivity| activity.created_sequence,
-        "$updated_at" => |activity: &RecordActivity| activity.updated_sequence,
-        _ => {
-            return sort_records_by_field(records, field, query.sort_direction.into())
-                .map_err(ApiError::from_domain);
-        }
-    };
-    let descending = query.sort_direction == ViewSortDirection::Desc;
-    records.sort_by(|left, right| {
-        let left_sequence = activity.get(&left.id).map(sequence);
-        let right_sequence = activity.get(&right.id).map(sequence);
-        // Records with no audit history stay last in both directions, exactly
-        // like a missing front matter value.
-        let ordering = match (left_sequence, right_sequence) {
-            (Some(left), Some(right)) if descending => right.cmp(&left),
-            (Some(left), Some(right)) => left.cmp(&right),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        };
-        ordering.then_with(|| left.id.cmp(&right.id))
-    });
-    Ok(())
+    sort_with_history(records, |record| record, &view_sort(query), Some(sequence))
+        .map_err(ApiError::from_domain)
 }
 
 /// One page of a server-rendered view, positioned by record ID.
@@ -14003,10 +14080,16 @@ fn view_query_string(query: &ViewQuery, limit: usize, position: ViewPosition<'_>
         );
         serializer.append_pair("filter_value", value);
     }
-    if let Some(field) = query.sort_field.as_deref() {
-        serializer.append_pair("sort_field", field.trim());
-        if !field.trim().is_empty() {
-            serializer.append_pair("sort_direction", query.sort_direction.as_str());
+    match query.requested_sort() {
+        None => {}
+        Some(keys) if keys.is_empty() => {
+            serializer.append_pair("sort_field", "");
+        }
+        Some(keys) => {
+            for key in keys {
+                serializer.append_pair("sort_field", &key.field);
+                serializer.append_pair("sort_direction", key.direction.as_str());
+            }
         }
     }
     if query_columns_custom(query) {
@@ -14031,45 +14114,43 @@ fn view_query_string(query: &ViewQuery, limit: usize, position: ViewPosition<'_>
     serializer.finish()
 }
 
+/// Where a column heading's sort link goes: that column alone, ascending, or
+/// descending when it already leads the sort ascending. A click replaces
+/// the whole sort, keys after the first included; several keys are chosen in
+/// the filter panel.
 fn view_sort_url(view: &ViewDefinition, query: &ViewQuery, field: &str, limit: usize) -> String {
     let mut next = query.clone();
-    next.sort_direction = if view_sort_field(query) == Some(field)
-        && query.sort_direction == ViewSortDirection::Asc
-    {
-        ViewSortDirection::Desc
+    let direction = if view_primary_sort(query) == Some((field, ViewSortDirection::Asc)) {
+        SortDirection::Desc
     } else {
-        ViewSortDirection::Asc
+        SortDirection::Asc
     };
-    next.sort_field = Some(field.to_owned());
+    next.set_sort(&[SortKey::new(field, direction)]);
     // Re-sorting starts the reader at the top of the new ordering: a cursor
     // from the previous one names a row that is now somewhere else entirely.
     view_page_url(view, &next, limit, ViewPosition::Start)
 }
 
 fn sort_indicator(query: &ViewQuery, field: &str) -> &'static str {
-    if view_sort_field(query) != Some(field) {
-        "↕"
-    } else if query.sort_direction == ViewSortDirection::Asc {
-        "↑"
-    } else {
-        "↓"
+    match view_primary_sort(query) {
+        Some((sorted, ViewSortDirection::Asc)) if sorted == field => "↑",
+        Some((sorted, ViewSortDirection::Desc)) if sorted == field => "↓",
+        _ => "↕",
     }
 }
 
+/// Only the first key's heading is marked, because `aria-sort` belongs on one
+/// heading at a time.
 fn sort_aria_state(query: &ViewQuery, field: &str) -> &'static str {
-    if view_sort_field(query) != Some(field) {
-        "none"
-    } else if query.sort_direction == ViewSortDirection::Asc {
-        "ascending"
-    } else {
-        "descending"
+    match view_primary_sort(query) {
+        Some((sorted, ViewSortDirection::Asc)) if sorted == field => "ascending",
+        Some((sorted, ViewSortDirection::Desc)) if sorted == field => "descending",
+        _ => "none",
     }
 }
 
 fn sort_link_label(query: &ViewQuery, label: &str, field: &str) -> String {
-    let direction = if view_sort_field(query) == Some(field)
-        && query.sort_direction == ViewSortDirection::Asc
-    {
+    let direction = if view_primary_sort(query) == Some((field, ViewSortDirection::Asc)) {
         "descending"
     } else {
         "ascending"
@@ -15344,6 +15425,15 @@ fn parse_filters(filters: Vec<String>) -> ApiResult<Vec<Assignment>> {
 
 fn parse_projection(select: &[String]) -> ApiResult<Option<Projection>> {
     Projection::from_lists(select).map_err(ApiError::from_domain)
+}
+
+/// `sort` and the one-key `direction` as the keys they ask for.
+fn parse_sort(
+    sort: &[String],
+    direction: Option<SortDirectionParameter>,
+) -> ApiResult<Vec<SortKey>> {
+    parse_sort_keys(sort, direction.map(SortDirection::from), "direction")
+        .map_err(ApiError::from_domain)
 }
 
 /// A page of records, as summaries or, with a projection, as the flat objects

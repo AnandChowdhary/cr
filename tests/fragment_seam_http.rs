@@ -46,7 +46,7 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use cr::{
-    Assignment, Database, SortDirection, UserKind, ViewLayout,
+    Assignment, Database, UserKind, ViewLayout,
     server::{ServerConfig, router},
 };
 use http_body_util::BodyExt;
@@ -209,8 +209,7 @@ fn database_with_a_board(name: &str) -> (TempDir, Database) {
             50,
             ViewLayout::Kanban,
             Some("stage".into()),
-            None,
-            SortDirection::Asc,
+            Vec::new(),
         )
         .unwrap();
     (temporary, database)

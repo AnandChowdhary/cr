@@ -43,7 +43,7 @@ use crate::{
     frontmatter::Document,
     paths,
     sync::{SYNC_DEFINITION_DIRECTORY, SYNC_LOCK_DIRECTORY, SYNC_STATE_DIRECTORY},
-    value::{canonical_yaml_value, compare_yaml_values, get_path, parse_path, remove_path},
+    value::{canonical_yaml_value, get_path, parse_path, remove_path},
     views::{UI_EXTENSION, VIEW_DIRECTORY, normalize_collection_icon, normalize_collection_label},
 };
 
@@ -470,14 +470,6 @@ fn assert_audit_sequence(audit: &AuditLog<'_>, expected: u64) -> Result<()> {
     ))
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SortDirection {
-    #[default]
-    Asc,
-    Desc,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkingChangeKind {
@@ -520,75 +512,6 @@ impl Record {
     pub fn field(&self, path: &str) -> Result<Option<&Value>> {
         let path = parse_path(path)?;
         Ok(get_path(&self.attributes, &path))
-    }
-}
-
-pub fn sort_records_by_field(
-    records: &mut [Record],
-    field: &str,
-    direction: SortDirection,
-) -> Result<()> {
-    sort_by_record_field(records, |record| record, field, direction)
-}
-
-/// Sort anything that carries a record by one of that record's fields, with
-/// exactly the rules [`sort_records_by_field`] applies to plain records.
-pub fn sort_by_record_field<T>(
-    items: &mut [T],
-    record: impl Fn(&T) -> &Record,
-    field: &str,
-    direction: SortDirection,
-) -> Result<()> {
-    let field = field.trim();
-    if field.is_empty() {
-        return Err(invalid("sort field cannot be empty"));
-    }
-    if matches!(field, "$created_at" | "$updated_at") {
-        // These exist only in the audit journal, and reading them is a
-        // history read with its own permission. Sorting a plain record scan by
-        // one would quietly replay the whole chain, so the server-rendered
-        // views that already hold an activity map are the only place they sort.
-        return Err(invalid(format!(
-            "sort field '{field}' comes from audit history and is only available in server-rendered views"
-        )));
-    }
-    if !matches!(field, "$id" | "$collection" | "$path") {
-        parse_path(field)?;
-    }
-
-    items.sort_by(|left, right| {
-        let (left, right) = (record(left), record(right));
-        let ordering = match field {
-            "$id" => direction_ordering(left.id.cmp(&right.id), direction),
-            "$collection" => direction_ordering(left.collection.cmp(&right.collection), direction),
-            "$path" => direction_ordering(left.path.cmp(&right.path), direction),
-            _ => {
-                let left_value = left.field(field).expect("sort field path was validated");
-                let right_value = right.field(field).expect("sort field path was validated");
-                match (left_value, right_value) {
-                    (Some(left), Some(right)) => {
-                        direction_ordering(compare_yaml_values(left, right), direction)
-                    }
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                }
-            }
-        };
-        ordering
-            .then_with(|| left.collection.cmp(&right.collection))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    Ok(())
-}
-
-fn direction_ordering(
-    ordering: std::cmp::Ordering,
-    direction: SortDirection,
-) -> std::cmp::Ordering {
-    match direction {
-        SortDirection::Asc => ordering,
-        SortDirection::Desc => ordering.reverse(),
     }
 }
 

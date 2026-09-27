@@ -148,6 +148,113 @@ fn deleting_a_saved_view_removes_its_file_and_gives_the_route_back() {
 }
 
 #[test]
+fn a_view_stores_several_sort_keys_and_keeps_one_in_the_older_shape() {
+    let database = TestDatabase::new("views-cli-sort");
+    let create = |name: &str, sort: &[&str]| {
+        let mut command = database.command();
+        command
+            .args(["view", "create", name, "--collection", "deals"])
+            .args(sort);
+        command
+    };
+
+    run_success(&mut create(
+        "ranked",
+        &[
+            "--sort-by",
+            "stage",
+            "--sort-by",
+            "value:desc,$updated_at:desc",
+        ],
+    ));
+    let stored = fs::read_to_string(database.root.join(".cr/views/ranked.yaml")).unwrap();
+    assert!(
+        stored.contains("sort:\n- stage\n- value:desc\n- $updated_at:desc\n"),
+        "{stored}"
+    );
+    assert!(!stored.contains("sort_by"));
+    let shown: Value = serde_json::from_str(&run_success(
+        database
+            .command()
+            .args(["view", "show", "ranked", "--json"]),
+    ))
+    .unwrap();
+    assert_eq!(
+        shown["sort"],
+        serde_json::json!(["stage", "value:desc", "$updated_at:desc"])
+    );
+    // What a reader of one key has always read names the first.
+    assert_eq!(shown["sort_by"], "stage");
+    assert_eq!(shown["sort_direction"], "asc");
+
+    // One key is written as it was before sorts had several, however it is
+    // spelled on the command line.
+    for (name, sort) in [
+        (
+            "legacy",
+            &["--sort-by", "value", "--sort-direction", "desc"][..],
+        ),
+        ("suffixed", &["--sort-by", "value:desc"]),
+    ] {
+        run_success(&mut create(name, sort));
+        let stored =
+            fs::read_to_string(database.root.join(format!(".cr/views/{name}.yaml"))).unwrap();
+        assert!(
+            stored.contains("sort_by: value\nsort_direction: desc\n"),
+            "{stored}"
+        );
+        assert!(!stored.contains("sort:"), "{stored}");
+        let shown: Value = serde_json::from_str(&run_success(
+            database.command().args(["view", "show", name, "--json"]),
+        ))
+        .unwrap();
+        assert_eq!(shown["sort"], serde_json::json!(["value:desc"]));
+        assert_eq!(shown["sort_by"], "value");
+        assert_eq!(shown["sort_direction"], "desc");
+    }
+
+    // A definition written before sorts had several keys loads unchanged.
+    fs::write(
+        database.root.join(".cr/views/older.yaml"),
+        "version: 1\ntitle: Older\ncollection: deals\nsort_by: value\nsort_direction: desc\npage_size: 25\n",
+    )
+    .unwrap();
+    let older: Value = serde_json::from_str(&run_success(
+        database.command().args(["view", "show", "older", "--json"]),
+    ))
+    .unwrap();
+    assert_eq!(older["sort"], serde_json::json!(["value:desc"]));
+    assert_eq!(older["sort_by"], "value");
+
+    for (sort, refusal) in [
+        (
+            &["--sort-by", "stage,value", "--sort-direction", "desc"][..],
+            "--sort-direction applies only to a single sort key",
+        ),
+        (
+            &["--sort-by", "value:asc", "--sort-direction", "desc"],
+            "--sort-direction applies only to a single sort key",
+        ),
+        (
+            &["--sort-by", "stage,value,stage"],
+            "sort field 'stage' is given more than once",
+        ),
+        (
+            &["--sort-by", "a,b,c,d,e,f"],
+            "a sort can have at most 5 keys, not 6",
+        ),
+        (
+            &["--sort-by", "stage,owner..email"],
+            "view 'refused' has invalid sort field 'owner..email'",
+        ),
+    ] {
+        let error = run_failure(&mut create("refused", sort));
+        assert!(error.contains(refusal), "{sort:?}: {error}");
+    }
+    assert!(!database.root.join(".cr/views/refused.yaml").exists());
+}
+
+#[test]
 fn view_cli_rejects_invalid_duplicate_reserved_and_malformed_definitions() {
     let database = TestDatabase::new("views-cli-errors");
 

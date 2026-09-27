@@ -52,7 +52,7 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use cr::{
-    Assignment, Database, SortDirection, ViewLayout,
+    Assignment, Database, ViewLayout,
     server::{ServerConfig, router},
 };
 use http_body_util::BodyExt;
@@ -290,8 +290,7 @@ fn database_with_deals(name: &str) -> (TempDir, Database) {
             2,
             ViewLayout::Kanban,
             Some("stage".into()),
-            None,
-            SortDirection::Asc,
+            Vec::new(),
         )
         .unwrap();
     (temporary, database)

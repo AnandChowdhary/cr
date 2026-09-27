@@ -28,7 +28,7 @@ use axum::{
     http::{Method, Request, StatusCode},
 };
 use cr::{
-    Assignment, Database, SortDirection, ViewLayout,
+    Assignment, Database, ViewLayout,
     server::{ServerConfig, router},
 };
 use http_body_util::BodyExt;
@@ -93,8 +93,7 @@ fn app_with_a_board(name: &str) -> (TempDir, Router) {
             50,
             ViewLayout::Kanban,
             Some("stage".into()),
-            None,
-            SortDirection::Asc,
+            Vec::new(),
         )
         .unwrap();
     (
