@@ -252,6 +252,54 @@ tree instead of a flat graph of `nodes` and `edges`:
 curl 'http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal/traverse?depth=2&expand=true'
 ```
 
+### Bundle records
+
+A record in a [bundle collection](working-with-records.md#bundle-records) is
+a folder: its Markdown entry and supporting files. Every record response lists
+the supporting files with their SHA-256 under `files`, which is absent for a
+record stored as one Markdown file, and the record's `version` and `ETag`
+cover every one of them.
+
+Create a record with files by naming them under `files`: text as is, or any
+bytes as standard base64:
+
+```sh
+curl -X POST http://127.0.0.1:3000/api/v1/collections/skills/records \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "id": "pdf-forms",
+    "front_matter": { "name": "pdf-forms", "description": "Fill in PDF forms" },
+    "markdown": "Run scripts/fill.py.",
+    "files": {
+      "scripts/fill.py": { "content": "print(\"filled\")\n" },
+      "assets/form.ttf": { "content": "AAEAAAALAIAAAwAw…", "encoding": "base64" }
+    }
+  }'
+```
+
+A PATCH adds or replaces the files it names, and `null` removes one. The
+changes go into the same audit event as the rest of the patch, under the same
+`If-Match`, and `preview=true` returns them, with their diffs, under `files`:
+
+```sh
+curl -X PATCH http://127.0.0.1:3000/api/v1/collections/skills/records/pdf-forms \
+  -H 'Content-Type: application/json' \
+  -H "If-Match: $etag" \
+  -d '{ "files": { "assets/form.ttf": null, "references/api.md": { "content": "# API\n" } } }'
+```
+
+Read one file's exact bytes, as `application/octet-stream` with the record's
+version as its `ETag`. Reading a file needs read access to the record:
+
+```sh
+curl http://127.0.0.1:3000/api/v1/collections/skills/records/pdf-forms/files/scripts/fill.py
+```
+
+`files` is refused with `422` for a collection that stores one Markdown file
+per record, as is a path with an empty, `.`, or `..` component or one that
+would shadow the entry. PUT replaces the entry and keeps every supporting
+file.
+
 ## Filtering, search, and pagination
 
 Repeated `where` parameters are combined with AND and retain YAML types. URL-encode the `=` when writing URLs manually:

@@ -71,9 +71,9 @@ use crate::{
         AnchorStatus, AuditedRecordState, AuditedRecordStates, SignatureJudgement, record_hash,
         untrusted_signature,
     },
+    bundle::{Staged, list_bundle, read_bundle},
     database::{
-        CollectionEntry, Database, collection_directory_name, collection_entry, schema_attributes,
-        validate_component,
+        CollectionEntry, Database, collection_directory_name, schema_attributes, validate_component,
     },
     error::{DomainError, invalid},
     frontmatter::Document,
@@ -372,7 +372,13 @@ pub(crate) fn run(database: &Database, scope: &CheckScope) -> Result<CheckReport
     // Phase one, always whole-database and cheap: directory listings only. The
     // index has to span every collection even under `--collection`, because a
     // relation from the selected collection may point into another one.
-    let index = index_records(root, records_dir, selected.as_deref(), &mut findings)?;
+    let index = index_records(
+        database,
+        root,
+        records_dir,
+        selected.as_deref(),
+        &mut findings,
+    )?;
 
     if let Some(collection) = &selected
         && !index.collections.contains(collection)
@@ -537,11 +543,13 @@ struct RecordIndex {
 /// collection's problems under `--collection` would be noise; the index itself
 /// always spans the database so link targets stay resolvable.
 fn index_records(
+    database: &Database,
     root: &Path,
     records_dir: &Path,
     selected: Option<&str>,
     findings: &mut Vec<Finding>,
 ) -> Result<RecordIndex> {
+    let layout = database.layout();
     let mut index = RecordIndex::default();
     let Some(entries) = paths::list_directory(root, records_dir, "the records directory")? else {
         return Ok(index);
@@ -576,7 +584,7 @@ fn index_records(
             continue;
         };
         for entry in entries {
-            let id = match collection_entry(&collection, &entry.name) {
+            let id = match layout.collection_entry(&collection, &entry.name, entry.kind) {
                 Ok(CollectionEntry::Record(id)) => id,
                 Ok(CollectionEntry::Ignored) => continue,
                 Err(error) => {
@@ -590,8 +598,19 @@ fn index_records(
                     continue;
                 }
             };
-            if !entry.kind.is_file() {
+            if !layout.stores_record_as(&collection, entry.kind) {
                 index.symlinked.insert((collection.clone(), id.clone()));
+            } else if let Some(entry_name) = layout.entry(&collection) {
+                // A folder with nothing in it is not a record. One that cannot
+                // even be listed is kept, so the scan reports why.
+                let folder = directory.join(&id);
+                let label = format!("record {collection}/{id}");
+                if matches!(
+                    list_bundle(root, &folder, entry_name, &label, Staged::Refuse),
+                    Ok(None)
+                ) {
+                    continue;
+                }
             }
             index.records.insert((collection.clone(), id));
         }
@@ -615,26 +634,69 @@ fn scan_record(
         attributes: None,
         blocked: false,
     };
+    let entry_name = database.layout().entry(collection);
     if special {
+        let stored_as = match entry_name {
+            Some(_) => "a folder",
+            None => "a regular file",
+        };
         findings.push(Finding::record(
             FindingKind::UnreadableRecord,
             Severity::Error,
             collection,
             id,
             format!(
-                "record {collection}/{id} is not a regular file, so the database refuses to read it"
+                "record {collection}/{id} is not {stored_as}, so the database refuses to read it"
             ),
         ));
         return Ok(record);
     }
 
-    let path = database
-        .records_dir()
-        .join(collection)
-        .join(format!("{id}.md"));
     let label = format!("record {collection}/{id}");
-    let contents = match paths::read(database.root(), &path, &label) {
-        Ok(contents) => contents,
+    let read = match entry_name {
+        Some(entry_name) => {
+            let folder = database.records_dir().join(collection).join(id);
+            read_bundle(database.root(), &folder, entry_name, &label, Staged::Refuse).map(
+                |bundle| {
+                    bundle.map(|bundle| {
+                        let version = bundle.version();
+                        (bundle.entry, version)
+                    })
+                },
+            )
+        }
+        None => {
+            let path = database
+                .records_dir()
+                .join(collection)
+                .join(format!("{id}.md"));
+            paths::read(database.root(), &path, &label).map(|contents| {
+                let version = record_hash(&contents);
+                Some((Some(contents), version))
+            })
+        }
+    };
+    let contents = match read {
+        // Removed since the index was taken; reconciliation says so.
+        Ok(None) => return Ok(record),
+        Ok(Some((Some(contents), version))) => {
+            record.hash = Some(version);
+            contents
+        }
+        Ok(Some((None, version))) => {
+            record.hash = Some(version);
+            findings.push(Finding::record(
+                FindingKind::UnreadableRecord,
+                Severity::Error,
+                collection,
+                id,
+                format!(
+                    "record {collection}/{id} has supporting files but no '{}'; restore it, or remove the folder",
+                    entry_name.unwrap_or_default()
+                ),
+            ));
+            return Ok(record);
+        }
         Err(error) => {
             findings.push(Finding::record(
                 FindingKind::UnreadableRecord,
@@ -649,7 +711,6 @@ fn scan_record(
             return Ok(record);
         }
     };
-    record.hash = Some(record_hash(&contents));
 
     let Ok(text) = String::from_utf8(contents) else {
         findings.push(Finding::record(

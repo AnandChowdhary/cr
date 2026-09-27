@@ -47,11 +47,11 @@ use crate::{
     Attribution, AttributionOverrides, AuditAction, AuditAgent, AuditAuthorization, AuditEntry,
     AuditFilter, AuditIntent, AuditIntentPart, AuditSource, Authentication, AuthenticationMethod,
     Backlink, COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary, CollectionModel,
-    CollectionPresentation, Database, DomainError, Filter, FilterExpression, FilterOperator,
-    Finding, MAX_TRAVERSAL_DEPTH, Projection, RECORD_ACCESS_FIELD, Record, RecordActivity,
-    RecordPrecondition, SchemaReview, SchemaViolation, SearchQuery, SearchTarget, SortDirection,
-    SortKey, TOKEN_PREFIX, TrustedKeys, USERS_COLLECTION, User, UserKind, UserStatus,
-    ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
+    CollectionPresentation, Database, DomainError, FileChange, Filter, FilterExpression,
+    FilterOperator, Finding, MAX_TRAVERSAL_DEPTH, Projection, RECORD_ACCESS_FIELD, Record,
+    RecordActivity, RecordFile, RecordPrecondition, SchemaReview, SchemaViolation, SearchQuery,
+    SearchTarget, SortDirection, SortKey, TOKEN_PREFIX, TrustedKeys, USERS_COLLECTION, User,
+    UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
     audit::AuditChange,
     cloudflare_access::{self, AssertionError, CloudflareAccess},
     database::relation_references,
@@ -588,6 +588,9 @@ struct ApiRecord {
     version: String,
     front_matter: JsonValue,
     markdown: String,
+    /// A bundle record's supporting files; absent for a Markdown-file record.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    files: Vec<RecordFile>,
 }
 
 #[derive(Debug, Serialize)]
@@ -608,6 +611,7 @@ impl TryFrom<Record> for ApiRecord {
             version: record.version,
             front_matter: json_front_matter(record.attributes)?,
             markdown: record.body,
+            files: record.files,
         })
     }
 }
@@ -1616,6 +1620,9 @@ struct CreateRecordRequest {
     front_matter: Mapping,
     #[serde(default)]
     markdown: String,
+    /// A bundle record's supporting files, by path.
+    #[serde(default)]
+    files: BTreeMap<String, FileContent>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1626,6 +1633,67 @@ struct PatchRecordRequest {
     #[serde(default)]
     remove: Vec<String>,
     markdown: Option<String>,
+    /// Supporting files to add or replace, by path, and `null` for each one
+    /// to remove.
+    #[serde(default)]
+    files: BTreeMap<String, Option<FileContent>>,
+}
+
+/// The contents of one supporting file in a request body: text as is, or
+/// any bytes as standard base64.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileContent {
+    content: String,
+    #[serde(default)]
+    encoding: FileEncoding,
+}
+
+#[derive(Debug, Default, Deserialize)]
+enum FileEncoding {
+    #[default]
+    #[serde(rename = "utf-8")]
+    Utf8,
+    #[serde(rename = "base64")]
+    Base64,
+}
+
+impl FileContent {
+    fn bytes(self, path: &str) -> ApiResult<Vec<u8>> {
+        match self.encoding {
+            FileEncoding::Utf8 => Ok(self.content.into_bytes()),
+            FileEncoding::Base64 => {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(self.content.as_bytes())
+                    .map_err(|_| {
+                        ApiError::unprocessable(format!(
+                            "file '{}' is not valid base64",
+                            path.escape_default()
+                        ))
+                        .with_field(format!("files.{path}"))
+                    })
+            }
+        }
+    }
+}
+
+/// The file changes a create or patch body requests, in path order.
+fn requested_files(
+    files: impl IntoIterator<Item = (String, Option<FileContent>)>,
+) -> ApiResult<Vec<FileChange>> {
+    files
+        .into_iter()
+        .map(|(path, content)| {
+            Ok(match content {
+                Some(content) => FileChange::Write {
+                    contents: content.bytes(&path)?,
+                    path,
+                },
+                None => FileChange::Remove { path },
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -2034,6 +2102,10 @@ fn application(
                 .route(
                     "/collections/{collection}/records/{id}/fields/{field}",
                     get(get_field),
+                )
+                .route(
+                    "/collections/{collection}/records/{id}/files/{*path}",
+                    get(get_record_file),
                 )
                 .route(
                     "/collections/{collection}/records/{id}/links",
@@ -5397,6 +5469,30 @@ async fn get_document(
     Ok(response)
 }
 
+/// One supporting file of a bundle record, byte for byte.
+///
+/// The ETag is the record's version, which covers every file, so a client can
+/// make its next write conditional on the record it read the file from.
+async fn get_record_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((collection, id, path)): Path<(String, String, String)>,
+) -> ApiResult<Response> {
+    let (contents, version) = run_database(&state, &headers, move |database| {
+        database.read_file(&collection, &id, &path)
+    })
+    .await?;
+    let mut response = (
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        contents,
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::ETAG, entity_tag(&version)?);
+    Ok(response)
+}
+
 async fn get_field(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5425,13 +5521,20 @@ async fn create_record(
 ) -> ApiResult<Response> {
     let query: PreviewQuery = parse_query(raw)?;
     let Json(payload) = json_payload(payload)?;
+    let files = requested_files(
+        payload
+            .files
+            .into_iter()
+            .map(|(path, content)| (path, Some(content))),
+    )?;
     if query.preview {
         let preview = run_idempotent_database(&state, &headers, move |database| {
-            database.preview_create_record(
+            database.preview_create_record_with_files(
                 &collection,
                 &payload.id,
                 payload.front_matter,
                 &payload.markdown,
+                &files,
             )
         })
         .await?;
@@ -5444,11 +5547,12 @@ async fn create_record(
         encode_segment(&id)
     );
     let record = run_idempotent_database(&state, &headers, move |database| {
-        database.create_record(
+        database.create_record_with_files(
             &collection,
             &payload.id,
             payload.front_matter,
             &payload.markdown,
+            &files,
         )
     })
     .await?;
@@ -5469,14 +5573,16 @@ async fn patch_record(
     let query: PreviewQuery = parse_query(raw)?;
     let Json(payload) = json_payload(payload)?;
     let precondition = if_match(&headers, false)?;
+    let files = requested_files(payload.files)?;
     if query.preview {
         let preview = run_idempotent_database(&state, &headers, move |database| {
-            database.preview_patch_conditionally(
+            database.preview_patch_with_files_conditionally(
                 &collection,
                 &id,
                 &payload.front_matter,
                 &payload.remove,
                 payload.markdown.as_deref(),
+                &files,
                 precondition.as_ref(),
             )
         })
@@ -5484,12 +5590,13 @@ async fn patch_record(
         return Ok(Json(preview).into_response());
     }
     let record = run_idempotent_database(&state, &headers, move |database| {
-        database.patch_conditionally(
+        database.patch_with_files_conditionally(
             &collection,
             &id,
             &payload.front_matter,
             &payload.remove,
             payload.markdown.as_deref(),
+            &files,
             precondition.as_ref(),
         )
     })
@@ -5973,7 +6080,12 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                     "properties": {
                         "collection": { "type": "string" },
                         "id": { "type": "string" },
-                        "markdown": { "type": "string" }
+                        "markdown": { "type": "string" },
+                        "files": {
+                            "type": "array",
+                            "description": "A bundle record's supporting files, in path order. Absent for a record stored as one Markdown file. The record's version covers every one of them.",
+                            "items": { "$ref": "#/components/schemas/RecordFile" }
+                        }
                     }
                 }
             ]
@@ -6058,7 +6170,12 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
             "properties": {
                 "id": { "type": "string" },
                 "front_matter": { "$ref": "#/components/schemas/FrontMatter" },
-                "markdown": { "type": "string", "default": "" }
+                "markdown": { "type": "string", "default": "" },
+                "files": {
+                    "type": "object",
+                    "description": "Supporting files of a bundle record, by path. Refused for a collection that stores each record as one Markdown file.",
+                    "additionalProperties": { "$ref": "#/components/schemas/FileContent" }
+                }
             }
         },
         "PatchRecordRequest": {
@@ -6067,7 +6184,12 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
             "properties": {
                 "front_matter": { "$ref": "#/components/schemas/FrontMatter" },
                 "remove": { "type": "array", "items": { "type": "string" } },
-                "markdown": { "type": "string" }
+                "markdown": { "type": "string" },
+                "files": {
+                    "type": "object",
+                    "description": "Supporting files of a bundle record to add or replace, by path, and null for each one to remove. Recorded in the same audit event as the rest of the patch.",
+                    "additionalProperties": { "oneOf": [{ "$ref": "#/components/schemas/FileContent" }, { "type": "null" }] }
+                }
             }
         },
         "ReplaceRecordRequest": {
@@ -6224,6 +6346,41 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
         },
     }))
     .expect("static OpenAPI schemas are objects");
+    let bundles: Map<String, JsonValue> = serde_json::from_value(json!({
+        "RecordFile": {
+            "type": "object",
+            "required": ["path", "hash"],
+            "properties": {
+                "path": { "type": "string", "description": "The file's path inside the record's folder, /-separated." },
+                "hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "The plain SHA-256 of the file's bytes." }
+            }
+        },
+        "FileContent": {
+            "type": "object",
+            "required": ["content"],
+            "additionalProperties": false,
+            "description": "The contents of one supporting file: text as is, or any bytes as standard base64.",
+            "properties": {
+                "content": { "type": "string" },
+                "encoding": { "enum": ["utf-8", "base64"], "default": "utf-8" }
+            }
+        },
+        "AuditFileChange": {
+            "type": "object",
+            "required": ["operation", "path"],
+            "additionalProperties": false,
+            "description": "One supporting file of a bundle record that an event added, removed, or replaced. before and after are the plain SHA-256 of its bytes on each side; diff, present for UTF-8 text of at most 256 KiB, is a unified diff that replay applies and holds to after.",
+            "properties": {
+                "operation": { "enum": ["add", "remove", "replace"] },
+                "path": { "type": "string" },
+                "before": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                "after": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                "diff": { "type": "string" }
+            }
+        }
+    }))
+    .expect("static OpenAPI schemas are objects");
+    schemas.extend(bundles);
     let rest: Map<String, JsonValue> = serde_json::from_value(json!({
         "CountMetrics": {
             "type": "object",
@@ -6262,9 +6419,10 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "action": { "enum": ["baseline", "create", "update", "link", "delete"] },
                 "record": { "type": "object" },
                 "changes": { "type": "array", "items": { "type": "object" } },
+                "files": { "type": "array", "items": { "$ref": "#/components/schemas/AuditFileChange" } },
                 "before_hash": { "type": ["string", "null"] },
                 "after_hash": { "type": ["string", "null"] },
-                "digest": { "type": "string", "description": "sha256 over the canonical bytes of changes. Send back as X-CR-Approved-Changes." }
+                "digest": { "type": "string", "description": "sha256 over the canonical bytes of changes, and of files when there are any. Send back as X-CR-Approved-Changes." }
             }
         },
         "ChangePreviews": {
@@ -6352,7 +6510,7 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
             "required": ["hash", "version", "sequence", "timestamp", "actor", "source", "action", "record", "changes", "before_hash", "after_hash", "previous_hash"],
             "properties": {
                 "hash": { "type": "string", "description": "Hash of the exact stored audit payload. For encrypted collections, changes, snapshots, and idempotency results are logical plaintext projections while this hash still commits to stored ciphertext and cannot be recomputed from the response." },
-                "version": { "type": "integer", "minimum": 1, "maximum": 3 },
+                "version": { "type": "integer", "minimum": 1, "maximum": 4 },
                 "sequence": { "type": "integer", "minimum": 1 },
                 "timestamp": { "type": "string", "format": "date-time" },
                 "actor": { "type": "string" },
@@ -6360,6 +6518,7 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "action": { "enum": ["baseline", "create", "update", "link", "delete"] },
                 "record": { "type": "object" },
                 "changes": { "type": "array", "description": "Logical audit changes. Protected values are decrypted for authorized history reads; hash and authorization.approved_changes still commit to the stored ciphertext representation.", "items": { "type": "object" } },
+                "files": { "type": "array", "description": "A bundle record's supporting files this event added, removed, or replaced. Version 4 and later.", "items": { "$ref": "#/components/schemas/AuditFileChange" } },
                 "after_snapshot": {
                     "type": "object",
                     "description": "Versioned exact Markdown witness. Protected content is decrypted in authorized history responses while the stored journal retains ciphertext.",
@@ -6755,6 +6914,9 @@ fn openapi_paths() -> JsonValue {
         },
         "/api/v1/collections/{collection}/records/{id}/fields/{field}": {
             "get": { "operationId": "getRecordField", "parameters": [collection.clone(), id.clone(), json!({ "name": "field", "in": "path", "required": true, "schema": { "type": "string" } })], "responses": ok("#/components/schemas/FieldResponse") }
+        },
+        "/api/v1/collections/{collection}/records/{id}/files/{path}": {
+            "get": { "operationId": "getRecordFile", "description": "One supporting file of a bundle record, byte for byte. Reading it needs the permission reading the record does. The ETag is the record's version, which covers every file.", "parameters": [collection.clone(), id.clone(), json!({ "name": "path", "in": "path", "required": true, "description": "The file's path inside the record's folder; its slashes are part of the path.", "schema": { "type": "string" } })], "responses": { "200": { "description": "The file's exact bytes", "headers": { "ETag": etag_response_header() }, "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } }, "404": error_response() } }
         },
         "/api/v1/collections/{collection}/records/{id}/links": {
             "post": { "operationId": "linkRecord", "parameters": conditional_mutation_parameters(vec![collection.clone(), id.clone()]), "requestBody": json_body("#/components/schemas/LinkRequest"), "responses": record_ok_or_preview("#/components/schemas/Record", "#/components/schemas/ChangePreview") }
@@ -12550,6 +12712,9 @@ fn render_record_form(
                         @if let Some(relations) = relations {
                             (render_record_relations(view, record, relations, permissions, csrf_token))
                         }
+                        @if !record.files.is_empty() {
+                            (render_record_files(record))
+                        }
                         section aria-labelledby="activity-heading" {
                             div class="flex items-baseline justify-between gap-2" {
                                 h2 id="activity-heading" class="cr-aside-heading" { "Activity" }
@@ -12565,6 +12730,32 @@ fn render_record_form(
         ui,
         csrf_token,
     )
+}
+
+/// A bundle record's supporting files, each a download of its exact bytes.
+///
+/// The form edits the entry alone and a save keeps every file as it is, so
+/// the page lists them rather than offering an editor that could not round-trip
+/// a font or an image.
+fn render_record_files(record: &Record) -> Markup {
+    let base = format!(
+        "/api/v1/collections/{}/records/{}/files",
+        encode_segment(&record.collection),
+        encode_segment(&record.id)
+    );
+    html! {
+        section id="files" class="cr-relations" aria-labelledby="files-heading" {
+            h2 id="files-heading" class="cr-aside-heading" { "Files" }
+            ul class="cr-relations-list" {
+                @for file in &record.files {
+                    @let segments = file.path.split('/').map(encode_segment).collect::<Vec<_>>();
+                    li class="cr-relation" {
+                        a href=(format!("{base}/{}", segments.join("/"))) class="cr-relation-target font-mono" download { (file.path) }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A record's recent history as its page shows it beside the form: what

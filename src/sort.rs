@@ -369,6 +369,7 @@ mod tests {
             version: String::new(),
             attributes,
             body: String::new(),
+            files: Vec::new(),
         }
     }
 

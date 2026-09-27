@@ -237,6 +237,21 @@ Priorities:
 - [x] **P1 — First-class collection and schema commands.**
   `cr collections` lists every collection the principal can discover with its title and schema features. `cr schema show` prints a schema (the built-in one for `users`); `cr schema check` judges a proposed schema file or standard input against every existing record without writing, naming each failing record and field and exiting 2 when any fail; `cr schema set` repeats that judgement under the audit lock and installs the schema only when every record satisfies it, or with `--allow-violations`; and `cr schema remove` returns a collection to schemaless. Proposals must be valid Draft 2020-12 schemas with usable `x-cr-*` annotations, may not change encryption markers or record-owned access (which change what is stored and keep their own history-checking commands), and `remove` refuses a schema that declares either. Protected collections are judged without quoting protected values. Changes are owner-only and, like every schema file, not audited; see the configuration-history entry above. `tests/schema_cli.rs` covers them.
 
+- [x] **P1 — Bundle records: a Markdown entry and its supporting files.**
+  A collection declared with `layout: bundle` in `.cr/config.yaml` stores each record as `records/<collection>/<id>/<entry>`, and every other file in the folder belongs to the record without front matter. Create and update add, replace, and remove files (`--file`, `--remove-file`, REST `files`), `get --file` and `GET …/files/{path}` read one, and the record's version, `If-Match`, `status`, `save`, `audit verify`, `check`, and access control cover them. Each file change is in the record's event with before/after SHA-256 and, for text, a replayed diff; such events are audit version 4, and the change digest covers them. Multi-file writes stage their contents and recover partway states. `tests/bundle_records.rs` and `tests/bundle_records_http.rs` cover it; the follow-ups are the three entries below.
+
+- [ ] **P1 — Encrypted bundle records.**
+  Bundle collections refuse encrypted storage because supporting files are stored and audited byte for byte. Encrypting them needs an envelope for whole files, a keyed replacement for text diffs in the journal, and an answer for `get --file` and staged recovery contents.
+
+- [ ] **P2 — Stream large supporting files.**
+  A supporting file is read into memory to hash, stage, and write, and every `list` of a bundle collection hashes every file. A write also stages the old contents of every file it changes so a failure can be put back, which makes deleting a large bundle need free space the size of the bundle. Stream hashing and staging, consider a stat-keyed hash cache like the verified-journal cache, and consider rolling a failed deletion forward instead of back, before bundles are used for large media.
+
+- [ ] **P3 — Refuse supporting-file names a filesystem would normalize together.**
+  A request may not add two paths that differ only by letter case, but two spellings of one name in different Unicode normalization forms are not compared, so on a filesystem that normalizes names they become one file. The write is then refused and put back rather than half-applied; comparing normalized forms up front needs a Unicode normalization table.
+
+- [ ] **P3 — Record file modes of supporting files.**
+  A supporting file created by `cr` is owner read/write only and a replaced one keeps its permissions, but no permission is audited, so marking a script executable is invisible to `status`. Decide whether an executable bit belongs in the bundle version and the event, as Git records it.
+
 - [ ] **P1 — Schema migrations.**
   Plan, preview, apply, and audit versioned record migrations with safe restart behavior and explicit handling of partial failures.
 

@@ -24,9 +24,12 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::{
     access::{AccessDecision, USERS_COLLECTION, principal_id},
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
+    bundle::{
+        BundleFiles, BundlePlan, PlanState, RecordLayout, Staged, apply_file_changes, content_hash,
+        file_changes, read_bundle, record_version, remove_staged_leftovers,
+    },
     database::{
-        CollectionEntry, RECORDS_LABEL, collection_directory_name, collection_entry, record_label,
-        validate_component,
+        CollectionEntry, RECORDS_LABEL, collection_directory_name, record_label, validate_component,
     },
     encryption::{EncryptionStorageMetadata, audit_document_encryption_metadata},
     error::{
@@ -109,7 +112,17 @@ const ANCHOR_VERSION: u32 = 1;
 const SIGNATURE_PATH: &str = ".cr-audit-head.sig.json";
 const SIGNATURE_LABEL: &str = "the signed audit checkpoint";
 
-const AUDIT_VERSION: u32 = 3;
+/// The newest payload version this build reads.
+const AUDIT_VERSION: u32 = 4;
+/// What an event is written as when no record it touches has supporting
+/// files, so a database that never uses bundles stays readable by a `cr` that
+/// predates them.
+const BASE_AUDIT_VERSION: u32 = 3;
+/// The version that introduced `files` and bundle versions. An event is
+/// written at it once either side of its record has a supporting file, and
+/// every event after the first one written at it is too, because a version
+/// may never decrease along the chain.
+const FILES_AUDIT_VERSION: u32 = 4;
 const MIN_AUDIT_VERSION: u32 = 1;
 const SNAPSHOT_VERSION: u32 = 1;
 const EVENT_HASH_DOMAIN: &[u8] = b"cr:audit:event:v1\0";
@@ -119,6 +132,16 @@ const RECORD_HASH_DOMAIN: &[u8] = b"cr:record:v1\0";
 /// Distinct from the event and record domains so a change-set digest can never
 /// be mistaken for, or substituted with, either of the other two hashes.
 const CHANGE_SET_HASH_DOMAIN: &[u8] = b"cr:audit:changes:v1\0";
+/// Domain separator for the digest of a change set that also changes a bundle
+/// record's supporting files; see [`change_set_hash`].
+const FILE_CHANGE_SET_HASH_DOMAIN: &[u8] = b"cr:audit:changes:v2\0";
+
+/// Where a bundle write stages the contents it is about to publish, so that
+/// recovery can finish a write that stopped between two files. Each file is
+/// named by its content hash and removed once the write is committed or
+/// abandoned.
+const STAGED_DIRECTORY: &str = ".cr/audit/staged";
+const STAGED_LABEL: &str = "a staged bundle file";
 
 /// Where the verified walk a write leaves behind lives: beneath `.cr/cache/`,
 /// which holds nothing but derived state and keeps itself out of Git, because
@@ -210,6 +233,47 @@ impl AuditChange {
         match self {
             Self::Add { path, .. } | Self::Remove { path, .. } | Self::Replace { path, .. } => path,
         }
+    }
+}
+
+/// One supporting file of a bundle record that an event changed.
+///
+/// `before` and `after` are `sha256:` and the plain SHA-256 of the file's
+/// bytes, so `sha256sum` agrees with them; each is absent where the file does
+/// not exist. When the new contents are UTF-8 text small enough to diff,
+/// `diff` is a unified diff to them from the previous text, or from nothing
+/// when the file is new or was binary, and replay applies it and requires the
+/// result to hash to `after`. A removed text file's diff removes every line.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditFileChange {
+    pub operation: AuditFileOperation,
+    /// The file's path inside the record's folder, `/`-separated.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+}
+
+/// Whether a supporting file was added, removed, or replaced.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditFileOperation {
+    Add,
+    Remove,
+    Replace,
+}
+
+impl std::fmt::Display for AuditFileOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Add => "add",
+            Self::Remove => "remove",
+            Self::Replace => "replace",
+        })
     }
 }
 
@@ -314,6 +378,10 @@ pub struct AuditPayload {
     pub action: AuditAction,
     pub record: AuditRecord,
     pub changes: Vec<AuditChange>,
+    /// The bundle record's supporting files this event added, removed, or
+    /// replaced, in path order. Version 4 and later; absent when none changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<AuditFileChange>,
     /// Exact post-mutation representation for every present version-3 state.
     ///
     /// Version 1 and 2 predate this witness. Version 3 retains it unconditionally
@@ -729,12 +797,15 @@ pub struct ChangePreview {
     pub record: AuditRecord,
     /// The change set exactly as the audit event would record it.
     pub changes: Vec<AuditChange>,
+    /// The supporting files the event would change, for a bundle record.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<AuditFileChange>,
     /// The record's current audited state, or absent when it does not exist.
     pub before_hash: Option<String>,
     /// The state the mutation would produce, or absent for a deletion.
     pub after_hash: Option<String>,
-    /// `sha256:` over the canonical bytes of `changes`. Pass to
-    /// `--approved-changes` or `X-CR-Approved-Changes`.
+    /// `sha256:` over the canonical bytes of `changes`, and of `files` when
+    /// there are any. Pass to `--approved-changes` or `X-CR-Approved-Changes`.
     pub digest: String,
 }
 
@@ -745,6 +816,10 @@ struct PendingMutation {
     after_hash: Option<String>,
     hash: String,
     payload: String,
+    /// Every file of a bundle record's folder before and after the write,
+    /// for a write that changes more than its entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bundle: Option<BundlePlan>,
 }
 
 pub(crate) struct PreparedEntry {
@@ -767,6 +842,7 @@ impl PreparedEntry {
             action: self.parsed.action,
             record: self.parsed.record,
             changes: self.parsed.changes,
+            files: self.parsed.files,
             before_hash: self.parsed.before_hash,
             after_hash: self.parsed.after_hash,
             digest: self.change_digest,
@@ -789,6 +865,9 @@ struct StoredLine {
 struct ChainState {
     entries: u64,
     head_hash: Option<String>,
+    /// The payload version of the head event, which the next event may not
+    /// go below.
+    head_version: Option<u32>,
     idempotency_identities: HashSet<IdempotencyIdentity>,
 }
 
@@ -878,6 +957,7 @@ impl ChainWalk {
         ChainState {
             entries: self.expected_sequence - 1,
             head_hash: self.previous_hash,
+            head_version: self.previous_version,
             idempotency_identities: self.idempotency_identities,
         }
     }
@@ -892,6 +972,7 @@ impl ChainWalk {
         ChainState {
             entries: self.expected_sequence - 1,
             head_hash: self.previous_hash.clone(),
+            head_version: self.previous_version,
             idempotency_identities: self.idempotency_identities.clone(),
         }
     }
@@ -1389,6 +1470,9 @@ struct IdempotencyIdentity {
 pub(crate) struct AuditLog<'a> {
     root: &'a Path,
     records_dir: &'a Path,
+    /// Which collections store records as bundles; `None` stores every record
+    /// as one Markdown file.
+    layout: Option<&'a RecordLayout>,
     segment_max_events: usize,
     segment_max_bytes: u64,
     actor: &'a str,
@@ -1404,10 +1488,25 @@ pub(crate) struct AuditMutation<'a> {
     pub after_document: Option<&'a Document>,
     pub before_bytes: Option<&'a [u8]>,
     pub after_bytes: Option<&'a [u8]>,
+    /// A bundle record's supporting files on each side, which its versions
+    /// cover and its event records the changes to. `None` for a record with
+    /// none on either side.
+    pub files: Option<FileTransition<'a>>,
     pub source: AuditSource,
     pub message: Option<&'a str>,
     pub access: Option<&'a AccessDecision>,
     pub idempotency: Option<&'a AuditIdempotency>,
+}
+
+/// A bundle record's supporting files before and after one mutation.
+///
+/// `before` is what the caller read from disk. The mutation is refused unless
+/// the version it implies is the audited one, so it describes the same files
+/// replay holds.
+#[derive(Clone, Copy)]
+pub(crate) struct FileTransition<'a> {
+    pub before: &'a BundleFiles,
+    pub after: &'a BundleFiles,
 }
 
 pub(crate) struct ReconciledMutation<'a> {
@@ -1418,6 +1517,8 @@ pub(crate) struct ReconciledMutation<'a> {
     pub after_document: Option<&'a Document>,
     pub before_hash: Option<&'a str>,
     pub after_bytes: Option<&'a [u8]>,
+    /// The supporting files on disk now, for a bundle record.
+    pub after_files: Option<&'a BundleFiles>,
     pub had_history: bool,
     pub message: Option<&'a str>,
     pub access: Option<&'a AccessDecision>,
@@ -1432,6 +1533,10 @@ struct PayloadMutation<'a> {
     before_hash: Option<String>,
     after_hash: Option<String>,
     after_bytes: Option<&'a [u8]>,
+    /// The record's supporting files as replay holds them before the event,
+    /// and as the event leaves them.
+    before_files: &'a BundleFiles,
+    after_files: &'a BundleFiles,
     chain: ChainState,
     source: AuditSource,
     message: Option<&'a str>,
@@ -1454,6 +1559,10 @@ pub(crate) struct AuditedRecordState {
     /// predates v3. When the materialized file still matches its hash, replay
     /// uses that file as the missing witness and checks its semantics too.
     legacy_representation_gap: Option<u64>,
+    /// A bundle record's supporting files: each one's content hash, and its
+    /// text where the events that wrote it carried a diff.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BundleFiles,
 }
 
 pub(crate) type AuditedRecordStates = HashMap<(String, String), AuditedRecordState>;
@@ -1515,11 +1624,57 @@ impl<'a> AuditLog<'a> {
         Self {
             root,
             records_dir,
+            layout: None,
             segment_max_events,
             segment_max_bytes,
             actor,
             attribution,
             journal: None,
+        }
+    }
+
+    /// Store the collections `layout` names as bundles.
+    pub(crate) fn with_layout(mut self, layout: &'a RecordLayout) -> Self {
+        self.layout = Some(layout);
+        self
+    }
+
+    /// The entry name when `collection` stores records as bundles.
+    fn bundle_entry(&self, collection: &str) -> Option<&'a str> {
+        self.layout.and_then(|layout| layout.entry(collection))
+    }
+
+    /// Where a record's Markdown lives, relative to the database root.
+    fn record_path(&self, collection: &str, id: &str) -> PathBuf {
+        match self.layout {
+            Some(layout) => layout.record_path(self.records_dir, collection, id),
+            None => self.records_dir.join(collection).join(format!("{id}.md")),
+        }
+    }
+
+    /// The version of the record as it is on disk, `None` when it does not
+    /// exist, refusing anything reached through a symbolic link.
+    ///
+    /// For a bundle this covers every supporting file. A folder that holds
+    /// files but no entry has a version no audited state can have, so it is
+    /// reported as a divergence rather than as a missing record.
+    pub(crate) fn record_version_on_disk(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<String>> {
+        validate_component(collection, "collection")?;
+        validate_component(id, "id")?;
+        let label = record_label(collection, id);
+        match self.bundle_entry(collection) {
+            Some(entry) => {
+                let directory = self.records_dir.join(collection).join(id);
+                Ok(
+                    read_bundle(self.root, &directory, entry, &label, Staged::Refuse)?
+                        .map(|bundle| bundle.version()),
+                )
+            }
+            None => self.record_file_hash(&self.record_path(collection, id), collection, id),
         }
     }
 
@@ -1608,11 +1763,19 @@ impl<'a> AuditLog<'a> {
         mutation: AuditMutation<'_>,
         admission: Admission,
     ) -> Result<PreparedEntry> {
-        let before_hash = mutation.before_bytes.map(record_hash);
-        let audited_state = admission
+        let no_files = BundleFiles::new();
+        let files = mutation.files.unwrap_or(FileTransition {
+            before: &no_files,
+            after: &no_files,
+        });
+        let before_hash = mutation
+            .before_bytes
+            .map(|bytes| record_version(bytes, files.before));
+        let record = admission
             .states()
-            .get(&(mutation.collection.to_owned(), mutation.id.to_owned()))
-            .map(|state| state.hash.clone());
+            .get(&(mutation.collection.to_owned(), mutation.id.to_owned()));
+        let audited_state = record.map(|state| state.hash.clone());
+        let audited_files = record.map_or(&no_files, |state| &state.files);
         if mutation.action == AuditAction::Baseline {
             if audited_state.is_some() {
                 return Err(conflict(format!(
@@ -1640,8 +1803,12 @@ impl<'a> AuditLog<'a> {
             before_document: mutation.before_document,
             after_document: mutation.after_document,
             before_hash,
-            after_hash: mutation.after_bytes.map(record_hash),
+            after_hash: mutation
+                .after_bytes
+                .map(|bytes| record_version(bytes, files.after)),
             after_bytes: mutation.after_bytes,
+            before_files: audited_files,
+            after_files: files.after,
             chain: admission.journal.walk.state(),
             source: mutation.source,
             message: mutation.message,
@@ -1667,17 +1834,23 @@ impl<'a> AuditLog<'a> {
         mutation: ReconciledMutation<'_>,
         snapshot: &ReconciliationSnapshot,
     ) -> Result<PreparedEntry> {
-        let audited_state = snapshot
+        let record = snapshot
             .states
-            .get(&(mutation.collection.to_owned(), mutation.id.to_owned()))
-            .map(|state| state.hash.clone());
-        self.prepare_reconciled_from_state(mutation, audited_state, snapshot.chain.clone())
+            .get(&(mutation.collection.to_owned(), mutation.id.to_owned()));
+        let no_files = BundleFiles::new();
+        self.prepare_reconciled_from_state(
+            mutation,
+            record.map(|state| state.hash.clone()),
+            record.map_or(&no_files, |state| &state.files),
+            snapshot.chain.clone(),
+        )
     }
 
     fn prepare_reconciled_from_state(
         &self,
         mutation: ReconciledMutation<'_>,
         audited_state: Option<Option<String>>,
+        audited_files: &BundleFiles,
         chain: ChainState,
     ) -> Result<PreparedEntry> {
         let before_hash = mutation.before_hash.map(str::to_owned);
@@ -1688,6 +1861,8 @@ impl<'a> AuditLog<'a> {
                 mutation.collection, mutation.id
             )));
         }
+        let no_files = BundleFiles::new();
+        let after_files = mutation.after_files.unwrap_or(&no_files);
         self.prepare_payload(PayloadMutation {
             action: mutation.action,
             collection: mutation.collection,
@@ -1695,8 +1870,12 @@ impl<'a> AuditLog<'a> {
             before_document: mutation.before_document,
             after_document: mutation.after_document,
             before_hash,
-            after_hash: mutation.after_bytes.map(record_hash),
+            after_hash: mutation
+                .after_bytes
+                .map(|bytes| record_version(bytes, after_files)),
             after_bytes: mutation.after_bytes,
+            before_files: audited_files,
+            after_files,
             chain,
             source: AuditSource::Filesystem,
             message: mutation.message,
@@ -1709,14 +1888,29 @@ impl<'a> AuditLog<'a> {
         let ChainState {
             entries,
             head_hash: previous_hash,
+            head_version,
             mut idempotency_identities,
         } = mutation.chain;
         let sequence = entries + 1;
         let before = mutation.before_document.map(document_value).transpose()?;
         let after = mutation.after_document.map(document_value).transpose()?;
         let after_snapshot = exact_snapshot(mutation.after_document, mutation.after_bytes)?;
+        let after_files = if mutation.after_bytes.is_some() {
+            mutation.after_files
+        } else {
+            &BundleFiles::new()
+        };
+        let files = file_changes(mutation.before_files, after_files);
+        let version = if !mutation.before_files.is_empty()
+            || !after_files.is_empty()
+            || head_version.is_some_and(|version| version >= FILES_AUDIT_VERSION)
+        {
+            FILES_AUDIT_VERSION
+        } else {
+            BASE_AUDIT_VERSION
+        };
         let payload = AuditPayload {
-            version: AUDIT_VERSION,
+            version,
             sequence,
             timestamp: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
@@ -1735,6 +1929,7 @@ impl<'a> AuditLog<'a> {
                 id: mutation.id.to_owned(),
             },
             changes: diff_documents(before.as_ref(), after.as_ref()),
+            files,
             after_snapshot,
             before_hash: mutation.before_hash,
             after_hash: mutation.after_hash,
@@ -1778,7 +1973,18 @@ impl<'a> AuditLog<'a> {
         id: &str,
         contents: &[u8],
     ) -> Result<()> {
-        let actual = Some(record_hash(contents));
+        Self::assert_version_in(states, collection, id, &record_hash(contents))
+    }
+
+    /// [`Self::assert_current_in`] for a version already computed, as a
+    /// bundle's is from its entry and every supporting file.
+    pub(crate) fn assert_version_in(
+        states: &AuditedRecordStates,
+        collection: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<()> {
+        let actual = Some(version.to_owned());
         match states.get(&(collection.to_owned(), id.to_owned())) {
             Some(state) if state.hash == actual => Ok(()),
             None => Err(missing_audit_history(collection, id, "using")),
@@ -1795,11 +2001,8 @@ impl<'a> AuditLog<'a> {
         let admission = entry.admission.take();
         let target = target.to_path_buf();
         validate_relative_target(&target)?;
-        let expected_target = self
-            .records_dir
-            .join(&entry.parsed.record.collection)
-            .join(format!("{}.md", entry.parsed.record.id));
-        if target != expected_target {
+        let (collection, id) = (&entry.parsed.record.collection, &entry.parsed.record.id);
+        if target != self.record_path(collection, id) {
             bail!("audit target does not match its record identity");
         }
         // The append decides again, and that answer is the one it acts on.
@@ -1813,22 +2016,12 @@ impl<'a> AuditLog<'a> {
             after_hash: entry.parsed.after_hash.clone(),
             hash: entry.hash.clone(),
             payload: entry.payload.clone(),
+            bundle: None,
         };
-        let pending_bytes = serde_json::to_vec_pretty(&pending)
-            .context("could not serialize pending audit mutation")?;
-        paths::write_new(
-            self.root,
-            Path::new(PENDING_PATH),
-            &pending_bytes,
-            PENDING_LABEL,
-        )?;
+        self.store_pending(&pending)?;
 
         let result = apply();
-        let current_hash = self.record_file_hash(
-            &pending.target,
-            &entry.parsed.record.collection,
-            &entry.parsed.record.id,
-        )?;
+        let current_hash = self.record_version_on_disk(collection, id)?;
 
         if current_hash == pending.after_hash {
             self.append(&entry, admission)?;
@@ -1844,6 +2037,98 @@ impl<'a> AuditLog<'a> {
         bail!(
             "record mutation completed without producing the audited state; pending recovery was retained"
         )
+    }
+
+    /// [`Self::commit`] for a bundle record: apply `plan` to the record's
+    /// folder and append the event.
+    ///
+    /// Several files cannot be replaced in one atomic step, so this does not
+    /// try to. Every file the write publishes is staged under
+    /// `.cr/audit/staged/` first, and the pending mutation names every file
+    /// of the folder on both sides of the write. A write that stops between
+    /// two files therefore leaves a state recovery recognizes, and the next
+    /// command finishes it from the staged contents and appends the event,
+    /// exactly as it appends one whose single file landed. `contents` holds
+    /// the bytes of every file the write publishes, by content hash.
+    pub(crate) fn commit_bundle(
+        &self,
+        mut entry: PreparedEntry,
+        plan: BundlePlan,
+        contents: &HashMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        let admission = entry.admission.take();
+        let (collection, id) = (&entry.parsed.record.collection, &entry.parsed.record.id);
+        let Some(entry_name) = self.bundle_entry(collection) else {
+            bail!("a bundle write targets a collection that does not store bundles");
+        };
+        plan.validate(&self.records_dir.join(collection).join(id), entry_name)?;
+        let label = record_label(collection, id);
+        self.clear_staged()?;
+        // Both sides of every changed file: the new contents to finish the
+        // write, and the old ones to put it back should it fail partway.
+        for file in plan.changed() {
+            if let Some(hash) = &file.after {
+                let bytes = contents
+                    .get(hash)
+                    .context("a bundle write is missing contents it publishes")?;
+                self.stage(hash, bytes)?;
+            }
+            if let Some(hash) = &file.before {
+                let bytes = paths::read(self.root, &plan.directory.join(&file.path), &label)?;
+                if &content_hash(&bytes) != hash {
+                    return Err(stale_audit_state(collection, id));
+                }
+                self.stage(hash, &bytes)?;
+            }
+        }
+        let pending = PendingMutation {
+            target: self.record_path(collection, id),
+            before_hash: entry.parsed.before_hash.clone(),
+            after_hash: entry.parsed.after_hash.clone(),
+            hash: entry.hash.clone(),
+            payload: entry.payload.clone(),
+            bundle: Some(plan),
+        };
+        self.store_pending(&pending)?;
+        let plan = pending.bundle.as_ref().expect("the plan was just stored");
+
+        let result = plan
+            .apply(self.root, &label, |hash| {
+                contents
+                    .get(hash)
+                    .cloned()
+                    .context("a bundle write is missing contents it publishes")
+            })
+            .and_then(|()| unplanned(plan.state(self.root, &label)?, &label));
+        if result.is_err() {
+            // One failed file must not leave the record half written, as a
+            // failed rename of one file never has. Should putting it back
+            // fail too, the pending write remains for recovery.
+            let _ = plan
+                .reversed()
+                .apply(self.root, &label, |hash| self.read_staged(hash));
+        }
+        match plan.state(self.root, &label)? {
+            PlanState::After
+                if self.record_version_on_disk(collection, id)? == entry.parsed.after_hash =>
+            {
+                self.append(&entry, admission)?;
+                self.clear_pending()?;
+                result
+            }
+            PlanState::Before if result.is_err() => {
+                self.clear_pending()?;
+                result
+            }
+            _ => match result {
+                Err(error) => Err(error.context(
+                    "the record was written partway; the next command that opens the database finishes the write or puts the record back",
+                )),
+                Ok(()) => bail!(
+                    "record mutation completed without producing the audited state; pending recovery was retained"
+                ),
+            },
+        }
     }
 
     /// Accept one event while advancing the verified generation held by a
@@ -1864,18 +2149,11 @@ impl<'a> AuditLog<'a> {
     fn validate_accepted_entry(&self, entry: &PreparedEntry, target: &Path) -> Result<AuditEntry> {
         let target = target.to_path_buf();
         validate_relative_target(&target)?;
-        let expected_target = self
-            .records_dir
-            .join(&entry.parsed.record.collection)
-            .join(format!("{}.md", entry.parsed.record.id));
-        if target != expected_target {
+        let (collection, id) = (&entry.parsed.record.collection, &entry.parsed.record.id);
+        if target != self.record_path(collection, id) {
             bail!("audit target does not match its record identity");
         }
-        let current_hash = self.record_file_hash(
-            &target,
-            &entry.parsed.record.collection,
-            &entry.parsed.record.id,
-        )?;
+        let current_hash = self.record_version_on_disk(collection, id)?;
         if current_hash != entry.parsed.after_hash {
             return Err(conflict(format!(
                 "record {}/{} changed while it was being saved",
@@ -1918,7 +2196,9 @@ impl<'a> AuditLog<'a> {
         let Some(serialized) =
             paths::read_optional(self.root, Path::new(PENDING_PATH), PENDING_LABEL)?
         else {
-            return Ok(());
+            // A crash after staging a bundle write's contents and before
+            // recording the write leaves contents nothing refers to.
+            return self.clear_staged();
         };
 
         let pending: PendingMutation =
@@ -1935,21 +2215,37 @@ impl<'a> AuditLog<'a> {
         if payload.before_hash != pending.before_hash || payload.after_hash != pending.after_hash {
             bail!("pending audit mutation state hashes are inconsistent");
         }
-        validate_component(&payload.record.collection, "collection")?;
-        validate_component(&payload.record.id, "id")?;
-        let expected_target = self
-            .records_dir
-            .join(&payload.record.collection)
-            .join(format!("{}.md", payload.record.id));
-        if pending.target != expected_target {
+        let (collection, id) = (&payload.record.collection, &payload.record.id);
+        validate_component(collection, "collection")?;
+        validate_component(id, "id")?;
+        if pending.target != self.record_path(collection, id) {
             bail!("pending audit mutation target does not match its record identity");
         }
+        let label = record_label(collection, id);
+        if let Some(plan) = &pending.bundle {
+            let Some(entry) = self.bundle_entry(collection) else {
+                bail!("pending bundle write targets a collection that does not store bundles");
+            };
+            plan.validate(&self.records_dir.join(collection).join(id), entry)?;
+            remove_staged_leftovers(self.root, &plan.directory, &label)?;
+        }
 
-        let current_hash = self.record_file_hash(
-            &pending.target,
-            &payload.record.collection,
-            &payload.record.id,
-        )?;
+        // Where the record stands: as before the write, as after it, or — for
+        // a bundle, whose files are written one at a time — partway between.
+        let current_state = || -> Result<PlanState> {
+            if let Some(plan) = &pending.bundle {
+                return plan.state(self.root, &label);
+            }
+            let current = self.record_version_on_disk(collection, id)?;
+            Ok(if current == pending.after_hash {
+                PlanState::After
+            } else if current == pending.before_hash {
+                PlanState::Before
+            } else {
+                PlanState::Neither
+            })
+        };
+        let mut state = current_state()?;
         // Recovery is a write path too. Refuse to append or bless a pending
         // event on top of a journal whose change sets no longer reproduce the
         // states they claim, and name the guilty committed sequence first.
@@ -1959,7 +2255,7 @@ impl<'a> AuditLog<'a> {
 
         if let Some(head) = head.as_ref() {
             if head.entry.payload.sequence == payload.sequence && head.entry.hash == pending.hash {
-                if current_hash != pending.after_hash {
+                if state != PlanState::After {
                     bail!(
                         "audit event was committed but the record does not match its audited state"
                     );
@@ -1972,7 +2268,37 @@ impl<'a> AuditLog<'a> {
             }
         }
 
-        if current_hash == pending.after_hash {
+        if state == PlanState::Partial
+            && let Some(plan) = &pending.bundle
+        {
+            // Finish the write; should that fail, put the folder back as it
+            // was and discard the write, rather than leave every later
+            // command to fail on the same file.
+            if plan
+                .apply(self.root, &label, |hash| self.read_staged(hash))
+                .and_then(|()| unplanned(plan.state(self.root, &label)?, &label))
+                .is_err()
+            {
+                plan.reversed()
+                    .apply(self.root, &label, |hash| self.read_staged(hash))?;
+            }
+            state = current_state()?;
+        }
+        // The plan is read back from disk, so what it says the folder holds
+        // must also be what the event says the record's version is.
+        if pending.bundle.is_some() {
+            let version = self.record_version_on_disk(collection, id)?;
+            let consistent = match state {
+                PlanState::After => version == pending.after_hash,
+                PlanState::Before => version == pending.before_hash,
+                PlanState::Partial | PlanState::Neither => true,
+            };
+            if !consistent {
+                bail!("pending bundle write does not describe the audited record states");
+            }
+        }
+
+        if state == PlanState::After {
             let expected_sequence = head
                 .as_ref()
                 .map_or(1, |head| head.entry.payload.sequence + 1);
@@ -2009,7 +2335,7 @@ impl<'a> AuditLog<'a> {
             return Ok(());
         }
 
-        if current_hash == pending.before_hash {
+        if state == PlanState::Before {
             self.clear_pending()?;
             return Ok(());
         }
@@ -2044,28 +2370,43 @@ impl<'a> AuditLog<'a> {
         id: &str,
         key_hash: &str,
         request_hash: &str,
-    ) -> Result<Option<AuditIdempotencyResult>> {
+    ) -> Result<Option<(AuditIdempotencyResult, BundleFiles)>> {
         let mut result = None;
         let mut latest = AuditedRecordStates::new();
+        let key = (collection.to_owned(), id.to_owned());
         self.verify_chain(|entry, _| {
+            let matched = entry.payload.idempotency.as_ref().filter(|stored| {
+                stored.principal == principal
+                    && stored.operation == operation
+                    && stored.key_hash == key_hash
+                    && entry.payload.record.collection == collection
+                    && entry.payload.record.id == id
+            });
+            // A deletion's result is the record as it was, files included.
+            let deleted_files = matched
+                .filter(|_| entry.payload.action == AuditAction::Delete)
+                .map(|_| {
+                    latest
+                        .get(&key)
+                        .map(|state| state.files.clone())
+                        .unwrap_or_default()
+                });
             replay_entry(&mut latest, entry)?;
-            let Some(stored) = entry.payload.idempotency.as_ref() else {
+            let Some(stored) = matched else {
                 return Ok(());
             };
-            if stored.principal != principal
-                || stored.operation != operation
-                || stored.key_hash != key_hash
-                || entry.payload.record.collection != collection
-                || entry.payload.record.id != id
-            {
-                return Ok(());
-            }
             if stored.request_hash != request_hash {
                 return Err(idempotency_conflict(format!(
                     "idempotency key was already used for a different {operation} request on record {collection}/{id}"
                 )));
             }
-            result = Some(stored.result.clone());
+            let files = deleted_files.unwrap_or_else(|| {
+                latest
+                    .get(&key)
+                    .map(|state| state.files.clone())
+                    .unwrap_or_default()
+            });
+            result = Some((stored.result.clone(), files));
             Ok(())
         })?;
         Ok(result)
@@ -3312,6 +3653,7 @@ impl<'a> AuditLog<'a> {
         }
         snapshot.chain.entries = entry.parsed.sequence;
         snapshot.chain.head_hash = Some(entry.hash.clone());
+        snapshot.chain.head_version = Some(entry.parsed.version);
         Ok(())
     }
 
@@ -3391,7 +3733,7 @@ impl<'a> AuditLog<'a> {
             };
             validate_component(collection, "collection")?;
             validate_component(id, "id")?;
-            let path = self.records_dir.join(collection).join(format!("{id}.md"));
+            let path = self.record_path(collection, id);
             let label = record_label(collection, id);
             let Some(bytes) = paths::read_optional(self.root, &path, &label)? else {
                 continue;
@@ -3432,10 +3774,7 @@ impl<'a> AuditLog<'a> {
         let mut audited: Vec<_> = latest.iter().collect();
         audited.sort_unstable_by_key(|(record, _)| *record);
         for ((collection, id), expected_hash) in audited {
-            validate_component(collection, "collection")?;
-            validate_component(id, "id")?;
-            let path = self.records_dir.join(collection).join(format!("{id}.md"));
-            let actual_hash = self.record_file_hash(&path, collection, id)?;
+            let actual_hash = self.record_version_on_disk(collection, id)?;
             if &actual_hash != expected_hash {
                 return Err(conflict(format!(
                     "record {collection}/{id} does not match its latest audited state"
@@ -3443,6 +3782,8 @@ impl<'a> AuditLog<'a> {
             }
         }
 
+        let no_layout = RecordLayout::default();
+        let layout = self.layout.unwrap_or(&no_layout);
         let collections =
             paths::list_directory(self.root, self.records_dir, RECORDS_LABEL)?.unwrap_or_default();
         for collection in collections {
@@ -3459,15 +3800,23 @@ impl<'a> AuditLog<'a> {
                 // reached the check below as an ID of `.` and `audit verify`
                 // reported a record named `deals/.` that nothing could name,
                 // read, or repair.
-                let CollectionEntry::Record(id) = collection_entry(&collection_name, &record.name)?
+                let CollectionEntry::Record(id) =
+                    layout.collection_entry(&collection_name, &record.name, record.kind)?
                 else {
                     continue;
                 };
-                if !record.kind.is_file() {
+                if !layout.stores_record_as(&collection_name, record.kind) {
                     return Err(paths::refuse_entry(
                         &record_label(&collection_name, &id),
                         record.kind,
                     ));
+                }
+                if self
+                    .record_version_on_disk(&collection_name, &id)?
+                    .is_none()
+                {
+                    // A bundle folder with nothing in it is not a record.
+                    continue;
                 }
                 if !latest.contains_key(&(collection_name.clone(), id.clone())) {
                     return Err(conflict(format!(
@@ -3547,8 +3896,73 @@ impl<'a> AuditLog<'a> {
         if paths::entry_kind(self.root, path, PENDING_LABEL)?.is_some() {
             paths::remove_file(self.root, path, PENDING_LABEL)?;
         }
+        self.clear_staged()
+    }
+
+    fn store_pending(&self, pending: &PendingMutation) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(pending)
+            .context("could not serialize pending audit mutation")?;
+        paths::write_new(self.root, Path::new(PENDING_PATH), &bytes, PENDING_LABEL)
+    }
+
+    /// Where the staged contents with `hash` are kept.
+    fn staged_path(hash: &str) -> Result<PathBuf> {
+        let name = hash
+            .strip_prefix("sha256:")
+            .context("a staged file is named by a content hash")?;
+        Ok(Path::new(STAGED_DIRECTORY).join(name))
+    }
+
+    fn stage(&self, hash: &str, contents: &[u8]) -> Result<()> {
+        if content_hash(contents) != hash {
+            bail!("staged contents do not match their hash");
+        }
+        let path = Self::staged_path(hash)?;
+        // Named by content, so contents already staged are these contents.
+        if paths::entry_kind(self.root, &path, STAGED_LABEL)?.is_some() {
+            return Ok(());
+        }
+        paths::write_new(self.root, &path, contents, STAGED_LABEL)
+    }
+
+    /// Staged contents, refused unless they still hash to the name they were
+    /// staged under.
+    fn read_staged(&self, hash: &str) -> Result<Vec<u8>> {
+        let contents = paths::read(self.root, &Self::staged_path(hash)?, STAGED_LABEL)
+            .context("the contents a bundle write staged are missing")?;
+        if content_hash(&contents) != hash {
+            bail!("the contents a bundle write staged were changed");
+        }
+        Ok(contents)
+    }
+
+    fn clear_staged(&self) -> Result<()> {
+        let directory = Path::new(STAGED_DIRECTORY);
+        let Some(entries) = paths::list_directory(self.root, directory, STAGED_LABEL)? else {
+            return Ok(());
+        };
+        for entry in entries {
+            if entry.kind.is_file() {
+                paths::remove_file(self.root, &directory.join(&entry.name), STAGED_LABEL)?;
+            }
+        }
         Ok(())
     }
+}
+
+/// Refuse a bundle write that ran to its end without reaching its after-state.
+///
+/// A filesystem that treats two of the plan's paths as one — as one that
+/// normalizes Unicode names does — can do that, and such a write has to be
+/// put back like any other that failed, or recovery would find it forever
+/// partway.
+fn unplanned(state: PlanState, label: &str) -> Result<()> {
+    if state == PlanState::After {
+        return Ok(());
+    }
+    Err(conflict(format!(
+        "{label} could not be written as planned; the filesystem may treat two of its file names as one"
+    )))
 }
 
 struct LoadedHead {
@@ -3707,6 +4121,8 @@ fn verify_idempotency_result(
     entry: &AuditEntry,
     before: Option<&Value>,
     after: Option<&Value>,
+    before_files: &BundleFiles,
+    after_files: &BundleFiles,
 ) -> Result<()> {
     let Some(idempotency) = entry.payload.idempotency.as_ref() else {
         return Ok(());
@@ -3739,10 +4155,10 @@ fn verify_idempotency_result(
     if entry.payload.action != expected_action {
         return Err(invalid("operation disagrees with the event"));
     }
-    let (expected_document, expected_version) = if expected_action == AuditAction::Delete {
-        (before, entry.payload.before_hash.as_deref())
+    let (expected_document, expected_version, files) = if expected_action == AuditAction::Delete {
+        (before, entry.payload.before_hash.as_deref(), before_files)
     } else {
-        (after, entry.payload.after_hash.as_deref())
+        (after, entry.payload.after_hash.as_deref(), after_files)
     };
     let Some(expected_document) = expected_document else {
         return Err(invalid("result has no record state"));
@@ -3762,7 +4178,7 @@ fn verify_idempotency_result(
         )))
     })?;
     if expected_version != Some(result.version.as_str())
-        || record_hash(result.markdown.as_bytes()) != result.version
+        || record_version(result.markdown.as_bytes(), files) != result.version
         || &result_document != expected_document
     {
         return Err(audit_integrity(format!(
@@ -3810,15 +4226,24 @@ fn valid_stored_digest(value: &str, prefix: &str) -> bool {
     })
 }
 
+/// A result path names the record's Markdown: `<collection>/<id>.md`, or a
+/// bundle's entry, `<collection>/<id>/<entry>.md`, beneath the records
+/// directory it was written under.
 fn validate_idempotency_result_path(entry: &AuditEntry, path: &Path) -> Result<()> {
-    let expected_file = format!("{}.md", entry.payload.record.id);
+    let record = &entry.payload.record;
+    let expected_file = format!("{}.md", record.id);
+    let named =
+        |path: Option<&Path>, name: &str| path.and_then(Path::file_name) == Some(OsStr::new(name));
+    let flat = path.file_name() == Some(OsStr::new(&expected_file))
+        && named(path.parent(), &record.collection);
+    let bundle = path.extension().is_some_and(|extension| extension == "md")
+        && named(path.parent(), &record.id)
+        && named(path.parent().and_then(Path::parent), &record.collection);
     let safe = !path.is_absolute()
         && path
             .components()
             .all(|component| matches!(component, std::path::Component::Normal(_)))
-        && path.file_name() == Some(OsStr::new(&expected_file))
-        && path.parent().and_then(Path::file_name)
-            == Some(OsStr::new(&entry.payload.record.collection));
+        && (flat || bundle);
     if safe {
         return Ok(());
     }
@@ -3846,20 +4271,35 @@ fn missing_audit_history(collection: &str, id: &str, action: &str) -> anyhow::Er
 /// Preview and apply hash a payload this process just serialized; `audit
 /// verify` hashes the payload as it sits on disk. All three go through here, so
 /// there is exactly one definition of what was approved.
+///
+/// An event that changes a bundle record's supporting files commits to those
+/// too, under its own domain: the `changes` bytes, a NUL, which JSON text
+/// cannot contain, and the exact bytes of `files`. Approving a change set
+/// therefore approves every file it adds, removes, or replaces, and an event
+/// without files keeps the digest it always had.
 pub(crate) fn change_set_hash(payload: &str) -> Result<String> {
     let parsed: PayloadChanges<'_> = serde_json::from_str(payload)
         .context("audit payload does not carry a readable change set")?;
-    Ok(digest(
-        CHANGE_SET_HASH_DOMAIN,
-        parsed.changes.get().as_bytes(),
-    ))
+    let Some(files) = parsed.files else {
+        return Ok(digest(
+            CHANGE_SET_HASH_DOMAIN,
+            parsed.changes.get().as_bytes(),
+        ));
+    };
+    let mut committed = parsed.changes.get().as_bytes().to_vec();
+    committed.push(0);
+    committed.extend_from_slice(files.get().as_bytes());
+    Ok(digest(FILE_CHANGE_SET_HASH_DOMAIN, &committed))
 }
 
-/// Just enough of a payload to borrow its `changes` bytes unchanged.
+/// Just enough of a payload to borrow its `changes` and `files` bytes
+/// unchanged.
 #[derive(Deserialize)]
 struct PayloadChanges<'a> {
     #[serde(borrow)]
     changes: &'a RawValue,
+    #[serde(borrow, default)]
+    files: Option<&'a RawValue>,
 }
 
 /// Recompute one event's previewed-change digest from its stored change set.
@@ -3927,6 +4367,7 @@ fn replay_entry(latest: &mut AuditedRecordStates, entry: &AuditEntry) -> Result<
         document: None,
         protected_storage_owned: false,
         legacy_representation_gap: None,
+        files: BundleFiles::new(),
     });
     if state.hash != entry.payload.before_hash {
         return Err(audit_integrity(format!(
@@ -3946,12 +4387,41 @@ fn replay_entry(latest: &mut AuditedRecordStates, entry: &AuditEntry) -> Result<
         )))
     })?;
     verify_action_transition(entry, existed_before, state.document.is_some())?;
-    state.legacy_representation_gap = if verify_replayed_after(entry, &state.document)? {
-        None
-    } else {
-        Some(sequence)
-    };
-    verify_idempotency_result(entry, before_document.as_ref(), state.document.as_ref())?;
+    if entry.payload.version < FILES_AUDIT_VERSION
+        && (!state.files.is_empty() || !entry.payload.files.is_empty())
+    {
+        return Err(audit_integrity(format!(
+            "audit replay is inconsistent at sequence {sequence}: a record with supporting files needs audit version {FILES_AUDIT_VERSION}"
+        )));
+    }
+    let before_files = entry
+        .payload
+        .idempotency
+        .is_some()
+        .then(|| state.files.clone());
+    apply_file_changes(&mut state.files, &entry.payload.files).map_err(|error| {
+        error.context(DomainError::AuditIntegrity(format!(
+            "audit replay is inconsistent at sequence {sequence}: file changes cannot be applied"
+        )))
+    })?;
+    if state.document.is_none() && !state.files.is_empty() {
+        return Err(audit_integrity(format!(
+            "audit replay is inconsistent at sequence {sequence}: a deleted record still has supporting files"
+        )));
+    }
+    state.legacy_representation_gap =
+        if verify_replayed_after(entry, &state.document, &state.files)? {
+            None
+        } else {
+            Some(sequence)
+        };
+    verify_idempotency_result(
+        entry,
+        before_document.as_ref(),
+        state.document.as_ref(),
+        before_files.as_ref().unwrap_or(&state.files),
+        &state.files,
+    )?;
     if let Some(document) = state.document.as_ref() {
         state.protected_storage_owned = audit_document_encryption_metadata(document)
             .is_some_and(|metadata| metadata.has_envelopes);
@@ -3986,7 +4456,11 @@ fn verify_action_transition(
 /// `true` means the event itself proves its exact representation. `false` is
 /// the narrow v1/v2 compatibility state whose current materialized file must
 /// serve as the missing witness when the gap remains at a record head.
-fn verify_replayed_after(entry: &AuditEntry, document: &Option<Value>) -> Result<bool> {
+fn verify_replayed_after(
+    entry: &AuditEntry,
+    document: &Option<Value>,
+    files: &BundleFiles,
+) -> Result<bool> {
     let sequence = entry.payload.sequence;
     let mismatch = |reason: &str| {
         audit_integrity(format!(
@@ -4026,7 +4500,7 @@ fn verify_replayed_after(entry: &AuditEntry, document: &Option<Value>) -> Result
                 "record snapshot does not describe the replayed document",
             ));
         }
-        if record_hash(snapshot.markdown.as_bytes()) != expected_hash {
+        if record_version(snapshot.markdown.as_bytes(), files) != expected_hash {
             return Err(mismatch("record snapshot does not match after hash"));
         }
         return Ok(true);
@@ -4397,6 +4871,7 @@ mod tests {
                 before: json!("open"),
                 after: json!("closed-won"),
             }],
+            files: Vec::new(),
             after_snapshot: None,
             before_hash: Some("sha256:70af0060".to_owned()),
             after_hash: Some("sha256:3c583cd6".to_owned()),
@@ -4797,6 +5272,7 @@ mod tests {
                 after_document: Some(&original),
                 before_bytes: None,
                 after_bytes: Some(original_raw.as_bytes()),
+                files: None,
                 source: AuditSource::Cli,
                 message: None,
                 access: None,
@@ -4826,6 +5302,7 @@ mod tests {
                     after_document: Some(&accepted),
                     before_hash: Some(&record_hash(original_raw.as_bytes())),
                     after_bytes: Some(accepted_raw.as_bytes()),
+                    after_files: None,
                     had_history: true,
                     message: None,
                     access: None,
@@ -4881,6 +5358,7 @@ mod tests {
                     after_document: Some(&document),
                     before_bytes: None,
                     after_bytes: Some(rendered.as_bytes()),
+                    files: None,
                     source: AuditSource::Cli,
                     message: None,
                     access: None,
@@ -5609,6 +6087,7 @@ mod tests {
                 after_document: Some(&document),
                 before_bytes: None,
                 after_bytes: Some(rendered.as_bytes()),
+                files: None,
                 source: AuditSource::Cli,
                 message: None,
                 access: None,
@@ -5802,6 +6281,7 @@ mod tests {
                 after_document: Some(&document),
                 before_bytes: None,
                 after_bytes: Some(rendered.as_bytes()),
+                files: None,
                 source: AuditSource::Cli,
                 message: None,
                 access: None,
@@ -5842,6 +6322,7 @@ mod tests {
                 after_document: Some(&document),
                 before_bytes: None,
                 after_bytes: Some(rendered.as_bytes()),
+                files: None,
                 source: AuditSource::Cli,
                 message: None,
                 access: None,
@@ -5883,6 +6364,7 @@ mod tests {
                 after_document: Some(&original),
                 before_bytes: None,
                 after_bytes: Some(original_raw.as_bytes()),
+                files: None,
                 source: AuditSource::Cli,
                 message: None,
                 access: None,
@@ -5922,6 +6404,7 @@ mod tests {
                 after_document: Some(&first),
                 before_bytes: Some(original_raw.as_bytes()),
                 after_bytes: Some(first_raw.as_bytes()),
+                files: None,
                 source: AuditSource::Cli,
                 message: None,
                 access: None,
@@ -5949,6 +6432,7 @@ mod tests {
                 after_document: Some(&second),
                 before_bytes: Some(first_raw.as_bytes()),
                 after_bytes: Some(second_raw.as_bytes()),
+                files: None,
                 source: AuditSource::Cli,
                 message: None,
                 access: None,
@@ -5971,6 +6455,7 @@ mod tests {
                 after_document: Some(&second),
                 before_bytes: Some(first_raw.as_bytes()),
                 after_bytes: Some(second_raw.as_bytes()),
+                files: None,
                 source: AuditSource::Cli,
                 message: None,
                 access: None,
@@ -6003,6 +6488,7 @@ mod tests {
             after_hash: entry.parsed.after_hash.clone(),
             hash: entry.hash.clone(),
             payload: entry.payload.clone(),
+            bundle: None,
         };
         paths::write_new(
             audit.root,

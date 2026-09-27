@@ -214,7 +214,7 @@ fn argument_checks_clap_cannot_express_are_usage_errors() {
         ),
         (
             vec!["update", "items", "one"],
-            "provide at least one --set, --set-env, --unset, or --body value",
+            "provide at least one --set, --set-env, --unset, --body, --file, or --remove-file value",
         ),
         (
             vec!["delete", "items", "one"],

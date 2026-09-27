@@ -286,6 +286,10 @@ struct SyncRunEvents {
 struct SyncOwnedState {
     action: AuditAction,
     version: Option<String>,
+    /// The exact Markdown the event left, which replay has already proven
+    /// belongs to `version`. A bundle's version also covers supporting files
+    /// a sync never writes, so the Markdown is what an upsert is judged by.
+    markdown: Option<String>,
 }
 
 struct SyncRecoverySnapshot {
@@ -1453,6 +1457,10 @@ fn classify_sync_run_events(
                     SyncOwnedState {
                         action: entry.payload.action,
                         version: entry.payload.after_hash,
+                        markdown: entry
+                            .payload
+                            .after_snapshot
+                            .map(|snapshot| snapshot.markdown),
                     },
                 )
                 .is_some()
@@ -1518,7 +1526,10 @@ fn validate_sync_run_events(
                             body: markdown.clone(),
                         }
                         .render()?;
-                        version == record_hash(rendered.as_bytes())
+                        match &state.markdown {
+                            Some(stored) => stored == &rendered,
+                            None => version == record_hash(rendered.as_bytes()),
+                        }
                     }
                     None => false,
                 };

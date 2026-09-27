@@ -11,11 +11,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
     AccessAction, AccessResource, AgentEvidence, Aggregation, Assignment, AttributionOverrides,
     AuditFilter, CheckReport, CheckScope, CollectionAccessPolicy, CollectionPresentation,
-    DEFAULT_VIEW_PAGE_SIZE, Database, DomainError, Filter, FilterExpression, JournalVerification,
-    Projection, Record, RecordPrecondition, RecordVisibility, Role, SchemaReview, SearchQuery,
-    SearchTarget, SigningKeySummary, SortDirection, SortKey, SyncAttribution, TrustedKeys,
-    UserDeleteOptions, UserEnsureOutcome, UserKind, UserRegistrationOptions, UserStatus,
-    UserUpdate, ViewLayout, parse_sort_keys, parse_threshold, sort_by_record_keys, sort_records,
+    DEFAULT_VIEW_PAGE_SIZE, Database, DomainError, FileChange, Filter, FilterExpression,
+    JournalVerification, Projection, Record, RecordPrecondition, RecordVisibility, Role,
+    SchemaReview, SearchQuery, SearchTarget, SigningKeySummary, SortDirection, SortKey,
+    SyncAttribution, TrustedKeys, UserDeleteOptions, UserEnsureOutcome, UserKind,
+    UserRegistrationOptions, UserStatus, UserUpdate, ViewLayout, parse_sort_keys, parse_threshold,
+    sort_by_record_keys, sort_records,
 };
 use serde::Serialize;
 use yaml_serde::Mapping;
@@ -83,6 +84,81 @@ impl FromStr for EnvironmentAssignment {
             variable: variable.to_owned(),
         })
     }
+}
+
+/// A supporting file of a bundle record to write, as `PATH=SOURCE`: the path
+/// inside the record's folder, and a local file whose bytes it gets, or `-`
+/// for standard input.
+///
+/// Only the source's name is kept by argument parsing; it is read after, so a
+/// missing source is reported as the refusal it is rather than as a usage
+/// error.
+#[derive(Clone, Debug)]
+struct FileArgument {
+    path: String,
+    source: PathBuf,
+}
+
+impl FromStr for FileArgument {
+    type Err = anyhow::Error;
+
+    fn from_str(input: &str) -> Result<Self> {
+        let (path, source) = input.split_once('=').ok_or_else(|| {
+            DomainError::Invalid(
+                "expected PATH=SOURCE (for example, scripts/run.py=./run.py)".to_owned(),
+            )
+        })?;
+        if path.is_empty() || source.is_empty() {
+            return Err(DomainError::Invalid(
+                "expected PATH=SOURCE with a non-empty path and source".to_owned(),
+            )
+            .into());
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            source: PathBuf::from(source),
+        })
+    }
+}
+
+/// Read every `--file` source and pair the writes with the `--remove-file`
+/// paths, in the order given.
+fn file_changes(writes: &[FileArgument], removals: &[String]) -> Result<Vec<FileChange>> {
+    if writes
+        .iter()
+        .filter(|file| file.source == Path::new("-"))
+        .count()
+        > 1
+    {
+        return Err(usage_error("standard input can supply only one --file"));
+    }
+    let mut changes = Vec::with_capacity(writes.len() + removals.len());
+    for file in writes {
+        let contents = if file.source == Path::new("-") {
+            let mut contents = Vec::new();
+            io::Read::read_to_end(&mut io::stdin(), &mut contents)
+                .context("could not read standard input")?;
+            contents
+        } else {
+            std::fs::read(&file.source).with_context(|| {
+                DomainError::Invalid(format!(
+                    "could not read '{}' for file '{}'",
+                    file.source.display(),
+                    file.path
+                ))
+            })?
+        };
+        changes.push(FileChange::Write {
+            path: file.path.clone(),
+            contents,
+        });
+    }
+    changes.extend(
+        removals
+            .iter()
+            .map(|path| FileChange::Remove { path: path.clone() }),
+    );
+    Ok(changes)
 }
 
 impl From<Record> for ListedRecord {
@@ -262,6 +338,10 @@ enum Command {
         #[arg(long, default_value = "")]
         body: String,
 
+        /// Add a supporting file to a bundle record, as PATH=SOURCE; SOURCE '-' reads standard input.
+        #[arg(long = "file", value_name = "PATH=SOURCE")]
+        files: Vec<FileArgument>,
+
         /// Explain why this record is being created.
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
@@ -303,6 +383,10 @@ enum Command {
         /// Comma-separated or repeated. Plain output is one tab-separated row.
         #[arg(long = "select", value_name = "FIELDS", conflicts_with = "field")]
         select: Vec<String>,
+
+        /// Write one supporting file of a bundle record, byte for byte.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["json", "field", "select"])]
+        file: Option<String>,
     },
 
     /// List and filter records in a collection.
@@ -641,6 +725,14 @@ enum Command {
         /// Replace the Markdown body. If omitted, the existing body is preserved.
         #[arg(long)]
         body: Option<String>,
+
+        /// Add or replace a supporting file of a bundle record, as PATH=SOURCE; SOURCE '-' reads standard input.
+        #[arg(long = "file", value_name = "PATH=SOURCE")]
+        files: Vec<FileArgument>,
+
+        /// Remove a supporting file of a bundle record. Refused if the file does not exist.
+        #[arg(long = "remove-file", value_name = "PATH")]
+        remove_files: Vec<String>,
 
         /// Refuse unless the record still has this sha256 version from `cr get --json`.
         #[arg(long, value_name = "SHA256")]
@@ -1739,6 +1831,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             mut assignments,
             environment_assignments,
             body,
+            files,
             message,
             idempotency_key,
             preview,
@@ -1746,17 +1839,34 @@ fn run(cli: Cli) -> Result<ExitCode> {
             attribution,
         } => {
             append_environment_assignments(&mut assignments, &environment_assignments)?;
+            let files = file_changes(&files, &[])?;
             let database = retryable(
                 attributed(database, &attribution, message.as_deref())?,
                 idempotency_key,
             )?;
             if preview {
-                let preview = database.preview_create(&collection, &id, &assignments, &body)?;
+                let preview = database.preview_create_with_files(
+                    &collection,
+                    &id,
+                    &assignments,
+                    &body,
+                    &files,
+                )?;
                 print_preview(&preview, json)?;
             } else {
-                let record = database.create(&collection, &id, &assignments, &body)?;
+                let record =
+                    database.create_with_files(&collection, &id, &assignments, &body, &files)?;
                 print_mutation_result(&record, json)?;
             }
+        }
+        Command::Get {
+            collection,
+            id,
+            file: Some(path),
+            ..
+        } => {
+            let (contents, _) = database.read_file(&collection, &id, &path)?;
+            io::stdout().write_all(&contents)?;
         }
         Command::Get {
             collection,
@@ -1765,6 +1875,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             field,
             raw,
             select,
+            file: None,
         } => {
             let record = database.get(&collection, &id)?;
             if let Some(projection) = Projection::from_lists(&select)? {
@@ -2126,6 +2237,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     }
                     if model.record_owned() {
                         features.push("record-owned");
+                    }
+                    if model.entry.is_some() {
+                        features.push("bundle");
                     }
                     let features = if features.is_empty() {
                         "-".to_owned()
@@ -2632,6 +2746,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             environment_assignments,
             unset,
             body,
+            files,
+            remove_files,
             expected_record_hash,
             message,
             idempotency_key,
@@ -2640,11 +2756,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
             attribution,
         } => {
             append_environment_assignments(&mut assignments, &environment_assignments)?;
-            if assignments.is_empty() && unset.is_empty() && body.is_none() {
+            if assignments.is_empty()
+                && unset.is_empty()
+                && body.is_none()
+                && files.is_empty()
+                && remove_files.is_empty()
+            {
                 return Err(usage_error(
-                    "provide at least one --set, --set-env, --unset, or --body value",
+                    "provide at least one --set, --set-env, --unset, --body, --file, or --remove-file value",
                 ));
             }
+            let files = file_changes(&files, &remove_files)?;
             let database = retryable(
                 attributed(database, &attribution, message.as_deref())?,
                 idempotency_key,
@@ -2653,22 +2775,24 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 .map(RecordPrecondition::version)
                 .transpose()?;
             if preview {
-                let preview = database.preview_update_conditionally(
+                let preview = database.preview_update_with_files_conditionally(
                     &collection,
                     &id,
                     &assignments,
                     &unset,
                     body.as_deref(),
+                    &files,
                     precondition.as_ref(),
                 )?;
                 print_preview(&preview, json)?;
             } else {
-                let record = database.update_conditionally(
+                let record = database.update_with_files_conditionally(
                     &collection,
                     &id,
                     &assignments,
                     &unset,
                     body.as_deref(),
+                    &files,
                     precondition.as_ref(),
                 )?;
                 print_mutation_result(&record, json)?;
@@ -3205,6 +3329,17 @@ fn print_preview(preview: &cr::ChangePreview, json: bool) -> Result<()> {
                     compact(after)?
                 );
             }
+        }
+    }
+    for file in &preview.files {
+        let hashes = match (&file.before, &file.after) {
+            (Some(before), Some(after)) => format!("{before} -> {after}"),
+            (Some(hash), None) | (None, Some(hash)) => hash.clone(),
+            (None, None) => String::new(),
+        };
+        println!("file {} {} {hashes}", file.operation, file.path);
+        if let Some(diff) = &file.diff {
+            print!("{diff}");
         }
     }
     println!("digest {}", preview.digest);

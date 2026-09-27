@@ -541,6 +541,14 @@ A record page lists the record's relations beside its form. **Links to** shows e
 
 To add a relation, open **+ Link a record**, enter a relation name such as `company`, and pick the record as `collection/id`. Both fields suggest what the database already contains. **Remove** takes a relation away. Each change is its own audited `link` event, exactly as if it had been made with `cr link` or `cr unlink`. A change made from a page that has since gone stale is refused rather than applied, and so is saving the record form after a relation changed underneath it. The record form carries the stored relations through unchanged, so saving it never undoes a link.
 
+### Supporting files of a bundle record
+
+A [bundle record](working-with-records.md#bundle-records)'s page lists its
+supporting files under **Files**, each a download of the file's exact bytes.
+The form edits the entry, and saving it keeps every file as it is; add,
+replace, and remove files with `cr update` or the REST API, or edit the folder
+directly and `cr save` it.
+
 ## Name collections and give them icons
 
 A collection's navigation name and emoji live beside `order`, in the same

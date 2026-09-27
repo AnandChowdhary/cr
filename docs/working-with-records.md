@@ -405,3 +405,123 @@ cr save candidates/alex-smith --message 'Reviewed' --json
 `save` parses and schema-validates every selected file before recording any event. Formatting-only changes are recorded because the exact file bytes changed, even when the fields and body have the same meaning.
 
 Do not run `cr save --all` automatically from a watcher or scheduled task. An explicit save is the point where you acknowledge that filesystem changes are legitimate rather than tampering. For unattended imports, use the validated [`cr sync`](sync.md) protocol instead of writing records and auto-accepting them.
+
+## Bundle records
+
+A record is normally one Markdown file. Some things are a folder instead: an
+[Agent Skill](https://agentskills.io) is a `SKILL.md` beside the references,
+scripts, and assets it uses. A collection can store each record as such a
+folder, the way Hugo stores a page bundle. Declare it in `.cr/config.yaml`:
+
+```yaml
+version: 1
+collections:
+  skills:
+    layout: bundle
+    entry: SKILL.md
+```
+
+A record is then `records/skills/<id>/SKILL.md`, and every other file in its
+folder belongs to it:
+
+```text
+records/skills/pdf-forms/
+├── SKILL.md              # the record: front matter and Markdown, as ever
+├── references/api.md     # supporting files, stored byte for byte
+├── scripts/fill.py
+└── assets/form.ttf
+```
+
+`entry` names the Markdown file and must end in `.md`; without it, a bundle's
+entry is `index.md`. The entry is exactly what a record always was: it is
+parsed, validated against the collection's schema, queried, and diffed field
+by field. A supporting file gets no front matter, so a script stays runnable
+and a font stays a font. The `users` collection cannot be a bundle, and a
+bundle collection cannot use [encrypted storage](encryption.md) yet, because
+its supporting files would be stored in plaintext beside the encrypted entry.
+
+A `cr` older than bundles refuses a configuration that declares one, rather
+than reading the collection as empty.
+
+### Add, replace, and remove files
+
+`--file PATH=SOURCE` stores the bytes of the local file SOURCE at PATH inside
+the record's folder; `-` reads standard input. `--remove-file PATH` removes one.
+Both go into the same audit event as the rest of the change:
+
+```sh
+cr create skills pdf-forms \
+  --set 'name=pdf-forms' \
+  --set 'description=Fill in PDF forms' \
+  --body 'Run scripts/fill.py with the form and the values.' \
+  --file scripts/fill.py=./fill.py \
+  --file assets/form.ttf=./form.ttf
+
+cr update skills pdf-forms \
+  --file references/api.md=./api.md \
+  --remove-file assets/form.ttf
+```
+
+Paths are relative and `/`-separated, with no empty, `.`, or `..` component,
+no backslash or control character, and no name longer than 255 bytes. A
+request may not shadow the entry, leave a file where a folder is needed, or add
+a path that differs from another only by letter case at any level, which some
+filesystems cannot keep apart. Removing a file and writing a folder of the same
+name in one request is fine. `cr get` returns the entry, `--json` lists every
+supporting file with its SHA-256, and `--file` writes one file's exact bytes:
+
+```sh
+cr get skills pdf-forms --file scripts/fill.py | python3 - form.pdf
+```
+
+A file created by `cr` is readable and writable only by its owner, like every
+record; a file it replaces keeps its permissions. Permissions and other
+metadata are not recorded, so making a script executable is not a change `cr`
+sees.
+
+### What the audit records
+
+Each file change is in the record's event under `files`: the SHA-256 of the
+file before and after and, for UTF-8 text up to 256 KiB, a unified diff.
+Binary and larger files are recorded by their hashes alone.
+
+```json
+"files": [
+  { "operation": "remove", "path": "assets/form.ttf", "before": "sha256:9f2c…" },
+  { "operation": "add", "path": "references/api.md", "after": "sha256:41a7…",
+    "diff": "@@ -0,0 +1,2 @@\n+# API\n+…\n" }
+]
+```
+
+`audit verify` applies every diff and requires it to produce the hash the
+event claims. `--preview` prints the file changes with their diffs, and its
+digest covers them, so `--approved-changes` approves the files as well as the
+front matter.
+
+### Versions, status, and access
+
+A record's version covers its supporting files: it is the SHA-256 of the entry
+and every file's path and hash. `--expected-record-hash` and `If-Match`
+therefore fail when any file changed, and a bundle with no supporting files
+has the version the same Markdown would have as a single file.
+
+Edit the folder directly and `cr status` reports the record as modified;
+`cr save` records every added, changed, and removed file with its diff. Every
+file in the folder belongs to the record, including one an editor or the
+operating system leaves there, such as `.DS_Store`. A folder copied into the
+collection is an added record, and a deleted folder a deleted one. A folder
+that holds files but no entry is reported by `status` and `check`, and refused
+by `save`, until its entry is restored or the folder removed. A symbolic link
+anywhere inside a folder is refused, never followed.
+
+Supporting files take the record's access control. Reading one needs read
+access to the record, and adding, replacing, or removing one needs update
+access.
+
+A change to several files cannot be one atomic rename, so `cr` stages both
+sides of every file it changes under `.cr/audit/staged/` and records the change
+before touching the folder. A write that fails partway puts the folder back
+before it returns; one a crash interrupts is finished by the next command,
+which records its event. A command reading the folder at the same moment may
+see some files changed and others not. See
+[Bundle writes and recovery](architecture.md#bundle-writes-and-recovery).

@@ -2,6 +2,7 @@ mod access;
 mod aggregate;
 mod attribution;
 mod audit;
+mod bundle;
 mod check;
 pub mod cloudflare_access;
 mod database;
@@ -38,15 +39,16 @@ pub use attribution::{
 };
 pub use audit::{
     AnchorReport, AnchorStatus, AnchorWrite, AuditAction, AuditAnchor, AuditChange, AuditEntry,
-    AuditFilter, AuditHead, AuditSource, AuditVerification, ChangePreview, JournalVerification,
-    RecordActivity, SignatureStatus,
+    AuditFileChange, AuditFileOperation, AuditFilter, AuditHead, AuditSource, AuditVerification,
+    ChangePreview, JournalVerification, RecordActivity, SignatureStatus,
 };
+pub use bundle::FileChange;
 pub use check::{
     CheckReport, CheckScope, CheckSummary, Finding, FindingKind, Severity, parse_threshold,
 };
 pub use database::{
-    Backlink, CollectionModel, Database, Record, RecordPrecondition, RecordSchemaViolation,
-    SchemaReview, SchemaViolation, WorkingChange, WorkingChangeKind,
+    Backlink, CollectionModel, Database, Record, RecordFile, RecordPrecondition,
+    RecordSchemaViolation, SchemaReview, SchemaViolation, WorkingChange, WorkingChangeKind,
 };
 pub use error::DomainError;
 pub use pins::Pin;

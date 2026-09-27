@@ -29,9 +29,9 @@ cr init PATH
 cr identity [--json] [ATTRIBUTION]
 
 cr create COLLECTION ID [--set KEY=YAML]... [--set-env KEY=ENV]...
-                        [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
+                        [--body TEXT] [--file PATH=SOURCE]... [-m MESSAGE] [ATTRIBUTION]
                         [--preview [--json]]
-cr get COLLECTION ID [--json | --field KEY [--raw] | --select FIELDS [--json]]
+cr get COLLECTION ID [--json | --field KEY [--raw] | --select FIELDS [--json] | --file PATH]
 cr list COLLECTION [--where KEY=YAML]... [--where-expr EXPRESSION]...
                    [--filter FILTER] [--select FIELDS]... [SORT] [--json]
 cr count COLLECTION [--where KEY=YAML]... [--where-expr EXPRESSION]... [--filter FILTER]
@@ -43,8 +43,9 @@ cr search PATTERN [--collection COLLECTION] [--where KEY=YAML]...
                   [--front-matter | --field KEY | --body | --path]
                   [--ignore-case] [--regex]
 cr update COLLECTION ID [--set KEY=YAML]... [--set-env KEY=ENV]...
-                        [--unset KEY]... [--body TEXT] [-m MESSAGE] [ATTRIBUTION]
-                        [--preview [--json]]
+                        [--unset KEY]... [--body TEXT]
+                        [--file PATH=SOURCE]... [--remove-file PATH]...
+                        [-m MESSAGE] [ATTRIBUTION] [--preview [--json]]
 cr link SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
               [-m MESSAGE] [ATTRIBUTION] [--preview [--json]]
 cr unlink SOURCE_COLLECTION SOURCE_ID RELATION TARGET_COLLECTION TARGET_ID
@@ -140,6 +141,11 @@ A sort takes at most five keys, most significant first, each field once.
 `--desc`, like `--sort-direction` on `cr view create`, gives the direction of
 a single key written without one, and is refused with several; see
 [Sort results](working-with-records.md#sort-results).
+
+`--file`, `--remove-file`, and `get --file` apply to a collection whose
+records are folders of files; see [Bundle records](working-with-records.md#bundle-records).
+`--file` reads SOURCE, a local file or `-` for standard input, and stores its
+bytes at PATH inside the record's folder.
 
 `CR_AGENT`, `CR_AUTHORIZATION`, and `CR_INTENT` supply ATTRIBUTION to every
 command, beneath the flags. `CR_HOOK_AGENT` and `CR_HOOK_AUTHORIZATION` are the
