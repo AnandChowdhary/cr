@@ -500,7 +500,10 @@ fn missing_view(error: anyhow::Error, name: &str) -> anyhow::Error {
     }
 }
 
-fn validate_view_name(name: &str) -> Result<()> {
+/// Whether a view may be called `name` at all. Creating a view checks this
+/// before anything else about the definition, which is what lets the browser's
+/// save form tell a refused name from a refused setting.
+pub(crate) fn validate_view_name(name: &str) -> Result<()> {
     validate_component(name, "view")?;
     if RESERVED_VIEW_NAMES.contains(&name) {
         return Err(invalid(format!(

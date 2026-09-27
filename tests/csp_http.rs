@@ -519,6 +519,44 @@ async fn every_html_answer_carries_the_policy() {
     assert_eq!(refused.header("cr-form-invalid".parse().unwrap()), "true");
     assert_policy("a refused form", &refused);
     assert_within_policy("a refused form", &refused.body);
+
+    // So is a refused "Save as view", as a page and as the form alone, with
+    // the hostile text typed into it as its title.
+    let board = get(&app, "/pipeline").await;
+    let submission = form_urlencoded::Serializer::new(String::new())
+        .append_pair("_csrf", csrf(&board.body))
+        .append_pair("filter_match", "all")
+        .append_pair("sort_direction", "asc")
+        .append_pair("name", "pipeline")
+        .append_pair("title", HOSTILE)
+        .append_pair("layout", "kanban")
+        .append_pair("group_by", "stage")
+        .finish();
+    for (context, headers) in [
+        ("a refused save", &[][..]),
+        (
+            "a refused save's form",
+            &[("hx-request", "true"), ("hx-target", "cr-save-view-form")][..],
+        ),
+    ] {
+        let refused = request(
+            &app,
+            Method::POST,
+            "/pipeline/save-view",
+            headers,
+            Some(submission.clone()),
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+        assert_eq!(refused.header("cr-form-invalid".parse().unwrap()), "true");
+        assert!(
+            refused
+                .body
+                .contains("&lt;script&gt;alert(1)&lt;/script&gt;")
+        );
+        assert_policy(context, &refused);
+        assert_within_policy(context, &refused.body);
+    }
 }
 
 #[tokio::test]

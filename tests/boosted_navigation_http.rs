@@ -10,8 +10,9 @@
 //! says `hx-boost="false"`, and so does every mutating form whose answers htmx
 //! cannot act on. Phase 3 of `.context/htmx-plan.md` gave the record form both
 //! answers it needs — `204` with `HX-Location` on success, the form itself on a
-//! refusal — so that one form is boosted and is asserted here to carry the whole
-//! contract rather than half of it. The second is that a boosted navigation is
+//! refusal — and "Save as view" was later given the same two, so those forms
+//! are boosted and are asserted here to carry the whole contract rather than
+//! half of it. The second is that a boosted navigation is
 //! still a request for a whole document: htmx swaps the response into `<body>`,
 //! so anything less than a document would leave the page without its shell.
 //!
@@ -166,30 +167,33 @@ async fn every_mutating_form_is_native_or_carries_the_boosted_contract() {
     let (_temporary, database) = database_with_a_board("boost-forms");
     let app = router(database, ServerConfig::default()).unwrap();
 
-    let mut boosted_forms = 0;
+    let mut boosted_forms = Vec::new();
     for uri in PAGES {
         let (_, html) = get(&app, uri, &[]).await;
         for tag in tags(&html, "form") {
             // A mutation is either left to the browser or given every part of
-            // the contract that makes boosting it safe. The record form has
-            // that contract: it targets itself, so a refusal comes back as the
-            // form rather than being swapped into `<body>`, and it disables its
-            // submit button for the life of the request, because an HTML form
-            // post is deliberately outside the `Idempotency-Key` contract and
-            // two clicks would otherwise be two writes.
+            // the contract that makes boosting it safe. The record form and
+            // "Save as view" have that contract: each targets itself, so a
+            // refusal comes back as the form rather than being swapped into
+            // `<body>`, and each disables its submit button for the life of the
+            // request, because an HTML form post is deliberately outside the
+            // `Idempotency-Key` contract and two clicks would otherwise be two
+            // writes.
             if tag.contains(r#"method="post""#) && !tag.contains(r#"hx-boost="false""#) {
-                boosted_forms += 1;
-                assert!(
-                    tag.contains(r#"id="cr-record-form""#),
-                    "{uri} boosts a mutating form that is not the record form: {tag}"
-                );
+                let form = ["cr-record-form", "cr-save-view-form"]
+                    .into_iter()
+                    .find(|id| tag.contains(&format!(r#"id="{id}""#)))
+                    .unwrap_or_else(|| {
+                        panic!("{uri} boosts a mutating form without the boosted contract: {tag}")
+                    });
+                boosted_forms.push((uri, form));
                 assert!(
                     tag.contains(r#"hx-target="this""#) && tag.contains(r#"hx-swap="outerHTML""#),
-                    "{uri} boosts the record form without targeting it: {tag}"
+                    "{uri} boosts {form} without targeting it: {tag}"
                 );
                 assert!(
                     tag.contains(r#"hx-disabled-elt="find button[type=submit]""#),
-                    "{uri} boosts the record form without disabling its submit button: {tag}"
+                    "{uri} boosts {form} without disabling its submit button: {tag}"
                 );
             }
             // The read-only forms are the opposite case, and the reason the
@@ -205,10 +209,17 @@ async fn every_mutating_form_is_native_or_carries_the_boosted_contract() {
         }
     }
 
-    // The create form and the edit form, and nothing else on these pages.
+    // The create form, the edit form, and "Save as view" on a table and on a
+    // board, and nothing else on these pages.
     assert_eq!(
-        boosted_forms, 2,
-        "expected exactly the create and edit record forms to be boosted"
+        boosted_forms,
+        [
+            ("/deals", "cr-save-view-form"),
+            ("/pipeline", "cr-save-view-form"),
+            ("/deals/new", "cr-record-form"),
+            ("/deals/records/alpha", "cr-record-form"),
+        ],
+        "expected exactly the record forms and save-as-view to be boosted"
     );
 
     // Both ways of moving a Kanban card are the same native POST: the drop

@@ -23,6 +23,20 @@ impl TestResponse {
     fn text(&self) -> &str {
         std::str::from_utf8(&self.body).unwrap()
     }
+
+    fn header(&self, name: &str) -> &str {
+        self.headers
+            .get(name)
+            .map(|value| value.to_str().unwrap())
+            .unwrap_or_default()
+    }
+
+    /// The body with this response's request ID replaced, so two answers to
+    /// two requests can be compared as markup.
+    fn without_request_id(&self) -> String {
+        self.text()
+            .replace(self.header("x-request-id"), "<request-id>")
+    }
 }
 
 fn test_database(name: &str) -> (TempDir, Database) {
@@ -4905,4 +4919,532 @@ async fn deleting_a_saved_view_asks_first_and_leaves_the_records() {
         .await;
         assert_eq!(missing.status, StatusCode::NOT_FOUND, "{uri}");
     }
+}
+
+// "Save as view" refuses with the form, not the error page.
+//
+// A name already taken, or a Kanban layout with nothing to group by, used to
+// answer with the generic error page, which lost the filters, sort and columns
+// the reader had assembled along with what they typed. These hold the form to
+// the record form's contract (`tests/record_form_http.rs`): the submitted
+// values come back exactly, escaped; the status is the status of the refusal;
+// the reason sits beside the control it is about where there is one; the
+// answer carries `CR-Form-Invalid`; and nothing is written.
+
+/// The id of the save form, which a submission names in `HX-Target` because
+/// the form points `hx-target` at itself.
+const SAVE_VIEW_FORM: &str = "cr-save-view-form";
+
+/// The headers htmx sends when it submits "Save as view" from `/deals`.
+const SAVE_VIEW_HTMX: [(&str, &str); 3] = [
+    ("hx-request", "true"),
+    ("hx-current-url", "http://127.0.0.1/deals"),
+    ("hx-target", SAVE_VIEW_FORM),
+];
+
+/// The page the reader assembled before saving: two conditions matched with
+/// `any`, a descending sort, and two chosen columns.
+const SAVE_VIEW_PAGE: &str = "/deals?filter_match=any&filter_field=status&filter_operator=eq&filter_value=won&filter_field=value&filter_operator=gte&filter_value=12000&sort_field=value&sort_direction=desc&columns=custom&column=name&column=value";
+
+/// That page's state as the save form's hidden fields submit it.
+const SAVE_VIEW_STATE: [(&str, &str); 11] = [
+    ("filter_match", "any"),
+    ("filter_field", "status"),
+    ("filter_operator", "eq"),
+    ("filter_value", "won"),
+    ("filter_field", "value"),
+    ("filter_operator", "gte"),
+    ("filter_value", "12000"),
+    ("sort_field", "value"),
+    ("sort_direction", "desc"),
+    ("column", "name"),
+    ("column", "value"),
+];
+
+/// Deals to save views of, and a saved view whose name a save can collide with.
+fn save_view_database(name: &str) -> (TempDir, Database) {
+    let (temporary, database) = test_database(name);
+    for (id, status, value) in [("alpha", "open", "12000"), ("beta", "won", "8000")] {
+        database
+            .create(
+                "deals",
+                id,
+                &[
+                    Assignment::from_str(&format!("name={id}")).unwrap(),
+                    Assignment::from_str(&format!("status={status}")).unwrap(),
+                    Assignment::from_str(&format!("value={value}")).unwrap(),
+                ],
+                "",
+            )
+            .unwrap();
+    }
+    database
+        .create_view("focus", Some("Focus"), "deals", vec![], vec![], 25)
+        .unwrap();
+    (temporary, database)
+}
+
+/// A save of `SAVE_VIEW_PAGE` with the given visible controls.
+fn save_view_submission(token: &str, controls: &[(&str, &str)]) -> String {
+    let mut pairs = vec![("_csrf", token)];
+    pairs.extend(SAVE_VIEW_STATE);
+    pairs.extend_from_slice(controls);
+    form(&pairs)
+}
+
+/// The hidden fields "Save as view" carries the page's state in.
+fn save_view_state(html: &str) -> &str {
+    let start = html
+        .find(r#"<div id="cr-view-save-state""#)
+        .unwrap_or_else(|| panic!("no save-view state in:\n{html}"));
+    let rest = &html[start..];
+    &rest[..rest.find("</div>").unwrap() + "</div>".len()]
+}
+
+/// What lies between a control's label and the control, which is where a
+/// refusal about that control is said.
+fn beside<'a>(html: &'a str, control: &str) -> &'a str {
+    let label = html
+        .find(&format!(r#"for="{control}""#))
+        .unwrap_or_else(|| panic!("no label for {control} in:\n{html}"));
+    let rest = &html[label..];
+    &rest[..rest
+        .find(&format!(r#"id="{control}""#))
+        .unwrap_or_else(|| panic!("no control {control} in:\n{html}"))]
+}
+
+/// Every saved view definition on disk, to show a refusal wrote none.
+fn view_files(database: &Database) -> Vec<(String, String)> {
+    let mut files = fs::read_dir(database.root().join(".cr/views"))
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                fs::read_to_string(&path).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn a_taken_view_name_answers_a_plain_post_with_the_whole_form_filled_in() {
+    let (_temporary, database) = save_view_database("save-view-taken");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, SAVE_VIEW_PAGE, None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    let token = csrf(page.text()).to_owned();
+    let before = view_files(&database);
+
+    let refused = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(save_view_submission(
+            &token,
+            &[
+                ("name", "focus"),
+                ("title", "Won & <big>"),
+                ("layout", "table"),
+                ("group_by", ""),
+            ],
+        )),
+        &[],
+    )
+    .await;
+    let html = refused.text();
+
+    // The status of the refusal, the header that lets htmx swap it, and a whole
+    // page for a browser with JavaScript off.
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert_eq!(refused.header("cr-form-invalid"), "true");
+    assert_eq!(refused.header("hx-push-url"), "false");
+    assert!(html.starts_with("<!DOCTYPE html>"));
+    assert!(html.contains("cr-sidebar"));
+    assert!(html.contains("This view was not saved."));
+    assert!(html.contains("Nothing was written."));
+    // The reason beside the name, which is marked invalid, and nothing else is.
+    assert!(
+        beside(html, "cr-save-view-name").contains("view 'focus' already exists"),
+        "the conflict is not beside the name:\n{html}"
+    );
+    assert!(html.contains(
+        r#"name="name" value="focus" placeholder="enterprise-deals" autocomplete="off" aria-invalid="true""#
+    ));
+    assert_eq!(html.matches(r#"aria-invalid="true""#).count(), 1);
+    // Every value as it was submitted, escaped.
+    assert!(html.contains(r#"name="title" value="Won &amp; &lt;big&gt;""#));
+    assert!(!html.contains("<big>"));
+    assert!(html.contains(r#"<option value="table" selected>"#));
+    assert!(html.contains(r#"<option value="" selected>Choose a field…</option>"#));
+    // The page's state, exactly as the page the reader saved from had it.
+    assert_eq!(save_view_state(html), save_view_state(page.text()));
+    for input in [
+        r#"name="filter_match" value="any""#,
+        r#"name="filter_field" value="status""#,
+        r#"name="filter_operator" value="eq""#,
+        r#"name="filter_value" value="won""#,
+        r#"name="filter_field" value="value""#,
+        r#"name="filter_operator" value="gte""#,
+        r#"name="filter_value" value="12000""#,
+        r#"name="sort_field" value="value""#,
+        r#"name="sort_direction" value="desc""#,
+        r#"name="column" value="name""#,
+        r#"name="column" value="value""#,
+    ] {
+        assert!(
+            save_view_state(html).contains(input),
+            "the refused form lost {input}"
+        );
+    }
+    assert_eq!(csrf(html), token);
+    // Cancel returns to the page as it was assembled.
+    let cancel = html
+        .split_once(r#"<a href="/deals?"#)
+        .map(|(_, rest)| format!("/deals?{}", rest.split_once('"').unwrap().0))
+        .expect("the refused page links back to the view")
+        .replace("&amp;", "&");
+    let back = request(&app, Method::GET, &cancel, None, &[]).await;
+    assert_eq!(back.status, StatusCode::OK);
+    assert_eq!(save_view_state(back.text()), save_view_state(page.text()));
+
+    assert_eq!(view_files(&database), before, "a refused save wrote a view");
+}
+
+#[tokio::test]
+async fn an_htmx_save_is_refused_with_the_form_region_alone() {
+    let (_temporary, database) = save_view_database("save-view-fragment");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, SAVE_VIEW_PAGE, None, &[]).await;
+    let token = csrf(page.text()).to_owned();
+    let before = view_files(&database);
+    let submission = save_view_submission(&token, &[("name", "focus"), ("layout", "table")]);
+
+    let document = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(submission.clone()),
+        &[],
+    )
+    .await;
+    let fragment = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(submission),
+        &SAVE_VIEW_HTMX,
+    )
+    .await;
+
+    assert_eq!(fragment.status, StatusCode::CONFLICT);
+    assert!(
+        fragment
+            .text()
+            .starts_with(&format!(r#"<form id="{SAVE_VIEW_FORM}""#)),
+        "the fragment is not rooted at the element it replaces:\n{}",
+        fragment.text()
+    );
+    assert!(fragment.text().ends_with("</form>"));
+    assert!(!fragment.text().contains("<!DOCTYPE"));
+    assert!(!fragment.text().contains("<title>"));
+    assert!(!fragment.text().contains("cr-sidebar"));
+    // The same markup the document embeds, not a second rendering of it.
+    assert!(
+        document
+            .without_request_id()
+            .contains(&fragment.without_request_id()),
+        "the fragment is not the document's own form:\n{}",
+        fragment.text()
+    );
+    // It still holds the element later results swaps patch, so a refused form
+    // goes on saving what is on screen.
+    assert_eq!(
+        save_view_state(fragment.text()),
+        save_view_state(page.text())
+    );
+    assert_eq!(fragment.header("cr-form-invalid"), "true");
+    assert_eq!(fragment.header("hx-push-url"), "false");
+    assert_eq!(fragment.header("cache-control"), "no-store");
+    assert_eq!(view_files(&database), before, "a refused save wrote a view");
+}
+
+#[tokio::test]
+async fn a_kanban_layout_with_nothing_to_group_by_is_refused_beside_the_grouping_control() {
+    let (_temporary, database) = save_view_database("save-view-kanban");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, SAVE_VIEW_PAGE, None, &[]).await;
+    let token = csrf(page.text()).to_owned();
+    let before = view_files(&database);
+    // What a browser with JavaScript off sends: the grouping control is only
+    // made required by script, so its empty first option is submitted.
+    let submission = save_view_submission(
+        &token,
+        &[
+            ("name", "board"),
+            ("title", "Board"),
+            ("layout", "kanban"),
+            ("group_by", ""),
+        ],
+    );
+
+    for headers in [&[][..], &SAVE_VIEW_HTMX[..]] {
+        let refused = request(
+            &app,
+            Method::POST,
+            "/deals/save-view",
+            Some(submission.clone()),
+            headers,
+        )
+        .await;
+        let html = refused.text();
+        assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused.header("cr-form-invalid"), "true");
+        assert!(
+            beside(html, "cr-save-view-group-by").contains("Kanban layout must provide group_by"),
+            "the refusal is not beside the grouping control:\n{html}"
+        );
+        assert!(html.contains(
+            r#"id="cr-save-view-group-by" name="group_by" aria-label="Group Kanban by" data-view-group-by="true" aria-invalid="true""#
+        ));
+        assert_eq!(html.matches(r#"aria-invalid="true""#).count(), 1);
+        assert!(html.contains(r#"name="name" value="board""#));
+        assert!(html.contains(r#"name="title" value="Board""#));
+        assert!(html.contains(r#"<option value="kanban" selected>"#));
+        assert!(html.contains(r#"<option value="" selected>Choose a field…</option>"#));
+        // The fields to choose from are still offered.
+        assert!(html.contains(r#"<option value="status">"#));
+        assert_eq!(save_view_state(html), save_view_state(page.text()));
+    }
+    assert_eq!(view_files(&database), before, "a refused save wrote a view");
+
+    // Choosing a field in the form that came back is the whole recovery.
+    let refused = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(submission.clone()),
+        &SAVE_VIEW_HTMX,
+    )
+    .await;
+    let corrected = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(save_view_submission(
+            csrf(refused.text()),
+            &[
+                ("name", "board"),
+                ("title", "Board"),
+                ("layout", "kanban"),
+                ("group_by", "status"),
+            ],
+        )),
+        &SAVE_VIEW_HTMX,
+    )
+    .await;
+    assert_eq!(corrected.status, StatusCode::NO_CONTENT);
+    assert_eq!(corrected.header("hx-location"), "/board?notice=View+saved");
+    let board = database.view("board").unwrap();
+    assert_eq!(board.layout, ViewLayout::Kanban);
+    assert_eq!(board.group_by.as_deref(), Some("status"));
+    assert_eq!(board.columns, ["name", "value"]);
+    assert_eq!(
+        board.filter_groups[0].expressions,
+        ["status=won", "value>=12000"]
+    );
+    assert_eq!(board.filter_groups[0].match_mode, ViewPredicateMatch::Any);
+    assert_eq!(board.sort_by.as_deref(), Some("value"));
+}
+
+#[tokio::test]
+async fn a_save_redirects_a_browser_and_relocates_htmx() {
+    let (_temporary, database) = save_view_database("save-view-success");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, SAVE_VIEW_PAGE, None, &[]).await;
+    let token = csrf(page.text()).to_owned();
+
+    let plain = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(save_view_submission(
+            &token,
+            &[("name", "plain"), ("layout", "table")],
+        )),
+        &[],
+    )
+    .await;
+    assert_eq!(plain.status, StatusCode::SEE_OTHER);
+    assert_eq!(plain.header("location"), "/plain?notice=View+saved");
+    assert_eq!(plain.header("cr-form-invalid"), "");
+    assert_eq!(plain.header("hx-location"), "");
+
+    // An `XMLHttpRequest` follows a `303` invisibly, so htmx is handed the
+    // destination as a path it can navigate to instead.
+    let boosted = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(save_view_submission(
+            &token,
+            &[("name", "boosted"), ("layout", "table")],
+        )),
+        &SAVE_VIEW_HTMX,
+    )
+    .await;
+    assert_eq!(boosted.status, StatusCode::NO_CONTENT);
+    assert_eq!(boosted.header("hx-location"), "/boosted?notice=View+saved");
+    assert_eq!(boosted.header("cr-form-invalid"), "");
+    assert!(boosted.body.is_empty());
+
+    for name in ["plain", "boosted"] {
+        let saved = database.view(name).unwrap();
+        assert_eq!(saved.columns, ["name", "value"], "{name}");
+        assert_eq!(
+            saved.filter_groups[0].expressions,
+            ["status=won", "value>=12000"],
+            "{name}"
+        );
+        assert_eq!(saved.sort_direction, cr::SortDirection::Desc, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_refused_save_says_which_control_it_is_about_only_when_it_can_tell() {
+    let (_temporary, database) = save_view_database("save-view-controls");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, SAVE_VIEW_PAGE, None, &[]).await;
+    let token = csrf(page.text()).to_owned();
+    let before = view_files(&database);
+
+    // A name no view may have is the name's refusal, whatever its status.
+    for (name, status, message) in [
+        ("   ", StatusCode::BAD_REQUEST, "view name cannot be empty"),
+        (
+            "a/b",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cannot contain path separators",
+        ),
+        (
+            "api",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "is reserved by the HTTP server",
+        ),
+    ] {
+        let refused = request(
+            &app,
+            Method::POST,
+            "/deals/save-view",
+            Some(save_view_submission(&token, &[("name", name)])),
+            &SAVE_VIEW_HTMX,
+        )
+        .await;
+        let html = refused.text();
+        assert_eq!(refused.status, status, "{name:?}");
+        assert_eq!(refused.header("cr-form-invalid"), "true", "{name:?}");
+        assert!(
+            beside(html, "cr-save-view-name").contains(message),
+            "{name:?} is not refused beside the name:\n{html}"
+        );
+        assert!(
+            html.contains(&format!(r#"name="name" value="{name}""#)),
+            "{name:?} did not come back as it was typed:\n{html}"
+        );
+        assert_eq!(html.matches(r#"aria-invalid="true""#).count(), 1);
+    }
+
+    // A token from before the server restarted concerns no control: the form
+    // comes back with the reason at the top, the current token, and the state.
+    let stale = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(save_view_submission(
+            "from-before-a-restart",
+            &[("name", "fresh")],
+        )),
+        &SAVE_VIEW_HTMX,
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::FORBIDDEN);
+    assert_eq!(stale.header("cr-form-invalid"), "true");
+    assert!(stale.text().contains("reload the form and try again"));
+    assert!(!stale.text().contains(r#"aria-invalid="true""#));
+    assert_eq!(csrf(stale.text()), token);
+    assert!(stale.text().contains(r#"name="name" value="fresh""#));
+    assert_eq!(save_view_state(stale.text()), save_view_state(page.text()));
+
+    // Nor does a condition sent without its value, which no page renders. It
+    // stays at the top, and comes back unpaired rather than quietly dropped,
+    // so pressing Save again is refused again instead of saving less.
+    let mut unpaired = vec![("_csrf", token.as_str())];
+    unpaired.extend(SAVE_VIEW_STATE);
+    unpaired.extend([("filter_field", "name"), ("name", "unpaired")]);
+    let refused = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(form(&unpaired)),
+        &SAVE_VIEW_HTMX,
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.header("cr-form-invalid"), "true");
+    assert!(
+        refused
+            .text()
+            .contains("each filter_field must have one matching filter_value")
+    );
+    assert!(!refused.text().contains(r#"aria-invalid="true""#));
+    let state = save_view_state(refused.text());
+    assert_eq!(state.matches(r#"name="filter_field""#).count(), 3);
+    assert_eq!(state.matches(r#"name="filter_value""#).count(), 2);
+    assert!(state.contains(r#"name="filter_field" value="name""#));
+
+    assert_eq!(view_files(&database), before, "a refused save wrote a view");
+}
+
+#[tokio::test]
+async fn a_save_with_no_form_to_go_back_to_still_gets_the_error_page() {
+    // A body that is not the form this server rendered says nothing about what
+    // was typed, and a view that does not exist has no form to render.
+    let (_temporary, database) = save_view_database("save-view-no-form");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/deals", None, &[]).await;
+    let token = csrf(page.text()).to_owned();
+    let before = view_files(&database);
+
+    let tampered = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(form(&[
+            ("_csrf", &token),
+            ("name", "tampered"),
+            ("surprise", "1"),
+        ])),
+        &SAVE_VIEW_HTMX,
+    )
+    .await;
+    assert_eq!(tampered.status, StatusCode::BAD_REQUEST);
+    assert_eq!(tampered.header("cr-form-invalid"), "");
+    assert!(tampered.text().contains("Request could not be completed"));
+    assert!(!tampered.text().contains(SAVE_VIEW_FORM));
+
+    let missing = request(
+        &app,
+        Method::POST,
+        "/no-such-view/save-view",
+        Some(save_view_submission(&token, &[("name", "orphan")])),
+        &SAVE_VIEW_HTMX,
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.header("cr-form-invalid"), "");
+    assert!(!missing.text().contains(SAVE_VIEW_FORM));
+
+    assert_eq!(view_files(&database), before, "a refused save wrote a view");
 }
