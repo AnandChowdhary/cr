@@ -1891,8 +1891,27 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         .with_state(state))
 }
 
+/// Run the server until a shutdown signal, then drain it.
+///
+/// The first `SIGINT` or `SIGTERM` (Ctrl-C off Unix) closes the listener and
+/// idle connections and waits, with no timer of its own, for every in-flight
+/// request to be answered. A second one stops waiting and fails the command,
+/// abandoning those responses.
+///
+/// Neither cuts a database operation in half. Handlers run them on the
+/// runtime's blocking pool, and dropping the runtime — which `cr serve` does
+/// on its way out — waits for pool work that has started and discards work
+/// that has not, so by the time the process exits a mutation has either
+/// committed its audit event or never written its pending file. Only
+/// something that ends the process outright — `SIGKILL`, `SIGHUP`, a crash —
+/// can stop one midway, and the write-ahead protocol recovers that on the
+/// next start.
 pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
     let bind = config.bind;
+    // Before the listener exists, so a client that can connect can rely on a
+    // signal draining the server rather than taking its default action and
+    // ending the process in the middle of a request.
+    let mut signals = ShutdownSignals::listen()?;
     // Given here rather than left to `router`, so the warm-up below fills the
     // cache every request will read.
     let database = database.with_journal_cache();
@@ -1919,14 +1938,100 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         let _ = journal.audit().record_states();
     });
-    axum::serve(listener, application)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("HTTP server failed")
+    let (drain, drain_requested) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, application)
+        .with_graceful_shutdown(async move {
+            let _ = drain_requested.await;
+        })
+        .into_future();
+    let mut server = std::pin::pin!(server);
+    let signal = tokio::select! {
+        result = server.as_mut() => return result.context("HTTP server failed"),
+        signal = signals.recv() => signal?,
+    };
+    log_shutdown(format_args!(
+        "signal={signal} state=draining detail=\"no longer accepting connections; waiting for in-flight requests; a second signal stops without waiting\""
+    ));
+    let _ = drain.send(());
+    tokio::select! {
+        result = server.as_mut() => {
+            result.context("HTTP server failed")?;
+            log_shutdown(format_args!("state=stopped detail=\"every in-flight request finished\""));
+            Ok(())
+        }
+        signal = signals.recv() => {
+            let signal = signal?;
+            log_shutdown(format_args!(
+                "signal={signal} state=abandoned detail=\"stopped waiting for in-flight requests; database work already running still finishes\""
+            ));
+            bail!("stopped before every in-flight request finished")
+        }
+    }
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+/// Write one shutdown line to standard error, beside the `cr error` lines.
+///
+/// Not `eprintln!`, which panics when standard error is a pipe nobody reads
+/// any more: losing a log line is better than turning a drain into a panic.
+fn log_shutdown(line: std::fmt::Arguments<'_>) {
+    let _ = writeln!(io::stderr(), "cr shutdown {line}");
+}
+
+/// The signals that ask `cr serve` to stop.
+///
+/// `SIGINT` is Ctrl-C at a terminal and `SIGTERM` is what `kill`, systemd,
+/// Docker, and Kubernetes send, so both mean the same thing here. `SIGHUP` is
+/// deliberately left alone: there is no configuration to reload, and catching
+/// it would override the `SIG_IGN` that `nohup` sets, ending a server that was
+/// asked to outlive its terminal. It keeps its default action and ends the
+/// process at once, which the write-ahead protocol recovers from like any
+/// other hard stop.
+///
+/// Registered once and for the life of the process: once tokio has replaced a
+/// signal's default action it never restores it, so a signal after the
+/// second is swallowed while database work finishes, and only `SIGKILL` stops
+/// the process sooner.
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn listen() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).context("could not listen for SIGINT")?,
+            terminate: signal(SignalKind::terminate()).context("could not listen for SIGTERM")?,
+        })
+    }
+
+    async fn recv(&mut self) -> Result<&'static str> {
+        tokio::select! {
+            _ = self.interrupt.recv() => Ok("SIGINT"),
+            _ = self.terminate.recv() => Ok("SIGTERM"),
+        }
+    }
+}
+
+/// Off Unix only Ctrl-C is handled; every other console event keeps its
+/// default action.
+#[cfg(not(unix))]
+struct ShutdownSignals;
+
+#[cfg(not(unix))]
+impl ShutdownSignals {
+    fn listen() -> Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) -> Result<&'static str> {
+        tokio::signal::ctrl_c()
+            .await
+            .context("could not listen for Ctrl-C")?;
+        Ok("Ctrl-C")
+    }
 }
 
 /// Give every request a correlation ID, publish it to the handlers beneath

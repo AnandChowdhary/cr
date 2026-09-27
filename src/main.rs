@@ -1774,6 +1774,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 max_body_bytes,
                 api_token,
             };
+            // Dropped, not `shutdown_timeout`: dropping waits for every
+            // database operation already running on the blocking pool, which
+            // is what lets shutdown promise never to cut a mutation in half.
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
