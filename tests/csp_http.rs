@@ -24,6 +24,13 @@
 //! not to, and evaluates JavaScript written in attributes for `hx-on`, trigger
 //! filters and `js:` values. `cr.js` switches both off, and no page uses any of
 //! those attributes.
+//!
+//! **Nothing else on the origin passes for a script or a stylesheet.** The
+//! policy's `'self'` trusts every URL here in those roles, not only
+//! `/static/`, so every response — JSON, errors, `/health`, the assets,
+//! `/openapi.json`, redirects, and the fallbacks, as well as the pages —
+//! carries exactly one `X-Content-Type-Options: nosniff`, which makes a browser
+//! refuse one whose type is not JavaScript or CSS.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -256,6 +263,29 @@ fn assert_policy(context: &str, answer: &Answer) {
         1,
         "{context} sends more than one policy, and a browser enforces them all"
     );
+}
+
+/// Assert that an answer is the one its route should give, and that it carries
+/// `nosniff` exactly once. An empty `content_type` is an answer with no body,
+/// such as a redirect, which has no type to assert.
+fn assert_nosniff(context: &str, answer: &Answer, status: StatusCode, content_type: &str) {
+    assert_eq!(answer.status, status, "{context}: {}", answer.body);
+    let actual = answer.header(header::CONTENT_TYPE);
+    if content_type.is_empty() {
+        assert_eq!(actual, "", "{context}");
+    } else {
+        assert!(
+            actual.starts_with(content_type),
+            "{context} is {actual:?}, not {content_type}"
+        );
+    }
+    let values: Vec<&str> = answer
+        .headers
+        .get_all(header::X_CONTENT_TYPE_OPTIONS)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(values, ["nosniff"], "{context}");
 }
 
 /// One opening tag: its name, its attributes, and where it ends in the page.
@@ -579,4 +609,99 @@ async fn htmx_is_configured_to_need_neither_inline_style_nor_eval() {
     let htmx_at = home.body.find(r#"<script src="/static/htmx-"#).unwrap();
     let script_at = home.body.find(r#"<script src="/static/cr-"#).unwrap();
     assert!(htmx_at < script_at);
+}
+
+#[tokio::test]
+async fn every_response_carries_nosniff_exactly_once() {
+    const JSON: &str = "application/json";
+    const HTML: &str = "text/html";
+    let (_temporary, database) = open_database("nosniff-open");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+
+    for (uri, status, content_type) in [
+        ("/api/v1/collections", StatusCode::OK, JSON),
+        (
+            "/api/v1/collections/deals/records/alpha",
+            StatusCode::OK,
+            JSON,
+        ),
+        // A handler's error, the router's fallback, and the asset route's
+        // refusal of a name it was not built with.
+        (
+            "/api/v1/collections/deals/records/nope",
+            StatusCode::NOT_FOUND,
+            JSON,
+        ),
+        ("/missing/route", StatusCode::NOT_FOUND, JSON),
+        (
+            "/static/cr-0000000000000000.js",
+            StatusCode::NOT_FOUND,
+            JSON,
+        ),
+        ("/health", StatusCode::OK, JSON),
+        ("/openapi.json", StatusCode::OK, JSON),
+        ("/", StatusCode::OK, HTML),
+        ("/no-such-view", StatusCode::NOT_FOUND, HTML),
+    ] {
+        assert_nosniff(uri, &get(&app, uri).await, status, content_type);
+    }
+    let region = fragment(&app, "/deals", "cr-view-table").await;
+    assert_nosniff("a fragment", &region, StatusCode::OK, HTML);
+
+    // The assets are what the pages load as scripts and stylesheets, so each
+    // has to be exactly the type it claims to be.
+    let linked = assert_within_policy("/", &get(&app, "/").await.body);
+    assert_served(&app, &linked).await;
+    for path in &linked {
+        let content_type = match path.rsplit_once('.').unwrap().1 {
+            "js" => "text/javascript",
+            "css" => "text/css",
+            "svg" => "image/svg+xml",
+            other => panic!("{path} is an unexpected .{other} asset"),
+        };
+        assert_nosniff(path, &get(&app, path).await, StatusCode::OK, content_type);
+    }
+
+    let wrong_method = request(&app, Method::POST, "/health", &[], None).await;
+    assert_nosniff(
+        "POST /health",
+        &wrong_method,
+        StatusCode::METHOD_NOT_ALLOWED,
+        JSON,
+    );
+
+    let page = get(&app, "/deals/new").await;
+    let submission = form_urlencoded::Serializer::new(String::new())
+        .append_pair("_csrf", csrf(&page.body))
+        .append_pair("id", "beta")
+        .append_pair("front_matter", "name: Beta\n")
+        .append_pair("markdown", "")
+        .finish();
+    let created = request(&app, Method::POST, "/deals/records", &[], Some(submission)).await;
+    assert_nosniff("a created record", &created, StatusCode::SEE_OTHER, "");
+    assert!(
+        created.header(header::LOCATION).starts_with("/deals"),
+        "{:?}",
+        created.headers
+    );
+    assert_eq!(database.get("deals", "beta").unwrap().id, "beta");
+
+    // Refusals from the authorization layer, which answers before any handler
+    // runs, and so before any handler could have set a header of its own.
+    let guarded = router(
+        database,
+        ServerConfig {
+            api_token: Some("secret-token".into()),
+            ..ServerConfig::default()
+        },
+    )
+    .unwrap();
+    for uri in ["/api/v1/collections", "/openapi.json", "/"] {
+        let refused = get(&guarded, uri).await;
+        assert_nosniff(uri, &refused, StatusCode::UNAUTHORIZED, JSON);
+        assert_eq!(
+            refused.header(header::WWW_AUTHENTICATE),
+            "Bearer realm=\"cr\""
+        );
+    }
 }

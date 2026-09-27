@@ -395,3 +395,8 @@ cr error request_id=9b40e2c1d7a35f66 status=404 code=not_found method=GET path=/
 
 Server-rendered HTML error pages apply the same rules and display the request
 ID so it can be quoted in a report.
+
+Every response, the JSON API's, `/health`'s, and `/static`'s included, also
+carries `X-Content-Type-Options: nosniff`, so a browser never runs an answer as
+a script or applies it as a stylesheet unless its `Content-Type` says it is
+one.

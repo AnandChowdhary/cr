@@ -2094,6 +2094,17 @@ impl ShutdownSignals {
 
 /// Give every request a correlation ID, publish it to the handlers beneath
 /// this layer, and return it so an operator can find the matching log line.
+///
+/// Every response also leaves here with `X-Content-Type-Options: nosniff`.
+/// The content security policy's `'self'` trusts every URL on this origin as
+/// a script or stylesheet source, not only `/static/`, and `nosniff` is what
+/// makes a browser refuse a response in either role whose type is not
+/// JavaScript or CSS. So it matters on the JSON API, its errors, `/health`,
+/// `/openapi.json`, the assets, the redirects, and the fallbacks as much as on
+/// the pages, and this is the one layer all of them pass through. No JSON
+/// answer is a useful script today, so this is hardening rather than a fix:
+/// what it buys is that a route added later cannot forget it. Inserted rather
+/// than appended, so a handler that sets it too still sends one value.
 async fn request_context(request: Request<Body>, next: Next) -> Response {
     let id = random_id();
     let header = HeaderValue::from_str(&id).ok();
@@ -2108,6 +2119,10 @@ async fn request_context(request: Request<Body>, next: Next) -> Response {
             .headers_mut()
             .insert(HeaderName::from_static(REQUEST_ID_HEADER), header);
     }
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     response
 }
 
@@ -14497,10 +14512,8 @@ fn html_response(status: StatusCode, markup: Markup) -> Response {
     response
         .headers_mut()
         .insert(header::VARY, HeaderValue::from_static(HTML_VARY));
-    response.headers_mut().insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
+    // No `nosniff` here: `request_context` sets it on every response, this
+    // one included.
     response.headers_mut().insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(CONTENT_SECURITY_POLICY),
