@@ -39,6 +39,25 @@
   --cr-warn-line: #fcd34d;
   --cr-warn-soft: #fffbeb;
   --cr-warn-ink: #92400e;
+
+  /* A person's avatar: eight tints, each with the ink that reads on it. Which
+     one a person gets comes from their principal ID; see `avatar_class`. */
+  --cr-avatar-0-soft: #e0e7ff;
+  --cr-avatar-0-ink: #3730a3;
+  --cr-avatar-1-soft: #ccfbf1;
+  --cr-avatar-1-ink: #115e59;
+  --cr-avatar-2-soft: #fef3c7;
+  --cr-avatar-2-ink: #92400e;
+  --cr-avatar-3-soft: #ffe4e6;
+  --cr-avatar-3-ink: #9f1239;
+  --cr-avatar-4-soft: #ede9fe;
+  --cr-avatar-4-ink: #5b21b6;
+  --cr-avatar-5-soft: #dcfce7;
+  --cr-avatar-5-ink: #166534;
+  --cr-avatar-6-soft: #e0f2fe;
+  --cr-avatar-6-ink: #075985;
+  --cr-avatar-7-soft: #ffedd5;
+  --cr-avatar-7-ink: #9a3412;
   --cr-invalid-line: #fca5a5;
   --cr-invalid-soft: #fef2f2;
 
@@ -94,6 +113,23 @@
     --cr-warn-line: #5b4517;
     --cr-warn-soft: #2a2211;
     --cr-warn-ink: #f3c46a;
+
+    --cr-avatar-0-soft: #272b52;
+    --cr-avatar-0-ink: #c7d2fe;
+    --cr-avatar-1-soft: #12332f;
+    --cr-avatar-1-ink: #99f6e4;
+    --cr-avatar-2-soft: #382a0e;
+    --cr-avatar-2-ink: #fcd34d;
+    --cr-avatar-3-soft: #3d1a23;
+    --cr-avatar-3-ink: #fda4af;
+    --cr-avatar-4-soft: #2e2449;
+    --cr-avatar-4-ink: #ddd6fe;
+    --cr-avatar-5-soft: #14321f;
+    --cr-avatar-5-ink: #86efac;
+    --cr-avatar-6-soft: #102c3d;
+    --cr-avatar-6-ink: #7dd3fc;
+    --cr-avatar-7-soft: #3b2314;
+    --cr-avatar-7-ink: #fdba74;
     --cr-invalid-line: #7a2f2f;
     --cr-invalid-soft: #2c1b1b;
 
@@ -431,6 +467,122 @@ html {
   color: var(--cr-gray-400);
   font-size: 0.62rem;
 }
+
+/* A person, wherever the UI shows one: a tiny avatar of their initials, in
+   their colour, and their name. It sits inline in a sentence of the audit
+   log as well as in a table cell, and truncates the name rather than wrap. */
+.cr-user {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 5px;
+  vertical-align: bottom;
+}
+
+.cr-user-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.cr-avatar {
+  display: inline-grid;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  border-radius: 999px;
+  font-size: 0.5rem;
+  font-weight: 700;
+  font-style: normal;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  user-select: none;
+}
+
+.cr-avatar-0 { background: var(--cr-avatar-0-soft); color: var(--cr-avatar-0-ink); }
+.cr-avatar-1 { background: var(--cr-avatar-1-soft); color: var(--cr-avatar-1-ink); }
+.cr-avatar-2 { background: var(--cr-avatar-2-soft); color: var(--cr-avatar-2-ink); }
+.cr-avatar-3 { background: var(--cr-avatar-3-soft); color: var(--cr-avatar-3-ink); }
+.cr-avatar-4 { background: var(--cr-avatar-4-soft); color: var(--cr-avatar-4-ink); }
+.cr-avatar-5 { background: var(--cr-avatar-5-soft); color: var(--cr-avatar-5-ink); }
+.cr-avatar-6 { background: var(--cr-avatar-6-soft); color: var(--cr-avatar-6-ink); }
+.cr-avatar-7 { background: var(--cr-avatar-7-soft); color: var(--cr-avatar-7-ink); }
+
+/* The registry's ID under the person it belongs to. */
+.cr-user-id {
+  display: block;
+  margin: 2px 0 0 21px;
+  color: var(--cr-gray-500);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.68rem;
+}
+
+/* Who is signed in, at the foot of the sidebar where the console's
+   perspective switcher sits. Every line truncates rather than wraps, and says
+   all of itself in its title. */
+.cr-account {
+  display: grid;
+  grid-template-areas:
+    "avatar name action"
+    "avatar address address"
+    "avatar meta meta";
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 9px;
+  row-gap: 1px;
+  margin-top: 8px;
+  border-top: 1px solid var(--cr-gray-200);
+  padding: 10px 8px 2px;
+}
+
+/* The same avatar, larger; `.cr-avatar-*` colours it. */
+.cr-account-avatar {
+  grid-area: avatar;
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 999px;
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  user-select: none;
+}
+
+.cr-account > p { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cr-account-name { grid-area: name; color: var(--cr-gray-900); font-size: 0.75rem; font-weight: 650; }
+.cr-account-address { grid-area: address; color: var(--cr-gray-500); font-size: 0.68rem; }
+.cr-account-meta { grid-area: meta; color: var(--cr-gray-400); font-size: 0.62rem; }
+
+.cr-account-sign-out {
+  grid-area: action;
+  border-radius: 5px;
+  color: var(--cr-gray-500);
+  padding: 1px 5px;
+  font-size: 0.66rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.cr-account-sign-out:hover { background: var(--cr-gray-100); color: var(--cr-gray-900); }
+
+/* The narrow header's avatar, which opens the same card. */
+.cr-account-menu { position: relative; margin-left: 4px; }
+.cr-account-menu summary { cursor: pointer; list-style: none; }
+.cr-account-menu summary::-webkit-details-marker { display: none; }
+.cr-account-menu summary:focus-visible { outline: 2px solid var(--cr-gray-900); outline-offset: 2px; }
+
+.cr-account-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 50;
+  width: 250px;
+  border: 1px solid var(--cr-gray-200);
+  border-radius: 10px;
+  background: var(--cr-gray-0);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.12);
+  padding: 2px 6px 10px;
+}
+
+.cr-account-popover .cr-account { margin: 0; border-top: 0; }
 
 .cr-mobile-header { display: none; }
 

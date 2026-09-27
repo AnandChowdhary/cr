@@ -416,6 +416,38 @@ async fn require_token_serves_only_authenticated_principals() {
 }
 
 #[tokio::test]
+async fn only_an_authenticated_principal_is_shown_as_signed_in() {
+    let (_temporary, database) = seeded_database("token-account");
+    let (token, _) = issue(&database, EDITOR);
+    let app = router(database, ServerConfig::default()).unwrap();
+
+    // The console has an operator and a perspective, not a signed-in person.
+    let console = request(&app, Method::GET, "/", None, &[]).await;
+    assert_eq!(console.status, StatusCode::OK);
+    assert!(!console.text().contains("cr-account"));
+    assert!(console.text().contains("Markdown database"));
+
+    let authorization = bearer(&token);
+    let page = request(
+        &app,
+        Method::GET,
+        "/",
+        None,
+        &[("authorization", &authorization)],
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.text());
+    let html = page.text();
+    assert!(html.contains("aria-label=\"Signed in\""));
+    assert!(html.contains(">Editor</p>"));
+    assert!(html.contains(">editor@example.com</p>"));
+    assert!(html.contains("editor · scoped · via token"));
+    // Nothing to sign out of: whatever attaches the token keeps attaching it.
+    assert!(!html.contains("Sign out"));
+    assert!(!html.contains("Markdown database"));
+}
+
+#[tokio::test]
 async fn require_token_is_refused_where_it_cannot_mean_anything() {
     let open = tempfile::tempdir().unwrap();
     let open = Database::init(open.path().join("open")).unwrap();

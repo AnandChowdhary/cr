@@ -47,7 +47,10 @@ launching owner under `access.impersonated_by`.
 A request that carries a [principal token](access-control.md#authenticate-principals-to-a-server-with-tokens)
 is not the console. Its pages are rendered for the token's principal alone:
 there is no switcher, the perspective cookie is ignored, and the file browser
-and pins are unavailable even to an owner's token.
+and pins are unavailable even to an owner's token. The foot of the sidebar
+shows who is signed in instead: the user's initials, name, email, role, and how
+the request was authenticated. On a narrow screen the same card opens from the
+avatar at the top right.
 
 To let several people use the UI as themselves, put the server behind
 Cloudflare Access and start it with
@@ -62,7 +65,9 @@ Each person then signs in with the organisation's login and sees the UI as the
 user whose email they signed in with, exactly as a principal token's pages are
 rendered: no switcher, no file browser, their own grants, and their own form
 token. Somebody whose address no active user holds is shown a page saying so.
-Cloudflare signs people out at `/cdn-cgi/access/logout` on the same host.
+Their card at the foot of the sidebar says "via Cloudflare" and has a **Sign
+out** link to `/cdn-cgi/access/logout`, where Cloudflare ends the session on
+that host.
 
 The HTTP layer calls the same Rust database methods as the CLI. It does not spawn a `cr` subprocess. Schema validation, atomic writes, audit locking, direct-edit reconciliation, and tamper checks therefore behave the same way in both interfaces. HTTP mutations are recorded with `source: api`.
 
@@ -539,6 +544,8 @@ If you start editing a record and then click a link, the page asks before discar
 
 A record page lists the record's relations beside its form. **Links to** shows each relation the record holds, named and linked to the other record's page. **Linked from** shows every record that links to this one, the same records `cr backlinks` finds. A related record that no longer exists, or that the current perspective cannot read, is shown only as its `collection/id`.
 
+A relation to a registered user — `cr link deals acme owner users ada@example.com` — shows the person: a small avatar of their initials beside their name. A perspective that may not read the user registry sees the avatar beside the user's ID instead, never the name.
+
 To add a relation, open **+ Link a record**, enter a relation name such as `company`, and pick the record as `collection/id`. Both fields suggest what the database already contains. **Remove** takes a relation away. Each change is its own audited `link` event, exactly as if it had been made with `cr link` or `cr unlink`. A change made from a page that has since gone stale is refused rather than applied, and so is saving the record form after a relation changed underneath it. The record form carries the stored relations through unchanged, so saving it never undoes a link.
 
 ### Supporting files of a bundle record
@@ -586,6 +593,8 @@ The built-in `users` collection keeps its fixed name.
 ## Browse audit history
 
 Open [http://127.0.0.1:3000/audit](http://127.0.0.1:3000/audit) for the global audit journal, newest first. Filter it by collection and record ID, page through older events, and expand an event to inspect its add/remove/replace operations with before and after values.
+
+People are shown the same way everywhere, as a small avatar of their initials beside their name, with a colour picked from their principal ID so that one person looks the same on every page: the actor of every event and anybody who impersonated them, with the recorded `Name <email>` in the tooltip; an event that changed a user's own record, which names the user rather than `users/<id>`; the users page; and the console's perspective banner.
 
 Every existing record page shows its newest activity beside the form as a short timeline: what happened and which fields it touched, who did it and through which agent, when, any save message, and the before and after values under **Show changes**. Hashes, sources, sessions, authorization, and intent are left to the audit log; **All activity** opens `/audit` with that collection and ID already selected. Historical values are escaped before rendering and long values are preview-limited in the page; the complete event remains available from the JSON API and CLI.
 
