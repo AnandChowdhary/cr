@@ -43,7 +43,7 @@ use crate::{
     frontmatter::Document,
     paths,
     sync::{SYNC_DEFINITION_DIRECTORY, SYNC_LOCK_DIRECTORY, SYNC_STATE_DIRECTORY},
-    value::{canonical_yaml_value, get_path, parse_path, remove_path},
+    value::{canonical_yaml_value, check_front_matter_depth, get_path, parse_path, remove_path},
     views::{UI_EXTENSION, VIEW_DIRECTORY, normalize_collection_icon, normalize_collection_label},
 };
 
@@ -4890,6 +4890,9 @@ impl Database {
     }
 
     fn validate(&self, collection: &str, attributes: &Mapping) -> Result<()> {
+        // Every write validates, schema or not, so this is the one place the
+        // depth the audit journal can store is enforced.
+        check_front_matter_depth(attributes)?;
         let Some(check) = self.schema_check(collection, attributes)? else {
             return Ok(());
         };

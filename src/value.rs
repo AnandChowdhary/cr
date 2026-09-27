@@ -337,13 +337,17 @@ fn number_as_f64(number: &yaml_serde::Number) -> f64 {
         .expect("YAML numbers are representable as integers or floats")
 }
 
+/// The order every sort uses: numbers numerically, strings lexicographically,
+/// sequences element by element, and values of different types by a fixed
+/// type rank.
+///
+/// It is a total order, which `slice::sort_by` requires: given one that is not,
+/// the sort may panic or answer differently for different input orders.
 pub fn compare_yaml_values(left: &Value, right: &Value) -> Ordering {
     match (left, right) {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
-        (Value::Number(left), Value::Number(right)) => number_as_f64(left)
-            .partial_cmp(&number_as_f64(right))
-            .unwrap_or(Ordering::Equal),
+        (Value::Number(left), Value::Number(right)) => compare_numbers(left, right),
         (Value::String(left), Value::String(right)) => left.cmp(right),
         (Value::Sequence(left), Value::Sequence(right)) => left
             .iter()
@@ -355,6 +359,19 @@ pub fn compare_yaml_values(left: &Value, right: &Value) -> Ordering {
             .cmp(&value_type_rank(right))
             .then_with(|| serialized_sort_value(left).cmp(&serialized_sort_value(right))),
     }
+}
+
+/// Numbers in numeric order, with NaN after every other number and equal to
+/// itself.
+///
+/// NaN compares to nothing, and treating that as "equal" made it equal to
+/// both 1 and 2 while they stayed unequal. With the ID tie-break a sort then
+/// had a cycle, so `value: .nan` gave an order that depended on the input
+/// order and, with enough records, panicked the sort.
+fn compare_numbers(left: &yaml_serde::Number, right: &yaml_serde::Number) -> Ordering {
+    let (left, right) = (number_as_f64(left), number_as_f64(right));
+    left.partial_cmp(&right)
+        .unwrap_or_else(|| left.is_nan().cmp(&right.is_nan()))
 }
 
 fn value_type_rank(value: &Value) -> u8 {
@@ -413,6 +430,46 @@ pub(crate) fn get_path<'a>(attributes: &'a Mapping, path: &[String]) -> Option<&
     }
 
     Some(current)
+}
+
+/// How deeply a record's front matter may nest, counting the front matter
+/// mapping itself as the first level.
+///
+/// The audit journal stores front matter inside each event's JSON, several
+/// objects below the top, and JSON nested more than 128 levels is refused when
+/// it is read back. Front matter 121 levels deep was therefore accepted,
+/// written, and committed in an event no later command could read, which
+/// stopped every read and write of the database from then on. 64 leaves the
+/// event's own nesting ample room, and no document a person writes comes near
+/// it.
+pub(crate) const MAX_FRONT_MATTER_DEPTH: usize = 64;
+
+/// Refuse front matter nested deeper than [`MAX_FRONT_MATTER_DEPTH`].
+pub(crate) fn check_front_matter_depth(attributes: &Mapping) -> Result<()> {
+    if nests_deeper_than(attributes, MAX_FRONT_MATTER_DEPTH - 1) {
+        return Err(invalid(format!(
+            "front matter nests more than {MAX_FRONT_MATTER_DEPTH} levels deep"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether anything below `mapping` is a mapping, sequence, or tagged value
+/// more than `levels` levels down. It stops descending there, so its own
+/// recursion is bounded by `levels` whatever the input.
+fn nests_deeper_than(mapping: &Mapping, levels: usize) -> bool {
+    fn value_nests_deeper_than(value: &Value, levels: usize) -> bool {
+        let deeper = |value: &Value| value_nests_deeper_than(value, levels - 1);
+        match value {
+            Value::Mapping(mapping) => levels == 0 || nests_deeper_than(mapping, levels - 1),
+            Value::Sequence(items) => levels == 0 || items.iter().any(deeper),
+            Value::Tagged(tagged) => levels == 0 || deeper(&tagged.value),
+            _ => false,
+        }
+    }
+    mapping.iter().any(|(key, value)| {
+        value_nests_deeper_than(key, levels) || value_nests_deeper_than(value, levels)
+    })
 }
 
 pub(crate) fn remove_path(attributes: &mut Mapping, path: &[String]) -> bool {
@@ -669,6 +726,26 @@ mod tests {
         );
         assert_eq!(
             compare_yaml_values(&Value::Bool(false), &Value::Number(0.into())),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn nan_sorts_after_every_number_and_equal_to_itself() {
+        let nan = Value::Number(f64::NAN.into());
+        for number in [
+            Value::Number(f64::INFINITY.into()),
+            Value::Number(i64::MAX.into()),
+            Value::Number(u64::MAX.into()),
+            Value::Number((-1).into()),
+        ] {
+            assert_eq!(compare_yaml_values(&nan, &number), Ordering::Greater);
+            assert_eq!(compare_yaml_values(&number, &nan), Ordering::Less);
+        }
+        assert_eq!(compare_yaml_values(&nan, &nan), Ordering::Equal);
+        // Still a number: before every string, as every other number is.
+        assert_eq!(
+            compare_yaml_values(&nan, &Value::String(String::new())),
             Ordering::Less
         );
     }

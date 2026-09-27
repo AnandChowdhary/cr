@@ -1,16 +1,13 @@
 //! Properties the audit chain must hold over arbitrary mutation sequences.
 //!
-//! ## Why there is no property-testing dependency here
+//! ## Generation
 //!
-//! A generator crate would buy shrinking and a nicer failure report. It would
-//! also change `Cargo.lock`, which needs an MSRV check and is contended with
-//! other work in flight, and the generation this suite needs is a weighted
-//! choice among five operations over a five-record namespace — not something a
-//! combinator library makes materially better. The generator below is
-//! SplitMix64 seeded from a constant, so every run explores exactly the same
-//! sequences: a failure here is reproducible from the seed printed in the
-//! assertion, and a green run in CI means the same thing as a green run on a
-//! laptop. That is worth more in a crash-recovery suite than shrinking is.
+//! The generation this suite needs is a weighted choice among five operations
+//! over a five-record namespace, drawn from the SplitMix64 generator every
+//! property file shares, `tests/common/rng.rs`, which also explains why there
+//! is no property-testing dependency and how a failing seed is reported and
+//! replayed. A green run in CI means the same thing as a green run on a
+//! laptop, which is worth more in a crash-recovery suite than shrinking is.
 //!
 //! ## What these tests check
 //!
@@ -26,33 +23,15 @@ mod common;
 
 use std::{fs, path::Path, str::FromStr};
 
-use common::chain;
+use common::{
+    chain,
+    rng::{Rng, cases},
+};
 use cr::{Assignment, Attribution, Database};
 
-/// SplitMix64. Deterministic, tiny, and identical on every platform.
-#[derive(Debug)]
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut value = self.0;
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        value ^ (value >> 31)
-    }
-
-    fn below(&mut self, bound: usize) -> usize {
-        (self.next() % bound as u64) as usize
-    }
-}
-
-/// Deterministic self-check: the generator must not drift between platforms or
-/// releases, or "the same seed" would stop meaning anything.
+/// Deterministic self-check of the generator every property file shares: it
+/// must not drift between platforms or releases, or "the same seed" would stop
+/// meaning anything.
 #[test]
 fn the_generator_is_reproducible() {
     let mut rng = Rng::new(0);
@@ -191,17 +170,21 @@ fn step(database: &Database, rng: &mut Rng, present: &mut Vec<String>) -> u64 {
 /// sequence numbers stay dense, and every stored hash covers its payload.
 #[test]
 fn arbitrary_mutation_sequences_leave_a_chain_that_always_verifies() {
-    for seed in 0..8u64 {
+    for mut case in cases(
+        "arbitrary_mutation_sequences_leave_a_chain_that_always_verifies",
+        8,
+    ) {
+        let seed = case.seed;
+        let rng = &mut case.rng;
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
         // Three events per segment, so rotation happens constantly.
         let database = init(root, 3);
-        let mut rng = Rng::new(seed);
         let mut present: Vec<String> = Vec::new();
         let mut expected = 0u64;
 
         for step_index in 0..40 {
-            expected += step(&database, &mut rng, &mut present);
+            expected += step(&database, rng, &mut present);
             let verification = database
                 .audit_verify(None)
                 .unwrap_or_else(|error| panic!("seed {seed} step {step_index}: {error:#}"));

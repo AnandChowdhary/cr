@@ -246,6 +246,8 @@ This makes the check and the operation the same act rather than two racing ones.
 
 Refusals are classified `DomainError::Conflict`, so they reach a caller as `409` with wording that names the record, collection, view, or configuration directory involved. The resolved location stays underneath the classification in the `anyhow` chain, where the CLI and the server log can use it and a response cannot.
 
+A name the filesystem cannot store at all — longer than a directory entry may be, or holding a NUL byte — is different: no entry can have it, so asking for one is the caller's mistake and not the stored state's. Wherever the walk meets one, `src/paths.rs` classifies it `DomainError::Invalid` (`422`). Checking lengths up front instead would need a bound per kind of name (a record ID loses three bytes to `.md`, a collection five to its schema's `.json`) and would reach into audit verification, which validates the names in stored events with the same function; the filesystem already knows the exact bound.
+
 ## Audit protocol
 
 Each stored line is a small JSON wrapper containing a SHA-256 hash and an exact JSON payload. The payload contains:
@@ -775,6 +777,8 @@ A key is written `FIELD`, `FIELD:asc`, or `FIELD:desc`, comma-separated or repea
 
 Nested Boolean groups, `NOT`, membership sets, multi-key ordering, projections, aggregation, and backlinks were added on top of this layer without changing the file format.
 
+Two properties of this layer are load-bearing for the server rather than conveniences. The `--filter` parser is recursive descent, so parentheses and `NOT` nest at most 64 levels deep: a filter of a few thousand `(` overflowed the stack of the thread parsing it, and a stack overflow aborts the process rather than failing the request. And `compare_yaml_values` is a total order, because `slice::sort_by` may panic when handed anything less; NaN, which compares to nothing, sorts after every other number and equal to itself.
+
 ## HTTP transport and OpenAPI
 
 `cr serve` is a transport over `Database`, not a subprocess adapter around the CLI binary. CLI and HTTP handlers therefore reach the same validation, locking, write-ahead audit, atomic file replacement, search, and reconciliation code. The database instance carries an audit source: command-line mutations use `cli`, REST mutations use `api`, accepted direct edits retain `filesystem`, and adapter mutations use `sync`.
@@ -958,6 +962,16 @@ Mutating forms include a cryptographically random token generated when the serve
 - Per-sync filesystem locks reject overlapping runs of one adapter. Different syncs may fetch concurrently, but a separate application lock plus the initial audit-head comparison rejects stale output if another sync or ordinary mutation committed first. During application, each operation also requires the audit generation produced by the preceding sync operation, so an ordinary audited writer interleaving with a stream stops its remaining operations. The audit lock still serializes each comparison and record mutation.
 - A run that stops partway through leaves a durable ledger under `.cr/sync/runs/`, so committed work and a lagging checkpoint can never disagree unnoticed. The next run refuses until the interrupted one is completed by `cr sync recover`, which replays the recorded stream forward and never deletes an audit event.
 - YAML comments and hand-chosen front matter formatting are not preserved after a CLI mutation; the Markdown body is preserved exactly. A syntax-preserving YAML editor could replace serialization later without changing the command model.
+- Rendering re-parses what it wrote and refuses, as invalid input, front matter that would not read back exactly. The YAML emitter writes a few strings holding a line or paragraph separator (U+2028, U+2029) beside other line breaks in a form that reads back differently; those are the only refusals today.
+- Front matter may nest at most 64 levels deep. Each audit event stores the front matter inside its own JSON, and serde_json will not read JSON nested more than 128 levels, so deeper front matter would commit an event no later command could read. `Database::validate`, which every write calls, holds the bound.
+
+## Property tests
+
+Example-based tests pin the behaviour someone thought of; the property tests look for the behaviour nobody did, at the boundaries where input arrives: the front matter parser and renderer, field paths and `KEY=YAML` assignments, `--where-expr` and `--filter`, sort keys and ordering, projections, HTTP request decoding, the generated OpenAPI document, and audit replay. Every one of them states what must hold for *any* input — parsed or refused with a classification, never a panic; round trips where a printed form exists; agreement with a reference evaluator written in the test from the documented semantics where none does; no `5xx`, no leaked path, and no write for a refused request — and checks it over generated inputs built to be near misses rather than noise.
+
+They share one generator, `tests/common/rng.rs`, and deliberately no property-testing crate. SplitMix64 is a dozen lines with a pinned output vector, so a seed means the same inputs on every platform and in every release, and a green run in CI means what a green run on a laptop means. Each property runs seeds `0..N`; a failing case prints its property and seed as it unwinds, `CR_PROPERTY_SEED` replays one seed alone, and `CR_PROPERTY_SCALE` multiplies the seed count for a longer search than CI affords. Shrinking is what a crate would add, and it buys little when cases are small by construction and replay is exact. The front matter parser is private, so its properties are a unit module that includes the shared generator by path; everything else is an integration test over the public API or the in-process router, and each HTTP seed gets a fresh database so it replays exactly.
+
+The generators aim at the places layers disagree: strings that are YAML indicators, document markers, YAML 1.1 booleans, line and paragraph separators, NUL, and non-BMP characters; YAML numbers at and past the edges of `i64` and floats that print badly; path segments that are empty, `..`, overlong, or percent-encoded into invalid UTF-8; JSON that is truncated, nested past the parser's limit, or out of range. Most of what they found was a boundary where one layer accepted what the next could not handle — a filter deep enough to exhaust the stack, front matter deep enough to make the journal unreadable, a name too long for the filesystem, a string the YAML emitter writes but cannot read — and each fix is a bound or a classification at the first layer, with a regression test named for the input.
 
 ## Roadmap
 

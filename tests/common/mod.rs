@@ -2,6 +2,9 @@
 
 pub mod chain;
 pub mod fault;
+pub mod generate;
+pub mod openapi;
+pub mod rng;
 
 use std::{path::Path, process::Command};
 

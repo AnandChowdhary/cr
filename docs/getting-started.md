@@ -119,6 +119,8 @@ Account notes go here.
 
 Values passed to `--set` and `--where` are parsed as YAML. Strings, numbers, booleans, lists, objects, and `null` retain their types. Quote arguments containing spaces or YAML punctuation.
 
+Front matter may nest at most 64 levels deep, and a write whose YAML would not read back exactly as given is refused rather than stored changed. In practice that is only a string holding a line or paragraph separator (U+2028 or U+2029) beside other line breaks, which the YAML emitter cannot write faithfully.
+
 ### What counts as a record
 
 A collection directory may hold anything you like: a `README`, an image, a
