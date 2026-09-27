@@ -5716,7 +5716,7 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                 "session": { "type": "string" },
                 "turn": { "type": "string" },
                 "detected_from": {
-                    "enum": ["environment", "flag", "header", "config"],
+                    "enum": ["environment", "hook", "flag", "header", "config"],
                     "description": "How cr came to believe this. No value means verified."
                 },
                 "via": { "type": "array", "items": { "$ref": "#/components/schemas/AuditAgent" }, "description": "Delegation chain, nearest actor first." }

@@ -168,6 +168,12 @@ A database created before this feature has no anchor at all. It keeps working an
 cr audit anchor --write && git add .cr-audit-head.json
 ```
 
+To put the head in the commit itself as well, including commits in a repository
+that does not hold the database, add a `Cr-Audit-Head:` trailer with the
+example `commit-msg` hook. [Commit as the agent, on the human's
+behalf](agents.md#commit-as-the-agent-on-the-humans-behalf) describes it with
+the rest of the Git convention for agent-made commits.
+
 ## Baseline existing records
 
 For records that existed before audit logging was introduced, establish their starting state once:

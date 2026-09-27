@@ -137,4 +137,9 @@ A sort takes at most five keys, most significant first, each field once.
 a single key written without one, and is refused with several; see
 [Sort results](working-with-records.md#sort-results).
 
+`CR_AGENT`, `CR_AUTHORIZATION`, and `CR_INTENT` supply ATTRIBUTION to every
+command, beneath the flags. `CR_HOOK_AGENT` and `CR_HOOK_AUTHORIZATION` are the
+layer a harness hook fills in, beneath those; see
+[Let Claude Code fill in the attribution](agents.md#let-claude-code-fill-in-the-attribution).
+
 Run `cr COMMAND --help` for complete command-specific help.
