@@ -568,7 +568,9 @@ fn query(rng: &mut Rng, reads: &[&'static str]) -> String {
     }
     let mut query = serializer.finish();
     if rng.chance(1, 5) {
-        query.push_str(rng.pick(&["&", "&&", "=", "%", "%zz", "%FF", "+", "&limit", "&=x", "#"]));
+        query.push_str(
+            rng.pick::<&str>(&["&", "&&", "=", "%", "%zz", "%FF", "+", "&limit", "&=x", "#"]),
+        );
     }
     query
 }
@@ -880,7 +882,7 @@ fn generated_request(rng: &mut Rng, csrf: &str) -> Generated {
         }
     }
     if rng.chance(1, 12) {
-        path.push_str(rng.pick(&["/", "//", "/extra", "/.."]));
+        path.push_str(rng.pick::<&str>(&["/", "//", "/extra", "/.."]));
     }
     let mut uri = path;
     if rng.chance(2, 5) {

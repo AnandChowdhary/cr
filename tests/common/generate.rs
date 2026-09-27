@@ -206,8 +206,8 @@ pub fn string(rng: &mut Rng) -> String {
             let mut text = String::new();
             for _ in 0..rng.between(1, 4) {
                 match rng.below(3) {
-                    0 => text.push_str(rng.pick(TRICKY_STRINGS)),
-                    1 => text.push_str(rng.pick(WORDS)),
+                    0 => text.push_str(rng.pick::<&str>(TRICKY_STRINGS)),
+                    1 => text.push_str(rng.pick::<&str>(WORDS)),
                     _ => text.push(*rng.pick(CHARACTERS)),
                 }
             }
@@ -305,7 +305,7 @@ pub fn body(rng: &mut Rng) -> String {
         if rng.chance(1, 4) {
             body.push_str(&noise(rng, 8));
         } else {
-            body.push_str(rng.pick(BODY_FRAGMENTS));
+            body.push_str(rng.pick::<&str>(BODY_FRAGMENTS));
         }
     }
     body

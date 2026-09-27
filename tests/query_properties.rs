@@ -122,7 +122,7 @@ fn token_soup(rng: &mut Rng) -> String {
         match rng.below(5) {
             0 => text.push_str(&generate::noise(rng, 3)),
             1 => text.push_str(&generate::string(rng)),
-            _ => text.push_str(rng.pick(TOKENS)),
+            _ => text.push_str(rng.pick::<&str>(TOKENS)),
         }
         if rng.chance(1, 2) {
             text.push(' ');
@@ -421,7 +421,7 @@ fn symbol(operator: FilterOperator) -> Option<&'static str> {
 }
 
 fn spaces(rng: &mut Rng) -> &'static str {
-    rng.pick(&["", " ", "  ", "\t"])
+    rng.pick::<&str>(&["", " ", "  ", "\t"])
 }
 
 // ---------------------------------------------------------------------------
@@ -672,7 +672,7 @@ fn print_value(rng: &mut Rng, value: &Value, out: &mut String) {
             }
         }
         Value::Bool(flag) => write!(out, "{flag}").unwrap(),
-        Value::Null => out.push_str(rng.pick(&["null", "~"])),
+        Value::Null => out.push_str(rng.pick::<&str>(&["null", "~"])),
         Value::Sequence(items) => print_list(rng, items, out),
         other => panic!("filters have no spelling for {other:?}"),
     }
