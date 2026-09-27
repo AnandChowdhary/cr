@@ -44,7 +44,10 @@ archive's name. To move to a newer release later, see [Update cr](#update-cr).
 
 ## Build from source
 
-To build a release from source instead, you need a current Rust toolchain:
+To build a release from source instead, you need a current Rust toolchain and
+a C compiler for the target (`ring`, the cryptography behind
+`cr serve --cloudflare-access`, compiles C; a static musl build needs
+`musl-gcc`, from `musl-tools` on Debian and Ubuntu):
 
 ```sh
 cargo install --git https://github.com/AnandChowdhary/cr --tag "$tag"

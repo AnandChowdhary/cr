@@ -49,6 +49,21 @@ is not the console. Its pages are rendered for the token's principal alone:
 there is no switcher, the perspective cookie is ignored, and the file browser
 and pins are unavailable even to an owner's token.
 
+To let several people use the UI as themselves, put the server behind
+Cloudflare Access and start it with
+[`--cloudflare-access`](access-control.md#sign-people-in-through-cloudflare-access):
+
+```sh
+cr serve --cloudflare-access https://example.cloudflareaccess.com \
+  --cloudflare-access-aud "$ACCESS_AUD_TAG"
+```
+
+Each person then signs in with the organisation's login and sees the UI as the
+user whose email they signed in with, exactly as a principal token's pages are
+rendered: no switcher, no file browser, their own grants, and their own form
+token. Somebody whose address no active user holds is shown a page saying so.
+Cloudflare signs people out at `/cdn-cgi/access/logout` on the same host.
+
 The HTTP layer calls the same Rust database methods as the CLI. It does not spawn a `cr` subprocess. Schema validation, atomic writes, audit locking, direct-edit reconciliation, and tamper checks therefore behave the same way in both interfaces. HTTP mutations are recorded with `source: api`.
 
 One thing differs, and it is what keeps pages fast on a database with a long history. A CLI command resumes the verified walk of the audit chain that the last write saved and verifies only what was appended since. The server does the same as soon as it is listening, and after that keeps the walk in memory, so a page costs about the same on the ten-thousandth event as on the tenth. The newest segment is still compared with what was verified on every read. An older segment is trusted while its file identity, size, and modification and change times are unchanged. A rewrite that also restores the change time, which takes resetting the clock or writing the disk directly, is only noticed by the next walk from the first event. `cr audit verify` and `cr check` and their API routes still verify the whole chain, a write does so once every `audit.full_walk_after_events` events, and `cr --verify-audit serve` starts the server, and every write it makes, from the first event. [`architecture.md`](architecture.md#the-verified-journal) has the details.

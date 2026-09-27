@@ -254,6 +254,99 @@ writes files outside the database, and a secret that travels should not be
 able to rewrite the host. `cr serve` does not terminate TLS, so put it behind a
 proxy that does before tokens cross a network.
 
+## Sign people in through Cloudflare Access
+
+A token is a secret a script can keep, but a browser cannot attach one to
+every request. When `cr serve` sits behind
+[Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/),
+the organisation's login can be the way in instead, and each person acts as
+their own user:
+
+```sh
+cr serve --bind 127.0.0.1:3000 \
+  --cloudflare-access https://example.cloudflareaccess.com \
+  --cloudflare-access-aud 4714c1358e65fe4b408ad6d432a5f878f08194bdb4752441fd56faefa9b2b6f2
+```
+
+`--cloudflare-access` is the team domain, as Zero Trust shows it under
+**Settings → Custom Pages** (`example.cloudflareaccess.com` and `example` are
+accepted too). `--cloudflare-access-aud` is the **Application Audience (AUD)
+tag** from the Access application's **Overview**. Cloudflare signs every
+request it lets through with a JSON Web Token in the `Cf-Access-Jwt-Assertion`
+header, and on every request the server:
+
+- verifies the token's RS256 signature against the team's keys, which it
+  fetches from `https://example.cloudflareaccess.com/cdn-cgi/access/certs`,
+  caches, and fetches again when a token names a key it does not hold;
+- requires `iss` to be the team domain and `aud` to include the tag;
+- requires `exp` and `nbf` to hold, allowing a minute of clock difference;
+- matches the token's `email` to the `email` of exactly one user.
+
+The match ignores the case of ASCII letters and nothing else. The request is
+refused `401` if no user has the address, if the one that does is not active,
+if more than one user has it — whatever their status, because choosing between
+them would decide somebody's grants by something other than the policy — or if
+the token has no email, which is what a Cloudflare service token's has. The
+user is found in the audited policy rather than the Markdown file, exactly as a
+principal token is: an address written into a user file by hand signs nobody
+in, and a user whose file has drifted is refused until `cr user restore`. Only
+an owner can change a user's email, so only an owner decides who a signed-in
+address becomes.
+
+So register each person with the address they sign in with:
+
+```sh
+cr user add ada@example.com --name 'Ada Lovelace' --email ada@example.com
+cr access grant ada@example.com editor collection:deals
+```
+
+The request then acts as that user, with that user's grants, and every event it
+writes records the token's `sub`, Cloudflare's ID for the person:
+
+```json
+"access": {
+  "principal": "ada@example.com",
+  "authentication": { "method": "cloudflare-access", "credential": "7335d417-61da-459d-899c-0a01c76a2f94" },
+  ...
+}
+```
+
+`cr audit log` prints it as `cloudflare-access=7335d417-…`, the web audit
+timeline says "authenticated by Cloudflare Access", and
+`GET /api/v1/identity` returns the same object.
+
+Only the signed token is read. `Cf-Access-Authenticated-User-Email` and the
+`CF_Authorization` cookie say the same thing without a signature, and anything
+that can reach the server's port can send them, so they are ignored. Otherwise
+the server behaves as `--require-token` does: every request except `/health`,
+`/ready`, and `/static` must sign in, there is no owner console or perspective
+switcher, no owner has to launch it, it may bind beyond loopback, `CR_API_TOKEN`
+is refused, and the file browser is unavailable even to an owner.
+
+Principal tokens are refused under `--cloudflare-access` alone, so everybody
+comes through the organisation's login. Add `--require-token` to accept both:
+a script then sends its principal token as before, and if it reaches the
+server through Access with a service token, the token is what names its
+principal, since the service token's assertion names nobody.
+
+A browser attaches the Access session to requests other sites make, so the
+server refuses a change a browser says another site started — by
+`Sec-Fetch-Site`, or, from a browser too old to send it, by an `Origin` that is
+not the server's own host — and every signed-in person's forms carry a form
+token of their own, which nobody else's form is accepted with.
+
+If the keys cannot be fetched, a sign-in whose key is not already held is
+answered `503 authentication_unavailable` rather than `401`, `/ready` reports
+`cloudflare_access_keys_unavailable`, and the reason is in the server log. The
+server fetches the keys when it starts and prints how many it holds, so a
+mistyped team domain is reported at once. It is the only request `cr` makes on
+its own.
+
+Keep the server where only Cloudflare can reach it: bind it to loopback behind
+`cloudflared`, or firewall it to Cloudflare's addresses. A signed token is
+still a credential, and a listener anybody can reach lets them replay one they
+saw for as long as it lasts.
+
 ## What access control does not protect against
 
 The local identity is still an assertion supplied by the process, so this is
@@ -262,10 +355,12 @@ Markdown can bypass CR. The RBAC perspective console therefore requires an
 owner to launch it and refuses non-loopback binds. It is an administrative
 preview, not a per-user login system.
 
-Tokens authenticate requests made through `cr serve`, not access to the files
-beneath it. `--require-token` is a boundary only when the account running the
-server is the only one that can open the database directory, which is why the
-server warns when group or other accounts can; the CLI run by that account, or
-anyone who can become it, is still trusted. Making the CLI a client of the
-server, authenticating local callers by operating-system account, and a
-browser login are the remaining parts of that boundary, tracked in `TODO.md`.
+Tokens and Cloudflare Access authenticate requests made through `cr serve`,
+not access to the files beneath it. `--require-token` and
+`--cloudflare-access` are a boundary only when the account running the server
+is the only one that can open the database directory, which is why the server
+warns when group or other accounts can; the CLI run by that account, or anyone
+who can become it, is still trusted. Making the CLI a client of the server,
+authenticating local callers by operating-system account, and a browser login
+without an identity-aware proxy are the remaining parts of that boundary,
+tracked in `TODO.md`.
