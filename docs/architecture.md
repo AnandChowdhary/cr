@@ -527,9 +527,11 @@ switcher stores one selected principal in an HTTP-only, same-site session
 cookie, and every HTML and REST request clones the owner's database handle and
 impersonates that selection before it reaches `Database`. `--as` cannot launch
 the long-lived server, so its original operator can never be lost at that
-boundary. Non-bypassable
-multi-user enforcement still requires a managed daemon or server that owns the
-Markdown directory and authenticates each client.
+boundary. Principal tokens and `cr serve --require-token` are the first part
+of the managed boundary: a server that authenticates each client and whose
+account alone can open the Markdown directory. Making the CLI a client of it,
+and authenticating local clients by operating-system account instead of a
+secret, are the rest.
 
 The server's `/browse` page deliberately steps outside the database-relative
 path boundary: its purpose is owner-only inspection of the complete filesystem
@@ -564,6 +566,54 @@ record file changed here is a direct edit, reported by `cr status` until
 `cr save` accepts it, exactly as one made in any other editor.
 
 `audit verify` validates the chain and reconciles every latest record hash, including deleted-record absence and manually added untracked files. `audit baseline` explicitly introduces legacy records into the chain. It cannot silently baseline a record that already has history.
+
+### Principal tokens
+
+A principal token is the first identity `cr` checks rather than takes on
+trust. It is `crt_<id>_<secret>`: sixteen hex characters of public ID and 256
+random bits of secret, base64url-encoded. The secret is printed once; the user
+record keeps `{id, label, hash, created, expires}` under a CR-owned `tokens`
+field, where `hash` is SHA-256 over the domain `cr:access:token:v1\0` and the
+whole token. A fast hash is the right verifier for a secret with that much
+entropy, and it is harmless to whoever may read the user record. Keeping the
+verifiers in the policy record rather than a side file is deliberate: issuing
+and revoking are then ordinary audited user versions, `user restore` covers
+them, the field-aware update boundary already refuses to open an unlisted
+field, and every decision's `policy_hash` moves when a principal's tokens do.
+An older binary refuses a user record with `tokens`, because `User` denies
+unknown fields — failing closed — while its `audit verify` still verifies the
+journal, whose replay is not typed.
+
+Only a database owner issues, lists, or revokes, because a token for a
+principal is that principal. `Database::authenticate_token` takes the audit
+lock, recovers a pending mutation, finds the ID in the *replayed* user states,
+compares the verifier in constant time, checks expiry and `status`, and then
+requires the materialized user file to equal the audited state, exactly as
+delegation does. Every way to fail is one `Ok(None)`, so a caller cannot tell a
+revoked token from a mistyped one; a journal that does not verify is an `Err`
+instead, because it must not read as a bad token. The result is a `Database`
+whose principal is the token's user and whose `authentication` field is copied
+into every `AccessDecision` it makes, beside `impersonated_by`. Anything that
+changes the principal — `with_actor` to another principal, impersonation —
+clears it, so the evidence never outlives the check. `authentication` is
+optional and skipped when absent, so no earlier event's bytes change, and its
+`method` is a stored-label enum that preserves a label a later `cr` adds, such
+as a peer-credential method. The idempotency envelope gains the field only
+when it is present, for the same reason.
+
+The server authenticates in its authorization layer, before any handler runs,
+and publishes the result in a task-local beside the request context. A bearer
+value equal to `CR_API_TOKEN` is the console; one with the `crt_` prefix
+authenticates or is refused `401`, never falling through to the console,
+because a revoked token that became the launching owner would make revocation
+an escalation. The four places that choose a request's database —
+`request_database`, `ui_context`, `switch_perspective`, and the file-browser
+check — read that one answer. `--require-token` removes the console:
+construction refuses it without access control or beside `CR_API_TOKEN`, no
+longer requires the launcher to be an owner, and lifts the loopback rule. The
+file browser and pins stay console-only for every token, an owner's included,
+because they reach files outside the database and a token is a secret that
+travels.
 
 ## Whole-database integrity checks
 
@@ -748,7 +798,7 @@ body decoding, and body limits—keep their own codes.
 
 Every request receives a correlation ID, returned as `X-Request-Id` and inside the error envelope. Before a response is rendered, the server writes the complete chain to standard error under that ID together with the method, path, status, and code; unexpected failures replace their message with a fixed generic one. Expected client errors keep their actionable wording. This holds the line that internal detail is a server-side artifact: the log is authoritative for diagnosis and the response is authoritative for what a caller may know.
 
-The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentication for HTML views, the OpenAPI document, and all `/api/v1` routes; `/health` remains public. `X-CR-Actor` is an audit attribution override with the same assertion-only trust boundary as CLI actor values, and `X-CR-Agent`, `X-CR-Authorization`, and `X-CR-Intent` extend that boundary unchanged to the three attribution objects. Each accepts the same compact or JSON form as its command-line option and is recorded as `detected_from: header`; because HTTP header values are visible ASCII, non-ASCII intent text must arrive as JSON escapes, and a header that is not decodable is refused with a message that names the header and nothing internal. `GET /api/v1/identity` returns the effective actor, principal, optional impersonating owner, and attribution a request would record, which is how a client checks its wiring without writing anything.
+The server binds to loopback by default. `CR_API_TOKEN` enables bearer authentication for HTML views, the OpenAPI document, and all `/api/v1` routes; `/health` remains public. `X-CR-Actor` is an audit attribution override with the same assertion-only trust boundary as CLI actor values, and `X-CR-Agent`, `X-CR-Authorization`, and `X-CR-Intent` extend that boundary unchanged to the three attribution objects. Each accepts the same compact or JSON form as its command-line option and is recorded as `detected_from: header`; because HTTP header values are visible ASCII, non-ASCII intent text must arrive as JSON escapes, and a header that is not decodable is refused with a message that names the header and nothing internal. `GET /api/v1/identity` returns the effective actor, principal, optional impersonating owner, token authentication, and attribution a request would record, which is how a client checks its wiring without writing anything. A principal token is the one bearer value that is not an assertion; see [principal tokens](#principal-tokens).
 
 For RBAC, router construction proves the launching principal is a database
 owner against its audited policy and rejects a non-loopback bind before opening
@@ -759,9 +809,10 @@ console enumerates the live fixed-schema user records and switches perspective
 through a CSRF-protected POST. The resulting HTTP-only, same-site cookie is a
 selection, not an authentication credential: any client admitted to this
 local console is intentionally allowed to choose any user. Responses vary on
-the cookie and are marked `no-store`. The server still does not implement TLS,
-per-token users, or rate limiting; real network deployments must supply an
-authenticated principal boundary rather than exposing this console.
+the cookie and are marked `no-store`. The server still does not implement TLS
+or rate limiting. Real network deployments should use `--require-token`, which
+replaces this console with [principal tokens](#principal-tokens), rather than
+exposing it.
 
 ## Views and server-rendered HTML
 
@@ -842,7 +893,7 @@ Mutating forms include a cryptographically random token generated when the serve
 ## Integrity boundaries
 
 - Collection names and IDs are single path components, preventing path traversal. `data_dir` must be a relative path of plain components.
-- Actor, agent, authorization, and intent values are asserted by the caller and bounded in length. Agent, authorization, and intent remain evidence only. In local RBAC mode the normalized actor is also the principal used by policy; the owner perspective console explicitly replaces both with the selected user and attaches the operator as `access.impersonated_by`. The documented process-controlled trust limitation remains explicit.
+- Actor, agent, authorization, and intent values are asserted by the caller and bounded in length. The exception is `access.authentication`, which the server writes only after a principal token verified against the audited policy. Agent, authorization, and intent remain evidence only. In local RBAC mode the normalized actor is also the principal used by policy; the owner perspective console explicitly replaces both with the selected user and attaches the operator as `access.impersonated_by`. The documented process-controlled trust limitation remains explicit.
 - No directory between the root and a target may be a symbolic link. That covers `data_dir`, its intermediate directories, each collection directory, `.cr/`, and the audit, schema, view, and sync directories beneath it. A configured directory replaced by a link is refused rather than followed.
 - Markdown record paths must be regular files. Single-record CRUD, status, save, and audit verification reject symlinks and other special file types rather than trusting them by content hash; ordinary collection, schema, view, and sync listings continue to ignore non-file entries, and every name they do yield is reopened safely before it is read.
 - Creation never overwrites an existing record.

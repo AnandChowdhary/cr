@@ -39,14 +39,14 @@ use yaml_serde::{Mapping, Value as YamlValue};
 use crate::{
     AccessAction, AccessIdentity, AccessResource, AgentEvidence, Aggregation, Assignment,
     Attribution, AttributionOverrides, AuditAction, AuditAgent, AuditAuthorization, AuditEntry,
-    AuditFilter, AuditIntent, AuditIntentPart, AuditSource, Backlink, COLLECTION_ACCESS_EXTENSION,
-    CheckScope, CheckSummary, CollectionModel, CollectionPresentation, Database, DomainError,
-    Filter, FilterExpression, FilterOperator, Finding, MAX_TRAVERSAL_DEPTH, Projection,
-    RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SchemaReview, SchemaViolation,
-    SearchQuery, SearchTarget, SortDirection, USERS_COLLECTION, User, UserKind, UserStatus,
-    ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch, audit::AuditChange,
-    database::relation_references, error::is_missing, paths, sort_by_record_field,
-    sort_records_by_field,
+    AuditFilter, AuditIntent, AuditIntentPart, AuditSource, Authentication, Backlink,
+    COLLECTION_ACCESS_EXTENSION, CheckScope, CheckSummary, CollectionModel, CollectionPresentation,
+    Database, DomainError, Filter, FilterExpression, FilterOperator, Finding, MAX_TRAVERSAL_DEPTH,
+    Projection, RECORD_ACCESS_FIELD, Record, RecordActivity, RecordPrecondition, SchemaReview,
+    SchemaViolation, SearchQuery, SearchTarget, SortDirection, TOKEN_PREFIX, USERS_COLLECTION,
+    User, UserKind, UserStatus, ViewDefinition, ViewFilterGroup, ViewLayout, ViewPredicateMatch,
+    audit::AuditChange, database::relation_references, error::is_missing, paths,
+    sort_by_record_field, sort_records_by_field,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -108,6 +108,9 @@ pub struct ServerConfig {
     pub max_page_size: usize,
     pub max_body_bytes: usize,
     pub api_token: Option<String>,
+    /// Refuse every protected request that does not present a principal
+    /// token, rather than serving the launching owner's perspective console.
+    pub require_token: bool,
 }
 
 impl Default for ServerConfig {
@@ -119,6 +122,7 @@ impl Default for ServerConfig {
             max_page_size: DEFAULT_MAX_PAGE_SIZE,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             api_token: None,
+            require_token: false,
         }
     }
 }
@@ -129,7 +133,40 @@ struct AppState {
     access_controlled: bool,
     max_page_size: usize,
     api_token: Option<Arc<str>>,
+    require_token: bool,
     csrf_token: Arc<str>,
+}
+
+/// Who a request is, as the authorization layer established it.
+///
+/// Published for the handler's duration exactly as [`RequestContext`] is, so
+/// the places that choose a request's database read one answer rather than
+/// each re-reading the `Authorization` header.
+#[derive(Clone)]
+enum RequestIdentity {
+    /// No principal token: the launching process's identity, and under access
+    /// control the owner console and its perspective cookie.
+    Console,
+    /// A principal token authenticated this database's principal.
+    Token(Box<Database>),
+}
+
+tokio::task_local! {
+    static REQUEST_IDENTITY: RequestIdentity;
+}
+
+/// The authenticated database for this request, when a token established one.
+///
+/// Outside the authorization layer — `/health` and `/static` — there is no
+/// identity, which is the console's answer: neither route reads a database.
+fn authenticated_database() -> Option<Database> {
+    REQUEST_IDENTITY
+        .try_with(|identity| match identity {
+            RequestIdentity::Token(database) => Some(database.as_ref().clone()),
+            RequestIdentity::Console => None,
+        })
+        .ok()
+        .flatten()
 }
 
 #[derive(Clone, Debug)]
@@ -192,6 +229,9 @@ struct UiContext {
     /// of the UI they would use to see it.
     pins_error: Option<String>,
     users: Vec<UiUser>,
+    /// Whether this is the owner console, which may view as another user. A
+    /// token-authenticated principal is who its token says and nobody else.
+    can_switch_perspective: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1527,6 +1567,9 @@ struct IdentityResponse {
     actor: String,
     principal: String,
     impersonated_by: Option<AccessIdentity>,
+    /// How this request's principal was authenticated; `null` when it is the
+    /// server's own identity or the owner console's selection.
+    authentication: Option<Authentication>,
     agent: Option<AuditAgent>,
     authorization: Option<AuditAuthorization>,
     intent: Option<AuditIntent>,
@@ -1748,12 +1791,26 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         Err(error) if matches!(DomainError::of(&error), Some(DomainError::Conflict(_))) => false,
         Err(error) => return Err(error),
     };
-    if access_controlled && !config.bind.ip().is_loopback() {
+    if config.require_token {
+        if !access_controlled {
+            bail!(
+                "--require-token authenticates registered principals, so it needs access control; run 'cr access init' first"
+            );
+        }
+        if config.api_token.is_some() {
+            bail!(
+                "--require-token cannot be combined with CR_API_TOKEN, which acts as the launching owner; issue that caller a principal token instead"
+            );
+        }
+    } else if access_controlled && !config.bind.ip().is_loopback() {
         bail!(
-            "the RBAC perspective switcher is an owner-only local console and must bind to a loopback address"
+            "the RBAC perspective switcher is an owner-only local console and must bind to a loopback address; use --require-token to serve authenticated principals beyond it"
         );
     }
-    if access_controlled {
+    // The console serves the launching process as an owner, so it has to be
+    // one. A server that requires tokens never acts as its launcher, which is
+    // what lets it run as a service account with no user record at all.
+    if access_controlled && !config.require_token {
         database.impersonate_verified(database.principal())?;
     }
     if config.max_page_size == 0 {
@@ -1771,6 +1828,7 @@ pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
         access_controlled,
         max_page_size: config.max_page_size,
         api_token: config.api_token.map(Arc::from),
+        require_token: config.require_token,
         csrf_token: Arc::from(random_token()?),
     };
     let protected = Router::new()
@@ -2054,23 +2112,11 @@ async fn request_context(request: Request<Body>, next: Next) -> Response {
 }
 
 async fn authorize(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
-    if let Some(token) = &state.api_token {
-        let authorized = request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|value| value == token.as_ref());
-        if !authorized {
-            return ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "provide a valid Bearer token",
-            )
-            .into_response();
-        }
-    }
-    let mut response = next.run(request).await;
+    let identity = match request_identity(&state, request.headers()).await {
+        Ok(identity) => identity,
+        Err(error) => return error.into_response(),
+    };
+    let mut response = REQUEST_IDENTITY.scope(identity, next.run(request)).await;
     if state.access_controlled {
         response
             .headers_mut()
@@ -2084,6 +2130,66 @@ async fn authorize(State(state): State<AppState>, request: Request<Body>, next: 
         vary_on(response.headers_mut(), "Cookie");
     }
     response
+}
+
+/// Establish who a request is from its `Authorization` header.
+///
+/// A principal token either authenticates or is refused: it never falls back
+/// to the console, because a revoked token that quietly became the launching
+/// owner would turn revocation into escalation. `CR_API_TOKEN` keeps its
+/// meaning — the console, as the launching owner — and `--require-token`
+/// accepts nothing but a principal token.
+async fn request_identity(state: &AppState, headers: &HeaderMap) -> ApiResult<RequestIdentity> {
+    let unauthorized =
+        |message: &str| ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", message.to_owned());
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if let (Some(presented), Some(expected)) = (bearer, &state.api_token)
+        && secrets_match(presented, expected)
+    {
+        return Ok(RequestIdentity::Console);
+    }
+    if let Some(presented) = bearer.filter(|value| value.starts_with(TOKEN_PREFIX)) {
+        if !state.access_controlled {
+            return Err(unauthorized(
+                "principal tokens authenticate registered users, and access control is not initialized",
+            ));
+        }
+        let database = state.database.clone();
+        let presented = presented.to_owned();
+        let authenticated =
+            tokio::task::spawn_blocking(move || database.authenticate_token(&presented))
+                .await
+                .map_err(|error| {
+                    ApiError::internal(anyhow!(error).context("database task failed"))
+                })?
+                .map_err(ApiError::from_domain)?;
+        return authenticated
+            .map(|database| RequestIdentity::Token(Box::new(database)))
+            .ok_or_else(|| unauthorized("the principal token is not valid"));
+    }
+    if state.require_token {
+        return Err(unauthorized("provide a principal token as a Bearer token"));
+    }
+    if state.api_token.is_some() {
+        return Err(unauthorized("provide a valid Bearer token"));
+    }
+    Ok(RequestIdentity::Console)
+}
+
+/// Compare two secrets in time that does not depend on where they differ.
+fn secrets_match(presented: &str, expected: &str) -> bool {
+    let presented = Sha256::digest(presented.as_bytes());
+    let expected = Sha256::digest(expected.as_bytes());
+    presented
+        .iter()
+        .zip(expected.iter())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 /// Declare that a response body depends on the named request header, without
@@ -2308,6 +2414,13 @@ async fn switch_perspective(State(state): State<AppState>, RawForm(raw): RawForm
                 StatusCode::NOT_FOUND,
                 "route_not_found",
                 "route not found",
+            ));
+        }
+        if authenticated_database().is_some() {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "a token-authenticated request acts as its own principal and has no perspective to switch",
             ));
         }
         let form: HtmlPerspectiveForm = parse_html_form(&raw)?;
@@ -2655,7 +2768,13 @@ async fn browse_view(
 }
 
 /// The check every file-browser route makes before it touches the filesystem:
-/// the routes exist only under RBAC, and only a database owner may use them.
+/// the routes exist only under RBAC, and only a database owner may use them,
+/// from the local console.
+///
+/// A token-authenticated owner is refused even so. The browser reads and
+/// writes any file the server's account can, beyond the database, and a token
+/// is a secret that travels: a leaked owner token that could rewrite files on
+/// the host would be worth far more than the database it was issued for.
 ///
 /// Returns the database root, where browsing starts and which the editor and
 /// the delete page compare a file against, and the sidebar's views.
@@ -2670,6 +2789,7 @@ async fn authorize_file_browser(
             "route not found",
         ));
     }
+    refuse_token_file_access()?;
     run_database(state, headers, |database| {
         if !database.owner_access_allowed(&AccessResource::Database)? {
             return Err(
@@ -2679,6 +2799,19 @@ async fn authorize_file_browser(
         Ok((database.root().to_path_buf(), database.views()?))
     })
     .await
+}
+
+/// Keep the server's filesystem to the local console; see
+/// [`authorize_file_browser`] for why a token never reaches it.
+fn refuse_token_file_access() -> ApiResult<()> {
+    if authenticated_database().is_some() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "the file browser belongs to the local owner console; a token-authenticated principal cannot browse server files",
+        ));
+    }
+    Ok(())
 }
 
 /// A text file, open for editing.
@@ -2958,6 +3091,7 @@ async fn change_pin(
                 "route not found",
             ));
         }
+        refuse_token_file_access()?;
         let form: HtmlPinForm = parse_html_form(&raw)?;
         verify_csrf(&state, &form.csrf)?;
         if !FilePath::new(&form.from).is_absolute() {
@@ -4557,6 +4691,7 @@ async fn identity(
         actor: database.actor().to_owned(),
         principal: database.principal().to_owned(),
         impersonated_by: database.impersonated_by().cloned(),
+        authentication: database.authentication().cloned(),
         agent: attribution.agent,
         authorization: attribution.authorization,
         intent: attribution.intent,
@@ -5219,7 +5354,7 @@ async fn audit_baseline(
 }
 
 async fn openapi(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<JsonValue>> {
-    let token_enabled = state.api_token.is_some();
+    let token_enabled = state.api_token.is_some() || state.require_token;
     let document = run_database(&state, &headers, move |database| {
         openapi_document(database, token_enabled)
     })
@@ -5244,7 +5379,11 @@ pub fn openapi_document(database: &Database, token_enabled: bool) -> Result<Json
     let mut components = json!({ "schemas": schemas });
     if token_enabled {
         components["securitySchemes"] = json!({
-            "bearerAuth": { "type": "http", "scheme": "bearer" }
+            "bearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "description": "Either the server's CR_API_TOKEN, which acts as the launching owner, or a principal token from `cr access token issue`, which authenticates its registered principal and is recorded in access.authentication on every event it writes."
+            }
         });
     }
     let mut document = json!({
@@ -5399,7 +5538,7 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
         },
         "Identity": {
             "type": "object", "required": ["actor", "principal", "impersonated_by"],
-            "description": "The effective principal and attribution this request would record. In the local RBAC console, impersonated_by identifies the owner operating the selected perspective.",
+            "description": "The effective principal and attribution this request would record. In the local RBAC console, impersonated_by identifies the owner operating the selected perspective. authentication is present when a principal token authenticated the principal.",
             "properties": {
                 "actor": { "type": "string" },
                 "principal": { "type": "string" },
@@ -5411,6 +5550,19 @@ fn base_openapi_schemas() -> Map<String, JsonValue> {
                             "properties": {
                                 "principal": { "type": "string" },
                                 "display": { "type": "string" }
+                            }
+                        },
+                        { "type": "null" }
+                    ]
+                },
+                "authentication": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "required": ["method"],
+                            "properties": {
+                                "method": { "type": "string", "description": "How the principal was authenticated: token." },
+                                "credential": { "type": "string", "description": "The public ID of the credential that passed." }
                             }
                         },
                         { "type": "null" }
@@ -7230,6 +7382,17 @@ fn render_audit_view(
     )
 }
 
+/// How a server authenticated an event's principal, in words: the method,
+/// and the public ID of the credential that passed.
+fn authentication_label(authentication: &Authentication) -> Markup {
+    html! {
+        "authenticated by " (authentication.method.label())
+        @if let Some(credential) = &authentication.credential {
+            " " code class="font-mono" { (credential) }
+        }
+    }
+}
+
 fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
     html! {
         div class="cr-audit-list" {
@@ -7259,6 +7422,14 @@ fn render_audit_entries(entries: &[AuditEntry]) -> Markup {
                                         .and_then(|access| access.impersonated_by.as_ref())
                                     {
                                         " · impersonated by " span class="font-medium text-gray-700" { (&operator.display) }
+                                    }
+                                    @if let Some(authentication) = entry
+                                        .payload
+                                        .access
+                                        .as_ref()
+                                        .and_then(|access| access.authentication.as_ref())
+                                    {
+                                        " · " (authentication_label(authentication))
                                     }
                                     @if let Some(agent) = &entry.payload.agent {
                                         " · via " a href=(audit_agent_url(&agent.id)) class="font-medium text-gray-700 hover:text-blue-700" { (&agent.id) }
@@ -11661,6 +11832,13 @@ fn render_record_activity(entries: &[AuditEntry]) -> Markup {
                             {
                                 " · impersonated by " span title=(&operator.display) { (identity_name(&operator.display)) }
                             }
+                            @if let Some(authentication) = payload
+                                .access
+                                .as_ref()
+                                .and_then(|access| access.authentication.as_ref())
+                            {
+                                " · " (authentication_label(authentication))
+                            }
                             @if let Some(agent) = &payload.agent {
                                 " · via " a href=(audit_agent_url(&agent.id)) class="hover:text-blue-700" { (&agent.id) }
                             }
@@ -13441,7 +13619,7 @@ fn sidebar_navigation(
                         span class="cr-external" aria-hidden="true" { "↗" }
                     }
                 }
-                @if let Some(ui) = ui {
+                @if let Some(ui) = ui.filter(|ui| ui.can_switch_perspective) {
                     (perspective_control(ui, csrf_token, "cr-perspective-sidebar"))
                 }
                 div class="cr-sidebar-meta" {
@@ -13509,7 +13687,7 @@ fn mobile_navigation(
                     span aria-hidden="true" class="cr-wordmark-mark" { "c" }
                     span { "cr" }
                 }
-                @if let Some(ui) = ui {
+                @if let Some(ui) = ui.filter(|ui| ui.can_switch_perspective) {
                     (perspective_control(ui, csrf_token, "cr-perspective-mobile"))
                 } @else {
                     div class="cr-mobile-utilities" {
@@ -15736,14 +15914,20 @@ async fn method_not_allowed() -> ApiError {
 }
 
 fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database> {
-    let mut database = state.database.clone();
+    let authenticated = authenticated_database();
+    let mut database = authenticated
+        .clone()
+        .unwrap_or_else(|| state.database.clone());
+    // For an authenticated principal the header can only restyle how that
+    // same principal is displayed: `with_actor` refuses any other principal
+    // under access control, which a token requires.
     if let Some(actor) = headers.get(ACTOR_HEADER) {
         let actor = actor.to_str().map_err(|_| {
             ApiError::bad_request("invalid_actor", "X-CR-Actor must be valid UTF-8")
         })?;
         database = database.with_actor(actor).map_err(ApiError::from_domain)?;
     }
-    if state.access_controlled {
+    if state.access_controlled && authenticated.is_none() {
         let principal =
             perspective_principal(headers)?.unwrap_or_else(|| database.principal().to_owned());
         database = database
@@ -15841,11 +16025,24 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
     if !state.access_controlled {
         return Ok(None);
     }
-    let selected =
-        perspective_principal(headers)?.unwrap_or_else(|| state.database.principal().to_owned());
-    let database = state.database.clone();
+    let authenticated = authenticated_database();
+    let selected = match &authenticated {
+        Some(database) => database.principal().to_owned(),
+        None => {
+            perspective_principal(headers)?.unwrap_or_else(|| state.database.principal().to_owned())
+        }
+    };
+    let database = authenticated
+        .clone()
+        .unwrap_or_else(|| state.database.clone());
     tokio::task::spawn_blocking(move || {
-        let users = database.users()?;
+        // The registry is the owner console's to list. A token-authenticated
+        // principal reads its own user record, which it always may, and is
+        // offered no one else to be.
+        let users = match &authenticated {
+            Some(database) => vec![(selected.clone(), database.user(&selected)?)],
+            None => database.users()?,
+        };
         let selected_user = users
             .iter()
             .find(|(id, _)| id == &selected)
@@ -15853,12 +16050,17 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
             .ok_or_else(|| DomainError::record_not_found("users", &selected))?;
         let selected_name = selected_user.name.clone();
         let selected_status = selected_user.status;
-        let selected_database = database.impersonate_verified(&selected)?;
+        let can_switch_perspective = authenticated.is_none();
+        let selected_database = match authenticated {
+            Some(database) => database,
+            None => database.impersonate_verified(&selected)?,
+        };
         let can_view_global_audit =
             selected_database.owner_access_allowed(&AccessResource::Database)?;
         let can_read_users = selected_database
             .access_allowed(AccessAction::ReadAccess, &AccessResource::Database)?;
-        let can_browse_files = selected_database.owner_access_allowed(&AccessResource::Database)?;
+        let can_browse_files = can_switch_perspective
+            && selected_database.owner_access_allowed(&AccessResource::Database)?;
         let can_save_views = selected_database.owner_access_allowed(&AccessResource::Database)?;
         let pins = if can_browse_files {
             selected_database
@@ -15896,6 +16098,7 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
                 pins,
                 pins_error: None,
                 users,
+                can_switch_perspective,
             },
             pins_error,
         ))

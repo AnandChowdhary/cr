@@ -42,6 +42,11 @@ authenticate different browser users. If the selected perspective performs an
 allowed mutation, the audit event names that user as actor and records the
 launching owner under `access.impersonated_by`.
 
+A request that carries a [principal token](access-control.md#authenticate-principals-to-a-server-with-tokens)
+is not the console. Its pages are rendered for the token's principal alone:
+there is no switcher, the perspective cookie is ignored, and the file browser
+and pins are unavailable even to an owner's token.
+
 The HTTP layer calls the same Rust database methods as the CLI. It does not spawn a `cr` subprocess. Schema validation, atomic writes, audit locking, direct-edit reconciliation, and tamper checks therefore behave the same way in both interfaces. HTTP mutations are recorded with `source: api`.
 
 One thing differs, and it is what keeps pages fast on a database with a long history. A CLI command resumes the verified walk of the audit chain that the last write saved and verifies only what was appended since. The server does the same as soon as it is listening, and after that keeps the walk in memory, so a page costs about the same on the ten-thousandth event as on the tenth. The newest segment is still compared with what was verified on every read. An older segment is trusted while its file identity, size, and modification and change times are unchanged. A rewrite that also restores the change time, which takes resetting the clock or writing the disk directly, is only noticed by the next walk from the first event. `cr audit verify` and `cr check` and their API routes still verify the whole chain, a write does so once every `audit.full_walk_after_events` events, and `cr --verify-audit serve` starts the server, and every write it makes, from the first event. [`architecture.md`](architecture.md#the-verified-journal) has the details.

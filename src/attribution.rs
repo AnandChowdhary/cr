@@ -291,6 +291,19 @@ pub struct AuditAuthorization {
 }
 
 stored_label_enum! {
+    /// How a server established the principal behind one change.
+    ///
+    /// Unlike every other label in this module, this one is not an assertion
+    /// by the caller: `cr` records it only after the check it names passed.
+    /// Its absence is the ordinary case, and means what every event before it
+    /// meant — the principal is whoever the process said it was.
+    AuthenticationMethod {
+        /// A principal token issued by `cr access token issue`.
+        Token => "token",
+    }
+}
+
+stored_label_enum! {
     /// Who a piece of recorded intent is attributed to.
     IntentAuthor {
         /// Attributed to the responsible human. `cr` did not witness them type it.

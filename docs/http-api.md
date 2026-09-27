@@ -26,10 +26,37 @@ no way to send a bearer header, and the file is part of the binary rather than
 part of the database. For a database without RBAC, binding to a non-loopback address without a token prints
 a warning. An RBAC-enabled server refuses every non-loopback bind because its
 user switcher is an owner impersonation console, not a network authentication
-boundary. The built-in server does not terminate TLS; use a trusted reverse
+boundary, unless `--require-token` replaces that console with principal tokens. The built-in server does not terminate TLS; use a trusted reverse
 proxy for access across a network.
 
 The token mechanism is an HTTP bearer header. A normal browser address-bar request cannot attach that header, so the built-in HTML UI is currently intended for the default loopback-without-token setup or a trusted proxy that injects authentication. A browser login/session flow is tracked in `TODO.md`.
+
+`CR_API_TOKEN` is one shared secret, and whoever holds it acts as the owner who
+launched the server. Under access control, a caller can instead present a
+[principal token](access-control.md#authenticate-principals-to-a-server-with-tokens)
+issued for its own registered user:
+
+```sh
+curl http://127.0.0.1:3000/api/v1/identity \
+  -H "Authorization: Bearer $CR_TOKEN"
+```
+
+The request then acts as that principal, and `/api/v1/identity` reports how:
+
+```json
+{
+  "actor": "Nightly <nightly@example.com>",
+  "principal": "nightly@example.com",
+  "impersonated_by": null,
+  "authentication": { "method": "token", "credential": "1f0c9a7b3e2d4c65" },
+  ...
+}
+```
+
+A principal token that does not authenticate is answered `401 unauthorized`,
+whatever else the server would accept. `cr serve --require-token` accepts
+nothing else: every request but `/health` and `/static` needs a principal
+token, and the server may then bind beyond loopback.
 
 Set the audit actor for one request with `X-CR-Actor`:
 

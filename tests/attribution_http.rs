@@ -57,6 +57,7 @@ fn test_app(name: &str) -> (TempDir, Router, Database) {
             max_page_size: 200,
             max_body_bytes: 8 * 1024 * 1024,
             api_token: None,
+            require_token: false,
         },
     )
     .unwrap();

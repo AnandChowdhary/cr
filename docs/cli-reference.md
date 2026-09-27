@@ -45,7 +45,7 @@ cr traverse COLLECTION ID [--relation NAME]... [--depth N]
                           [--json [--expand] [--select FIELDS]...]
 cr delete COLLECTION ID --yes [-m MESSAGE] [ATTRIBUTION]
 cr delete COLLECTION ID --preview [--json]
-cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N]
+cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N] [--require-token]
 
 cr collections [--json]
 cr schema show COLLECTION
@@ -64,6 +64,9 @@ cr access revoke USER RESOURCE
 cr access policy set collection:NAME --mode record-owned [--default-visibility private]
 cr access visibility COLLECTION ID private|shared
 cr access owner COLLECTION ID PRINCIPAL
+cr access token issue USER [--label TEXT] [--expires-in 90d|12h] [--json]
+cr access token list [USER] [--json]
+cr access token revoke USER ID
 
 cr user add ID --name NAME [--email EMAIL] [--kind human|service | --service]
             [--set KEY=YAML]... [--reuse-deleted-id] [--json]
