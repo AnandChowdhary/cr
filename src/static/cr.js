@@ -475,18 +475,27 @@ const enhanceKanbanBoard = () => {
 
 // htmx configuration. It lives here rather than in a `<script>` block or a
 // `meta[name=htmx-config]` tag for the same reason the enhancements above do:
-// the pages must stay able to declare `script-src 'self'`, and a configuration
-// nobody can read in a JavaScript file is a configuration nobody maintains.
-// This runs before htmx reads any of these settings, because both scripts are
-// deferred — so they run in document order, htmx first — and htmx applies its
-// configuration on DOMContentLoaded, which is after every deferred script.
+// the pages' content security policy allows scripts from this origin and no
+// inline ones, and a configuration nobody can read in a JavaScript file is a
+// configuration nobody maintains. This runs before htmx reads any of these
+// settings, because both scripts are deferred — so they run in document order,
+// htmx first — and htmx applies its configuration on DOMContentLoaded, which is
+// after every deferred script.
 if (window.htmx) {
   // Otherwise htmx injects a <style> element for the `htmx-indicator` class it
   // ships. Nothing here uses that class — the progress bar is styled in the
-  // server's own sheet from htmx's `htmx-request` class — and an injected
-  // inline <style> is one more thing standing between these pages and a strict
-  // content security policy.
+  // server's own sheet from htmx's `htmx-request` class — and the policy
+  // refuses an inline <style>, so all the injection would produce is an error
+  // in the console.
   window.htmx.config.includeIndicatorStyles = false;
+
+  // htmx evaluates JavaScript written in attributes for `hx-on`, for trigger
+  // filters such as `click[ctrlKey]`, and for `js:` values in `hx-vals`. None of
+  // those appears in any page, and the policy grants no `'unsafe-eval'`, so the
+  // browser would refuse them anyway. Saying so here makes htmx refuse them
+  // itself, with its own `htmx:evalDisallowedError` rather than a syntax error
+  // that does not say why.
+  window.htmx.config.allowEval = false;
 
   // Do not keep visited pages in sessionStorage. htmx's history cache would
   // make the back button instant, but it writes rendered pages — records,

@@ -186,9 +186,17 @@ async fn every_page_carries_one_empty_live_region_above_its_content() {
     // other element degrades to unstyled but readable, and this one would
     // degrade to a duplicate sentence in the middle of the page.
     let (_, home) = get(&app, "/", &[]).await;
+    let sheet = home
+        .split(r#"<link rel="stylesheet" href=""#)
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|href| href.starts_with("/static/cr-"))
+        .expect("the page links the server's stylesheet");
+    let (status, sheet) = get(&app, sheet, &[]).await;
+    assert_eq!(status, StatusCode::OK);
     assert!(
-        home.contains(STYLES_MARKER),
-        "the inline stylesheet does not define the class that hides the region"
+        sheet.contains(STYLES_MARKER),
+        "the server's stylesheet does not define the class that hides the region"
     );
 }
 

@@ -12,10 +12,10 @@
 @source "./cr.js";
 
 /* The greys are the server sheet's own scale rather than a Tailwind palette:
-   `text-gray-500` compiles to `var(--cr-gray-500)`, which `GLOBAL_STYLES` in
-   `src/server.rs` defines for both colour schemes, so the markup and the sheet
-   cannot drift apart and dark mode needs nothing here. The other hues are
-   Tailwind's defaults; the sheet gives each one it uses a dark value. */
+   `text-gray-500` compiles to `var(--cr-gray-500)`, which `cr.css` beside this
+   file defines for both colour schemes, so the markup and the sheet cannot
+   drift apart and dark mode needs nothing here. The other hues are Tailwind's
+   defaults; the sheet gives each one it uses a dark value. */
 @theme inline {
   --color-white: var(--cr-gray-0);
   --color-gray-50: var(--cr-gray-50);

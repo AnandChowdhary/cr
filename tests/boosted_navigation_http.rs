@@ -141,14 +141,13 @@ async fn every_page_boosts_its_body_and_renders_the_progress_indicator() {
             html.contains(r#"<div id="cr-progress" class="cr-progress" aria-hidden="true">"#),
             "{uri} renders no progress indicator"
         );
-        // No inline handler and no inline `<script>`: phase 0 moved the last of
-        // those out so `script-src 'self'` stays reachable, and a boost must not
-        // reintroduce one. The delete form's `onsubmit` is gone — its
-        // confirmation is a page the server renders, which is also the only way
-        // a browser with no JavaScript is asked the question at all. The
-        // perspective selector's `onchange` is the last one and is tracked in
-        // `TODO.md`; it is not on any of these pages, because it renders only
-        // under access control.
+        // No inline handler and no inline `<script>`: the content security
+        // policy refuses both, and a boost must not reintroduce one. The delete
+        // form's `onsubmit` is gone — its confirmation is a page the server
+        // renders, which is also the only way a browser with no JavaScript is
+        // asked the question at all — and so is the perspective selector's
+        // `onchange`. `tests/csp_http.rs` checks every attribute of every tag,
+        // on these pages and on the ones only access control renders.
         assert!(
             !html.contains("hx-on:"),
             "{uri} uses an inline hx-on handler"
@@ -278,14 +277,55 @@ async fn the_perspective_switcher_is_not_boosted() {
     // The switcher posts and is answered with `303 See Other` back to the page
     // it was on. An `XMLHttpRequest` follows that redirect invisibly, so htmx
     // would swap the right page in while pushing `/perspective` into the address
-    // bar. It is also submitted by `form.submit()` from an `onchange`, which
-    // fires no submit event, so htmx would not see it either way — the
-    // attribute makes the opt-out a decision rather than an accident.
-    let switcher = tags(&html, "form")
+    // bar. It is submitted by its own button now, which htmx would intercept, so
+    // the attribute is what keeps it a native post.
+    let switchers: Vec<_> = tags(&html, "form")
         .into_iter()
-        .find(|tag| tag.contains(r#"action="/perspective""#))
-        .expect("no perspective form");
-    assert!(switcher.contains(r#"hx-boost="false""#), "{switcher}");
+        .filter(|tag| tag.contains(r#"action="/perspective""#))
+        .collect();
+    // One in the sidebar and one in the narrow screens' header.
+    assert_eq!(switchers.len(), 2, "{switchers:?}");
+    for switcher in switchers {
+        assert!(switcher.contains(r#"hx-boost="false""#), "{switcher}");
+    }
+}
+
+#[tokio::test]
+async fn choosing_a_perspective_waits_for_its_button() {
+    let temporary = tempfile::tempdir().unwrap();
+    let database = Database::init(temporary.path().join("perspective-button"))
+        .unwrap()
+        .with_actor("Owner <owner@example.com>")
+        .unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    database
+        .add_user("reader@example.com", "Reader", None, UserKind::Human)
+        .unwrap();
+    let app = router(database, ServerConfig::default()).unwrap();
+    let (_, html) = get(&app, "/", &[]).await;
+
+    // The select used to submit itself on `change`, so arrowing through the
+    // options with a keyboard switched perspective, and reloaded the page, at
+    // every option it passed: a change of context on input, which WCAG 3.2.2
+    // rules out. Now nothing happens until the button is pressed, and the
+    // button is the same for everyone rather than a `<noscript>` fallback.
+    for select in tags(&html, "select")
+        .into_iter()
+        .filter(|tag| tag.contains(r#"name="principal""#))
+    {
+        assert!(!select.contains("onchange"), "{select}");
+    }
+    assert!(!html.contains("<noscript><button"));
+    for id in ["cr-perspective-sidebar", "cr-perspective-mobile"] {
+        let control = &html[html.find(&format!(r#"<select id="{id}""#)).unwrap()..];
+        let control = &control[..control.find("</form>").unwrap()];
+        assert!(
+            control.contains(r#"</select><button type="submit" class="cr-button">Switch</button>"#),
+            "{id} has no button of its own: {control}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -293,23 +333,32 @@ async fn the_progress_indicator_is_driven_by_htmx_classes_and_honours_reduced_mo
     let (_temporary, database) = database_with_a_board("boost-progress");
     let app = router(database, ServerConfig::default()).unwrap();
     let (_, html) = get(&app, "/", &[]).await;
+    let sheet = html
+        .split(r#"<link rel="stylesheet" href=""#)
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|href| href.starts_with("/static/cr-"))
+        .expect("the page links the server's stylesheet");
+    let (status, sheet) = get(&app, sheet, &[]).await;
+    assert_eq!(status, StatusCode::OK);
 
     // htmx adds `htmx-request` to whatever `hx-indicator` names for exactly as
     // long as a request is in flight, and the sheet animates from nothing else,
     // so the bar is inert markup rather than a second mechanism to keep in step.
-    assert!(html.contains(".cr-progress.htmx-request { opacity: 1; }"));
-    assert!(html.contains("animation: cr-progress"));
+    assert!(sheet.contains(".cr-progress.htmx-request { opacity: 1; }"));
+    assert!(sheet.contains("animation: cr-progress"));
     // htmx also ships a `<style>` element for its own `htmx-indicator` class,
-    // which `cr.js` switches off. Nothing here uses that class, and an injected
-    // inline style is one more obstacle to a strict content security policy.
+    // which `cr.js` switches off. Nothing here uses that class, and the content
+    // security policy would refuse the injected style anyway.
     assert!(!html.contains("htmx-indicator"));
+    assert!(!sheet.contains("htmx-indicator"));
 
     // Reduced motion keeps the feedback and drops the movement: with no
     // animation the bar rests at its full width, so it is a plain static strip
     // for as long as the navigation is waiting. Stated rather than left to the
     // sheet's blanket `animation-duration: 0.01ms` rule, which would collapse
     // the growth by accident.
-    let (_, reduced) = html
+    let (_, reduced) = sheet
         .split_once("@media (prefers-reduced-motion: reduce) {")
         .unwrap();
     assert!(reduced.contains(".cr-progress.htmx-request::after { animation: none; }"));

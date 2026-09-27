@@ -89,6 +89,21 @@ fn csrf(html: &str) -> &str {
     rest.split_once('"').unwrap().0
 }
 
+/// The server's own stylesheet for a page, fetched from the link in its head,
+/// so a rule is asserted against the sheet a browser is sent with that page.
+async fn stylesheet(app: &Router, page: &TestResponse) -> String {
+    let path = page
+        .text()
+        .split(r#"<link rel="stylesheet" href=""#)
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|href| href.starts_with("/static/cr-"))
+        .expect("the page links the server's stylesheet");
+    let sheet = request(app, Method::GET, path, None, &[]).await;
+    assert_eq!(sheet.status, StatusCode::OK);
+    sheet.text().to_owned()
+}
+
 fn expected_record_hash(html: &str) -> &str {
     let marker = "name=\"_expected_record_hash\" value=\"";
     let rest = html
@@ -1151,7 +1166,7 @@ async fn kanban_cards_show_their_values_as_chips_without_labels_or_blanks() {
             .text()
             .contains(r#"<details class="cr-kanban-move"><summary>Move…</summary>"#)
     );
-    assert!(board.text().contains(".cr-kanban-card:not(:hover):not(:focus-within) .cr-kanban-move:not([open]) summary { opacity: 0; }"));
+    assert!(stylesheet(&app, &board).await.contains(".cr-kanban-card:not(:hover):not(:focus-within) .cr-kanban-move:not([open]) summary { opacity: 0; }"));
 }
 
 #[tokio::test]
@@ -1386,7 +1401,7 @@ async fn a_kanban_board_fits_the_window_with_lanes_that_scroll_on_their_own() {
             .text()
             .contains(r#"class="cr-kanban-lane"><div class="cr-lane-head">"#)
     );
-    let sheet = board.text();
+    let sheet = stylesheet(&app, &board).await;
     let rule = |selector: &str| {
         let start = sheet
             .find(&format!("{selector} {{"))
@@ -1438,7 +1453,8 @@ async fn a_kanban_board_fits_the_window_with_lanes_that_scroll_on_their_own() {
     assert!(sheet.contains(
         ".cr-kanban-lane[data-drop-target] { outline: 2px solid var(--cr-accent); outline-offset: -1px; }"
     ));
-    let script = sheet
+    let script = board
+        .text()
         .split(r#"<script src=""#)
         .skip(1)
         .filter_map(|rest| rest.split('"').next())
@@ -2054,6 +2070,7 @@ async fn the_records_table_scrolls_in_its_own_box_with_its_heading_and_edges_pin
         )
     );
     // The box is bounded, so the heading can stick to its top edge.
+    let sheet = stylesheet(&app, &page).await;
     for rule in [
         "max-height: max(20rem, calc(100dvh - 12.5rem));",
         ".cr-table-scroll thead th { position: sticky; top: 0;",
@@ -2061,22 +2078,21 @@ async fn the_records_table_scrolls_in_its_own_box_with_its_heading_and_edges_pin
         ".cr-table-scroll tbody td:first-child:not([colspan]) { position: sticky; left: 0;",
         "animation-timeline: --cr-table-x;",
     ] {
-        assert!(page.text().contains(rule), "missing `{rule}`");
+        assert!(sheet.contains(rule), "missing `{rule}`");
     }
     // Both hints start hidden. A table that fits has an inactive timeline,
     // and an animation on one has no effect, so without this they showed on
     // every table that did not scroll.
     for hint in ["animation: cr-more-ahead", "animation: cr-more-behind"] {
         // The table's rule, not the sidebar's, which shares the keyframes.
-        let (at, _) = page
-            .text()
+        let (at, _) = sheet
             .match_indices(hint)
             .find(|(at, _)| {
-                let rest = &page.text()[*at..];
+                let rest = &sheet[*at..];
                 rest[..rest.find('}').unwrap()].contains("--cr-table-x")
             })
             .unwrap_or_else(|| panic!("no table rule animates `{hint}`"));
-        let rule = &page.text()[..at];
+        let rule = &sheet[..at];
         let rule = &rule[rule.rfind('{').unwrap()..];
         assert!(rule.contains("opacity: 0;"), "`{hint}` starts visible");
     }
@@ -2102,7 +2118,7 @@ async fn the_sidebar_list_scrolls_under_a_pinned_footer_with_faded_edges() {
 
     let page = request(&app, Method::GET, "/tasks", None, &[]).await;
     assert_eq!(page.status, StatusCode::OK);
-    let sheet = page.text();
+    let sheet = stylesheet(&app, &page).await;
     let rule = |selector: &str| {
         let start = sheet
             .find(&format!("{selector} {{"))
@@ -2202,14 +2218,17 @@ async fn header_controls_are_one_height() {
     let app = router(database.clone(), ServerConfig::default()).unwrap();
 
     let page = request(&app, Method::GET, "/tasks", None, &[]).await;
-    let sheet = page.text();
+    let sheet = stylesheet(&app, &page).await;
     let button = &sheet[sheet.find(".cr-button {").unwrap()..];
     let button = &button[..button.find('}').unwrap()];
     // A height, not a minimum, so a badge inside cannot stretch one button.
     assert!(button.contains("height: 32px;") && !button.contains("min-height"));
     assert!(sheet.contains(".cr-button .cr-pill { padding: 1px 6px; }"));
     // The search box among them is the same 2rem.
-    assert!(sheet.contains(r#"data-view-search="true" class="h-8 w-full"#));
+    assert!(
+        page.text()
+            .contains(r#"data-view-search="true" class="h-8 w-full"#)
+    );
 }
 
 #[tokio::test]
@@ -2833,11 +2852,9 @@ async fn states_are_coloured_badges_by_what_they_say() {
             .contains(r#"class="block max-w-xs truncate">done</span>"#)
     );
     // The tones have colours in both schemes.
+    let sheet = stylesheet(&app, &page).await;
     for tone in ["positive", "negative", "active", "warn"] {
-        assert!(
-            page.text()
-                .contains(&format!(".cr-pill-{tone} {{ border-color: var("))
-        );
+        assert!(sheet.contains(&format!(".cr-pill-{tone} {{ border-color: var(")));
     }
 }
 
@@ -3181,7 +3198,8 @@ async fn a_row_has_one_link_to_its_record_and_opens_it_from_anywhere() {
     );
     assert!(page.text().contains(r#"data-row-links="true""#));
     assert!(
-        page.text()
+        stylesheet(&app, &page)
+            .await
             .contains(".cr-rows-open tbody tr:has(td a[href]) { cursor: pointer; }")
     );
     let script = page
@@ -3288,8 +3306,8 @@ async fn every_page_opens_with_one_compact_bar() {
     // On a phone only the nearest step back is kept, and the meta takes its
     // own line.
     assert!(
-        automatic
-            .text()
+        stylesheet(&app, &automatic)
+            .await
             .contains(".cr-crumbs > :nth-last-child(n+3) { display: none; }")
     );
 }
