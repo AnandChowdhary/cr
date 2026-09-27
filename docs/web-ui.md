@@ -49,6 +49,40 @@ One thing differs, and it is what keeps pages fast on a database with a long his
 To require a bearer token, see
 [Authentication and identity](http-api.md#authentication-and-identity).
 
+## Stop the server
+
+Press Ctrl-C, or send `SIGTERM` as `kill`, systemd, Docker, and Kubernetes do;
+the two are handled the same way. The server stops accepting connections,
+closes idle ones, finishes every request it has already begun, and exits with
+status 0, writing two lines to standard error:
+
+```text
+cr shutdown signal=SIGTERM state=draining detail="no longer accepting connections; waiting for in-flight requests; a second signal stops without waiting"
+cr shutdown state=stopped detail="every in-flight request finished"
+```
+
+The wait has no time limit of its own. If it is taking too long, send either
+signal again: the server stops waiting, drops the connections it was still
+answering, and exits with status 1 and
+`error: stopped before every in-flight request finished`. Under a service
+manager, its stop timeout bounds the wait from outside.
+
+Neither kind of stop interrupts a change to the database. A mutation that has
+begun runs to completion, record and audit event both, before the process
+exits, even after a second signal, whose only effect is that the client may
+never see the answer; one that has not begun never starts. If a mutation is
+itself waiting — for the audit lock another `cr` process holds, say — the exit
+waits with it. Neither stop leaves a mutation half done.
+
+Anything that ends the process without asking can interrupt a mutation
+partway: `SIGKILL`, a crash, a power cut, or `SIGHUP` from a closing terminal,
+which `cr serve` deliberately does not catch so that `nohup cr serve` keeps
+running. The write-ahead journal covers those: the next `cr` command, or the
+next `cr serve`, finishes or discards the interrupted mutation before it does
+anything else (see [the audit protocol](architecture.md#audit-protocol)).
+
+On Windows, only Ctrl-C is handled.
+
 ## Browse automatic views
 
 ![A filtered table of high-value CRM deals](screenshots/high-value-deals.jpg)

@@ -129,7 +129,8 @@ sudo ./update-cr.sh          # the latest release
   signed out, even for a public repository, so run `gh auth login` or set
   `GH_TOKEN` to a GitHub token first.
 - Restart `cr serve` afterwards. A running server keeps the binary it started
-  with until it restarts.
+  with until it restarts. `SIGTERM` or Ctrl-C
+  [stops it](web-ui.md#stop-the-server) once in-flight requests finish.
 - Because the archive names include the version, GitHub's
   `/releases/latest/download/<file>` shortcut cannot name the latest archive.
   The script asks GitHub which tag is latest instead.
