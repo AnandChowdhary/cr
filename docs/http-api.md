@@ -241,7 +241,8 @@ curl -G 'http://127.0.0.1:3000/api/v1/collections/deals/records' \
 ```
 
 A filter that does not parse is refused with `422 validation_failed` and a
-message naming the column.
+message naming the column, as is one whose parentheses and `NOT`s nest more
+than 64 levels deep.
 
 `sort` orders lists, search, and backlinks before they are paginated, with the
 keys `--sort` takes: `FIELD`, `FIELD:asc`, or `FIELD:desc`, comma-separated or
@@ -493,6 +494,14 @@ names itself by collection and ID:
   }
 }
 ```
+
+A request the transport cannot decode is refused before it reaches the
+database, in the same envelope: `400 invalid_json` for a body, `400
+invalid_query` for a query string, and `400 invalid_path` for a path segment
+that is not UTF-8 once percent-decoded. A collection, record, or view name
+the filesystem cannot store, because it is too long or holds a NUL byte, is
+`422 validation_failed`, and so is front matter nested more than 64 levels
+deep.
 
 An unexpected failure returns `500` with a fixed generic message. Every
 response, including successful ones, carries an `X-Request-Id` header that

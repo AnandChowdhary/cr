@@ -21,7 +21,8 @@
 //! list       := '[' ( value ( ',' value )* )? ']'
 //! ```
 //!
-//! `NOT` binds tighter than `AND`, which binds tighter than `OR`. Keywords are
+//! `NOT` binds tighter than `AND`, which binds tighter than `OR`, and
+//! parentheses and `NOT` nest at most 64 levels deep. Keywords are
 //! case-insensitive. A field is a dotted front matter path or one of `$id`,
 //! `$collection`, and `$path`. A quoted value is always a string; a bare word
 //! is read as a YAML scalar, exactly as `--where` reads one, so `10` is a
@@ -108,6 +109,7 @@ impl FromStr for Filter {
             tokens: &tokens,
             position: 0,
             input_length: input.chars().count(),
+            depth: 0,
         };
         let root = parser.or()?;
         if let Some(token) = parser.peek() {
@@ -318,10 +320,20 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
+/// How deeply parentheses and `NOT` may nest.
+///
+/// The parser recurses once per level, and a filter of a thousand `(` used to
+/// overflow the stack, which aborts the process rather than failing the
+/// request: one query string could stop `cr serve`. No filter a person writes
+/// comes near this.
+const MAX_FILTER_DEPTH: usize = 64;
+
 struct Parser<'a> {
     tokens: &'a [Token],
     position: usize,
     input_length: usize,
+    /// Parentheses and `NOT`s open around the current position.
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -381,10 +393,32 @@ impl Parser<'_> {
     }
 
     fn not(&mut self) -> Result<Node> {
+        let Some(token) = self.peek().cloned() else {
+            return self.primary();
+        };
         if self.keyword("not") {
-            return Ok(Node::Not(Box::new(self.not()?)));
+            return self.nested(&token, |parser| Ok(Node::Not(Box::new(parser.not()?))));
         }
         self.primary()
+    }
+
+    /// Parse one more level of nesting, opened by `token`, or refuse it past
+    /// [`MAX_FILTER_DEPTH`].
+    fn nested(
+        &mut self,
+        token: &Token,
+        parse: impl FnOnce(&mut Self) -> Result<Node>,
+    ) -> Result<Node> {
+        if self.depth == MAX_FILTER_DEPTH {
+            return Err(self.error_at(
+                token,
+                format!("parentheses and NOT nest more than {MAX_FILTER_DEPTH} levels deep"),
+            ));
+        }
+        self.depth += 1;
+        let node = parse(self);
+        self.depth -= 1;
+        node
     }
 
     fn primary(&mut self) -> Result<Node> {
@@ -393,7 +427,7 @@ impl Parser<'_> {
         };
         match token.kind.clone() {
             TokenKind::Open => {
-                let node = self.or()?;
+                let node = self.nested(&token, Self::or)?;
                 match self.next() {
                     Some(Token {
                         kind: TokenKind::Close,
@@ -639,7 +673,7 @@ mod tests {
 
     use yaml_serde::Mapping;
 
-    use super::Filter;
+    use super::{Filter, MAX_FILTER_DEPTH};
     use crate::database::Record;
 
     fn record(front_matter: &str) -> Record {
@@ -743,6 +777,25 @@ mod tests {
         assert!(matches("stage IN [open] And value Is Not Null", DEAL));
         assert!(matches(r#"quote = "say \"hi\"""#, "quote: say \"hi\"\n"));
         assert!(matches(r"quote = 'it\'s'", "quote: it's\n"));
+    }
+
+    #[test]
+    fn nesting_is_bounded_where_it_would_exhaust_the_stack() {
+        let parenthesized =
+            |depth: usize| format!("{}stage = open{}", "(".repeat(depth), ")".repeat(depth));
+        assert!(matches(&parenthesized(MAX_FILTER_DEPTH), DEAL));
+        assert!(matches(
+            &format!("{}stage = open", "NOT NOT ".repeat(MAX_FILTER_DEPTH / 2)),
+            DEAL
+        ));
+        assert_eq!(
+            error(&parenthesized(MAX_FILTER_DEPTH + 1)),
+            "parentheses and NOT nest more than 64 levels deep at column 65"
+        );
+        assert_eq!(
+            error(&format!("({}a = 1)", "NOT ".repeat(MAX_FILTER_DEPTH))),
+            "parentheses and NOT nest more than 64 levels deep at column 254"
+        );
     }
 
     #[test]

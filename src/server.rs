@@ -20,8 +20,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path, RawForm, RawQuery, State, rejection::JsonRejection},
-    http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header},
+    extract::{
+        DefaultBodyLimit, FromRequestParts, Path, RawForm, RawQuery, State,
+        rejection::JsonRejection,
+    },
+    http::{
+        HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header, request::Parts,
+    },
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
@@ -2554,7 +2559,7 @@ const UNBOOSTED: &str = "false";
 /// The content type is per asset, because they are scripts, stylesheets and an
 /// image. The cache lifetime is shared and never has to move into the match,
 /// because every name here is derived from the bytes it names.
-async fn static_asset(Path(file): Path<String>) -> Response {
+async fn static_asset(Segments(file): Segments<String>) -> Response {
     const JAVASCRIPT: &str = "text/javascript; charset=utf-8";
     const CSS: &str = "text/css; charset=utf-8";
     let (content, content_type) = match file.as_str() {
@@ -3713,7 +3718,7 @@ fn browse_change_error(error: anyhow::Error) -> ApiError {
 async fn view_records(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(view_name): Path<String>,
+    Segments(view_name): Segments<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let result: ApiResult<Markup> = async {
@@ -3843,7 +3848,7 @@ async fn view_records(
 async fn save_view_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(view_name): Path<String>,
+    Segments(view_name): Segments<String>,
     RawForm(raw): RawForm,
 ) -> Response {
     // As on the record form, a body that is not the form this server rendered
@@ -4085,7 +4090,7 @@ fn saved_view(database: &Database, name: &str) -> Result<ViewDefinition> {
 async fn edit_view_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(view_name): Path<String>,
+    Segments(view_name): Segments<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let result: ApiResult<Markup> = async {
@@ -4115,7 +4120,7 @@ async fn edit_view_form(
 async fn update_view_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(view_name): Path<String>,
+    Segments(view_name): Segments<String>,
     RawForm(raw): RawForm,
 ) -> Response {
     let form: HtmlViewEditForm = match parse_html_form(&raw) {
@@ -4213,7 +4218,7 @@ async fn reject_view_edit(
 async fn confirm_delete_view(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(view_name): Path<String>,
+    Segments(view_name): Segments<String>,
 ) -> Response {
     let result: ApiResult<Markup> = async {
         let (view, navigation) = run_database(&state, &headers, move |database| {
@@ -4236,7 +4241,7 @@ async fn confirm_delete_view(
 async fn delete_view_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(view_name): Path<String>,
+    Segments(view_name): Segments<String>,
     RawForm(raw): RawForm,
 ) -> Response {
     let result: ApiResult<Response> = async {
@@ -4262,7 +4267,7 @@ async fn delete_view_form(
 async fn new_record_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(view_name): Path<String>,
+    Segments(view_name): Segments<String>,
 ) -> Response {
     let result: ApiResult<Markup> = async {
         let requested_view = view_name.clone();
@@ -4321,7 +4326,7 @@ struct RecordPageQuery {
 async fn edit_record_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((view_name, id)): Path<(String, String)>,
+    Segments((view_name, id)): Segments<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let result: ApiResult<Markup> = async {
@@ -4379,7 +4384,7 @@ async fn edit_record_form(
 async fn create_record_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(view_name): Path<String>,
+    Segments(view_name): Segments<String>,
     RawForm(raw): RawForm,
 ) -> Response {
     // A body that is not the form this server rendered — a field it never emits,
@@ -4445,7 +4450,7 @@ fn taken_record_id(error: ApiError) -> ApiError {
 async fn update_record_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((view_name, id)): Path<(String, String)>,
+    Segments((view_name, id)): Segments<(String, String)>,
     RawForm(raw): RawForm,
 ) -> Response {
     let form = match parse_document_form(&raw) {
@@ -4687,7 +4692,7 @@ async fn reject_record_form(
 async fn link_record_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((view_name, id)): Path<(String, String)>,
+    Segments((view_name, id)): Segments<(String, String)>,
     RawForm(raw): RawForm,
 ) -> Response {
     change_relation_form(
@@ -4704,7 +4709,7 @@ async fn link_record_form(
 async fn unlink_record_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((view_name, id)): Path<(String, String)>,
+    Segments((view_name, id)): Segments<(String, String)>,
     RawForm(raw): RawForm,
 ) -> Response {
     change_relation_form(
@@ -4805,7 +4810,7 @@ async fn change_relation_form(
 async fn move_kanban_card(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((view_name, id)): Path<(String, String)>,
+    Segments((view_name, id)): Segments<(String, String)>,
     RawForm(raw): RawForm,
 ) -> Response {
     let result: ApiResult<Response> = async {
@@ -4882,7 +4887,7 @@ async fn move_kanban_card(
 async fn confirm_delete_record(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((view_name, id)): Path<(String, String)>,
+    Segments((view_name, id)): Segments<(String, String)>,
 ) -> Response {
     let result: ApiResult<Markup> = async {
         let requested_view = view_name.clone();
@@ -4922,7 +4927,7 @@ async fn confirm_delete_record(
 async fn delete_record_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((view_name, id)): Path<(String, String)>,
+    Segments((view_name, id)): Segments<(String, String)>,
     RawForm(raw): RawForm,
 ) -> Response {
     let result: ApiResult<Response> = async {
@@ -4973,7 +4978,7 @@ async fn collections(
 async fn get_schema(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(collection): Path<String>,
+    Segments(collection): Segments<String>,
 ) -> ApiResult<Json<JsonValue>> {
     let schema = run_database(&state, &headers, move |database| {
         database.schema(&collection)?.ok_or_else(|| {
@@ -4988,7 +4993,7 @@ async fn get_schema(
 async fn put_schema(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(collection): Path<String>,
+    Segments(collection): Segments<String>,
     RawQuery(raw): RawQuery,
     payload: std::result::Result<Json<JsonValue>, JsonRejection>,
 ) -> ApiResult<Json<SchemaReview>> {
@@ -5008,7 +5013,7 @@ async fn put_schema(
 async fn delete_schema(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(collection): Path<String>,
+    Segments(collection): Segments<String>,
 ) -> ApiResult<Json<JsonValue>> {
     let removed = run_database(&state, &headers, move |database| {
         database.remove_schema(&collection)
@@ -5020,7 +5025,7 @@ async fn delete_schema(
 async fn list_records(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(collection): Path<String>,
+    Segments(collection): Segments<String>,
     RawQuery(raw): RawQuery,
 ) -> ApiResult<Response> {
     let query: ListQuery = parse_query(raw)?;
@@ -5050,7 +5055,7 @@ async fn list_records(
 async fn count_records(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(collection): Path<String>,
+    Segments(collection): Segments<String>,
     RawQuery(raw): RawQuery,
 ) -> ApiResult<Json<JsonValue>> {
     let query: CountQuery = parse_query(raw)?;
@@ -5082,7 +5087,7 @@ async fn count_records(
 async fn get_record(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((collection, id)): Path<(String, String)>,
+    Segments((collection, id)): Segments<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> ApiResult<Response> {
     let query: GetRecordQuery = parse_query(raw)?;
@@ -5106,7 +5111,7 @@ async fn get_record(
 async fn get_document(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((collection, id)): Path<(String, String)>,
+    Segments((collection, id)): Segments<(String, String)>,
 ) -> ApiResult<Response> {
     let (document, version) = run_database(&state, &headers, move |database| {
         database.read_raw_versioned(&collection, &id)
@@ -5126,7 +5131,7 @@ async fn get_document(
 async fn get_field(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((collection, id, field)): Path<(String, String, String)>,
+    Segments((collection, id, field)): Segments<(String, String, String)>,
 ) -> ApiResult<Json<JsonValue>> {
     let value = run_database(&state, &headers, move |database| {
         let record = database.get(&collection, &id)?;
@@ -5145,7 +5150,7 @@ async fn get_field(
 async fn create_record(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(collection): Path<String>,
+    Segments(collection): Segments<String>,
     RawQuery(raw): RawQuery,
     payload: std::result::Result<Json<CreateRecordRequest>, JsonRejection>,
 ) -> ApiResult<Response> {
@@ -5188,7 +5193,7 @@ async fn create_record(
 async fn patch_record(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((collection, id)): Path<(String, String)>,
+    Segments((collection, id)): Segments<(String, String)>,
     RawQuery(raw): RawQuery,
     payload: std::result::Result<Json<PatchRecordRequest>, JsonRejection>,
 ) -> ApiResult<Response> {
@@ -5226,7 +5231,7 @@ async fn patch_record(
 async fn replace_record(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((collection, id)): Path<(String, String)>,
+    Segments((collection, id)): Segments<(String, String)>,
     RawQuery(raw): RawQuery,
     payload: std::result::Result<Json<ReplaceRecordRequest>, JsonRejection>,
 ) -> ApiResult<Response> {
@@ -5262,7 +5267,7 @@ async fn replace_record(
 async fn delete_record(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((collection, id)): Path<(String, String)>,
+    Segments((collection, id)): Segments<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> ApiResult<Response> {
     let query: PreviewQuery = parse_query(raw)?;
@@ -5288,7 +5293,7 @@ async fn delete_record(
 async fn link_record(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((collection, id)): Path<(String, String)>,
+    Segments((collection, id)): Segments<(String, String)>,
     RawQuery(raw): RawQuery,
     payload: std::result::Result<Json<LinkRequest>, JsonRejection>,
 ) -> ApiResult<Response> {
@@ -5327,7 +5332,7 @@ async fn link_record(
 async fn list_backlinks(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((collection, id)): Path<(String, String)>,
+    Segments((collection, id)): Segments<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> ApiResult<Response> {
     let query: BacklinkQuery = parse_query(raw)?;
@@ -5374,7 +5379,7 @@ async fn list_backlinks(
 async fn traverse_record(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((collection, id)): Path<(String, String)>,
+    Segments((collection, id)): Segments<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> ApiResult<Json<JsonValue>> {
     let query: TraverseQuery = parse_query(raw)?;
@@ -5397,7 +5402,7 @@ async fn traverse_record(
 async fn unlink_record(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((collection, id, relation, target_collection, target_id)): Path<(
+    Segments((collection, id, relation, target_collection, target_id)): Segments<(
         String,
         String,
         String,
@@ -15610,6 +15615,35 @@ fn json_payload<T>(payload: std::result::Result<Json<T>, JsonRejection>) -> ApiR
             ApiError::bad_request("invalid_json", error.body_text())
         }
     })
+}
+
+/// `Path`, answering a segment it cannot decode — invalid UTF-8 once
+/// percent-decoded — with the error envelope rather than axum's plain-text
+/// rejection, as [`json_payload`] does for a body and [`parse_query`] for a
+/// query string.
+#[derive(Debug)]
+struct Segments<T>(T);
+
+impl<T, S> FromRequestParts<S> for Segments<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> ApiResult<Self> {
+        match Path::<T>::from_request_parts(parts, state).await {
+            Ok(Path(value)) => Ok(Self(value)),
+            Err(rejection) if rejection.status().is_server_error() => {
+                Err(ApiError::internal(anyhow!(rejection.body_text())))
+            }
+            Err(rejection) => Err(ApiError::new(
+                rejection.status(),
+                "invalid_path",
+                rejection.body_text(),
+            )),
+        }
+    }
 }
 
 fn parse_query<T: DeserializeOwned>(raw: Option<String>) -> ApiResult<T> {

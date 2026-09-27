@@ -216,7 +216,7 @@ cr list deals --filter '$id starts-with acme AND tags contains enterprise'
 ```
 
 `NOT` binds tighter than `AND`, and `AND` tighter than `OR`; keywords are
-case-insensitive. A field is a dotted front matter path or `$id`,
+case-insensitive, and parentheses and `NOT` nest at most 64 levels deep. A field is a dotted front matter path or `$id`,
 `$collection`, or `$path`. The tests are:
 
 | Test | Matches when the field |
@@ -257,12 +257,12 @@ cr list deals --sort 'stage,value:desc,owner.name' --json
 ```
 
 Records are ordered by the first key, records that tie on it by the second,
-and so on. Within a key, numbers compare numerically and strings
-lexicographically, so normalized ISO dates and times sort in time order, and
-values of different types keep a fixed type order. A record without the field
-comes after every record with it, in either direction. Records that tie on
-every key are ordered by collection and then record ID, ascending, so the same
-sort gives the same order every time.
+and so on. Within a key, numbers compare numerically, with `.nan` after every
+other number, and strings lexicographically, so normalized ISO dates and times
+sort in time order, and values of different types keep a fixed type order. A
+record without the field comes after every record with it, in either
+direction. Records that tie on every key are ordered by collection and then
+record ID, ascending, so the same sort gives the same order every time.
 
 `--desc` is the one-key spelling: `--sort value --desc` is
 `--sort value:desc`. With several keys, or with a key that already has a

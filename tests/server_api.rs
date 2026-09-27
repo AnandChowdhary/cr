@@ -1,3 +1,5 @@
+mod common;
+
 use std::{fs, process::Command};
 
 use axum::{
@@ -1200,7 +1202,8 @@ async fn openapi_authentication_and_http_errors_are_structured() {
     assert_eq!(openapi.status, StatusCode::OK);
     let openapi = openapi.json();
     assert_eq!(openapi["openapi"], "3.1.1");
-    assert_local_schema_references_resolve(&openapi, &openapi);
+    common::openapi::assert_references_resolve(&openapi);
+    common::openapi::assert_operations_are_unambiguous(&openapi);
     assert_eq!(
         openapi["components"]["schemas"]["RecordSummary"]["properties"]["version"]["pattern"],
         "^sha256:[0-9a-f]{64}$"
@@ -1381,30 +1384,6 @@ async fn openapi_authentication_and_http_errors_are_structured() {
     let wrong_method = request(&app, Method::POST, "/health", None, &[]).await;
     assert_eq!(wrong_method.status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(wrong_method.json()["error"]["code"], "method_not_allowed");
-}
-
-fn assert_local_schema_references_resolve(root: &Value, value: &Value) {
-    match value {
-        Value::Object(object) => {
-            if let Some(reference) = object.get("$ref").and_then(Value::as_str)
-                && let Some(component) = reference.strip_prefix("#/components/schemas/")
-            {
-                assert!(
-                    root["components"]["schemas"].get(component).is_some(),
-                    "unresolved OpenAPI schema reference: {reference}"
-                );
-            }
-            for value in object.values() {
-                assert_local_schema_references_resolve(root, value);
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                assert_local_schema_references_resolve(root, value);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// One request that must produce one public status and error code: a label for

@@ -107,7 +107,11 @@ pub(crate) fn create_directory_all(root: &Path, relative: &Path, label: &str) ->
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => {
-                        return Err(anyhow!(error).context(format!("could not create {label}")));
+                        return Err(io_failure(
+                            error,
+                            label,
+                            format!("could not create {label}"),
+                        ));
                     }
                 }
                 directory
@@ -132,7 +136,11 @@ pub(crate) fn entry_kind(root: &Path, relative: &Path, label: &str) -> Result<Op
     match directory.child_kind(name) {
         Ok(kind) => Ok(Some(kind)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(anyhow!(error).context(format!("could not inspect {label}"))),
+        Err(error) => Err(io_failure(
+            error,
+            label,
+            format!("could not inspect {label}"),
+        )),
     }
 }
 
@@ -240,7 +248,7 @@ pub(crate) fn write_new(root: &Path, relative: &Path, contents: &[u8], label: &s
     let (temporary, _staged) = staged_file(&directory, contents, label)?;
     let result = directory
         .link_child(&temporary, name)
-        .map_err(|error| anyhow!(error).context(format!("could not create {label}")));
+        .map_err(|error| io_failure(error, label, format!("could not create {label}")));
     let _ = directory.unlink_child(&temporary);
     result?;
     directory
@@ -292,11 +300,17 @@ pub(crate) fn remove_file(root: &Path, relative: &Path, label: &str) -> Result<(
                 &directory.path().join(name),
             ));
         }
-        Err(error) => return Err(anyhow!(error).context(format!("could not inspect {label}"))),
+        Err(error) => {
+            return Err(io_failure(
+                error,
+                label,
+                format!("could not inspect {label}"),
+            ));
+        }
     }
     directory
         .unlink_child(name)
-        .map_err(|error| anyhow!(error).context(format!("could not delete {label}")))?;
+        .map_err(|error| io_failure(error, label, format!("could not delete {label}")))?;
     directory
         .sync()
         .with_context(|| format!("could not sync the directory holding {label}"))
@@ -464,6 +478,23 @@ fn refuse_not_regular(label: &str) -> anyhow::Error {
     )))
 }
 
+/// Keep an operating-system failure on the entry `label` names under
+/// `context`, classifying a name the filesystem cannot store at all — one
+/// longer than a directory entry may be, or holding a NUL byte — as invalid
+/// input. No entry can have such a name, so asking for one is the caller's
+/// mistake rather than a failure of the database, and `cr serve` used to answer
+/// it with `500`.
+fn io_failure(error: io::Error, label: &str, context: String) -> anyhow::Error {
+    let unstorable = error.kind() == io::ErrorKind::InvalidFilename;
+    let error = anyhow!(error).context(context);
+    if unstorable {
+        return error.context(DomainError::Invalid(format!(
+            "{label} has a name the filesystem cannot store, because it is too long or holds a NUL byte"
+        )));
+    }
+    error
+}
+
 /// Attach where a refusal happened without letting it reach a caller.
 fn located(error: anyhow::Error, location: &Path) -> anyhow::Error {
     let Some(domain) = DomainError::of(&error).cloned() else {
@@ -484,7 +515,11 @@ fn directory_failure(
     match parent.child_kind(name) {
         Ok(EntryKind::Symlink) => located(refuse_symlink(label), &location),
         Ok(EntryKind::File | EntryKind::Other) => located(refuse_not_directory(label), &location),
-        _ => anyhow!(error).context(format!("could not read {label} at {}", location.display())),
+        _ => io_failure(
+            error,
+            label,
+            format!("could not read {label} at {}", location.display()),
+        ),
     }
 }
 
@@ -495,7 +530,11 @@ fn file_failure(parent: &Directory, name: &OsStr, error: io::Error, label: &str)
         Ok(EntryKind::Directory | EntryKind::Other) => {
             located(refuse_not_regular(label), &location)
         }
-        _ => anyhow!(error).context(format!("could not read {label} at {}", location.display())),
+        _ => io_failure(
+            error,
+            label,
+            format!("could not read {label} at {}", location.display()),
+        ),
     }
 }
 
@@ -506,7 +545,11 @@ fn lock_failure(parent: &Directory, name: &OsStr, error: io::Error, label: &str)
         Ok(EntryKind::Directory | EntryKind::Other) => {
             located(refuse_not_regular(label), &location)
         }
-        _ => anyhow!(error).context(format!("could not open {label} at {}", location.display())),
+        _ => io_failure(
+            error,
+            label,
+            format!("could not open {label} at {}", location.display()),
+        ),
     }
 }
 
@@ -549,8 +592,12 @@ mod unix {
     const PRIVATE_MODE: libc::mode_t = 0o600;
 
     fn terminated(name: &OsStr) -> io::Result<CString> {
-        CString::new(name.as_bytes())
-            .map_err(|_| io::Error::other("a database path cannot contain a NUL byte"))
+        CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidFilename,
+                "a database path cannot contain a NUL byte",
+            )
+        })
     }
 
     fn checked(result: libc::c_int) -> io::Result<libc::c_int> {

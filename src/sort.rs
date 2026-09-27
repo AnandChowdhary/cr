@@ -9,9 +9,10 @@
 //! total and a page boundary never depends on the order records were read in.
 //!
 //! Within a key, values compare with [`compare_yaml_values`] — numbers
-//! numerically, strings lexicographically, other types by a stable rank — and a
-//! record without the field sorts after every record with it in either
-//! direction, so reversing a key never floats the gaps to the top.
+//! numerically with NaN after every other number, strings lexicographically,
+//! other types by a stable rank — and a record without the field sorts after
+//! every record with it in either direction, so reversing a key never floats
+//! the gaps to the top.
 //!
 //! The written form of a key is `FIELD`, `FIELD:asc`, or `FIELD:desc`. It is
 //! the same text on the command line, in a query string, and in a saved view,
