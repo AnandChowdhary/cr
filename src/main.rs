@@ -6,7 +6,7 @@ use std::{
     str::FromStr,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cr::{
     AccessAction, AccessResource, AgentEvidence, Aggregation, Assignment, AttributionOverrides,
@@ -1477,6 +1477,34 @@ enum AuditCommand {
 /// make a missing database look like a clean bill of health with findings.
 const FOUND_PROBLEMS: u8 = 2;
 
+/// Exit status for a command line `cr` refuses to run, the status clap exits
+/// with for the mistakes it catches while parsing.
+const BAD_USAGE: u8 = 2;
+
+/// A command line clap accepted that `cr` still refuses to run: an argument
+/// check clap cannot express, such as the confirmation a destructive command
+/// requires or an option the command cannot honour.
+///
+/// It is the mistake clap reports, caught later, so it is reported the same
+/// way: `usage_error` under `--json-errors`, and exit status [`BAD_USAGE`].
+/// It is deliberately not a [`DomainError`]. Those are shared with HTTP, and a
+/// request has no command line to get wrong.
+#[derive(Debug)]
+struct UsageError(String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+/// Refuse the command line; see [`UsageError`].
+fn usage_error(message: impl Into<String>) -> anyhow::Error {
+    UsageError(message.into()).into()
+}
+
 fn main() -> ExitCode {
     let requested_json_errors = std::env::args_os().any(|argument| argument == "--json-errors");
     let cli = match Cli::try_parse() {
@@ -1509,19 +1537,21 @@ fn main() -> ExitCode {
     let json_errors = cli.json_errors;
     match run(cli) {
         Ok(code) => code,
-        Err(error) => {
-            print_command_error(&error, json_errors);
-            ExitCode::FAILURE
-        }
+        Err(error) => print_command_error(&error, json_errors),
     }
 }
 
-fn print_command_error(error: &anyhow::Error, json: bool) {
+/// Report a command that failed, and return the status to exit with.
+fn print_command_error(error: &anyhow::Error, json: bool) -> ExitCode {
+    let usage = error.downcast_ref::<UsageError>();
     if json {
-        let (code, message) = cr::DomainError::of(error).map_or_else(
-            || ("internal_error", format!("{error:#}")),
-            |domain| (domain.code(), domain.message().to_owned()),
-        );
+        let (code, message) = match usage {
+            Some(usage) => ("usage_error", usage.to_string()),
+            None => cr::DomainError::of(error).map_or_else(
+                || ("internal_error", format!("{error:#}")),
+                |domain| (domain.code(), domain.message().to_owned()),
+            ),
+        };
         eprintln!(
             "{}",
             serde_json::json!({
@@ -1534,15 +1564,24 @@ fn print_command_error(error: &anyhow::Error, json: bool) {
     } else {
         eprintln!("error: {error:#}");
     }
+    if usage.is_some() {
+        ExitCode::from(BAD_USAGE)
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
     if cli.as_principal.is_some() && matches!(&cli.command, Command::Serve { .. }) {
-        bail!("--as cannot be used to launch the long-lived server");
+        return Err(usage_error(
+            "--as cannot be used to launch the long-lived server",
+        ));
     }
     if let Command::Init { path } = cli.command {
         if cli.as_principal.is_some() {
-            bail!("--as cannot be used while initializing a database");
+            return Err(usage_error(
+                "--as cannot be used while initializing a database",
+            ));
         }
         let path = cli.database.unwrap_or(path);
         let database = Database::init(path)?;
@@ -1616,9 +1655,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             } else if json {
                 println!("{}", serde_json::to_string_pretty(&record)?);
             } else if let Some(path) = field {
-                let value = record
-                    .field(&path)?
-                    .ok_or_else(|| anyhow::anyhow!("field '{path}' does not exist"))?;
+                let value = record.field(&path)?.ok_or_else(|| {
+                    DomainError::NotFound(format!("field '{path}' does not exist"))
+                })?;
                 if raw {
                     let yaml_serde::Value::String(value) = value else {
                         return Err(DomainError::Invalid(format!(
@@ -2259,11 +2298,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 json,
             } => {
                 if !yes {
-                    return Err(DomainError::Invalid(
-                        "deleting a user requires --yes to confirm the destructive operation"
-                            .to_owned(),
-                    )
-                    .into());
+                    return Err(usage_error(
+                        "deleting a user requires --yes to confirm the destructive operation",
+                    ));
                 }
                 let record = database.delete_user(&id, UserDeleteOptions { if_unused })?;
                 if json {
@@ -2366,10 +2403,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     default_visibility: DefaultVisibilityArg::Private,
                 } => {
                     let AccessResource::Collection { collection } = resource else {
-                        return Err(DomainError::Invalid(
-                            "record-owned access policy requires collection:NAME".to_owned(),
-                        )
-                        .into());
+                        return Err(usage_error(
+                            "record-owned access policy requires collection:NAME",
+                        ));
                     };
                     let changed = database.set_record_access_policy(
                         &collection,
@@ -2488,7 +2524,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         } => {
             append_environment_assignments(&mut assignments, &environment_assignments)?;
             if assignments.is_empty() && unset.is_empty() && body.is_none() {
-                bail!("provide at least one --set, --set-env, --unset, or --body value");
+                return Err(usage_error(
+                    "provide at least one --set, --set-env, --unset, or --body value",
+                ));
             }
             let database = retryable(
                 attributed(database, &attribution, message.as_deref())?,
@@ -2725,7 +2763,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 print_preview(&preview, json)?;
             } else {
                 if !yes {
-                    bail!("deleting a record requires --yes to confirm the destructive operation");
+                    return Err(usage_error(
+                        "deleting a record requires --yes to confirm the destructive operation",
+                    ));
                 }
                 let record =
                     database.delete_conditionally(&collection, &id, precondition.as_ref())?;
@@ -2746,7 +2786,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 json,
             } => {
                 if limit == 0 {
-                    bail!("audit log limit must be greater than zero");
+                    return Err(usage_error("audit log limit must be greater than zero"));
                 }
                 let entries = database.audit_recent(
                     limit,
@@ -2994,11 +3034,10 @@ fn append_environment_assignments(
             .iter()
             .any(|assignment| assignment.path() == resolved.path())
         {
-            return Err(DomainError::Invalid(format!(
+            return Err(usage_error(format!(
                 "field '{}' is assigned more than once across --set and --set-env",
                 environment.field
-            ))
-            .into());
+            )));
         }
         assignments.push(resolved);
     }

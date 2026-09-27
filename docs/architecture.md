@@ -793,8 +793,13 @@ response carries the generic message. Opening and initializing a database and
 every sync failure a caller can act on are classified too, although only the
 CLI reaches them today. By default the CLI keeps printing the
 complete chain; global `--json-errors` instead emits the same stable domain code
-and authored message in a JSON envelope, uses `usage_error` for command-line
-parsing failures, and reserves `internal_error` for unclassified failures.
+and authored message in a JSON envelope, uses `usage_error` for a command line
+`cr` will not run, and reserves `internal_error` for unclassified failures. A
+usage error is either one clap refuses while parsing or an argument check clap
+cannot express—a missing `--yes`, an option the command cannot honour—which
+`main.rs` raises as its own `UsageError` rather than a `DomainError`, since a
+request has no command line to get wrong. Both exit with status 2, where every
+other failure exits 1.
 Transport-level problems the domain layer never sees—authentication, routing,
 body decoding, and body limits—keep their own codes.
 

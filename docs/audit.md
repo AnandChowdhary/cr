@@ -243,6 +243,8 @@ cr check --fail-on never              # report without ever failing
 | `2`  | Ran successfully; found problems at or above the threshold. |
 | `1`  | Could not run at all — no database, an unknown `--collection`, unreadable configuration. |
 
+A command line `cr` cannot parse, such as one with a misspelled option, exits `2` as well, as it does for every command. It prints no findings, and under `--json-errors` its stderr carries the `usage_error` code. A `--fail-on` value that is not a threshold is `1`, like an unknown `--collection`.
+
 That split is the point in CI and cron: a typo in a scheduled job must never look like a clean bill of health. The default threshold is `error`, so an ordinary unsaved edit does not fail the build.
 
 `check` never writes. It cannot repair anything, and there is no `--fix`: a dangling link might want the relation removed, the target restored, or a delete policy applied, and only you know which.

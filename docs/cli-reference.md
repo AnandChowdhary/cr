@@ -5,10 +5,21 @@ Global `--verify-audit` makes the command verify the audit journal from its
 first event instead of resuming the walk the last write saved under
 `.cr/cache/`; see [Reads, writes, and the saved walk](audit.md#reads-writes-and-the-saved-walk).
 Global `--json-errors` writes failures to stderr as
-`{"error":{"code":"...","message":"..."}}`; command-line syntax failures use
-`usage_error`, classified domain failures retain their stable code, and an
-unclassified failure uses `internal_error`. The codes a scheduled sync can fail
-with are listed in [Run on a schedule](sync.md#run-on-a-schedule).
+`{"error":{"code":"...","message":"..."}}`. A command line `cr` will not run
+uses `usage_error`, whether parsing refused it or a check parsing cannot
+express did: `--as` with `init` or `serve`, an `update` with nothing to change,
+a `delete` or `user delete` without `--yes`, `audit log --limit 0`, a
+record-owned `access policy set` on anything but `collection:NAME`, or one
+field given to both `--set` and `--set-env`. A value parsing takes as text and
+the database then refuses — a field path, a `--select` list, a record hash, a
+`--fail-on` threshold — is `validation_failed` instead, as every value the
+database refuses is. Classified domain failures retain their stable code, and
+an unclassified failure uses `internal_error`. The codes a scheduled sync can
+fail with are listed in [Run on a schedule](sync.md#run-on-a-schedule).
+
+A failed command exits 1, except a usage error, which exits 2 with or without
+`--json-errors`. `check` and `schema check` also exit 2 when they ran and found
+problems; their findings go to stdout, and a usage error only to stderr.
 
 ```text
 cr [--database PATH] [--actor IDENTITY] [--as PRINCIPAL] [--verify-audit] [--json-errors] COMMAND
