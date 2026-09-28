@@ -727,7 +727,7 @@ sort:
 - value:desc
 ```
 
-Every table and Kanban page also has a **Save as view** control. It creates a new definition from the current applied filters, all/any match mode, currently visible columns, layout, and sorting. The source view's mandatory predicates are copied, and the current browser filter becomes a separate `filter_groups` entry, so saving an **any** query preserves its Boolean meaning instead of flattening it into AND:
+Every table and Kanban page also has a **Save as view** control. It creates a new definition from the current applied filters, all/any match mode, currently visible columns, layout, and sorting. The form says which sort it will save, such as “Sort: Updated descending”, and keeps that line current as you re-sort, since a column heading shows only the first key; a sort left at **None** is saved as record ID order, the order on screen, rather than the newest-first default. The source view's mandatory predicates are copied, and the current browser filter becomes a separate `filter_groups` entry, so saving an **any** query preserves its Boolean meaning instead of flattening it into AND:
 
 ```yaml
 filter_groups:

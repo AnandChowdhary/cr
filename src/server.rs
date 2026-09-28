@@ -4336,7 +4336,12 @@ async fn save_view_form(
             &form.filter_operator,
             &form.filter_value,
         )?;
-        let sort = submitted_sort(&form.sort_field, &form.sort_direction);
+        let mut sort = submitted_sort(&form.sort_field, &form.sort_direction);
+        // The panel's "None" is record ID order, and a view saved with no sort
+        // would open on the default instead, so it is saved as what it is.
+        if sort.is_empty() && !form.sort_field.is_empty() {
+            sort.push(SortKey::new("$id", SortDirection::Asc));
+        }
         let requested_view = view_name.clone();
         // Two layers of refusal: the outer one is reading the source view, and
         // the inner one is a refusal of what was submitted, classified where it
@@ -4487,6 +4492,7 @@ async fn reject_save_view_form(
         &Representation::requested(headers),
         &view,
         &view_available_columns(&view, &records, schema.as_ref()),
+        schema.as_ref(),
         &request_csrf_token(state),
         &rejection,
         &navigation,
@@ -8991,7 +8997,7 @@ fn render_view_records(
                 (view_record_count(page.total, OutOfBand::Yes))
                 (view_filter_summary(active_filter_count, OutOfBand::Yes))
                 @if can_manage_views {
-                    (view_save_state(query, columns, OutOfBand::Yes))
+                    (view_save_state(query, columns, schema, OutOfBand::Yes))
                     @if view.saved {
                         (view_edit_link(view, query, page.limit, OutOfBand::Yes))
                     }
@@ -9150,6 +9156,7 @@ fn render_view_records(
                             query,
                             columns,
                             available_columns,
+                            schema,
                             csrf_token,
                         ))
                     }
@@ -10081,15 +10088,16 @@ fn render_save_view_control(
     query: &ViewQuery,
     columns: &[String],
     available_columns: &[String],
+    schema: Option<&JsonValue>,
     csrf_token: &str,
 ) -> Markup {
     html! {
-        details class="relative" {
+        details class="relative" data-save-view-disclosure="true" {
             summary class="cr-button cursor-pointer list-none" {
                 "Save as view"
             }
-            div class="cr-popover absolute right-0 z-20 mt-2 w-80 p-4" {
-                (render_save_view_form(view, query, columns, available_columns, csrf_token, None))
+            div class="cr-popover cr-save-view-popover absolute right-0 z-20 mt-2" {
+                (render_save_view_form(view, query, columns, available_columns, schema, csrf_token, None))
             }
         }
     }
@@ -10111,6 +10119,7 @@ fn render_save_view_form(
     query: &ViewQuery,
     columns: &[String],
     available_columns: &[String],
+    schema: Option<&JsonValue>,
     csrf_token: &str,
     rejection: Option<&SaveViewRejection>,
 ) -> Markup {
@@ -10132,53 +10141,60 @@ fn render_save_view_form(
     let group_by_diagnostics = form_diagnostics(rejection, GROUP_BY_CONTROL);
     html! {
         form id=(SAVE_VIEW_FORM_REGION) method="post" action=(action)
-            hx-target="this" hx-swap="outerHTML" hx-disabled-elt="find button[type=submit]" class="cr-save-view space-y-3" {
+            hx-target="this" hx-swap="outerHTML" hx-disabled-elt="find button[type=submit]" class="cr-save-view" {
             input type="hidden" name="_csrf" value=(csrf_token);
-            (view_save_state(query, columns, OutOfBand::No))
-            div {
-                h2 class="text-sm font-bold text-gray-900" { "Save current view" }
-                p class="mt-1 text-xs leading-5 text-gray-500" { "Preserves applied filters, all/any matching, layout, columns, and sorting. Search text remains shareable in the URL." }
-            }
-            @if let Some(rejection) = rejection {
-                (rejected_form_alert(
-                    "This view was not saved.",
-                    &rejection.error,
-                    "Nothing was written. The values below are exactly what you submitted.",
-                ))
-            }
-            // The two controls a refusal can be about are labelled by `for`
-            // rather than by wrapping, because the reason goes between the
-            // label and the control and a list cannot go inside a `<label>`.
-            div {
-                label for="cr-save-view-name" class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "View name" }
-                (render_field_diagnostics(name_diagnostics))
-                input id="cr-save-view-name" required name="name" value=[submitted.map(|submitted| submitted.name.as_str())] placeholder="enterprise-deals" autocomplete="off" aria-invalid=[(!name_diagnostics.is_empty()).then_some("true")] class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
-            }
-            label class="block" {
-                span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Title (optional)" }
-                input name="title" value=[submitted.map(|submitted| submitted.title.as_str())] placeholder=(format!("{} copy", view.title)) autocomplete="off" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2";
-            }
-            div class="grid gap-3 sm:grid-cols-2" {
-                label class="block" {
-                    span class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Layout" }
-                    select name="layout" aria-label="Layout" data-view-layout="true" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2" {
-                        option value="table" selected[layout == ViewLayout::Table] { "Table" }
-                        option value="kanban" selected[layout == ViewLayout::Kanban] { "Kanban" }
-                    }
-                }
+            div class="cr-save-view-body" {
                 div {
-                    label for="cr-save-view-group-by" class="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-500" { "Group Kanban by" }
-                    (render_field_diagnostics(group_by_diagnostics))
-                    select id="cr-save-view-group-by" name="group_by" aria-label="Group Kanban by" data-view-group-by="true" aria-invalid=[(!group_by_diagnostics.is_empty()).then_some("true")] class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-400" {
-                        option value="" selected[group_by.is_none_or(str::is_empty)] { "Choose a field…" }
-                        @for column in available_columns.iter().map(String::as_str).chain(unlisted_group_by) {
-                            option value=(column) selected[group_by == Some(column)] { (humanize_field_name(column)) }
+                    h2 class="cr-save-view-heading" { "Save current view" }
+                    p class="cr-field-help" { "Preserves applied filters, all/any matching, layout, columns, and sorting. Search text remains shareable in the URL." }
+                }
+                (view_save_state(query, columns, schema, OutOfBand::No))
+                @if let Some(rejection) = rejection {
+                    (rejected_form_alert(
+                        "This view was not saved.",
+                        &rejection.error,
+                        "Nothing was written. The values below are exactly what you submitted.",
+                    ))
+                }
+                // The two controls a refusal can be about are labelled by `for`
+                // rather than by wrapping, because the reason goes between the
+                // label and the control and a list cannot go inside a `<label>`.
+                div class=(if name_diagnostics.is_empty() { "cr-field" } else { "cr-field cr-field-invalid" }) {
+                    label for="cr-save-view-name" class="cr-field-label" { "View name" span class="cr-required" aria-hidden="true" { "*" } }
+                    (render_field_diagnostics(name_diagnostics))
+                    input id="cr-save-view-name" required name="name" value=[submitted.map(|submitted| submitted.name.as_str())] placeholder="enterprise-deals" autocomplete="off" aria-invalid=[(!name_diagnostics.is_empty()).then_some("true")] class="cr-input";
+                }
+                div class="cr-field" {
+                    div class="cr-field-head" {
+                        label for="cr-save-view-title" class="cr-field-label" { "Title" }
+                        span class="cr-field-hint" { "Optional" }
+                    }
+                    input id="cr-save-view-title" name="title" value=[submitted.map(|submitted| submitted.title.as_str())] placeholder=(format!("{} copy", view.title)) autocomplete="off" class="cr-input";
+                }
+                div class="cr-save-view-grid" {
+                    label class="cr-field" {
+                        span class="cr-field-label" { "Layout" }
+                        select name="layout" aria-label="Layout" data-view-layout="true" class="cr-input" {
+                            option value="table" selected[layout == ViewLayout::Table] { "Table" }
+                            option value="kanban" selected[layout == ViewLayout::Kanban] { "Kanban" }
                         }
                     }
+                    div class=(if group_by_diagnostics.is_empty() { "cr-field" } else { "cr-field cr-field-invalid" }) {
+                        label for="cr-save-view-group-by" class="cr-field-label" { "Group Kanban by" }
+                        (render_field_diagnostics(group_by_diagnostics))
+                        select id="cr-save-view-group-by" name="group_by" aria-label="Group Kanban by" data-view-group-by="true" aria-invalid=[(!group_by_diagnostics.is_empty()).then_some("true")] class="cr-input" {
+                            option value="" selected[group_by.is_none_or(str::is_empty)] { "Choose a field…" }
+                            @for column in available_columns.iter().map(String::as_str).chain(unlisted_group_by) {
+                                option value=(column) selected[group_by == Some(column)] { (field_label(schema, column)) }
+                            }
+                        }
+                    }
+                    p class="cr-field-help cr-field-wide" { "Kanban uses the chosen front matter field as lanes; moving a card updates that field through the audited database path." }
                 }
             }
-            p class="text-xs leading-5 text-gray-500" { "Kanban uses the chosen front matter field as lanes; moving a card updates that field through the audited database path." }
-            button type="submit" class="cr-button cr-button-primary w-full" { "Save view" }
+            div class="cr-save-view-footer" {
+                button type="submit" class="cr-button cr-button-primary" { "Save view" }
+            }
         }
     }
 }
@@ -10197,6 +10213,7 @@ fn render_refused_save_view(
     representation: &Representation,
     view: &ViewDefinition,
     available_columns: &[String],
+    schema: Option<&JsonValue>,
     csrf_token: &str,
     rejection: &SaveViewRejection,
     navigation: &[ViewDefinition],
@@ -10224,6 +10241,7 @@ fn render_refused_save_view(
         &query,
         &submitted.column,
         available_columns,
+        schema,
         csrf_token,
         Some(rejection),
     );
@@ -10260,7 +10278,7 @@ fn render_refused_save_view(
                 },
             ))
             // The popover's width, which is what the form is laid out for.
-            div class="cr-popover mx-auto max-w-80 p-4" {
+            div class="cr-popover cr-save-view-popover mx-auto" {
                 (form)
             }
         },
@@ -10270,10 +10288,22 @@ fn render_refused_save_view(
 }
 
 /// The page's current filters, sort and columns as the hidden inputs of "Save
-/// as view", in the element a results swap patches; see `VIEW_SAVE_STATE_ID`.
-fn view_save_state(query: &ViewQuery, columns: &[String], out_of_band: OutOfBand) -> Markup {
+/// as view", and the sort they save in words, in the element a results swap
+/// patches; see `VIEW_SAVE_STATE_ID`.
+fn view_save_state(
+    query: &ViewQuery,
+    columns: &[String],
+    schema: Option<&JsonValue>,
+    out_of_band: OutOfBand,
+) -> Markup {
     html! {
-        div id=(VIEW_SAVE_STATE_ID) hidden hx-swap-oob=[out_of_band.attribute()] {
+        div id=(VIEW_SAVE_STATE_ID) hx-swap-oob=[out_of_band.attribute()] {
+            // Said because it is not seen anywhere else: a column heading
+            // shows only the first key, and the filter panel is closed.
+            p class="cr-save-view-sort" {
+                span { "Sort: " }
+                (saved_sort_summary(query, schema))
+            }
             input type="hidden" name="filter_match" value=(match query.filter_match { ViewFilterMatch::All => "all", ViewFilterMatch::Any => "any" });
             // Every row, rather than the pairs a zip would keep. A page only
             // ever has pairs, but a refused save is rendered back from what was
@@ -10305,6 +10335,33 @@ fn view_save_state(query: &ViewQuery, columns: &[String], out_of_band: OutOfBand
             }
         }
     }
+}
+
+/// The sort "Save as view" writes, as "Updated descending, then Name
+/// ascending": the panel's "None" is saved as record ID order, and a query
+/// naming no sort leaves the new view on the default.
+fn saved_sort_summary(query: &ViewQuery, schema: Option<&JsonValue>) -> String {
+    let keys = match query.requested_sort() {
+        None => vec![SortKey::new(DEFAULT_VIEW_SORT_FIELD, SortDirection::Desc)],
+        Some(keys) if keys.is_empty() => return "Record ID".to_owned(),
+        Some(keys) => keys,
+    };
+    keys.iter()
+        .map(|key| {
+            let label = match key.field.as_str() {
+                "$created_at" => "Created".to_owned(),
+                "$updated_at" => "Updated".to_owned(),
+                "$id" => "Record ID".to_owned(),
+                field => field_label(schema, field),
+            };
+            let direction = match key.direction {
+                SortDirection::Asc => "ascending",
+                SortDirection::Desc => "descending",
+            };
+            format!("{label} {direction}")
+        })
+        .collect::<Vec<_>>()
+        .join(", then ")
 }
 
 /// "Edit view" on a saved view, linking to its editor with the page's query,
@@ -13736,7 +13793,8 @@ const VIEW_COUNT_ID: &str = "cr-view-count";
 const VIEW_FILTER_SUMMARY_ID: &str = "cr-view-filter-summary";
 
 /// The DOM id of the hidden inputs inside "Save as view" that carry the page's
-/// current filters, sort and columns into the new definition.
+/// current filters, sort and columns into the new definition, beside the
+/// sentence saying which sort that is.
 ///
 /// A passenger of every results swap for the reason the filter summary is: an
 /// apply, a re-sort or a column change alters what the page shows while

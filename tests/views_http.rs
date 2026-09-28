@@ -488,9 +488,14 @@ async fn automatic_and_saved_views_render_safe_filterable_paginated_tables() {
     )
     .await;
     assert_eq!(cleared_sort.status, StatusCode::SEE_OTHER);
+    // The panel's "None" is record ID order, which a view with no sort would
+    // not open in, so it is saved as that.
     let unsorted = database.view("open-deals-unsorted").unwrap();
     assert_eq!(unsorted.filters, ["status=open"]);
-    assert!(unsorted.sort.is_empty());
+    assert_eq!(
+        unsorted.sort,
+        [cr::SortKey::new("$id", cr::SortDirection::Asc)]
+    );
 
     let invalid_csrf = request(
         &app,
@@ -4601,6 +4606,10 @@ async fn a_view_sorted_by_several_keys_renders_pages_swaps_and_saves_them() {
         r#"<input type="hidden" name="sort_field" value="stage"><input type="hidden" name="sort_direction" value="asc">"#,
         r#"<input type="hidden" name="sort_field" value="value"><input type="hidden" name="sort_direction" value="desc">"#,
     )));
+    assert!(
+        save_state.contains("Sort: </span>Stage ascending, then Value descending</p>"),
+        "{save_state}"
+    );
     let token = csrf(page.text()).to_owned();
     let saved = request(
         &app,
@@ -5704,6 +5713,63 @@ async fn a_refused_save_keeps_every_sort_key_and_the_corrected_one_writes_them()
     assert!(
         stored.contains("sort:\n- status\n- value:desc\n- name\n"),
         "{stored}"
+    );
+}
+
+/// "Save as view" says which sort it saves, following a re-sort, and the
+/// panel's "None" is saved as the record ID order it shows rather than
+/// leaving the new view to open on the default.
+#[tokio::test]
+async fn a_save_says_which_sort_it_saves_and_saves_none_as_record_id_order() {
+    let (_temporary, database) = save_view_database("save-view-sort-summary");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let sentence = |html: &str| {
+        save_view_state(html)
+            .split_once("Sort: </span>")
+            .unwrap_or_else(|| panic!("no sort sentence in:\n{html}"))
+            .1
+            .split_once("</p>")
+            .unwrap()
+            .0
+            .to_owned()
+    };
+
+    let page = request(&app, Method::GET, "/deals", None, &[]).await;
+    assert_eq!(sentence(page.text()), "Created descending");
+    let swapped = request(
+        &app,
+        Method::GET,
+        "/deals?filter_match=all&sort_field=%24updated_at&sort_direction=desc",
+        None,
+        &[
+            ("hx-request", "true"),
+            ("hx-boosted", "true"),
+            ("hx-target", "cr-view-table"),
+        ],
+    )
+    .await;
+    assert_eq!(sentence(swapped.text()), "Updated descending");
+
+    let unsorted = request(&app, Method::GET, "/deals?sort_field=", None, &[]).await;
+    assert_eq!(sentence(unsorted.text()), "Record ID");
+    let token = csrf(unsorted.text()).to_owned();
+    let saved = request(
+        &app,
+        Method::POST,
+        "/deals/save-view",
+        Some(form(&[
+            ("_csrf", &token),
+            ("name", "by-id"),
+            ("filter_match", "all"),
+            ("sort_field", ""),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        database.view("by-id").unwrap().sort,
+        [cr::SortKey::new("$id", cr::SortDirection::Asc)]
     );
 }
 

@@ -1390,9 +1390,8 @@ a.cr-field-open:hover { color: var(--cr-accent); }
    control itself is marked `aria-invalid`. */
 .cr-field-invalid .cr-field-label { color: var(--cr-danger); }
 .cr-app .cr-field .cr-input[aria-invalid=true] { border-color: var(--cr-danger); background-color: var(--cr-invalid-soft); }
-/* "Save as view" builds its controls from utilities rather than `cr-input`, so
-   the control a refused save is about is marked here, the same way. */
-.cr-app .cr-save-view :is(input, select)[aria-invalid=true] { border-color: var(--cr-danger); background-color: var(--cr-invalid-soft); }
+/* A control the form has switched off, such as Kanban grouping on a table. */
+.cr-app :is(input, select, textarea).cr-input:disabled { border-color: var(--cr-gray-200); background-color: var(--cr-gray-50); color: var(--cr-gray-400); cursor: not-allowed; }
 
 .cr-form-more { margin-top: 18px; }
 .cr-form-more summary { width: fit-content; cursor: pointer; color: var(--cr-gray-600); font-size: 0.75rem; font-weight: 600; }
@@ -1562,6 +1561,28 @@ a.cr-field-open:hover { color: var(--cr-accent); }
   border-top: 1px solid var(--cr-gray-200);
   padding: 12px 16px;
 }
+
+/* "Save as view": the record form's fields at the filter panel's size, with
+   its one action in the same footer. */
+.cr-save-view-popover { width: min(22rem, calc(100vw - 32px)); }
+[data-save-view-disclosure][open] > summary { border-color: var(--cr-gray-400); background: var(--cr-gray-100); color: var(--cr-gray-900); }
+.cr-save-view-body { display: flex; flex-direction: column; gap: 14px; padding: 16px; }
+.cr-save-view-heading { margin-bottom: 4px; color: var(--cr-gray-900); font-size: 0.8rem; font-weight: 650; }
+.cr-save-view .cr-form-alert { margin-bottom: 0; padding: 10px 12px; font-size: 0.78rem; }
+.cr-save-view .cr-input { min-height: 32px; padding: 5px 9px; font-size: 0.8rem; }
+.cr-save-view-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+.cr-save-view-sort {
+  border: 1px solid var(--cr-gray-200);
+  border-radius: 7px;
+  background: var(--cr-gray-50);
+  color: var(--cr-gray-900);
+  padding: 6px 10px;
+  font-size: 0.75rem;
+  font-weight: 550;
+  line-height: 1.45;
+}
+.cr-save-view-sort > span { color: var(--cr-gray-500); font-weight: 600; }
+.cr-save-view-footer { display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--cr-gray-200); padding: 12px 16px; }
 
 .cr-record-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; align-items: start; gap: 32px; }
 .cr-record-activity { position: sticky; top: 20px; min-width: 0; max-height: calc(100vh - 40px); overflow-y: auto; padding: 2px; scrollbar-width: thin; }
