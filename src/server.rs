@@ -8438,6 +8438,8 @@ fn render_audit_entries(entries: &[AuditEntry], people: &BTreeMap<String, String
 
 /// An event's changes, each with the value before and after it. `narrow` is
 /// for a sidebar, where before and after are stacked rather than side by side.
+/// A string that spans lines, a record's notes most often, is shown as a diff
+/// instead: two full copies of a long text hide the one line that changed.
 fn render_audit_changes(changes: &[AuditChange], narrow: bool) -> Markup {
     html! {
         div class=(if narrow { "mt-2 space-y-2" } else { "mt-3 space-y-3" }) {
@@ -8447,17 +8449,23 @@ fn render_audit_changes(changes: &[AuditChange], narrow: bool) -> Markup {
                         span class="rounded bg-gray-200 px-2 py-0.5 text-xs font-bold uppercase text-gray-700" { (audit_change_operation(change)) }
                         code class="text-xs text-gray-700" { (audit_change_path(change)) }
                     }
-                    div class=(if narrow { "mt-2 grid gap-2" } else { "mt-3 grid gap-3 lg:grid-cols-2" }) {
-                        @if let Some(before) = audit_change_before(change) {
-                            div {
-                                p class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500" { "Before" }
-                                pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-red-100 bg-red-50 p-3 text-xs leading-5 text-red-950" { (json_preview(before)) }
-                            }
+                    @if let Some((before, after)) = audit_change_text(change) {
+                        div class=(if narrow { "cr-diff mt-2" } else { "cr-diff mt-3" }) {
+                            (render_text_diff(before, after))
                         }
-                        @if let Some(after) = audit_change_after(change) {
-                            div {
-                                p class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500" { "After" }
-                                pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-xs leading-5 text-emerald-950" { (json_preview(after)) }
+                    } @else {
+                        div class=(if narrow { "mt-2 grid gap-2" } else { "mt-3 grid gap-3 lg:grid-cols-2" }) {
+                            @if let Some(before) = audit_change_before(change) {
+                                div {
+                                    p class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500" { "Before" }
+                                    pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-red-100 bg-red-50 p-3 text-xs leading-5 text-red-950" { (json_preview(before)) }
+                                }
+                            }
+                            @if let Some(after) = audit_change_after(change) {
+                                div {
+                                    p class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500" { "After" }
+                                    pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-xs leading-5 text-emerald-950" { (json_preview(after)) }
+                                }
                             }
                         }
                     }
@@ -8465,6 +8473,222 @@ fn render_audit_changes(changes: &[AuditChange], narrow: bool) -> Markup {
             }
         }
     }
+}
+
+/// How much of a text diff a page shows, in characters of its lines and in
+/// lines. A rewrite of a long document is otherwise as long as the document,
+/// on every page that lists the event.
+const TEXT_DIFF_PREVIEW_CHARS: usize = 8_000;
+const TEXT_DIFF_PREVIEW_LINES: usize = 200;
+
+/// The most words and separators a removed line and its replacement may have
+/// between them for the words that changed to be marked. Longer pairs are
+/// still shown, only as whole lines.
+const MAX_WORD_DIFF_TOKENS: usize = 2_000;
+
+/// A line of a text diff as a page shows it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffLine {
+    Hunk,
+    Context,
+    Removed,
+    Added,
+}
+
+/// The two sides of a change that replaced one string with another where
+/// either spans lines. Only a replacement has two sides to compare, and a
+/// single line reads fine as before and after.
+fn audit_change_text(change: &AuditChange) -> Option<(&str, &str)> {
+    let AuditChange::Replace { before, after, .. } = change else {
+        return None;
+    };
+    let (before, after) = (before.as_str()?, after.as_str()?);
+    (before.contains('\n') || after.contains('\n')).then_some((before, after))
+}
+
+/// `before` to `after` as a unified diff, the same one `cr` audits a bundle's
+/// text files with: hunk headers, then context, removed and added lines, with
+/// the words that changed marked where a removed line is followed by the line
+/// that replaced it. Past [`TEXT_DIFF_PREVIEW_CHARS`] or
+/// [`TEXT_DIFF_PREVIEW_LINES`] the rest is elided.
+fn render_text_diff(before: &str, after: &str) -> Markup {
+    let diff = crate::bundle::diff_text(before, after);
+    let mut lines: Vec<(DiffLine, &str)> = Vec::new();
+    let mut budget = TEXT_DIFF_PREVIEW_CHARS;
+    let mut elided = false;
+    for line in diff.lines() {
+        if lines.len() == TEXT_DIFF_PREVIEW_LINES {
+            elided = true;
+            break;
+        }
+        // A missing final newline is a change no one can see on a page, so
+        // its marker, the one line starting with a backslash, is left out.
+        let (kind, text) = match line.as_bytes().first() {
+            Some(b'@') => (DiffLine::Hunk, line),
+            Some(b' ') => (DiffLine::Context, &line[1..]),
+            Some(b'-') => (DiffLine::Removed, &line[1..]),
+            Some(b'+') => (DiffLine::Added, &line[1..]),
+            _ => continue,
+        };
+        match text.char_indices().nth(budget) {
+            Some((cut, _)) => {
+                lines.push((kind, &text[..cut]));
+                elided = true;
+                break;
+            }
+            None => {
+                budget -= text.chars().count();
+                lines.push((kind, text));
+            }
+        }
+    }
+
+    let mut spans: Vec<MarkedRuns<'_>> =
+        lines.iter().map(|(_, text)| vec![(false, *text)]).collect();
+    let mut index = 0;
+    while index < lines.len() {
+        let removed = lines[index..]
+            .iter()
+            .take_while(|(kind, _)| *kind == DiffLine::Removed)
+            .count();
+        let added = lines[index + removed..]
+            .iter()
+            .take_while(|(kind, _)| *kind == DiffLine::Added)
+            .count();
+        for offset in 0..removed.min(added) {
+            let (old, new) = (index + offset, index + removed + offset);
+            // A line cut short would be marked as having lost its tail.
+            if elided && new == lines.len() - 1 {
+                break;
+            }
+            if let Some((old_spans, new_spans)) = changed_words(lines[old].1, lines[new].1) {
+                spans[old] = old_spans;
+                spans[new] = new_spans;
+            }
+        }
+        index += (removed + added).max(1);
+    }
+
+    html! {
+        @for ((kind, text), spans) in lines.iter().zip(&spans) {
+            @match kind {
+                DiffLine::Hunk => div class="cr-diff-hunk" { (text) },
+                DiffLine::Context => div class="cr-diff-line" {
+                    span class="cr-diff-sign" { " " }
+                    span { (text) }
+                },
+                DiffLine::Removed => div class="cr-diff-line cr-diff-removed" {
+                    span class="cr-diff-sign" { "-" }
+                    span {
+                        @for (changed, text) in spans {
+                            @if *changed { del { (text) } } @else { (text) }
+                        }
+                    }
+                },
+                DiffLine::Added => div class="cr-diff-line cr-diff-added" {
+                    span class="cr-diff-sign" { "+" }
+                    span {
+                        @for (changed, text) in spans {
+                            @if *changed { ins { (text) } } @else { (text) }
+                        }
+                    }
+                },
+            }
+        }
+        @if elided {
+            div class="cr-diff-hunk" { "…" }
+        }
+    }
+}
+
+/// A line of a diff as runs of text, each marked by whether it changed.
+type MarkedRuns<'a> = Vec<(bool, &'a str)>;
+
+/// A removed line and the line added in its place, each as [`MarkedRuns`], or
+/// `None` when the two share too little for marking words to say more than
+/// marking the whole lines already does.
+fn changed_words<'a>(old: &'a str, new: &'a str) -> Option<(MarkedRuns<'a>, MarkedRuns<'a>)> {
+    let (old_words, new_words) = (diff_words(old), diff_words(new));
+    if old_words.len() + new_words.len() > MAX_WORD_DIFF_TOKENS {
+        return None;
+    }
+    let operations =
+        similar::capture_diff_slices(similar::Algorithm::Myers, &old_words, &new_words);
+    if similar::diff_ratio(&operations, old_words.len(), new_words.len()) < 0.5 {
+        return None;
+    }
+    let mut old_changed = vec![false; old_words.len()];
+    let mut new_changed = vec![false; new_words.len()];
+    for operation in &operations {
+        if operation.tag() != similar::DiffTag::Equal {
+            old_changed[operation.old_range()].fill(true);
+            new_changed[operation.new_range()].fill(true);
+        }
+    }
+    Some((
+        marked_runs(old, &old_words, &old_changed),
+        marked_runs(new, &new_words, &new_changed),
+    ))
+}
+
+/// A line cut where a diff of its words should be able to tell pieces apart:
+/// runs of letters and digits, runs of whitespace, and every other character
+/// on its own, so a word that gained backticks keeps the word unchanged.
+fn diff_words(line: &str) -> Vec<&str> {
+    #[derive(PartialEq)]
+    enum Class {
+        Word,
+        Space,
+        Other,
+    }
+    let class = |character: char| {
+        if character.is_alphanumeric() || character == '_' {
+            Class::Word
+        } else if character.is_whitespace() {
+            Class::Space
+        } else {
+            Class::Other
+        }
+    };
+    let mut words = Vec::new();
+    let mut start = 0;
+    let mut previous = None;
+    for (index, character) in line.char_indices() {
+        let current = class(character);
+        if index > start && (current == Class::Other || previous.as_ref() != Some(&current)) {
+            words.push(&line[start..index]);
+            start = index;
+        }
+        previous = Some(current);
+    }
+    if start < line.len() {
+        words.push(&line[start..]);
+    }
+    words
+}
+
+/// `line`, whose pieces are `words`, as runs of pieces that are all changed or
+/// all unchanged. Whitespace between two changed pieces counts as changed, so
+/// a rewritten phrase is marked as one run rather than word by word.
+fn marked_runs<'a>(line: &'a str, words: &[&str], changed: &[bool]) -> MarkedRuns<'a> {
+    let mut runs: Vec<(bool, usize, usize)> = Vec::new();
+    let mut start = 0;
+    for (index, word) in words.iter().enumerate() {
+        let end = start + word.len();
+        let marked = changed[index]
+            || (word.trim().is_empty()
+                && index > 0
+                && changed[index - 1]
+                && changed.get(index + 1).copied().unwrap_or(false));
+        match runs.last_mut() {
+            Some((last, _, last_end)) if *last == marked => *last_end = end,
+            _ => runs.push((marked, start, end)),
+        }
+        start = end;
+    }
+    runs.into_iter()
+        .map(|(marked, start, end)| (marked, &line[start..end]))
+        .collect()
 }
 
 fn view_filter_fields(schema: Option<&JsonValue>, columns: &[String]) -> Vec<ViewFilterField> {
@@ -16543,13 +16767,114 @@ fn collection_component_name(collection: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, INTERNAL_MESSAGE, ViewIndex, avatar_class, initials};
+    use super::{
+        ApiError, INTERNAL_MESSAGE, TEXT_DIFF_PREVIEW_CHARS, TEXT_DIFF_PREVIEW_LINES, ViewIndex,
+        avatar_class, initials, render_audit_changes,
+    };
     use crate::{
         Database, DomainError,
-        audit::{reset_verify_chain_calls, verify_chain_calls},
+        audit::{AuditChange, reset_verify_chain_calls, verify_chain_calls},
     };
     use anyhow::anyhow;
     use axum::http::StatusCode;
+    use serde_json::json;
+
+    fn replaced(before: &str, after: &str) -> String {
+        render_audit_changes(
+            &[AuditChange::Replace {
+                path: "/body".to_owned(),
+                before: json!(before),
+                after: json!(after),
+            }],
+            true,
+        )
+        .into_string()
+    }
+
+    /// Notes that changed in one paragraph show that paragraph, the lines
+    /// around it and the words that changed, not two copies of the notes.
+    #[test]
+    fn a_change_to_text_that_spans_lines_is_shown_as_a_diff() {
+        let before = "# Title\n\none\ntwo\nthree\nCheck `drafts` for a draft before creating another.\nfour\nfive\nsix\nseven\n";
+        let after =
+            "# Title\n\none\ntwo\nthree\nCheck drafts for a draft.\nfour\nfive\nsix\nseven\n";
+        let html = replaced(before, after);
+
+        assert!(html.contains(r#"<div class="cr-diff mt-2">"#), "{html}");
+        assert!(
+            html.contains(r#"<div class="cr-diff-hunk">@@ -3,7 +3,7 @@</div>"#),
+            "{html}"
+        );
+        assert!(html.contains(
+            r#"<div class="cr-diff-line cr-diff-removed"><span class="cr-diff-sign">-</span><span>Check <del>`</del>drafts<del>`</del> for a draft<del> before creating another</del>.</span></div>"#
+        ), "{html}");
+        assert!(html.contains(
+            r#"<div class="cr-diff-line cr-diff-added"><span class="cr-diff-sign">+</span><span>Check drafts for a draft.</span></div>"#
+        ), "{html}");
+        // Three lines of context either side, and nothing further away.
+        assert!(html.contains(r#"<span class="cr-diff-sign"> </span><span>three</span>"#));
+        assert!(html.contains(r#"<span class="cr-diff-sign"> </span><span>six</span>"#));
+        assert!(!html.contains("Title") && !html.contains("seven"), "{html}");
+        assert!(
+            !html.contains("Before") && !html.contains("After"),
+            "{html}"
+        );
+    }
+
+    /// Lines that share almost nothing are shown whole rather than as a
+    /// scatter of marked words.
+    #[test]
+    fn a_rewritten_line_is_not_marked_word_by_word() {
+        let html = replaced("alpha beta gamma\nkept\n", "one two three\nkept\n");
+        assert!(html.contains("<span>alpha beta gamma</span>"), "{html}");
+        assert!(html.contains("<span>one two three</span>"), "{html}");
+        assert!(!html.contains("<del>") && !html.contains("<ins>"), "{html}");
+    }
+
+    /// A single line reads fine as before and after, and so does anything
+    /// that is not a string on both sides.
+    #[test]
+    fn a_change_to_a_single_line_keeps_before_and_after() {
+        let html = replaced("open", "won");
+        assert!(html.contains("Before") && html.contains("After"), "{html}");
+        assert!(!html.contains("cr-diff"), "{html}");
+
+        let html = render_audit_changes(
+            &[AuditChange::Replace {
+                path: "/attributes/notes".to_owned(),
+                before: json!(null),
+                after: json!("one\ntwo"),
+            }],
+            true,
+        )
+        .into_string();
+        assert!(!html.contains("cr-diff"), "{html}");
+    }
+
+    /// A rewrite of a long document is cut short rather than repeated whole
+    /// on every page that lists it, whether its lines are many or long.
+    #[test]
+    fn a_long_text_diff_is_elided() {
+        let html = replaced(&"old\n".repeat(1_000), &"new\n".repeat(1_000));
+        assert!(html.ends_with(r#"<div class="cr-diff-hunk">…</div></div></div></div>"#));
+        // The lines, the hunk header among them, and then the ellipsis.
+        assert_eq!(
+            html.matches(r#"<div class="cr-diff-"#).count(),
+            TEXT_DIFF_PREVIEW_LINES + 1,
+            "{html}"
+        );
+
+        let html = replaced(
+            &"old ".repeat(5_000),
+            &format!("{}\n", "new ".repeat(5_000)),
+        );
+        assert!(html.ends_with(r#"<div class="cr-diff-hunk">…</div></div></div></div>"#));
+        assert!(
+            html.len() < TEXT_DIFF_PREVIEW_CHARS + 1_000,
+            "{}",
+            html.len()
+        );
+    }
 
     #[test]
     fn a_person_is_shown_by_the_initials_of_their_first_and_last_names() {

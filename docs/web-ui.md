@@ -592,11 +592,11 @@ The built-in `users` collection keeps its fixed name.
 
 ## Browse audit history
 
-Open [http://127.0.0.1:3000/audit](http://127.0.0.1:3000/audit) for the global audit journal, newest first. Filter it by collection and record ID, page through older events, and expand an event to inspect its add/remove/replace operations with before and after values.
+Open [http://127.0.0.1:3000/audit](http://127.0.0.1:3000/audit) for the global audit journal, newest first. Filter it by collection and record ID, page through older events, and expand an event to inspect its add/remove/replace operations with before and after values. A replaced string that spans lines, such as a record's notes, is shown as a unified diff instead: the changed lines with three lines of context either side, and the words that changed within a line marked.
 
 People are shown the same way everywhere, as a small avatar of their initials beside their name, with a colour picked from their principal ID so that one person looks the same on every page: the actor of every event and anybody who impersonated them, with the recorded `Name <email>` in the tooltip; an event that changed a user's own record, which names the user rather than `users/<id>`; the users page; and the console's perspective banner.
 
-Every existing record page shows its newest activity beside the form as a short timeline: what happened and which fields it touched, who did it and through which agent, when, any save message, and the before and after values under **Show changes**. Hashes, sources, sessions, authorization, and intent are left to the audit log; **All activity** opens `/audit` with that collection and ID already selected. Historical values are escaped before rendering and long values are preview-limited in the page; the complete event remains available from the JSON API and CLI.
+Every existing record page shows its newest activity beside the form as a short timeline: what happened and which fields it touched, who did it and through which agent, when, any save message, and the before and after values under **Show changes**, or a diff of the lines that changed for notes and other multiline text. Hashes, sources, sessions, authorization, and intent are left to the audit log; **All activity** opens `/audit` with that collection and ID already selected. Historical values are escaped before rendering and long values are preview-limited in the page; the complete event remains available from the JSON API and CLI.
 
 On wide screens, record fields and their newest activity share a two-column
 workspace so policy and provenance stay visible while editing. At smaller
