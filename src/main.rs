@@ -654,6 +654,18 @@ enum Command {
         /// front of this server.
         #[arg(long, value_name = "TAG", requires = "cloudflare_access")]
         cloudflare_access_aud: Option<String>,
+
+        /// Let this user, once signed in by a principal token or Cloudflare
+        /// Access, use the file browser and its pins. Repeat for more users.
+        ///
+        /// Everything else follows the user's grants, so each must be an
+        /// active owner of the database; the server refuses to start
+        /// otherwise, and stops offering the file browser to one whose
+        /// ownership is revoked while it runs. The file browser reads and
+        /// writes any file the server's account can, so a superadmin's
+        /// sign-in is worth as much as that account.
+        #[arg(long, value_name = "USER_ID")]
+        superadmin: Vec<String>,
     },
 
     /// Create and inspect saved web views.
@@ -2086,6 +2098,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             require_token,
             cloudflare_access,
             cloudflare_access_aud,
+            superadmin,
         } => {
             let api_token = std::env::var("CR_API_TOKEN")
                 .ok()
@@ -2126,6 +2139,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 api_token,
                 require_token,
                 cloudflare_access,
+                superadmins: superadmin,
             };
             // Dropped, not `shutdown_timeout`: dropping waits for every
             // database operation already running on the blocking pool, which

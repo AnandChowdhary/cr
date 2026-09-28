@@ -1033,6 +1033,34 @@ async fn each_signed_in_person_has_their_own_form_token_and_no_console() {
     assert!(database.get("deals", "acme").is_err());
 }
 
+/// A person the server names with `--superadmin` who signs in as a database
+/// owner is offered the server's files, which no other sign-in is.
+#[tokio::test]
+async fn a_signed_in_superadmin_is_offered_the_file_browser() {
+    let (_temporary, database) = seeded_database("cloudflare-superadmin");
+    let team = Signer::team();
+    let keys = KeyServer::start(&[&team]);
+    let config = ServerConfig {
+        superadmins: vec!["owner@example.com".to_owned()],
+        ..signed_in(keys.access())
+    };
+    let app = router(database.clone(), config).unwrap();
+    let owner = team.assertion("owner@example.com");
+    let editor = team.assertion(EDITOR);
+
+    let home = get(&app, "/", &[(ASSERTION, &owner)]).await;
+    assert!(home.text().contains("href=\"/browse\""), "{}", home.text());
+    // Still a person signed in, with nobody else to be.
+    assert!(!home.text().contains("action=\"/perspective\""));
+    let browse = get(&app, "/browse", &[(ASSERTION, &owner)]).await;
+    assert_eq!(browse.status, StatusCode::OK, "{}", browse.text());
+
+    let home = get(&app, "/", &[(ASSERTION, &editor)]).await;
+    assert!(!home.text().contains("href=\"/browse\""));
+    let browse = get(&app, "/browse", &[(ASSERTION, &editor)]).await;
+    assert_eq!(browse.status, StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn a_signed_in_person_sees_who_they_are_and_can_sign_out() {
     let (_temporary, database) = seeded_database("cloudflare-account");

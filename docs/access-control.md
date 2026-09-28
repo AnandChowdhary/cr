@@ -249,9 +249,10 @@ Every request except `/health`, `/ready`, and `/static` must then present a
 principal token, `CR_API_TOKEN` is refused, and there is no perspective
 switcher, so the server no longer has to be launched by an owner and may bind
 beyond loopback.
-The file browser is never available to a token, even an owner's: it reads and
+The file browser is not available to a token, even an owner's: it reads and
 writes files outside the database, and a secret that travels should not be
-able to rewrite the host. `cr serve` does not terminate TLS, so put it behind a
+able to rewrite the host, unless the server was started naming its principal
+with [`--superadmin`](#give-superadmins-the-file-browser). `cr serve` does not terminate TLS, so put it behind a
 proxy that does before tokens cross a network.
 
 ## Sign people in through Cloudflare Access
@@ -321,7 +322,8 @@ that can reach the server's port can send them, so they are ignored. Otherwise
 the server behaves as `--require-token` does: every request except `/health`,
 `/ready`, and `/static` must sign in, there is no owner console or perspective
 switcher, no owner has to launch it, it may bind beyond loopback, `CR_API_TOKEN`
-is refused, and the file browser is unavailable even to an owner.
+is refused, and the file browser is unavailable even to an owner who is not a
+[superadmin](#give-superadmins-the-file-browser).
 
 Principal tokens are refused under `--cloudflare-access` alone, so everybody
 comes through the organisation's login. Add `--require-token` to accept both:
@@ -346,6 +348,31 @@ Keep the server where only Cloudflare can reach it: bind it to loopback behind
 `cloudflared`, or firewall it to Cloudflare's addresses. A signed token is
 still a credential, and a listener anybody can reach lets them replay one they
 saw for as long as it lasts.
+
+## Give superadmins the file browser
+
+Signed in by a token or through Cloudflare Access, even an owner gets
+everything but the file browser and its pins, which stay with the local
+console. Name the people who should have those too when starting the server:
+
+```sh
+cr access grant ada@example.com owner database
+cr serve --cloudflare-access https://example.cloudflareaccess.com \
+  --cloudflare-access-aud "$ACCESS_AUD_TAG" \
+  --superadmin ada@example.com
+```
+
+Repeat `--superadmin` for each user ID. Everything else — the audit log, users,
+saving views, schemas, deletion — already comes from owning the database, so
+the flag adds only the file browser, and only for a superadmin who is an active
+owner: the server refuses to start otherwise, and stops offering it to one
+whose ownership is revoked while it runs. It is not a perspective switcher; a
+superadmin still acts, and is audited, as themselves.
+
+The file browser reads and writes any file the server's account can, beyond
+the database and outside its audit log. Naming a superadmin makes their
+sign-in, or their token, worth as much as that account, so name only people
+already trusted with it.
 
 ## What access control does not protect against
 

@@ -415,6 +415,98 @@ async fn require_token_serves_only_authenticated_principals() {
     assert!(!owner_home.text().contains("href=\"/browse\""));
 }
 
+/// `--superadmin` opens the file browser to the owners it names and to
+/// nobody else: not another owner, and not a named one whose ownership is
+/// revoked while the server runs.
+#[tokio::test]
+async fn a_superadmin_token_reaches_the_file_browser() {
+    const SECOND: &str = "second@example.com";
+    let (_temporary, database) = seeded_database("token-superadmin");
+    database
+        .add_user(SECOND, "Second", Some(SECOND), UserKind::Human)
+        .unwrap();
+    database
+        .grant_access(SECOND, AccessResource::Database, Role::Owner)
+        .unwrap();
+    let (owner_token, _) = issue(&database, "owner@example.com");
+    let (second_token, _) = issue(&database, SECOND);
+    let config = ServerConfig {
+        require_token: true,
+        // Named as a person would type it, and found as its principal.
+        superadmins: vec!["Second <Second@Example.com>".to_owned()],
+        ..ServerConfig::default()
+    };
+    let app = router(database.clone(), config).unwrap();
+    let get = async |path: &str, token: &str| {
+        request(
+            &app,
+            Method::GET,
+            path,
+            None,
+            &[("authorization", &bearer(token))],
+        )
+        .await
+    };
+
+    let home = get("/", &second_token).await;
+    assert!(home.text().contains("href=\"/browse\""), "{}", home.text());
+    let browse = get("/browse", &second_token).await;
+    assert_eq!(browse.status, StatusCode::OK, "{}", browse.text());
+
+    // Owning the database is not enough without the flag.
+    let home = get("/", &owner_token).await;
+    assert!(!home.text().contains("href=\"/browse\""));
+    let browse = get("/browse", &owner_token).await;
+    assert_eq!(browse.status, StatusCode::FORBIDDEN);
+
+    // Nor is the flag without owning the database, however it was lost.
+    database
+        .revoke_access(SECOND, &AccessResource::Database)
+        .unwrap();
+    let home = get("/", &second_token).await;
+    assert!(!home.text().contains("href=\"/browse\""));
+    let browse = get("/browse", &second_token).await;
+    assert_eq!(browse.status, StatusCode::FORBIDDEN);
+}
+
+/// A superadmin the server could never serve is a launch error, not a page
+/// that quietly lacks the file browser.
+#[tokio::test]
+async fn superadmins_are_refused_where_they_cannot_mean_anything() {
+    let (_temporary, database) = seeded_database("token-superadmin-refused");
+    let superadmin = |superadmin: &str, require_token: bool| ServerConfig {
+        require_token,
+        superadmins: vec![superadmin.to_owned()],
+        ..ServerConfig::default()
+    };
+
+    // The console already offers its owner everything.
+    let error = router(database.clone(), superadmin("owner@example.com", false))
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("--require-token or --cloudflare-access")
+    );
+
+    for (principal, why) in [
+        (EDITOR, "an editor"),
+        ("nobody@example.com", "unregistered"),
+    ] {
+        let error = router(database.clone(), superadmin(principal, true))
+            .err()
+            .unwrap_or_else(|| panic!("{why} was accepted"));
+        assert!(
+            error.to_string().contains(&format!(
+                "--superadmin {principal} is not an active owner of the database"
+            )),
+            "{why}: {error}"
+        );
+    }
+    assert!(router(database, superadmin("owner@example.com", true)).is_ok());
+}
+
 #[tokio::test]
 async fn only_an_authenticated_principal_is_shown_as_signed_in() {
     let (_temporary, database) = seeded_database("token-account");
