@@ -59,7 +59,6 @@ fn test_app(name: &str) -> (TempDir, Router, Database) {
             api_token: None,
             require_token: false,
             cloudflare_access: None,
-            superadmins: Vec::new(),
         },
     )
     .unwrap();
