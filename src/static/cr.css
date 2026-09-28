@@ -60,6 +60,14 @@
   --cr-avatar-7-ink: #9a3412;
   --cr-invalid-line: #fca5a5;
   --cr-invalid-soft: #fef2f2;
+  /* A text diff's removed and added lines, the words that changed within
+     them, and the +/- beside each. */
+  --cr-diff-removed-soft: #fff1f1;
+  --cr-diff-removed-strong: #fdcfcf;
+  --cr-diff-removed-ink: #b42318;
+  --cr-diff-added-soft: #edfbf2;
+  --cr-diff-added-strong: #bdeccd;
+  --cr-diff-added-ink: #067647;
 
   --cr-radius: 8px;
   --cr-emoji: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
@@ -132,6 +140,12 @@
     --cr-avatar-7-ink: #fdba74;
     --cr-invalid-line: #7a2f2f;
     --cr-invalid-soft: #2c1b1b;
+    --cr-diff-removed-soft: #2c1b1b;
+    --cr-diff-removed-strong: #5a2a2a;
+    --cr-diff-removed-ink: #f87171;
+    --cr-diff-added-soft: #15271d;
+    --cr-diff-added-strong: #1f4d33;
+    --cr-diff-added-ink: #6ee7a8;
 
     --cr-shadow-popover: 0 18px 44px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.4);
 
@@ -1580,6 +1594,30 @@ a.cr-field-open:hover { color: var(--cr-accent); }
 .cr-activity-message { margin-top: 4px; color: var(--cr-gray-700); font-size: 0.75rem; line-height: 1.45; }
 .cr-activity-changes summary { width: fit-content; margin-top: 3px; cursor: pointer; color: var(--cr-gray-500); font-size: 0.72rem; font-weight: 600; }
 .cr-activity-changes summary:hover { color: var(--cr-gray-900); }
+
+/* A change to text that spans lines, a record's notes most often, as a
+   unified diff: hunk headers, then unchanged, removed and added lines, each
+   wrapped beside its sign so a long paragraph stays readable in the sidebar. */
+.cr-diff {
+  max-height: 20rem;
+  overflow: auto;
+  border: 1px solid var(--cr-gray-200);
+  border-radius: 6px;
+  background: var(--cr-gray-0);
+  color: var(--cr-gray-700);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.7rem;
+  line-height: 1.55;
+}
+.cr-diff-hunk { padding: 1px 8px; background: var(--cr-gray-100); color: var(--cr-gray-500); }
+.cr-diff-line { display: grid; grid-template-columns: 1.5em minmax(0, 1fr); padding-right: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cr-diff-sign { text-align: center; color: var(--cr-gray-400); }
+.cr-diff-removed { background: var(--cr-diff-removed-soft); color: var(--cr-gray-900); }
+.cr-diff-removed .cr-diff-sign { color: var(--cr-diff-removed-ink); }
+.cr-diff-added { background: var(--cr-diff-added-soft); color: var(--cr-gray-900); }
+.cr-diff-added .cr-diff-sign { color: var(--cr-diff-added-ink); }
+.cr-diff del { border-radius: 2px; background: var(--cr-diff-removed-strong); text-decoration: none; }
+.cr-diff ins { border-radius: 2px; background: var(--cr-diff-added-strong); text-decoration: none; }
 
 /* The record page's relations panel, above its activity. */
 .cr-relations { margin-bottom: 28px; }
