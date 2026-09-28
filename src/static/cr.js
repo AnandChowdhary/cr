@@ -572,16 +572,19 @@ document.addEventListener('htmx:beforeSwap', (event) => {
   }
 });
 
-// A click outside an open filter panel closes it, as a click outside any
-// popover does. Closing keeps what was typed in it, so reopening shows the
-// same conditions. One listener for the document rather than one per panel,
-// because a navigation brings a new panel and this would otherwise pile up a
-// listener for every one the tab had shown. The event's path rather than its
-// target, because a row's remove button has left the document by the time the
-// click reaches this listener, and a detached node is inside nothing.
+// A click outside an open filter panel or "Save as view" closes it, as a
+// click outside any popover does. Closing keeps what was typed in it, so
+// reopening shows the same conditions. One listener for the document rather
+// than one per panel, because a navigation brings a new panel and this would
+// otherwise pile up a listener for every one the tab had shown. The event's
+// path rather than its target, because a row's remove button has left the
+// document by the time the click reaches this listener, and a detached node is
+// inside nothing.
 document.addEventListener('click', (event) => {
-  const disclosure = document.querySelector('[data-filter-disclosure][open]');
-  if (disclosure && !event.composedPath().includes(disclosure)) disclosure.open = false;
+  const path = event.composedPath();
+  document.querySelectorAll('[data-filter-disclosure][open], [data-save-view-disclosure][open]').forEach((disclosure) => {
+    if (!path.includes(disclosure)) disclosure.open = false;
+  });
 });
 
 // The unsaved-edits guard's two prompts. `htmx:confirm` fires before every
