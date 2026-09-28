@@ -1104,6 +1104,18 @@ impl Database {
         self.can_access(action, resource)
     }
 
+    /// Whether `principal` owns the database by its current policy, as it
+    /// would once a server authenticated it. `cr serve --superadmin` checks
+    /// the principals it names at launch, before any of them has signed in,
+    /// and whoever launched it need not be one of them.
+    pub(crate) fn principal_owns_database(&self, principal: &str) -> Result<bool> {
+        let mut database = self.clone();
+        database.principal = principal.to_owned();
+        database.impersonated_by = None;
+        database.authentication = None;
+        database.owner_access_allowed(&AccessResource::Database)
+    }
+
     /// Whether the current principal owns the resource, without performing an
     /// operation.
     pub fn owner_access_allowed(&self, resource: &AccessResource) -> Result<bool> {

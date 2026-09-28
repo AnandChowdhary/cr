@@ -47,7 +47,8 @@ launching owner under `access.impersonated_by`.
 A request that carries a [principal token](access-control.md#authenticate-principals-to-a-server-with-tokens)
 is not the console. Its pages are rendered for the token's principal alone:
 there is no switcher, the perspective cookie is ignored, and the file browser
-and pins are unavailable even to an owner's token. The foot of the sidebar
+and pins are unavailable even to an owner's token, unless the server names that
+owner with [`--superadmin`](access-control.md#give-superadmins-the-file-browser). The foot of the sidebar
 shows who is signed in instead: the user's initials, name, email, role, and how
 the request was authenticated. On a narrow screen the same card opens from the
 avatar at the top right.
@@ -63,8 +64,9 @@ cr serve --cloudflare-access https://example.cloudflareaccess.com \
 
 Each person then signs in with the organisation's login and sees the UI as the
 user whose email they signed in with, exactly as a principal token's pages are
-rendered: no switcher, no file browser, their own grants, and their own form
-token. Somebody whose address no active user holds is shown a page saying so.
+rendered: no switcher, no file browser unless they are a
+[superadmin](access-control.md#give-superadmins-the-file-browser), their own
+grants, and their own form token. Somebody whose address no active user holds is shown a page saying so.
 Their card at the foot of the sidebar says "via Cloudflare" and has a **Sign
 out** link to `/cdn-cgi/access/logout`, where Cloudflare ends the session on
 that host.
