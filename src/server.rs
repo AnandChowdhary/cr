@@ -132,10 +132,6 @@ pub struct ServerConfig {
     /// refused, so everybody reaches the server through the organisation's
     /// login.
     pub cloudflare_access: Option<Arc<CloudflareAccess>>,
-    /// Principals who, once a token or Cloudflare Access signs them in, get
-    /// what otherwise only the local console has: the file browser and its
-    /// pins. Each must own the database, at launch and on every request.
-    pub superadmins: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -149,7 +145,6 @@ impl Default for ServerConfig {
             api_token: None,
             require_token: false,
             cloudflare_access: None,
-            superadmins: Vec::new(),
         }
     }
 }
@@ -162,9 +157,6 @@ struct AppState {
     api_token: Option<Arc<str>>,
     require_token: bool,
     cloudflare_access: Option<Arc<CloudflareAccess>>,
-    /// The principals `--superadmin` named, canonical; see
-    /// [`ServerConfig::superadmins`].
-    superadmins: Arc<BTreeSet<String>>,
     /// The console's form token, and the key every authenticated principal's
     /// own form token is derived from; see [`request_csrf_token`].
     csrf_token: Arc<str>,
@@ -2146,26 +2138,6 @@ fn application(
     if access_controlled && console {
         database.impersonate_verified(database.principal())?;
     }
-    let superadmins = config
-        .superadmins
-        .iter()
-        .map(|superadmin| crate::principal_id(superadmin))
-        .collect::<Result<BTreeSet<_>>>()?;
-    if !superadmins.is_empty() && console {
-        bail!(
-            "--superadmin names principals who sign in, so it needs --require-token or --cloudflare-access; the local console already offers its owner everything"
-        );
-    }
-    // Checked again on every request, since a grant can be revoked while the
-    // server runs; this is so a mistyped ID or a missing grant is reported
-    // now rather than as a page that quietly lacks the file browser.
-    for superadmin in &superadmins {
-        if !database.principal_owns_database(superadmin)? {
-            bail!(
-                "--superadmin {superadmin} is not an active owner of the database; register them and run 'cr access grant {superadmin} owner database' first"
-            );
-        }
-    }
     if config.max_page_size == 0 {
         bail!("maximum page size must be greater than zero");
     }
@@ -2183,7 +2155,6 @@ fn application(
         api_token: config.api_token.map(Arc::from),
         require_token: config.require_token,
         cloudflare_access: config.cloudflare_access,
-        superadmins: Arc::new(superadmins),
         csrf_token: Arc::from(random_token()?),
         journal_warm_up,
     };
@@ -3451,15 +3422,11 @@ async fn browse_view(
 
 /// The check every file-browser route makes before it touches the filesystem:
 /// the routes exist only under RBAC, and only a database owner may use them,
-/// from the local console.
+/// from the local console or signed in by a token or Cloudflare Access.
 ///
-/// An owner authenticated by a token or by Cloudflare Access is refused even
-/// so. The browser reads and writes any file the server's account can, beyond
-/// the database, and both credentials travel: a leaked owner token, or an
-/// owner's hijacked sign-in, that could rewrite files on the host would be
-/// worth far more than the database it was issued for. The exception is an
-/// owner the server was launched naming with `--superadmin`, for whom whoever
-/// runs the server has accepted that.
+/// The browser reads and writes any file the server's account can, beyond the
+/// database and outside its audit log, so an owner's token or sign-in is worth
+/// as much as that account.
 ///
 /// Returns the database root, where browsing starts and which the editor and
 /// the delete page compare a file against, and the sidebar's views.
@@ -3474,7 +3441,6 @@ async fn authorize_file_browser(
             "route not found",
         ));
     }
-    refuse_token_file_access(state)?;
     run_database(state, headers, |database| {
         if !database.owner_access_allowed(&AccessResource::Database)? {
             return Err(
@@ -3484,28 +3450,6 @@ async fn authorize_file_browser(
         Ok((database.root().to_path_buf(), database.views()?))
     })
     .await
-}
-
-/// Keep the server's filesystem to the local console and the superadmins;
-/// see [`authorize_file_browser`] for why any other authenticated principal
-/// never reaches it.
-fn refuse_token_file_access(state: &AppState) -> ApiResult<()> {
-    if !reaches_server_files(state) {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "the file browser belongs to the local owner console and the server's --superadmin principals; an authenticated principal cannot browse server files",
-        ));
-    }
-    Ok(())
-}
-
-/// Whether this request comes from where the server's files may be reached:
-/// the local console, or a principal `--superadmin` named, signed in. Owning
-/// the database is a separate check, since the console can be viewing as
-/// somebody who does not.
-fn reaches_server_files(state: &AppState) -> bool {
-    authenticated_database().is_none_or(|database| state.superadmins.contains(database.principal()))
 }
 
 /// A text file, open for editing.
@@ -3785,7 +3729,6 @@ async fn change_pin(
                 "route not found",
             ));
         }
-        refuse_token_file_access(&state)?;
         let form: HtmlPinForm = parse_html_form(&raw)?;
         verify_csrf(&state, &form.csrf)?;
         if !FilePath::new(&form.from).is_absolute() {
@@ -16185,8 +16128,6 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
     let database = authenticated
         .clone()
         .unwrap_or_else(|| state.database.clone());
-    // Read here, on the request's own task, where its identity is published.
-    let reaches_files = reaches_server_files(state);
     tokio::task::spawn_blocking(move || {
         // The registry is the owner console's to list. An authenticated
         // principal reads its own user record, which it always may, and is
@@ -16214,8 +16155,7 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
             selected_database.owner_access_allowed(&AccessResource::Database)?;
         let can_read_users = selected_database
             .access_allowed(AccessAction::ReadAccess, &AccessResource::Database)?;
-        let can_browse_files =
-            reaches_files && selected_database.owner_access_allowed(&AccessResource::Database)?;
+        let can_browse_files = selected_database.owner_access_allowed(&AccessResource::Database)?;
         let can_save_views = selected_database.owner_access_allowed(&AccessResource::Database)?;
         let pins = if can_browse_files {
             selected_database

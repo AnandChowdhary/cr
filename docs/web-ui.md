@@ -46,9 +46,8 @@ launching owner under `access.impersonated_by`.
 
 A request that carries a [principal token](access-control.md#authenticate-principals-to-a-server-with-tokens)
 is not the console. Its pages are rendered for the token's principal alone:
-there is no switcher, the perspective cookie is ignored, and the file browser
-and pins are unavailable even to an owner's token, unless the server names that
-owner with [`--superadmin`](access-control.md#give-superadmins-the-file-browser). The foot of the sidebar
+there is no switcher and the perspective cookie is ignored, though an owner's
+token still has the file browser and pins. The foot of the sidebar
 shows who is signed in instead: the user's initials, name, email, role, and how
 the request was authenticated. On a narrow screen the same card opens from the
 avatar at the top right.
@@ -64,9 +63,8 @@ cr serve --cloudflare-access https://example.cloudflareaccess.com \
 
 Each person then signs in with the organisation's login and sees the UI as the
 user whose email they signed in with, exactly as a principal token's pages are
-rendered: no switcher, no file browser unless they are a
-[superadmin](access-control.md#give-superadmins-the-file-browser), their own
-grants, and their own form token. Somebody whose address no active user holds is shown a page saying so.
+rendered: no switcher, their own grants, which for an owner include the file
+browser, and their own form token. Somebody whose address no active user holds is shown a page saying so.
 Their card at the foot of the sidebar says "via Cloudflare" and has a **Sign
 out** link to `/cdn-cgi/access/logout`, where Cloudflare ends the session on
 that host.
@@ -445,8 +443,11 @@ file until it is fixed.
 
 **Browse can reveal every secret readable by the operating-system account that
 runs `cr serve`, including files outside the database, and change or delete any
-file that account may write.** Keep the RBAC console on its enforced loopback
-bind and do not weaken the host, reverse-proxy, or bearer-token boundary.
+file that account may write.** An owner has it at the console, through a
+principal token, and signed in through Cloudflare Access alike, so an owner's
+token or sign-in is worth as much as that account. Keep the RBAC console on its
+enforced loopback bind and do not weaken the host, reverse-proxy, or
+bearer-token boundary.
 
 ## Use schema-driven record forms
 

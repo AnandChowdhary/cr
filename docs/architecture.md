@@ -673,17 +673,13 @@ and publishes the result in a task-local beside the request context. A bearer
 value equal to `CR_API_TOKEN` is the console; one with the `crt_` prefix
 authenticates or is refused `401`, never falling through to the console,
 because a revoked token that became the launching owner would make revocation
-an escalation. The four places that choose a request's database —
-`request_database`, `ui_context`, `switch_perspective`, and the file-browser
-check — read that one answer. `--require-token` removes the console:
+an escalation. The three places that choose a request's database —
+`request_database`, `ui_context`, and `switch_perspective` — read that one
+answer. `--require-token` removes the console:
 construction refuses it without access control or beside `CR_API_TOKEN`, no
 longer requires the launcher to be an owner, and lifts the loopback rule. The
-file browser and pins stay console-only for every token, an owner's included,
-because they reach files outside the database and a token is a secret that
-travels. The one exception is an owner named with `--superadmin`, which the
-server checks is an active owner at construction and `reaches_server_files`
-checks is the signed-in principal on every request, beside the usual owner
-check.
+file browser and pins follow ownership alone, so an owner's token has them as
+the console does.
 
 ### Cloudflare Access
 

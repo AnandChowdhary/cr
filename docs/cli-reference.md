@@ -60,7 +60,6 @@ cr delete COLLECTION ID --yes [-m MESSAGE] [ATTRIBUTION]
 cr delete COLLECTION ID --preview [--json]
 cr serve [--bind ADDRESS] [--max-page-size N] [--max-body-bytes N] [--require-token]
          [--cloudflare-access TEAM_DOMAIN --cloudflare-access-aud TAG]
-         [--superadmin USER_ID]...
 
 cr collections [--json]
 cr schema show COLLECTION
