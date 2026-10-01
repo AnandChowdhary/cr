@@ -83,7 +83,7 @@ fn collection_label(collection: &str) -> String {
     format!("collection '{collection}'")
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct Config {
     version: u32,
@@ -100,7 +100,7 @@ struct Config {
     collections: BTreeMap<String, CollectionConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 struct AuditConfig {
@@ -721,10 +721,33 @@ impl Database {
     }
 
     /// Load the configuration on disk again, exactly as opening the database
-    /// would, and discard it. This process keeps the configuration it opened
-    /// with; this is whether the next one could open the database at all.
+    /// would, and discard it. A server keeps the last configuration that
+    /// loaded (see [`Self::reconfigured`]); this is whether the next process
+    /// could open the database at all.
     pub(crate) fn configuration_loads(&self) -> Result<()> {
         load_config(&self.root).map(drop)
+    }
+
+    /// This database with `.cr/config.yaml` as it is on disk now, or `None`
+    /// when that is the configuration it already holds.
+    ///
+    /// For the server, which outlives edits to the configuration. Each command
+    /// opens the database afresh and sees them; a server that kept the
+    /// configuration it opened with read a collection declared as bundles
+    /// since as an empty one. The journal cache is shared rather than
+    /// rebuilt, so how often a write walks the whole journal stays what the
+    /// process started with.
+    pub(crate) fn reconfigured(&self) -> Result<Option<Self>> {
+        let config = load_config(&self.root)?;
+        if config == self.config {
+            return Ok(None);
+        }
+        let layout = RecordLayout::from_config(&config.collections)?;
+        Ok(Some(Self {
+            config,
+            layout,
+            ..self.clone()
+        }))
     }
 
     /// The configured records directory, relative to the root.

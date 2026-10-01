@@ -421,8 +421,10 @@ collections:
     entry: SKILL.md
 ```
 
-A record is then `records/skills/<id>/SKILL.md`, and every other file in its
-folder belongs to it:
+A running `cr serve` reads the declaration on its next request, as every
+command does, so it needs no restart. A record is then
+`records/skills/<id>/SKILL.md`, and every other file in its folder belongs to
+it:
 
 ```text
 records/skills/pdf-forms/

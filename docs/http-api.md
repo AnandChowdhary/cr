@@ -494,7 +494,7 @@ its log lines are under:
 | Check | Code | Meaning, and what clears it |
 | --- | --- | --- |
 | `database` | `database_unreachable` | The root, `.cr/`, or the records directory cannot be opened, or `.cr/` or the records directory has become a symbolic link. When this fails it is the only check listed, because every other one reads beneath it. |
-| `config` | `config_invalid` | `.cr/config.yaml` no longer loads as `cr` would load it at startup: it does not parse, or names an unsupported version, an unknown key, an unsafe `data_dir`, or a zero limit. The running server keeps the configuration it started with; the next `cr` command, and the next start, would refuse. |
+| `config` | `config_invalid` | `.cr/config.yaml` no longer loads as `cr` would load it at startup: it does not parse, or names an unsupported version, an unknown key, an unsafe `data_dir`, or a zero limit. The running server keeps the last configuration that loaded; the next `cr` command, and the next start, would refuse. |
 | `audit_recovery` | `pending_mutation` | A mutation was interrupted — its process crashed or was killed — and is waiting for recovery. The next request that reads the audit journal, any `cr` command, or a restart finishes or discards it. |
 | `audit_recovery` | `audit_recovery_unreadable` | Whether one is waiting could not be determined. |
 | `sync_recovery` | `interrupted_sync_run` | A sync run stopped partway through applying its records. `cr sync recover <name> --check` describes it and `cr sync recover <name>` completes it; the log line names the sync. |

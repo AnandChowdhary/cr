@@ -299,3 +299,70 @@ async fn the_record_page_lists_supporting_files_as_downloads() {
         "{html}"
     );
 }
+
+/// A running server reads `.cr/config.yaml` for every request, as each command
+/// does, so a collection declared as bundles after it started is not read as
+/// empty. A configuration that stops loading leaves the last one that did.
+#[tokio::test]
+async fn a_running_server_follows_the_configuration_a_command_reads() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("bundles");
+    Database::init(&root).unwrap();
+    let app = router(
+        Database::discover(Some(&root)).unwrap(),
+        ServerConfig::default(),
+    )
+    .unwrap();
+
+    // Another process declares the collection and writes a record to it.
+    let config = root.join(".cr/config.yaml");
+    fs::write(
+        &config,
+        "version: 1\ncollections:\n  skills:\n    layout: bundle\n    entry: SKILL.md\n",
+    )
+    .unwrap();
+    Database::discover(Some(&root))
+        .unwrap()
+        .create("skills", "pdf", &[], "Fill PDF forms.\n")
+        .unwrap();
+    assert!(root.join("records/skills/pdf/SKILL.md").is_file());
+
+    let listed = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/skills/records",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK);
+    assert_eq!(listed.json()["pagination"]["total"], 1);
+    let read = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/skills/records/pdf",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK, "{}", read.json());
+
+    fs::write(&config, "version: 1\nsurprise: true\n").unwrap();
+    let listed = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/skills/records",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK);
+    assert_eq!(listed.json()["pagination"]["total"], 1);
+    let ready = request(&app, Method::GET, "/ready", None, &[]).await;
+    assert_eq!(ready.status, StatusCode::SERVICE_UNAVAILABLE);
+    let checks = ready.json()["checks"].as_array().unwrap().clone();
+    assert!(
+        checks.contains(&json!({ "name": "config", "ok": false, "code": "config_invalid" })),
+        "{checks:?}"
+    );
+}

@@ -333,7 +333,7 @@ async fn a_configuration_cr_cannot_load_is_not_ready() {
     // `cr init` writes no configuration, and none means the defaults.
     let config = database.root().join(".cr/config.yaml");
     assert!(!config.exists());
-    // The server keeps the configuration it started with, so it could go on
+    // The server keeps the last configuration that loaded, so it could go on
     // answering; the next `cr` command, and the next start, could not.
     for (contents, why) in [
         ("version: [\n", "not YAML"),
