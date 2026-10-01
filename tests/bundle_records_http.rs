@@ -9,7 +9,7 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use cr::{
-    Database,
+    AccessResource, Database, Role, UserKind,
     server::{ServerConfig, router},
 };
 use http_body_util::BodyExt;
@@ -25,6 +25,10 @@ struct TestResponse {
 }
 
 impl TestResponse {
+    fn text(&self) -> &str {
+        std::str::from_utf8(&self.body).unwrap()
+    }
+
     fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or_else(|error| {
             panic!(
@@ -68,11 +72,36 @@ async fn request(
         builder = builder.header(*name, *value);
     }
     let body = body.map(|body| body.to_string()).unwrap_or_default();
-    let response = app
-        .clone()
-        .oneshot(builder.body(Body::from(body)).unwrap())
-        .await
-        .unwrap();
+    send_request(app, builder.body(Body::from(body)).unwrap()).await
+}
+
+async fn post_form(app: &Router, uri: &str, fields: &[(&str, &str)]) -> TestResponse {
+    post_form_with_headers(app, uri, fields, &[]).await
+}
+
+async fn post_form_with_headers(
+    app: &Router,
+    uri: &str,
+    fields: &[(&str, &str)],
+    headers: &[(&str, &str)],
+) -> TestResponse {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (name, value) in fields {
+        serializer.append_pair(name, value);
+    }
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(Body::from(serializer.finish())).unwrap();
+    send_request(app, request).await
+}
+
+async fn send_request(app: &Router, request: Request<Body>) -> TestResponse {
+    let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let headers = response.headers().clone();
     let body = response
@@ -87,6 +116,17 @@ async fn request(
         headers,
         body,
     }
+}
+
+fn hidden_field<'response>(response: &'response TestResponse, name: &str) -> &'response str {
+    response
+        .text()
+        .split_once(&format!("name=\"{name}\" value=\""))
+        .unwrap()
+        .1
+        .split_once('"')
+        .unwrap()
+        .0
 }
 
 fn sha256(contents: &[u8]) -> String {
@@ -297,6 +337,454 @@ async fn the_record_page_lists_supporting_files_as_downloads() {
     assert!(
         html.contains(r#"href="/api/v1/collections/skills/records/pdf/files/scripts/run.py""#),
         "{html}"
+    );
+}
+
+#[tokio::test]
+async fn markdown_files_open_in_editors_and_other_files_remain_downloads() {
+    let (temporary, app) = bundle_app();
+    create_skill(&app).await;
+    let database = Database::discover(Some(&temporary.path().join("bundles"))).unwrap();
+    database
+        .create_view(
+            "project-docs",
+            Some("Project docs"),
+            "skills",
+            vec![],
+            vec![],
+            50,
+        )
+        .unwrap();
+    let text = "\n# Draft\n<script>alert('unsafe')</script>\n</textarea>\n";
+    let patched = request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/skills/records/pdf",
+        Some(json!({"files": {
+            "references/draft & review.MD": {"content": text},
+            "notes.markdown": {"content": "# Notes\n"}
+        }})),
+        &[],
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK);
+    let page = request(&app, Method::GET, "/project-docs/records/pdf", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    let uri = "/project-docs/records/pdf/files/references/draft%20%26%20review.MD";
+    assert!(
+        page.text().contains(
+            "href=\"/project-docs/records/pdf/files/references/draft%20&amp;%20review.MD\""
+        )
+    );
+    assert!(
+        page.text()
+            .contains("href=\"/project-docs/records/pdf/files/notes.markdown\"")
+    );
+    assert!(
+        !page
+            .text()
+            .contains("/api/v1/collections/skills/records/pdf/files/references/")
+    );
+    assert!(page.text().contains(
+        "href=\"/api/v1/collections/skills/records/pdf/files/fonts/body.ttf\" hx-boost=\"false\""
+    ));
+    assert!(page.text().contains(
+        "href=\"/api/v1/collections/skills/records/pdf/files/scripts/run.py\" hx-boost=\"false\""
+    ));
+
+    for headers in [
+        &[][..],
+        &[("hx-request", "true"), ("hx-boosted", "true")][..],
+    ] {
+        let editor = request(&app, Method::GET, uri, None, headers).await;
+        assert_eq!(editor.status, StatusCode::OK);
+        assert!(
+            editor.headers[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        assert!(editor.text().contains("data-file-editor=\"true\""));
+        assert!(
+            editor
+                .text()
+                .contains("<textarea id=\"record-file-editor\"")
+        );
+        assert!(editor.text().contains("class=\"cr-file-editor\">\n\n# Draft\n&lt;script&gt;alert('unsafe')&lt;/script&gt;\n&lt;/textarea&gt;\n</textarea>"));
+        assert!(
+            editor
+                .text()
+                .contains("href=\"/project-docs/records/pdf#files\"")
+        );
+        assert_eq!(
+            hidden_field(&editor, "_expected_record_hash"),
+            patched.etag().trim_matches('"')
+        );
+        assert!(!editor.text().contains("<script>alert('unsafe')</script>"));
+    }
+    let raw = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/skills/records/pdf/files/references/draft%20%26%20review.MD",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(raw.status, StatusCode::OK);
+    assert_eq!(raw.body, text.as_bytes());
+    assert_eq!(
+        raw.headers[header::CONTENT_TYPE],
+        "application/octet-stream"
+    );
+}
+
+#[tokio::test]
+async fn markdown_file_saves_are_audited_without_changing_the_rest_of_the_record() {
+    let (_temporary, app) = bundle_app();
+    create_skill(&app).await;
+    let patched = request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/skills/records/pdf",
+        Some(json!({"files": {
+            "draft.md": {"content": "# Draft\nOld text\n"},
+            "windows.md": {"content": "# Windows\r\nOld text\r\n"}
+        }})),
+        &[],
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK);
+    for (path, submitted, expected) in [
+        ("draft.md", "# Draft\r\nNew text\r\n", "# Draft\nNew text\n"),
+        (
+            "windows.md",
+            "# Windows\r\nNew text\r\n",
+            "# Windows\r\nNew text\r\n",
+        ),
+    ] {
+        let uri = format!("/skills/records/pdf/files/{path}");
+        let editor = request(&app, Method::GET, &uri, None, &[]).await;
+        let saved = post_form(
+            &app,
+            &uri,
+            &[
+                ("_csrf", hidden_field(&editor, "_csrf")),
+                (
+                    "_expected_record_hash",
+                    hidden_field(&editor, "_expected_record_hash"),
+                ),
+                ("contents", submitted),
+            ],
+        )
+        .await;
+        assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.text());
+        assert_eq!(saved.headers[header::LOCATION], uri);
+        let raw = request(
+            &app,
+            Method::GET,
+            &format!("/api/v1/collections/skills/records/pdf/files/{path}"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(raw.body, expected.as_bytes());
+        let history = request(
+            &app,
+            Method::GET,
+            "/api/v1/audit/log?collection=skills&id=pdf&limit=1",
+            None,
+            &[],
+        )
+        .await
+        .json();
+        let event = &history["data"][0];
+        assert_eq!(event["action"], "update");
+        assert_eq!(event["source"], "api");
+        assert_eq!(event["files"].as_array().unwrap().len(), 1);
+        assert_eq!(event["files"][0]["path"], path);
+    }
+    let record = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/skills/records/pdf",
+        None,
+        &[],
+    )
+    .await
+    .json();
+    assert_eq!(
+        record["front_matter"],
+        json!({"name": "pdf", "description": "Fill PDF forms"})
+    );
+    assert_eq!(record["markdown"], "Run scripts/run.py.\n");
+    let font = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/skills/records/pdf/files/fonts/body.ttf",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(font.body, FONT);
+    let script = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/skills/records/pdf/files/scripts/run.py",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(script.body, b"print('hi')\n");
+}
+
+#[tokio::test]
+async fn refused_markdown_file_saves_preserve_the_submitted_text() {
+    let (_temporary, app) = bundle_app();
+    create_skill(&app).await;
+    request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/skills/records/pdf",
+        Some(json!({"files": {"draft.md": {"content": "# Draft\n"}}})),
+        &[],
+    )
+    .await;
+    let uri = "/skills/records/pdf/files/draft.md";
+    let editor = request(&app, Method::GET, uri, None, &[]).await;
+    let csrf = hidden_field(&editor, "_csrf");
+    let version = hidden_field(&editor, "_expected_record_hash");
+    let invalid_csrf = post_form(
+        &app,
+        uri,
+        &[
+            ("_csrf", "wrong"),
+            ("_expected_record_hash", version),
+            ("contents", "My <unsaved> changes"),
+        ],
+    )
+    .await;
+    assert_eq!(invalid_csrf.status, StatusCode::FORBIDDEN);
+    assert!(
+        invalid_csrf
+            .text()
+            .contains("My &lt;unsaved&gt; changes</textarea>")
+    );
+    let changed = request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/skills/records/pdf",
+        Some(json!({"files": {"scripts/run.py": {"content": "Newer script\n"}}})),
+        &[],
+    )
+    .await;
+    assert_eq!(changed.status, StatusCode::OK);
+    let stale = post_form(
+        &app,
+        uri,
+        &[
+            ("_csrf", csrf),
+            ("_expected_record_hash", version),
+            ("contents", "My <unsaved> changes"),
+        ],
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+    assert!(stale.text().contains("The file was not saved"));
+    assert!(
+        stale
+            .text()
+            .contains("My &lt;unsaved&gt; changes</textarea>")
+    );
+    assert_eq!(hidden_field(&stale, "_expected_record_hash"), version);
+    let raw = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/skills/records/pdf/files/draft.md",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(raw.body, b"# Draft\n");
+    assert_eq!(raw.etag(), changed.etag());
+}
+
+#[tokio::test]
+async fn record_file_editors_refuse_binary_oversized_missing_and_unsafe_files() {
+    let (_temporary, app) = bundle_app();
+    create_skill(&app).await;
+    let patched = request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/skills/records/pdf",
+        Some(json!({"files": {
+            "binary.md": {"content": "AP8QgA==", "encoding": "base64"},
+            "null.md": {"content": "hello\u{0000}world"},
+            "large.md": {"content": "x".repeat(1024 * 1024 + 1)},
+            "draft.md": {"content": "# Draft\n"}
+        }})),
+        &[],
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "{}", patched.text());
+    for (path, status) in [
+        ("binary.md", StatusCode::UNPROCESSABLE_ENTITY),
+        ("null.md", StatusCode::UNPROCESSABLE_ENTITY),
+        ("large.md", StatusCode::UNPROCESSABLE_ENTITY),
+        ("missing.md", StatusCode::NOT_FOUND),
+        ("SKILL.md", StatusCode::NOT_FOUND),
+        (
+            "%2E%2E/%2E%2E/config.yaml",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let response = request(
+            &app,
+            Method::GET,
+            &format!("/skills/records/pdf/files/{path}"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, status, "{}", response.text());
+        assert!(!response.text().contains("<textarea"));
+    }
+    let uri = "/skills/records/pdf/files/draft.md";
+    let editor = request(&app, Method::GET, uri, None, &[]).await;
+    let oversized = "x".repeat(1024 * 1024 + 1);
+    let rejected = post_form(
+        &app,
+        uri,
+        &[
+            ("_csrf", hidden_field(&editor, "_csrf")),
+            (
+                "_expected_record_hash",
+                hidden_field(&editor, "_expected_record_hash"),
+            ),
+            ("contents", &oversized),
+        ],
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(rejected.text().contains(&oversized));
+    let raw = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/skills/records/pdf/files/draft.md",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(raw.body, b"# Draft\n");
+}
+
+#[tokio::test]
+async fn record_file_editors_follow_record_permissions_not_filesystem_owner_access() {
+    let (temporary, app) = bundle_app();
+    create_skill(&app).await;
+    request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/skills/records/pdf",
+        Some(json!({"files": {"draft.md": {"content": "# Draft\n"}}})),
+        &[],
+    )
+    .await;
+    let database = Database::discover(Some(&temporary.path().join("bundles")))
+        .unwrap()
+        .with_actor("owner@example.com")
+        .unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    for (principal, role) in [
+        ("reader@example.com", Some(Role::Viewer)),
+        ("editor@example.com", Some(Role::Editor)),
+        ("stranger@example.com", None),
+    ] {
+        database
+            .add_user(principal, principal, Some(principal), UserKind::Human)
+            .unwrap();
+        if let Some(role) = role {
+            database
+                .grant_access(principal, AccessResource::record("skills", "pdf"), role)
+                .unwrap();
+        }
+    }
+    let uri = "/skills/records/pdf/files/draft.md";
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let home = request(&app, Method::GET, "/", None, &[]).await;
+    for (principal, editable) in [("reader@example.com", false), ("editor@example.com", true)] {
+        let switched = post_form(
+            &app,
+            "/perspective",
+            &[
+                ("_csrf", hidden_field(&home, "_csrf")),
+                ("principal", principal),
+            ],
+        )
+        .await;
+        assert_eq!(switched.status, StatusCode::SEE_OTHER);
+        let cookie = switched.headers[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let editor = request(&app, Method::GET, uri, None, &[("cookie", cookie)]).await;
+        assert_eq!(editor.status, StatusCode::OK, "{}", editor.text());
+        assert_eq!(editor.text().contains("autofocus readonly"), !editable);
+        assert_eq!(editor.text().contains(">Save</button>"), editable);
+        assert_eq!(
+            editor.text().contains("data-file-editor=\"true\""),
+            editable
+        );
+        let saved = post_form_with_headers(
+            &app,
+            uri,
+            &[
+                ("_csrf", hidden_field(&editor, "_csrf")),
+                (
+                    "_expected_record_hash",
+                    hidden_field(&editor, "_expected_record_hash"),
+                ),
+                ("contents", "# Updated\n"),
+            ],
+            &[("cookie", cookie)],
+        )
+        .await;
+        assert_eq!(
+            saved.status,
+            if editable {
+                StatusCode::SEE_OTHER
+            } else {
+                StatusCode::FORBIDDEN
+            },
+            "{}",
+            saved.text()
+        );
+    }
+    let switched = post_form(
+        &app,
+        "/perspective",
+        &[
+            ("_csrf", hidden_field(&home, "_csrf")),
+            ("principal", "stranger@example.com"),
+        ],
+    )
+    .await;
+    assert_eq!(switched.status, StatusCode::SEE_OTHER);
+    let cookie = switched.headers[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let denied = request(&app, Method::GET, uri, None, &[("cookie", cookie)]).await;
+    assert_eq!(denied.status, StatusCode::NOT_FOUND, "{}", denied.text());
+    assert!(!denied.text().contains("# Updated"));
+    assert_eq!(
+        database.read_file("skills", "pdf", "draft.md").unwrap().0,
+        b"# Updated\n"
     );
 }
 

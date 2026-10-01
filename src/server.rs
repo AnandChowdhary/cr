@@ -1578,6 +1578,26 @@ struct HtmlFileEditForm {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct HtmlRecordFileForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    #[serde(rename = "_expected_record_hash")]
+    expected_record_hash: String,
+    contents: String,
+}
+
+struct RecordFileEditor {
+    view: ViewDefinition,
+    id: String,
+    path: String,
+    contents: String,
+    version: String,
+    editable: bool,
+    rejection: Option<PublicError>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HtmlFileDeleteForm {
     #[serde(rename = "_csrf")]
     csrf: String,
@@ -2219,6 +2239,10 @@ fn application(
         .route(
             "/{view}/records/{id}",
             get(edit_record_form).post(update_record_form),
+        )
+        .route(
+            "/{view}/records/{id}/files/{*path}",
+            get(edit_record_file).post(save_record_file),
         )
         .route("/{view}/records/{id}/move", post(move_kanban_card))
         .route("/{view}/records/{id}/relations", post(link_record_form))
@@ -4877,6 +4901,148 @@ async fn edit_record_form(
     }
     .await;
     html_result(result)
+}
+
+async fn record_file_editor(
+    state: &AppState,
+    headers: &HeaderMap,
+    view_name: String,
+    id: String,
+    path: String,
+) -> ApiResult<(RecordFileEditor, Vec<ViewDefinition>)> {
+    let (view, contents, version, editable, navigation) = run_database(state, headers, {
+        let id = id.clone();
+        let path = path.clone();
+        move |database| {
+            let view = database.view(&view_name)?;
+            let (contents, version) = database.read_file(&view.collection, &id, &path)?;
+            let editable = database.access_allowed(
+                AccessAction::Update,
+                &AccessResource::record(&view.collection, &id),
+            )?;
+            Ok((view, contents, version, editable, database.views()?))
+        }
+    })
+    .await?;
+    Ok((
+        RecordFileEditor {
+            view,
+            id,
+            path,
+            contents: record_file_text(&contents)?,
+            version,
+            editable,
+            rejection: None,
+        },
+        navigation,
+    ))
+}
+
+fn record_file_text(contents: &[u8]) -> ApiResult<String> {
+    if contents.len() > MAX_FILE_PREVIEW_BYTES {
+        return Err(ApiError::unprocessable(format!(
+            "only a text file of at most {} can be edited in the browser",
+            format_file_size(MAX_FILE_PREVIEW_BYTES as u64)
+        )));
+    }
+    text_file_preview(contents, false)
+        .map(|(text, _)| text)
+        .ok_or_else(|| {
+            ApiError::unprocessable("only a UTF-8 text file can be edited in the browser")
+        })
+}
+
+async fn edit_record_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Segments((view_name, id, path)): Segments<(String, String, String)>,
+) -> Response {
+    let result: ApiResult<Markup> = async {
+        let (editor, navigation) =
+            record_file_editor(&state, &headers, view_name, id, path).await?;
+        let ui = ui_context(&state, &headers).await?;
+        Ok(render_record_file_editor(
+            &Representation::requested(&headers),
+            &editor,
+            &navigation,
+            ui.as_ref(),
+            &request_csrf_token(&state),
+        ))
+    }
+    .await;
+    html_result(result)
+}
+
+async fn save_record_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Segments((view_name, id, path)): Segments<(String, String, String)>,
+    RawForm(raw): RawForm,
+) -> Response {
+    let result: ApiResult<Response> = async {
+        let form: HtmlRecordFileForm = parse_html_form(&raw)?;
+        let (mut editor, navigation) =
+            record_file_editor(&state, &headers, view_name, id, path).await?;
+        let saved: ApiResult<()> = async {
+            verify_csrf(&state, &form.csrf)?;
+            let precondition = RecordPrecondition::version(form.expected_record_hash.clone())
+                .map_err(ApiError::from_domain)?;
+            let contents = form_text(&form.contents);
+            let contents = if editor.contents.contains("\r\n")
+                && !editor.contents.replace("\r\n", "").contains('\n')
+            {
+                contents.replace('\n', "\r\n")
+            } else {
+                contents
+            };
+            record_file_text(contents.as_bytes())?;
+            let collection = editor.view.collection.clone();
+            let id = editor.id.clone();
+            let path = editor.path.clone();
+            run_database(&state, &headers, move |database| {
+                database.update_with_files_conditionally(
+                    &collection,
+                    &id,
+                    &[],
+                    &[],
+                    None,
+                    &[FileChange::Write {
+                        path,
+                        contents: contents.into_bytes(),
+                    }],
+                    Some(&precondition),
+                )
+            })
+            .await?;
+            Ok(())
+        }
+        .await;
+        let Err(error) = saved else {
+            return Ok(see_other(&record_file_url(
+                &editor.view.name,
+                &editor.id,
+                &editor.path,
+            )));
+        };
+        let error = error.publish();
+        let status = error.status;
+        editor.contents = form.contents;
+        editor.version = form.expected_record_hash;
+        editor.rejection = Some(error);
+        let ui = ui_context(&state, &headers).await?;
+        Ok(html_response(
+            status,
+            render_record_file_editor(
+                &Representation::requested(&headers),
+                &editor,
+                &navigation,
+                ui.as_ref(),
+                &request_csrf_token(&state),
+            ),
+        ))
+    }
+    .await;
+    result.unwrap_or_else(html_error)
 }
 
 async fn create_record_form(
@@ -13170,7 +13336,7 @@ fn render_record_form(
                             (render_record_relations(view, record, relations, permissions, csrf_token))
                         }
                         @if !record.files.is_empty() {
-                            (render_record_files(record))
+                            (render_record_files(view, record))
                         }
                         section aria-labelledby="activity-heading" {
                             div class="flex items-baseline justify-between gap-2" {
@@ -13189,12 +13355,79 @@ fn render_record_form(
     )
 }
 
-/// A bundle record's supporting files, each a download of its exact bytes.
-///
-/// The form edits the entry alone and a save keeps every file as it is, so
-/// the page lists them rather than offering an editor that could not round-trip
-/// a font or an image.
-fn render_record_files(record: &Record) -> Markup {
+fn record_file_url(view_name: &str, id: &str, path: &str) -> String {
+    let path = path.split('/').map(encode_segment).collect::<Vec<_>>();
+    format!(
+        "/{}/records/{}/files/{}",
+        encode_segment(view_name),
+        encode_segment(id),
+        path.join("/")
+    )
+}
+
+fn render_record_file_editor(
+    representation: &Representation,
+    editor: &RecordFileEditor,
+    navigation: &[ViewDefinition],
+    ui: Option<&UiContext>,
+    csrf_token: &str,
+) -> Markup {
+    let record_url = format!(
+        "/{}/records/{}",
+        encode_segment(&editor.view.name),
+        encode_segment(&editor.id)
+    );
+    let url = record_file_url(&editor.view.name, &editor.id, &editor.path);
+    page_or_content(
+        representation,
+        &editor.path,
+        &url,
+        navigation,
+        html! {
+            (page_bar(
+                &[
+                    ("/".to_owned(), None, "Views"),
+                    (format!("/{}", encode_segment(&editor.view.name)), Some(view_icon(&editor.view)), &editor.view.title),
+                    (record_url.clone(), None, &editor.id),
+                ],
+                None,
+                &editor.path,
+                html! {},
+                html! {},
+            ))
+            form method="post" action=(&url) hx-boost=(UNBOOSTED) data-file-editor=[editor.editable.then_some("true")] class="cr-table-shell overflow-hidden" {
+                input type="hidden" name="_csrf" value=(csrf_token);
+                input type="hidden" name="_expected_record_hash" value=(&editor.version);
+                div class="flex flex-wrap items-center justify-between gap-2 border-b border-gray-200 bg-gray-50 px-4 py-3 text-xs text-gray-600" {
+                    div class="flex flex-wrap items-center gap-2" {
+                        label for="record-file-editor" class="font-mono text-sm font-semibold text-gray-900" { (&editor.path) }
+                        span class="cr-pill" { (if editor.editable { "editing" } else { "read only" }) }
+                    }
+                    div class="flex items-center gap-2" {
+                        a href=(format!("{record_url}#files")) hx-boost="true" class="cr-button cr-button-small" { "Back to record" }
+                        @if editor.editable {
+                            button type="submit" class="cr-button cr-button-small cr-button-primary" { "Save" }
+                        }
+                    }
+                }
+                @if let Some(error) = &editor.rejection {
+                    div role="alert" class="border-b border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" {
+                        p class="font-semibold" { "The file was not saved" }
+                        p class="mt-1" { (&error.message) }
+                        p class="mt-2 text-xs text-red-700" {
+                            "The text below is exactly what you submitted. Request ID " (&error.request_id)
+                        }
+                    }
+                }
+                textarea id="record-file-editor" name="contents" spellcheck="false" autofocus readonly[!editor.editable] class="cr-file-editor" { (textarea_text(&editor.contents)) }
+            }
+        },
+        ui,
+        csrf_token,
+    )
+}
+
+fn render_record_files(view: &ViewDefinition, record: &Record) -> Markup {
     let base = format!(
         "/api/v1/collections/{}/records/{}/files",
         encode_segment(&record.collection),
@@ -13207,7 +13440,11 @@ fn render_record_files(record: &Record) -> Markup {
                 @for file in &record.files {
                     @let segments = file.path.split('/').map(encode_segment).collect::<Vec<_>>();
                     li class="cr-relation" {
-                        a href=(format!("{base}/{}", segments.join("/"))) class="cr-relation-target font-mono" download { (file.path) }
+                        @if FilePath::new(&file.path).extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")) {
+                            a href=(record_file_url(&view.name, &record.id, &file.path)) class="cr-relation-target font-mono" { (file.path) }
+                        } @else {
+                            a href=(format!("{base}/{}", segments.join("/"))) hx-boost=(UNBOOSTED) class="cr-relation-target font-mono" download { (file.path) }
+                        }
                     }
                 }
             }
