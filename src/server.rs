@@ -12339,18 +12339,11 @@ fn render_schema_field(field: &SchemaFormField, diagnostics: &[String]) -> Marku
     }
 }
 
-/// An object as a group of controls, one per property its schema declares,
-/// under the object's own label. What is said about the object as a whole, a
-/// missing property for one, is shown under that label.
-///
 /// An optional object with nothing in it is folded to its label. A record can
 /// declare a dozen objects and hold two, and a dozen boxes of empty controls
 /// would bury the two. It opens when it holds something, when the schema
 /// requires it, and when a refusal has something to say inside it.
-fn render_object_field(field: &SchemaFormField, rejection: Option<&RecordFormRejection>) -> Markup {
-    let id = format!("field-{}", field.key);
-    let help = field.description.as_ref().map(|_| format!("{id}-help"));
-    let diagnostics = form_diagnostics(rejection, &field.key);
+fn object_field_is_open(field: &SchemaFormField, rejection: Option<&RecordFormRejection>) -> bool {
     let holds_something = field.members.iter().any(|member| match &member.submitted {
         Some(values) => values.iter().any(|value| !value.is_empty()),
         None => member
@@ -12358,13 +12351,23 @@ fn render_object_field(field: &SchemaFormField, rejection: Option<&RecordFormRej
             .as_ref()
             .is_some_and(|value| !is_empty_value(value)),
     });
-    let open = field.required
+    field.required
         || holds_something
-        || !diagnostics.is_empty()
+        || !form_diagnostics(rejection, &field.key).is_empty()
         || field
             .members
             .iter()
-            .any(|member| !form_diagnostics(rejection, &member.key).is_empty());
+            .any(|member| !form_diagnostics(rejection, &member.key).is_empty())
+}
+
+/// An object as a group of controls, one per property its schema declares,
+/// under the object's own label. What is said about the object as a whole, a
+/// missing property for one, is shown under that label.
+fn render_object_field(field: &SchemaFormField, rejection: Option<&RecordFormRejection>) -> Markup {
+    let id = format!("field-{}", field.key);
+    let help = field.description.as_ref().map(|_| format!("{id}-help"));
+    let diagnostics = form_diagnostics(rejection, &field.key);
+    let open = object_field_is_open(field, rejection);
     html! {
         details id=(&id) open[open] aria-describedby=[help.as_deref()] class=(if diagnostics.is_empty() { "cr-field cr-field-wide cr-field-group" } else { "cr-field cr-field-wide cr-field-group cr-field-invalid" }) {
             summary class="cr-field-label" {
@@ -13037,7 +13040,7 @@ fn render_record_form(
     // that the text is the submitted string throughout: re-serializing what the
     // server parsed would answer a rejected `1.50` with `1.5` and a rejected
     // YAML mapping with its keys reordered.
-    let form_fields = match mode {
+    let mut form_fields = match mode {
         DocumentFormMode::Structured => {
             let mut fields = schema_fields.unwrap_or_default();
             if let Some(submitted) =
@@ -13085,6 +13088,11 @@ fn render_record_form(
         },
         DocumentFormMode::Yaml => Vec::new(),
     };
+    // Empty, folded objects follow the fields in use instead of interrupting
+    // them. Keep the schema's order within each group, and use the same
+    // decision as the disclosure so required fields and diagnostics stay up.
+    form_fields
+        .sort_by_key(|field| !field.members.is_empty() && !object_field_is_open(field, rejection));
     let front_matter = submitted
         .and_then(|submitted| submitted.front_matter.clone())
         .unwrap_or_else(|| yaml_serde::to_string(attributes).unwrap_or_else(|_| "{}\n".to_owned()));
@@ -15797,9 +15805,9 @@ fn parse_structured_attributes(form: &HtmlDocumentForm, schema: &JsonValue) -> A
         .flatten()
         .filter_map(JsonValue::as_str)
         .collect::<BTreeSet<_>>();
-    // Declared fields in the order the form shows them, then the rest, so a
-    // new record's file reads in the same order as its form. Saving an
-    // existing record puts its own order back; see `in_stored_order`.
+    // Declared fields in schema order, then the rest, so a new record's
+    // file follows the schema even when empty groups appear last in the form.
+    // Saving an existing record puts its own order back; see `in_stored_order`.
     let mut attributes = Mapping::new();
     for field in fields {
         if !field.members.is_empty() && submitted_as_group(form, &field.key) {
@@ -15879,7 +15887,7 @@ fn parse_object_group(
 /// `attributes` with the keys `stored` has in the order it has them, and any
 /// others after those in the order they came.
 ///
-/// The structured form lists fields in the schema's order, which is rarely the
+/// The structured form parses fields in the schema's order, which is rarely the
 /// order a record's file keeps them in: a record written by the CLI, an agent
 /// or by hand has its own. Writing the form's order back moved the front
 /// matter's lines around on every save, so a one-field change showed up in the
