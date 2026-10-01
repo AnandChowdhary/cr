@@ -7,7 +7,7 @@ use std::{
     path::{Path as FilePath, PathBuf},
     str::FromStr,
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, PoisonError, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::SystemTime,
@@ -151,7 +151,9 @@ impl Default for ServerConfig {
 
 #[derive(Clone)]
 struct AppState {
-    database: Database,
+    /// The database every request starts from, holding the last
+    /// configuration that loaded; see [`AppState::database`].
+    database: Arc<RwLock<Database>>,
     access_controlled: bool,
     max_page_size: usize,
     api_token: Option<Arc<str>>,
@@ -162,6 +164,35 @@ struct AppState {
     csrf_token: Arc<str>,
     /// The walk that fills the verified journal, which readiness reports on.
     journal_warm_up: Arc<JournalWarmUp>,
+}
+
+impl AppState {
+    /// The database a request starts from, with `.cr/config.yaml` as it is
+    /// now.
+    ///
+    /// Every command reads the configuration when it opens the database, so
+    /// the server reads it for every request rather than once: a server that
+    /// kept what it started with read a collection declared as bundles since
+    /// as an empty one. A configuration that no longer loads leaves the last
+    /// one that did in place, and `/ready` reports `config_invalid` until it
+    /// loads again.
+    fn database(&self) -> Database {
+        let current = self
+            .database
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match current.reconfigured() {
+            Ok(Some(reconfigured)) => {
+                *self
+                    .database
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = reconfigured.clone();
+                reconfigured
+            }
+            Ok(None) | Err(_) => current,
+        }
+    }
 }
 
 /// Who a request is, as the authorization layer established it.
@@ -2149,7 +2180,7 @@ fn application(
     }
 
     let state = AppState {
-        database: database.with_source(AuditSource::Api),
+        database: Arc::new(RwLock::new(database.with_source(AuditSource::Api))),
         access_controlled,
         max_page_size: config.max_page_size,
         api_token: config.api_token.map(Arc::from),
@@ -2569,7 +2600,7 @@ async fn request_identity(
                 "this server signs people in through Cloudflare Access and accepts no principal tokens; start it with --require-token as well to accept both",
             ));
         }
-        let database = state.database.clone();
+        let database = state.database();
         let presented = presented.to_owned();
         let authenticated =
             tokio::task::spawn_blocking(move || database.authenticate_token(&presented))
@@ -2639,7 +2670,7 @@ async fn cloudflare_access_database(
         }
     };
     let access = Arc::clone(access);
-    let database = state.database.clone();
+    let database = state.database();
     tokio::task::spawn_blocking(move || {
         let verified = match access.verify(&assertion) {
             Ok(verified) => verified,
@@ -2775,7 +2806,7 @@ async fn health() -> Json<HealthResponse> {
 /// failed goes to the server log under the request ID, as any error's detail
 /// does. Each check is cheap and none waits for a lock; see `src/readiness.rs`.
 async fn ready(State(state): State<AppState>) -> Response {
-    let database = state.database.clone();
+    let database = state.database();
     let warm_up = Arc::clone(&state.journal_warm_up);
     let cloudflare_access = state.cloudflare_access.clone();
     let readiness = match tokio::task::spawn_blocking(move || {
@@ -3070,7 +3101,7 @@ async fn switch_perspective(State(state): State<AppState>, RawForm(raw): RawForm
         let form: HtmlPerspectiveForm = parse_html_form(&raw)?;
         verify_csrf(&state, &form.csrf)?;
         let principal = form.principal.trim().to_owned();
-        let database = state.database.clone();
+        let database = state.database();
         let principal_for_check = principal.clone();
         tokio::task::spawn_blocking(move || database.impersonate_verified(&principal_for_check))
             .await
@@ -16066,9 +16097,7 @@ async fn method_not_allowed() -> ApiError {
 
 fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database> {
     let authenticated = authenticated_database();
-    let mut database = authenticated
-        .clone()
-        .unwrap_or_else(|| state.database.clone());
+    let mut database = authenticated.clone().unwrap_or_else(|| state.database());
     // For an authenticated principal the header can only restyle how that
     // same principal is displayed: `with_actor` refuses any other principal
     // under access control, which authentication requires.
@@ -16177,15 +16206,11 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
         return Ok(None);
     }
     let authenticated = authenticated_database();
+    let database = authenticated.clone().unwrap_or_else(|| state.database());
     let selected = match &authenticated {
         Some(database) => database.principal().to_owned(),
-        None => {
-            perspective_principal(headers)?.unwrap_or_else(|| state.database.principal().to_owned())
-        }
+        None => perspective_principal(headers)?.unwrap_or_else(|| database.principal().to_owned()),
     };
-    let database = authenticated
-        .clone()
-        .unwrap_or_else(|| state.database.clone());
     tokio::task::spawn_blocking(move || {
         // The registry is the owner console's to list. An authenticated
         // principal reads its own user record, which it always may, and is
