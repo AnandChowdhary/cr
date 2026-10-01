@@ -554,10 +554,21 @@ To add a relation, open **+ Link a record**, enter a relation name such as `comp
 ### Supporting files of a bundle record
 
 A [bundle record](working-with-records.md#bundle-records)'s page lists its
-supporting files under **Files**, each a download of the file's exact bytes.
-The form edits the entry, and saving it keeps every file as it is; add,
-replace, and remove files with `cr update` or the REST API, or edit the folder
-directly and `cr save` it.
+supporting files under **Files**. Markdown files (`.md` or `.markdown`,
+case-insensitive) open in an editable textarea rather than navigating to the
+raw API response. **Save** updates only that file and records its change in
+the record's audit history; **Back to record** returns to the file list.
+Readers without update access get a read-only textarea. Other files remain
+downloads of their exact bytes.
+
+The editor accepts complete UTF-8 text files up to 1 MiB and preserves LF or
+CRLF line endings. A save checks the whole record's version, so a change to
+the entry or any supporting file refuses a stale save without overwriting it.
+Refused saves keep the submitted text in the textarea.
+
+The main record form still edits the entry and keeps every supporting file as
+it is. Add, replace, and remove files with `cr update` or the REST API, or edit
+the folder directly and `cr save` it.
 
 ## Name collections and give them icons
 
