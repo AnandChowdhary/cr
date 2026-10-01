@@ -1199,6 +1199,11 @@ async fn an_object_the_schema_describes_is_edited_one_property_at_a_time() {
     // An object holding something is open, and an empty one folded.
     assert!(html.contains(r#"<details id="field-costs" open"#));
     assert!(html.contains(r#"<details id="field-delivery" class="#));
+    // The folded, empty group follows all populated fields rather than
+    // taking a row between Costs and Learning.
+    let order = ["name", "claim", "costs", "learning", "delivery"]
+        .map(|key| html.find(&format!(r#"id="field-{key}""#)).unwrap());
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{html}");
 
     let saved = request(
         &app,
@@ -1227,6 +1232,53 @@ async fn an_object_the_schema_describes_is_edited_one_property_at_a_time() {
     assert_eq!(costs, ["worker", "total"]);
     assert!(record.attributes.get("delivery").is_none());
     database.audit_verify(None).unwrap();
+}
+
+#[tokio::test]
+async fn folded_objects_follow_active_fields_without_reordering_required_zero_or_false_values() {
+    let (_temporary, database) = test_database("folded-object-order");
+    fs::write(
+        database.root().join(".cr/schemas/tasks.json"),
+        r#"{
+  "type": "object",
+  "required": ["name", "required_group"],
+  "x-cr-ui": { "order": ["empty_first", "zero_group", "required_group", "false_group", "name", "empty_last"] },
+  "properties": {
+    "name": { "type": "string" },
+    "empty_first": { "type": "object", "properties": { "text": { "type": "string" } } },
+    "zero_group": { "type": "object", "properties": { "number": { "type": "number" } } },
+    "required_group": { "type": "object", "properties": { "text": { "type": "string" } } },
+    "false_group": { "type": "object", "properties": { "flag": { "type": "boolean" } } },
+    "empty_last": { "type": "object", "properties": { "text": { "type": "string" } } }
+  }
+}"#,
+    )
+    .unwrap();
+    let assignments = [
+        "name=Rate applicant",
+        "zero_group.number=0",
+        "required_group={}",
+        "false_group.flag=false",
+    ]
+    .map(|assignment| Assignment::from_str(assignment).unwrap());
+    database.create("tasks", "rate", &assignments, "").unwrap();
+    let app = router(database, ServerConfig::default()).unwrap();
+    let page = request(&app, Method::GET, "/tasks/records/rate", None, &[]).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    let order = [
+        "zero_group",
+        "required_group",
+        "false_group",
+        "name",
+        "empty_first",
+        "empty_last",
+    ]
+    .map(|key| page.body.find(&format!(r#"id="field-{key}""#)).unwrap());
+    assert!(
+        order.windows(2).all(|pair| pair[0] < pair[1]),
+        "{}",
+        page.body
+    );
 }
 
 #[tokio::test]
