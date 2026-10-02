@@ -349,6 +349,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "form_urlencoded",
+ "futures-util",
  "getrandom 0.4.3",
  "hmac",
  "http-body-util",

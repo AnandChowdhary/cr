@@ -1168,6 +1168,9 @@ struct VerifiedJournal {
     walk: ChainWalk,
     states: Arc<AuditedRecordStates>,
     activity: Arc<CollectionsActivity>,
+    /// In-memory locations and manifest transitions, built only from a full
+    /// verified replay. Saved walks deliberately omit this derived index.
+    history: Option<Arc<HistoryIndex>>,
     /// Every segment before the newest, as it was when it was verified.
     sealed: Vec<(PathBuf, SegmentStamp)>,
     /// The newest segment and exactly the part of it that was verified.
@@ -1188,6 +1191,7 @@ impl VerifiedJournal {
             walk: ChainWalk::new(),
             states: Arc::default(),
             activity: Arc::default(),
+            history: Some(Arc::default()),
             sealed: Vec::new(),
             tail: None,
             walked: true,
@@ -1199,6 +1203,11 @@ impl VerifiedJournal {
         JournalSnapshot {
             states: Arc::clone(&self.states),
             activity: Arc::clone(&self.activity),
+            history: self.history.clone(),
+            head: AuditHead {
+                sequence: self.walk.entries(),
+                hash: self.walk.previous_hash.clone(),
+            },
         }
     }
 
@@ -1209,9 +1218,49 @@ impl VerifiedJournal {
         // snapshot, which is what lets a snapshot be read without a lock.
         let states = Arc::make_mut(&mut self.states);
         let activity = Arc::make_mut(&mut self.activity);
+        let history = self.history.as_mut().map(Arc::make_mut);
+        let segment = Arc::new(path.to_path_buf());
+        let mut offset = from.unwrap_or(0);
+        let mut lengths = contents[offset..].split_inclusive(|byte| *byte == b'\n');
+        let mut history = history;
         let mut visitor = |entry: &AuditEntry, _: &str| {
+            let key = (
+                entry.payload.record.collection.clone(),
+                entry.payload.record.id.clone(),
+            );
+            let before = history.as_ref().and_then(|_| {
+                states
+                    .get(&key)
+                    .and_then(|state| state.document.as_ref())
+                    .and_then(audit_document_encryption_metadata)
+            });
             track_activity(activity, entry);
-            replay_entry(states, entry)
+            replay_entry(states, entry)?;
+            if let Some(history) = history.as_mut() {
+                let after = states
+                    .get(&key)
+                    .and_then(|state| state.document.as_ref())
+                    .and_then(audit_document_encryption_metadata);
+                let transition = AuditEncryptionTransition { before, after };
+                // `lines` calls the visitor exactly once for every complete
+                // line, including when it extends an already verified prefix.
+                let length = lengths.next().expect("verified audit line").len();
+                let index = history.events.len();
+                history
+                    .collections
+                    .entry(key.0.clone())
+                    .or_default()
+                    .push(index);
+                history.records.entry(key).or_default().push(index);
+                history.events.push(HistoryLocation {
+                    segment: Arc::clone(&segment),
+                    start: offset,
+                    end: offset + length - 1,
+                    transition: (!transition.is_empty()).then(|| Box::new(transition)),
+                });
+                offset += length;
+            }
+            Ok(())
         };
         match from {
             Some(from) => {
@@ -1306,6 +1355,7 @@ impl VerifiedJournal {
             walk: journal.walk,
             states: Arc::new(states),
             activity: Arc::new(journal.activity),
+            history: None,
             sealed: journal.sealed,
             tail: journal.tail.map(|tail| {
                 (
@@ -1419,6 +1469,25 @@ struct UnverifiedSegment {
 struct JournalSnapshot {
     states: Arc<AuditedRecordStates>,
     activity: Arc<CollectionsActivity>,
+    history: Option<Arc<HistoryIndex>>,
+    head: AuditHead,
+}
+
+/// Offsets rather than event payloads: history does not retain record bodies
+/// or decrypted projections, and a task lookup reads only its own events.
+#[derive(Clone, Default)]
+struct HistoryIndex {
+    events: Vec<HistoryLocation>,
+    collections: HashMap<String, Vec<usize>>,
+    records: HashMap<(String, String), Vec<usize>>,
+}
+
+#[derive(Clone)]
+struct HistoryLocation {
+    segment: Arc<PathBuf>,
+    start: usize,
+    end: usize,
+    transition: Option<Box<AuditEncryptionTransition>>,
 }
 
 /// What rewriting a sealed segment cannot leave as it was.
@@ -2463,6 +2532,16 @@ impl<'a> AuditLog<'a> {
         filter: AuditFilter<'_>,
         mut visible: impl FnMut(&AuditEntry) -> Result<bool>,
     ) -> Result<AuditHistory> {
+        if let Some(journal) = self.journal {
+            let snapshot = self.cached_journal(journal)?;
+            let history = match snapshot.history {
+                Some(history) => history,
+                // Persisted walks contain current state, not historical
+                // locations or transitions. Establish those once ourselves.
+                None => self.walk_fresh()?.history.expect("fresh history index"),
+            };
+            return self.indexed_history(&history, limit, filter, visible);
+        }
         let mut entries = VecDeque::new();
         let mut encryption_transitions = HashMap::new();
         self.replay_encryption_chain(|entry, _, transition| {
@@ -2487,12 +2566,84 @@ impl<'a> AuditLog<'a> {
         })
     }
 
+    fn indexed_history(
+        &self,
+        history: &HistoryIndex,
+        limit: usize,
+        filter: AuditFilter<'_>,
+        mut visible: impl FnMut(&AuditEntry) -> Result<bool>,
+    ) -> Result<AuditHistory> {
+        let indices: Box<dyn Iterator<Item = usize> + '_> = match (filter.collection, filter.id) {
+            (Some(collection), Some(id)) => Box::new(
+                history
+                    .records
+                    .get(&(collection.to_owned(), id.to_owned()))
+                    .into_iter()
+                    .flatten()
+                    .rev()
+                    .copied(),
+            ),
+            (Some(collection), None) => Box::new(
+                history
+                    .collections
+                    .get(collection)
+                    .into_iter()
+                    .flatten()
+                    .rev()
+                    .copied(),
+            ),
+            _ => Box::new((0..history.events.len()).rev()),
+        };
+        let mut entries = Vec::new();
+        let mut encryption_transitions = HashMap::new();
+        let mut segment = None;
+        let mut contents = Vec::new();
+        for index in indices {
+            let location = &history.events[index];
+            if segment.as_ref() != Some(&location.segment) {
+                contents = self.read_segment_bytes(&location.segment)?;
+                segment = Some(Arc::clone(&location.segment));
+            }
+            let line = contents
+                .get(location.start..location.end)
+                .ok_or_else(|| audit_integrity("indexed audit event is no longer present"))?;
+            let stored = parse_line(line)?;
+            if stored.entry.payload.sequence != index as u64 + 1 {
+                return Err(audit_integrity("indexed audit event has changed sequence"));
+            }
+            if !filter.matches(&stored.entry.payload) || !visible(&stored.entry)? {
+                continue;
+            }
+            if let Some(transition) = &location.transition {
+                encryption_transitions
+                    .insert(stored.entry.payload.sequence, (**transition).clone());
+            }
+            entries.push(stored.entry);
+            if limit > 0 && entries.len() == limit {
+                break;
+            }
+        }
+        Ok(AuditHistory {
+            entries,
+            encryption_transitions,
+        })
+    }
+
     pub fn head(&self) -> Result<AuditHead> {
         let state = self.verify_chain(|_, _| Ok(()))?;
         Ok(AuditHead {
             sequence: state.entries,
             hash: state.head_hash,
         })
+    }
+
+    /// A background observer needs the same up-to-date verified head as
+    /// ordinary reads, rather than a new full-chain integrity audit per tick.
+    pub(crate) fn cached_head(&self) -> Result<AuditHead> {
+        match self.journal {
+            Some(journal) => Ok(self.cached_journal(journal)?.head),
+            None => self.head(),
+        }
     }
 
     /// Replay the complete verified chain and retain each event's exact
@@ -5433,6 +5584,116 @@ mod tests {
 
     fn activity(database: &Database) -> CollectionsActivity {
         database.audit().collections_activity(|_| true).unwrap()
+    }
+
+    #[test]
+    fn indexed_history_extends_external_commits_without_replaying_old_events() {
+        let root = tempfile::tempdir().unwrap();
+        let (cached, writer) = cached_and_uncached(root.path(), 2);
+        replayed(&cached);
+        for index in 0..8 {
+            writer
+                .create("items", &format!("item-{index}"), &[], "Original\n")
+                .unwrap();
+            writer
+                .update("items", "item-0", &[], Some("Changed\n"))
+                .unwrap();
+            if index == 4 {
+                writer.delete("items", "item-0").unwrap();
+                writer
+                    .create("items", "item-0", &[], "Recreated\n")
+                    .unwrap();
+            }
+            writer
+                .create("other", &format!("item-{index}"), &[], "Other\n")
+                .unwrap();
+            for filter in [
+                AuditFilter::all(),
+                AuditFilter {
+                    collection: Some("items"),
+                    ..AuditFilter::all()
+                },
+                AuditFilter::record("items", "item-0"),
+            ] {
+                for limit in [0, 1, 3, 50] {
+                    super::reset_verify_chain_calls();
+                    let actual = cached
+                        .audit()
+                        .recent_history_where(limit, filter, |entry| {
+                            Ok(entry.payload.sequence % 3 != 0)
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        super::verify_chain_calls(),
+                        0,
+                        "history replayed old events"
+                    );
+                    let expected = writer
+                        .audit()
+                        .recent_history_where(limit, filter, |entry| {
+                            Ok(entry.payload.sequence % 3 != 0)
+                        })
+                        .unwrap();
+                    assert_eq!(actual.entries, expected.entries);
+                    assert_eq!(
+                        actual.encryption_transitions,
+                        expected.encryption_transitions
+                    );
+                }
+            }
+            super::reset_verify_chain_calls();
+            assert_eq!(
+                cached.audit().cached_head().unwrap().sequence,
+                writer.audit().head().unwrap().sequence
+            );
+            // Only the uncached reference above walks the complete journal.
+            assert_eq!(super::verify_chain_calls(), 1);
+        }
+    }
+
+    #[test]
+    fn history_index_is_built_once_after_resuming_a_saved_walk_and_refuses_tampering() {
+        let root = tempfile::tempdir().unwrap();
+        let (database, _) = cached_and_uncached(root.path(), 2);
+        let writer = database.with_journal_verification(JournalVerification::Resume);
+        for id in ["one", "two", "three"] {
+            writer.create("items", id, &[], "Body\n").unwrap();
+        }
+        let reader = writer
+            .clone()
+            .with_journal_verification(JournalVerification::Resume);
+        replayed(&reader);
+        super::reset_verify_chain_calls();
+        let first = reader
+            .audit_recent(50, AuditFilter::record("items", "one"))
+            .unwrap();
+        assert_eq!(super::verify_chain_calls(), 1);
+        super::reset_verify_chain_calls();
+        assert_eq!(
+            reader
+                .audit_recent(50, AuditFilter::record("items", "one"))
+                .unwrap(),
+            first
+        );
+        assert_eq!(super::verify_chain_calls(), 0);
+        let segment = reader.audit().segment_paths().unwrap().remove(0);
+        let path = root.path().join(segment);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let hash = bytes
+            .windows(8)
+            .position(|window| window == b"\"hash\":\"")
+            .unwrap()
+            + 8;
+        bytes[hash] = if bytes[hash] == b'0' { b'1' } else { b'0' };
+        std::fs::write(path, bytes).unwrap();
+        for _ in 0..2 {
+            assert!(
+                reader
+                    .audit_recent(50, AuditFilter::record("items", "one"))
+                    .is_err()
+            );
+            assert!(reader.audit().cached_head().is_err());
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::{
         Arc, LazyLock, PoisonError, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
 
 #[cfg(unix)]
@@ -62,6 +62,8 @@ use crate::{
     sort_by_record_keys, sort_records,
     views::validate_view_name,
 };
+
+mod live;
 
 const DEFAULT_PAGE_SIZE: usize = 50;
 const DEFAULT_MAX_PAGE_SIZE: usize = 200;
@@ -164,6 +166,7 @@ struct AppState {
     csrf_token: Arc<str>,
     /// The walk that fills the verified journal, which readiness reports on.
     journal_warm_up: Arc<JournalWarmUp>,
+    live_updates: Arc<live::Updates>,
 }
 
 impl AppState {
@@ -2134,7 +2137,7 @@ fn log_error(status: StatusCode, code: &str, request_id: &str, detail: &str) {
 }
 
 pub fn router(database: Database, config: ServerConfig) -> Result<Router> {
-    application(database, config, Arc::default())
+    application(database, config, Arc::default(), Arc::default())
 }
 
 /// [`router`], with `journal_warm_up` as the walk its readiness reports on.
@@ -2142,6 +2145,7 @@ fn application(
     database: Database,
     config: ServerConfig,
     journal_warm_up: Arc<JournalWarmUp>,
+    live_updates: Arc<live::Updates>,
 ) -> Result<Router> {
     // Every request is derived from this one database, so they all resume the
     // same verified journal rather than each re-hashing it from the first
@@ -2208,6 +2212,7 @@ fn application(
         cloudflare_access: config.cloudflare_access,
         csrf_token: Arc::from(random_token()?),
         journal_warm_up,
+        live_updates,
     };
     let protected = Router::new()
         .route("/openapi.json", get(openapi))
@@ -2312,6 +2317,7 @@ fn application(
                 .route("/check", get(check))
                 .route("/save", post(save))
                 .route("/audit/log", get(audit_log))
+                .route("/events", get(live::events))
                 .route("/audit/head", get(audit_head))
                 .route("/audit/verify", get(audit_verify))
                 .route("/audit/baseline", post(audit_baseline)),
@@ -2365,7 +2371,13 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
     let journal = database.clone();
     let warm_up = Arc::<JournalWarmUp>::default();
     let cloudflare_access = config.cloudflare_access.clone();
-    let application = application(database, config, Arc::clone(&warm_up))?;
+    let live_updates = Arc::<live::Updates>::default();
+    let application = application(
+        database,
+        config,
+        Arc::clone(&warm_up),
+        Arc::clone(&live_updates),
+    )?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("could not bind HTTP server to {bind}"))?;
@@ -2416,6 +2428,7 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
     log_shutdown(format_args!(
         "signal={signal} state=draining detail=\"no longer accepting connections; waiting for in-flight requests; a second signal stops without waiting\""
     ));
+    live_updates.stop();
     let _ = drain.send(());
     tokio::select! {
         result = server.as_mut() => {
@@ -2512,6 +2525,7 @@ impl ShutdownSignals {
 /// what it buys is that a route added later cannot forget it. Inserted rather
 /// than appended, so a handler that sets it too still sends one value.
 async fn request_context(request: Request<Body>, next: Next) -> Response {
+    let started = Instant::now();
     let id = random_id();
     let header = HeaderValue::from_str(&id).ok();
     let context = RequestContext {
@@ -2520,6 +2534,14 @@ async fn request_context(request: Request<Body>, next: Next) -> Response {
         path: Arc::from(request.uri().path()),
     };
     let mut response = REQUEST_CONTEXT.scope(context, next.run(request)).await;
+    if let Ok(timing) = HeaderValue::from_str(&format!(
+        "app;dur={:.2}",
+        started.elapsed().as_secs_f64() * 1_000.0
+    )) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("server-timing"), timing);
+    }
     if let Some(header) = header {
         response
             .headers_mut()
@@ -4251,7 +4273,6 @@ async fn view_records(
             navigation,
             can_create,
             can_manage_views,
-            updatable,
         ) = run_database(&state, &headers, move |database| {
             let view = database.view(&requested_view)?;
             let predicates = ViewPredicates::parse(&view)?;
@@ -4284,15 +4305,6 @@ async fn view_records(
             let navigation = database.views()?;
             let can_create = can_create_in_collection(database, &view.collection)?;
             let can_manage_views = database.owner_access_allowed(&AccessResource::Database)?;
-            let mut updatable = BTreeSet::new();
-            for record in &records {
-                if database.access_allowed(
-                    AccessAction::Update,
-                    &AccessResource::record(&record.collection, &record.id),
-                )? {
-                    updatable.insert(record.id.clone());
-                }
-            }
             Ok((
                 view,
                 records,
@@ -4302,7 +4314,6 @@ async fn view_records(
                 navigation,
                 can_create,
                 can_manage_views,
-                updatable,
             ))
         })
         .await?;
@@ -4337,6 +4348,33 @@ async fn view_records(
                 state.max_page_size,
                 view_position(&query, bounds.offset),
             ),
+        };
+        // Only displayed Kanban cards have move controls. Checking every
+        // matching record before pagination made even a table page perform
+        // hundreds of authorization reads it never used.
+        let updatable = if view.layout == ViewLayout::Kanban {
+            let resources: Vec<_> = page
+                .records
+                .iter()
+                .map(|record| {
+                    (
+                        record.id.clone(),
+                        AccessResource::record(&record.collection, &record.id),
+                    )
+                })
+                .collect();
+            run_database(&state, &headers, move |database| {
+                let mut updatable = BTreeSet::new();
+                for (id, resource) in resources {
+                    if database.access_allowed(AccessAction::Update, &resource)? {
+                        updatable.insert(id);
+                    }
+                }
+                Ok(updatable)
+            })
+            .await?
+        } else {
+            BTreeSet::new()
         };
         let ui = ui_context(&state, &headers).await?;
         Ok(render_view_records(
@@ -7313,6 +7351,14 @@ fn openapi_paths() -> JsonValue {
             { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
             { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } }
         ], "responses": ok("#/components/schemas/AuditPage") } },
+        "/api/v1/events": { "get": {
+            "operationId": "watchChanges",
+            "description": "A best-effort Server-Sent Events feed for live views. reset requests a fresh query on every connection; change carries an array of collections whose readable records changed; unavailable closes the feed. No record contents, identifiers, global sequence, or replay cursor are exposed. Authentication is rechecked while connected.",
+            "responses": { "200": {
+                "description": "Permission-filtered change notifications with periodic keep-alive comments",
+                "content": { "text/event-stream": { "schema": { "type": "string" } } }
+            }, "400": error_response(), "401": error_response(), "403": error_response(), "500": error_response() }
+        } },
         "/api/v1/audit/head": { "get": { "operationId": "getAuditHead", "responses": ok("#/components/schemas/AuditHead") } },
         "/api/v1/audit/verify": { "get": { "operationId": "verifyAudit", "parameters": [
             { "name": "expected_head", "in": "query", "schema": { "type": "string" } },
@@ -9226,6 +9272,7 @@ fn render_view_records(
                             span class="mx-1.5 text-gray-300" aria-hidden="true" { "·" }
                         }
                         (view_record_count(page.total, OutOfBand::No))
+                        span class="cr-live-status" data-live-status="true" hidden { "Connecting…" }
                     }
                 },
                 html! {
@@ -10185,7 +10232,7 @@ fn view_results(
         .filter(|column| Some(column.as_str()) != title_field)
         .collect::<Vec<_>>();
     html! {
-        div id=(VIEW_TABLE_REGION) {
+        div id=(VIEW_TABLE_REGION) data-live-collection=(&view.collection) data-live-key=(csrf_token) {
             (render_active_filters(view, query, page, schema))
             @if view.layout == ViewLayout::Kanban {
                 (render_kanban_board(view, columns, page, activity, query, schema, csrf_token, updatable))

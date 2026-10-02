@@ -46,6 +46,18 @@ fn test_database(name: &str) -> (TempDir, Database) {
     (temporary, database)
 }
 
+#[tokio::test]
+async fn response_timing_covers_pages_and_errors() {
+    let (_temporary, database) = test_database("response-timing");
+    let app = router(database, ServerConfig::default()).unwrap();
+    for uri in ["/", "/api/v1/records/missing/one"] {
+        let response = request(&app, Method::GET, uri, None, &[]).await;
+        let timing = response.headers["server-timing"].to_str().unwrap();
+        let duration: f64 = timing.strip_prefix("app;dur=").unwrap().parse().unwrap();
+        assert!(duration.is_finite() && duration >= 0.0);
+    }
+}
+
 async fn request(
     app: &Router,
     method: Method,

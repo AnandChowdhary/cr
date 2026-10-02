@@ -4,7 +4,7 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -283,6 +283,10 @@ pub struct Database {
     /// one database and by `--as` and the command it delegates; see
     /// [`Self::with_journal_cache`] and [`Self::with_journal_verification`].
     journal: Option<Arc<JournalCache>>,
+    /// Validated schema content, shared across perspectives but never their
+    /// permissions. Every lookup still reads the file through `paths`, so
+    /// direct edits, removals, and unsafe filesystem entries take effect now.
+    schemas: Arc<Mutex<BTreeMap<String, (String, JsonValue)>>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -634,6 +638,7 @@ impl Database {
             attribution: Attribution::from_environment()?,
             idempotency_key: None,
             journal: None,
+            schemas: Arc::default(),
         };
         let database = database.with_default_actor();
         database.audit().ensure_layout()?;
@@ -699,6 +704,7 @@ impl Database {
             attribution: Attribution::from_environment()?,
             idempotency_key: None,
             journal: None,
+            schemas: Arc::default(),
         };
         let database = database.with_default_actor();
         let audit = database.audit();
@@ -3077,26 +3083,29 @@ impl Database {
                 &schema_root.join(&entry.name),
                 &schema_label(&name),
             )?;
-            let schema: serde_json::Value =
-                serde_json::from_str(&serialized).with_context(|| {
+            let schema = self.cached_schema(&name, &serialized, || {
+                let schema: serde_json::Value =
+                    serde_json::from_str(&serialized).with_context(|| {
+                        DomainError::Invalid(format!(
+                            "schema for collection '{name}' is not valid JSON"
+                        ))
+                    })?;
+                jsonschema::meta::validate(&schema).map_err(|error| {
+                    anyhow!("{error}").context(DomainError::Invalid(format!(
+                        "invalid JSON Schema for collection '{name}'"
+                    )))
+                })?;
+                EncryptionPolicy::from_schema(Some(&schema)).with_context(|| {
                     DomainError::Invalid(format!(
-                        "schema for collection '{name}' is not valid JSON"
+                        "invalid encryption annotations for collection '{name}'"
                     ))
                 })?;
-            jsonschema::meta::validate(&schema).map_err(|error| {
-                anyhow!("{error}").context(DomainError::Invalid(format!(
-                    "invalid JSON Schema for collection '{name}'"
-                )))
-            })?;
-            EncryptionPolicy::from_schema(Some(&schema)).with_context(|| {
-                DomainError::Invalid(format!(
-                    "invalid encryption annotations for collection '{name}'"
-                ))
-            })?;
-            CollectionAccessPolicy::from_schema(Some(&schema)).with_context(|| {
-                DomainError::Invalid(format!(
-                    "invalid access annotations for collection '{name}'"
-                ))
+                CollectionAccessPolicy::from_schema(Some(&schema)).with_context(|| {
+                    DomainError::Invalid(format!(
+                        "invalid access annotations for collection '{name}'"
+                    ))
+                })?;
+                Ok(schema)
             })?;
             self.refuse_encrypted_bundles(&name, &schema)?;
             models.insert(name, Some(schema));
@@ -5668,16 +5677,56 @@ impl Database {
                 "collection '{collection}' has an unusable JSON Schema"
             ))
         };
-        let schema: serde_json::Value = serde_json::from_str(&serialized)
-            .with_context(|| format!("{label} is not valid JSON"))
-            .with_context(unusable)?;
-        jsonschema::meta::validate(&schema)
-            .map_err(|error| anyhow!("invalid JSON Schema for {label}: {error}"))
-            .with_context(unusable)?;
-        EncryptionPolicy::from_schema(Some(&schema)).with_context(unusable)?;
-        CollectionAccessPolicy::from_schema(Some(&schema)).with_context(unusable)?;
+        let schema = self.cached_schema(collection, &serialized, || {
+            let schema: serde_json::Value = serde_json::from_str(&serialized)
+                .with_context(|| format!("{label} is not valid JSON"))
+                .with_context(unusable)?;
+            jsonschema::meta::validate(&schema)
+                .map_err(|error| anyhow!("invalid JSON Schema for {label}: {error}"))
+                .with_context(unusable)?;
+            EncryptionPolicy::from_schema(Some(&schema)).with_context(unusable)?;
+            CollectionAccessPolicy::from_schema(Some(&schema)).with_context(unusable)?;
+            Ok(schema)
+        })?;
         self.refuse_encrypted_bundles(collection, &schema)?;
         Ok(Some(schema))
+    }
+
+    fn cached_schema(
+        &self,
+        collection: &str,
+        serialized: &str,
+        validate: impl FnOnce() -> Result<JsonValue>,
+    ) -> Result<JsonValue> {
+        if let Some((contents, schema)) = self
+            .schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(collection)
+            && contents == serialized
+        {
+            return Ok(schema.clone());
+        }
+        let schema = validate()?;
+        // Large schemas remain supported without retaining arbitrarily large
+        // file contents in a long-running server.
+        if serialized.len() > 256 * 1024 {
+            return Ok(schema);
+        }
+        let mut schemas = self
+            .schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Schema bytes alone are retained, never records or decrypted values.
+        // Bound retained collections even when many transient schemas appear.
+        if schemas.len() >= 128 && !schemas.contains_key(collection) {
+            schemas.pop_first();
+        }
+        schemas.insert(
+            collection.to_owned(),
+            (serialized.to_owned(), schema.clone()),
+        );
+        Ok(schema)
     }
 
     /// Refuse encrypted storage in a collection that stores bundles.
@@ -7040,8 +7089,36 @@ fn validate_relative_path(path: &Path, label: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_component, validate_relative_path};
+    use super::{Database, validate_component, validate_relative_path};
     use std::path::Path;
+
+    #[test]
+    fn cached_schemas_observe_direct_edits_removal_and_unsafe_replacements() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::init(root.path()).unwrap();
+        database.create("items", "one", &[], "Body").unwrap();
+        let path = root.path().join(".cr/schemas/items.json");
+        std::fs::write(&path, r#"{"type":"object","title":"Original"}"#).unwrap();
+        assert_eq!(
+            database.schema("items").unwrap().unwrap()["title"],
+            "Original"
+        );
+        // Same-size replacement catches caches based on size alone; content
+        // changes must be visible to an already-open clone as well.
+        std::fs::write(&path, r#"{"type":"object","title":"Modified"}"#).unwrap();
+        assert_eq!(
+            database.clone().schema("items").unwrap().unwrap()["title"],
+            "Modified"
+        );
+        std::fs::write(&path, r#"{"type":"invalid"}"#).unwrap();
+        assert!(database.collection_models().is_err());
+        assert!(database.get("items", "one").is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(database.schema("items").unwrap().is_none());
+        assert!(database.get("items", "one").is_ok());
+        std::fs::create_dir(&path).unwrap();
+        assert!(database.get("items", "one").is_err());
+    }
 
     #[test]
     fn path_validation_blocks_traversal_but_allows_unicode() {

@@ -4,6 +4,26 @@
 on the same address. [Start the server](web-ui.md#start-the-server) first; the
 examples below use the default `http://127.0.0.1:3000`.
 
+## Live change notifications
+
+`GET /api/v1/events` serves a best-effort Server-Sent Events feed for browser
+views under the same authentication as the rest of the API. Its content type
+is `text/event-stream`, with `Cache-Control: no-store` and
+`X-Accel-Buffering: no`; reverse proxies must forward streaming responses
+without buffering. Normal browser connections use the local console or
+Cloudflare Access session; native `EventSource` cannot attach a custom bearer
+header, so bearer-authenticated clients must use a streaming HTTP client.
+
+Every connection begins with `event: reset` and `data: {}`: fetch the current
+query to recover changes missed while disconnected. `event: change` carries a
+JSON array of affected collection names, such as `["tasks"]`. Only changes to
+the principal's readable records are reported, including deletion or revoked
+visibility. No record IDs, contents, or database-wide sequence are exposed.
+`event: unavailable` means the client should reconnect and reauthenticate;
+the stream then closes. Periodic comment frames keep idle connections alive.
+This feed observes committed record changes and has no replay cursor; use
+the audit endpoints for durable history.
+
 ## Authentication and identity
 
 Local access has no token by default. Set `CR_API_TOKEN` before starting the server to require a bearer token for the HTML views, `/openapi.json`, and every `/api/v1` endpoint:
@@ -587,6 +607,8 @@ that is not UTF-8 once percent-decoded. A collection, record, or view name
 the filesystem cannot store, because it is too long or holds a NUL byte, is
 `422 validation_failed`, and so is front matter nested more than 64 levels
 deep.
+
+Every response also includes `Server-Timing: app;dur=<milliseconds>`, the time spent processing the request through response creation, including authentication and waiting for database work. Streaming responses report the time to open the response. This header helps compare server time with the full request duration in a browser's Network panel; it contains no record data.
 
 An unexpected failure returns `500` with a fixed generic message. Every
 response, including successful ones, carries an `X-Request-Id` header that

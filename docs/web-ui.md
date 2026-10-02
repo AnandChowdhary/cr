@@ -653,6 +653,33 @@ cr view create interviews \
   --sort-direction desc
 ```
 
+## Live updates
+
+Tables and Kanban boards refresh automatically while the tab is visible. One
+Server-Sent Events connection is shared across the tab's views. The server
+checks the committed audit journal once a second, including changes from
+separate CLI commands, agents, and sync adapters, and the browser batches
+relevant notifications for 300 ms before fetching the current results. The
+same query recalculates filtering, ordering, pagination, and lane counts; the
+sidebar, search box, and filter panel stay in place. Board and lane scroll
+positions are retained, and background swaps do not add browser history.
+
+The heading shows **Live**, **Updates pending**, or **Reconnecting…**. Updates
+wait while a card is being dragged, a move control is open, results have
+keyboard focus or selected text, or a form has unsaved changes. Hidden tabs
+close the stream and refresh when shown again. Reconnecting also refreshes
+the current results, so missed notifications cannot leave a view stale.
+Background failures keep the page in place and retry instead of navigating
+away to sign in. Without JavaScript, ordinary navigation still fetches fresh
+data.
+
+The stream exposes only collection names affected by changes to records the
+current principal can read, including records removed from that readable set.
+It rechecks authentication and permissions while connected. Direct filesystem
+edits become live notifications after an explicit `cr save`; watching never
+accepts edits into the journal automatically. Schema and saved-view definition
+edits still take effect on the next query or navigation.
+
 ## Create a Kanban pipeline
 
 ![A sales pipeline rendered as a Kanban board](screenshots/sales-pipeline.jpg)
@@ -785,6 +812,12 @@ page_size: 200
 ```
 
 You can edit these files directly. The server reloads them on each request. Persisted `filters` in view definitions use typed `KEY=YAML` equality; the page's ad hoc filter builder adds comparisons and all/any composition without changing the saved scope.
+
+## Diagnose slow navigation
+
+Every response includes `Server-Timing: app;dur=<milliseconds>`, measuring server processing through response creation, including authentication and waits for database work. For an event stream this measures opening the response, not its lifetime. In your browser's Network panel, select the slow page request and compare this value with the request's total time. A large `app` duration points to server work; a small duration beside a much longer request points to time outside the handler, such as the proxy or network. The existing `X-Request-Id` identifies the request in error logs.
+
+The server reuses verified journal state, an in-memory history index, and validated schemas across navigation. It continues to check current permissions and file contents. Listing and searching still read matching records, and a task's relations panel scans readable collections, so database size and filesystem latency can still affect navigation. Use a release build for representative measurements (`cargo build --release` when building from source).
 
 ## How pages are rendered
 

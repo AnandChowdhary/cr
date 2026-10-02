@@ -723,6 +723,8 @@ html {
 
 .cr-button > span[aria-hidden="true"] { margin-left: 0.2em; }
 .cr-button .cr-pill { padding: 1px 6px; }
+.cr-live-status { color: var(--cr-gray-500); font-size: 0.75rem; margin-left: 0.75rem; white-space: nowrap; }
+
 /* A button inside a card, such as a Kanban card's Move. */
 .cr-button-small { height: 28px; padding: 0 10px; font-size: 0.72rem; }
 

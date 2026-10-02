@@ -51,6 +51,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 # stays on so a loaded signing key is wiped when it is dropped.
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
 form_urlencoded = "1.2.2"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = "0.4.3"
 hmac = "0.13.0"
 # Default features stay off: they are `resolve-http`/`resolve-file`/`tls-*`,
@@ -81,7 +82,7 @@ sha2 = "0.11.0"
 similar = { version = "3.2.0", default-features = false, features = ["text"] }
 tempfile = "3.27.0"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
-tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 # The one request `cr` makes on its own: `cr serve --cloudflare-access` fetches
 # the team's signing keys over HTTPS, and nothing else does. `rustls` with its
 # bundled web PKI roots, not the default `gzip` as well, since the key set is
