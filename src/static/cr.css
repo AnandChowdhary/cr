@@ -1095,22 +1095,46 @@ html {
 .cr-audit-entry:last-child { border-bottom: 0; }
 .cr-audit-entry:target { background: var(--cr-accent-soft); }
 
-/* A board fits the window: it scrolls sideways once its lanes are wider than
-   the workspace, and each lane is at most as tall as the window leaves room
-   for, its cards scrolling inside it under a heading that stays put, so a
-   lane of a hundred cards neither stretches the page nor hides the lanes
-   beside it. */
+/* A board uses the space left by the actual header, navigation and filter
+   chips, whose heights change when they wrap. Keep that space bounded all
+   the way from the workspace to the lanes, so only the board scrolls sideways
+   and only each lane's cards scroll vertically. Other pages keep their normal
+   document flow, including after a boosted navigation replaces the board. */
+.cr-shell:has(.cr-board-scroll) { min-height: 100dvh; }
+.cr-shell:has(.cr-board-scroll) .cr-sidebar { height: 100dvh; }
+.cr-workspace:has(.cr-board-scroll) {
+  display: flex;
+  height: 100dvh;
+  flex-direction: column;
+}
+.cr-main:has(.cr-board-scroll),
+#cr-view-table:has(.cr-board-scroll) {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+.cr-workspace:has(.cr-board-scroll) > :not(.cr-main),
+.cr-main:has(.cr-board-scroll) > :not(#cr-view-table),
+#cr-view-table:has(.cr-board-scroll) > :not(.cr-board-scroll) { flex: 0 0 auto; }
+
+/* Hidden card labels are absolutely positioned. A containing block inside
+   each scroller keeps those labels from extending the document's scroll area
+   to the positions of cards and lanes that are clipped out of view. */
 .cr-board-scroll {
+  position: relative;
+  min-height: 0;
+  flex: 1 1 auto;
   overflow-x: auto;
   overscroll-behavior-x: contain;
   padding-bottom: 8px;
   scroll-timeline: --cr-board-x inline;
 }
-.cr-board { display: flex; width: max-content; align-items: flex-start; gap: 10px; }
+.cr-board { display: flex; width: max-content; height: 100%; align-items: flex-start; gap: 10px; }
 .cr-kanban-lane {
   display: flex;
   width: 272px;
-  max-height: max(22rem, calc(100dvh - 10.5rem));
+  max-height: 100%;
   flex: 0 0 auto;
   flex-direction: column;
   border: 1px solid var(--cr-gray-200);
@@ -1122,8 +1146,9 @@ html {
 /* The lane a dragged card would drop into. */
 .cr-kanban-lane[data-drop-target] { outline: 2px solid var(--cr-accent); outline-offset: -1px; }
 .cr-lane-cards {
+  position: relative;
   display: flex;
-  min-height: 5rem;
+  min-height: 0;
   flex: 1 1 auto;
   flex-direction: column;
   gap: 6px;
@@ -1215,6 +1240,7 @@ a.cr-lane-more:hover { background: var(--cr-gray-100); color: var(--cr-gray-900)
 /* A card: its title in two lines at most, the ID in one quiet line under it,
    then a row of the values it holds. */
 .cr-kanban-card {
+  flex: 0 0 auto;
   border: 1px solid var(--cr-gray-200);
   border-radius: 8px;
   background: var(--cr-gray-0);

@@ -1427,9 +1427,9 @@ async fn a_kanban_board_fits_the_window_with_lanes_that_scroll_on_their_own() {
             .unwrap_or_else(|| panic!("no {selector}"));
         &sheet[start..start + sheet[start..].find('}').unwrap()]
     };
-    // A lane is no taller than the window leaves room for, and its cards
-    // scroll inside it under its heading.
-    assert!(rule(".cr-kanban-lane").contains("max-height: max(22rem, calc(100dvh - 10.5rem));"));
+    // A lane is no taller than the space its board has left after the page's
+    // controls, and its cards scroll inside it under its heading.
+    assert!(rule(".cr-kanban-lane").contains("max-height: 100%;"));
     assert!(rule(".cr-lane-cards").contains("overflow-y: auto;"));
     // Each lane's cards fade at its edges while there are more past them, on
     // the lane's own timeline, so a lane that fits shows no fade.
