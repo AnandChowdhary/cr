@@ -26,6 +26,10 @@ pub struct SearchQuery {
 }
 
 impl SearchQuery {
+    pub(crate) fn needs_document(&self) -> bool {
+        matches!(self.target, SearchTarget::Document)
+    }
+
     pub fn new(
         pattern: &str,
         target: SearchTarget,

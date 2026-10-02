@@ -276,3 +276,156 @@ async fn result_fragments_keep_the_live_subscription_metadata() {
         }
     }
 }
+
+async fn connect_scoped(app: &Router, collection: &str, headers: &[(&str, &str)]) -> Body {
+    let mut request = Request::builder().uri(format!("/api/v1/events?collection={collection}"));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body()
+}
+
+#[tokio::test]
+async fn scoped_resets_match_the_page_and_detect_unaudited_content_and_renames() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = Database::init(temp.path()).unwrap();
+    create(&database, "tasks", "one");
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/tasks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let page = String::from_utf8(
+        page.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    let generation = page
+        .split("data-live-generation=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let mut body = connect_scoped(&app, "tasks", &[]).await;
+    let reset = event(&mut body).await;
+    let data: serde_json::Value = serde_json::from_str(
+        reset
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(data["generation"], generation);
+    create(&database, "unrelated", "other");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1200), body.frame())
+            .await
+            .is_err()
+    );
+    // Exact reconciliation notices even an edit that restores its modification
+    // timestamp and never updates the audit head.
+    let file = temp.path().join("records/tasks/one.md");
+    let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+    std::fs::write(&file, "---\nstatus: hand-edited\n---\nDirect note").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert_eq!(changed(&event(&mut body).await), ["tasks"]);
+    assert_eq!(database.audit_head().unwrap().sequence, 2);
+    std::fs::rename(&file, temp.path().join("records/tasks/renamed.md")).unwrap();
+    assert_eq!(changed(&event(&mut body).await), ["tasks"]);
+    let page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/tasks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let page = String::from_utf8(
+        page.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("/tasks/records/renamed"));
+    assert!(!page.contains("/tasks/records/one\""));
+}
+
+#[tokio::test]
+async fn scoped_subscriptions_refuse_hidden_collections_and_keep_hidden_updates_silent() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = Database::init(temp.path())
+        .unwrap()
+        .with_actor("Owner <owner@example.com>")
+        .unwrap();
+    database.initialize_access(None, None).unwrap();
+    database
+        .add_user("reader@example.com", "Reader", None, UserKind::Human)
+        .unwrap();
+    create(&database, "tasks", "public");
+    create(&database, "tasks", "secret");
+    create(&database, "hidden", "hidden");
+    let resource = AccessResource::record("tasks", "public");
+    database
+        .grant_access("reader@example.com", resource.clone(), Role::Viewer)
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let cookie = "cr_perspective=reader%40example.com";
+    let refused = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events?collection=hidden")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    let mut body = connect_scoped(&app, "tasks", &[("cookie", cookie)]).await;
+    assert!(event(&mut body).await.contains("event: reset"));
+    database
+        .update("tasks", "secret", &["status=hidden".parse().unwrap()], None)
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1200), body.frame())
+            .await
+            .is_err()
+    );
+    database
+        .grant_access("reader@example.com", resource.clone(), Role::Editor)
+        .unwrap();
+    assert_eq!(changed(&event(&mut body).await), ["tasks"]);
+    database
+        .revoke_access("reader@example.com", &resource)
+        .unwrap();
+    assert_eq!(changed(&event(&mut body).await), ["tasks"]);
+    assert!(body.frame().await.is_none());
+}

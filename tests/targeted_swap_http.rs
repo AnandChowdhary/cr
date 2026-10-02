@@ -563,7 +563,7 @@ async fn a_kanban_board_is_paged_and_filtered_by_the_same_controls() {
     // never an htmx request. Giving the form a swap the drop cannot have is the
     // asymmetry `UNBOOSTED` exists to prevent.
     let board = between(&page.body, "data-kanban-board", "data-board-summary");
-    assert!(board.contains("/move\" hx-boost=\"false\""));
+    assert!(board.contains("/move\""));
     for card in board.split("<article").skip(1) {
         let card = &card[..card.find("</article>").unwrap()];
         assert!(

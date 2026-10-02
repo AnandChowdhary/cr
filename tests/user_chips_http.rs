@@ -85,7 +85,7 @@ async fn a_relation_to_a_user_shows_the_person() {
     let (_temporary, database, editor) = seeded_database();
     let app = router(database, ServerConfig::default()).unwrap();
 
-    let owner_page = page(&app, "/deals/records/acme", &[]).await;
+    let owner_page = page(&app, "/deals/records/acme?relations=true", &[]).await;
     assert!(
         owner_page.contains(
             "<span class=\"cr-relation-target\"><span class=\"cr-user\" title=\"ada@example.com\"><span class=\"cr-avatar cr-avatar-"
@@ -98,7 +98,12 @@ async fn a_relation_to_a_user_shows_the_person() {
 
     // An editor of deals may not read the registry, so the relation shows only
     // the ID it states — still as a person, and never the name.
-    let editor_page = page(&app, "/deals/records/acme", &[("authorization", &editor)]).await;
+    let editor_page = page(
+        &app,
+        "/deals/records/acme?relations=true",
+        &[("authorization", &editor)],
+    )
+    .await;
     assert!(
         editor_page.contains("<span class=\"cr-relation-missing\" title=\"Missing, or not visible to this perspective\"><span class=\"cr-user\">"),
         "{editor_page}"
@@ -114,7 +119,7 @@ async fn audit_actors_and_the_users_they_changed_show_the_person() {
 
     // The record's activity names who changed it, with the recorded actor in
     // the tooltip.
-    let record = page(&app, "/deals/records/acme", &[]).await;
+    let record = page(&app, "/deals/records/acme?relations=true", &[]).await;
     assert!(
         record.contains("<span class=\"cr-user\" title=\"Owner &lt;owner@example.com&gt;\">"),
         "{record}"

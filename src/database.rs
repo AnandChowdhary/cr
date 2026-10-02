@@ -4,7 +4,11 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -60,6 +64,15 @@ const IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] = b"cr:idempotency:key:v1\0";
 const IDEMPOTENCY_REQUEST_HASH_DOMAIN: &[u8] = b"cr:idempotency:request:v2\0";
 const MIN_IDEMPOTENCY_KEY_BYTES: usize = 16;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
+
+#[cfg(test)]
+thread_local! {
+    // Users-directory walks, principal reads, and schema reads. Counting the
+    // work keeps scan regressions testable without filesystem timing limits.
+    static READ_POLICY_CALLS: std::cell::Cell<(usize, usize, usize)> = const {
+        std::cell::Cell::new((0, 0, 0))
+    };
+}
 
 /// How the database directory itself is named to a caller.
 pub(crate) const DATABASE_LABEL: &str = "the database directory";
@@ -287,6 +300,14 @@ pub struct Database {
     /// permissions. Every lookup still reads the file through `paths`, so
     /// direct edits, removals, and unsafe filesystem entries take effect now.
     schemas: Arc<Mutex<BTreeMap<String, (String, JsonValue)>>>,
+    /// Only server list/search operations opt into this disposable source
+    /// cache. Authorization, details, preconditions and writes never use it.
+    reads: Arc<CollectionReadCache>,
+    cached_lists: bool,
+    entry_only_lists: bool,
+    read_cancelled: Option<Arc<AtomicBool>>,
+    request_models: Option<Arc<Mutex<Option<Vec<CollectionModel>>>>>,
+    view_definitions: Arc<Mutex<BTreeMap<String, (String, crate::ViewDefinition)>>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -404,10 +425,103 @@ pub struct RecordFile {
 
 /// A record exactly as it is stored: its Markdown, a bundle's supporting
 /// files, and the version that covers them both.
+#[derive(Clone, Debug)]
 struct StoredRecord {
     raw: String,
     files: BundleFiles,
     version: String,
+}
+
+fn yaml_memory(value: &Value) -> usize {
+    std::mem::size_of::<Value>()
+        + match value {
+            Value::String(value) => value.capacity(),
+            Value::Sequence(values) => {
+                values.iter().map(yaml_memory).sum::<usize>()
+                    + values.capacity().saturating_sub(values.len()) * std::mem::size_of::<Value>()
+            }
+            Value::Mapping(values) => values
+                .iter()
+                .map(|(key, value)| yaml_memory(key) + yaml_memory(value) + 64)
+                .sum(),
+            Value::Tagged(value) => yaml_memory(&value.value) + value.tag.to_string().len() + 64,
+            _ => 0,
+        }
+}
+
+// At most 64 collections and 128 MiB of accounted source/parsed data,
+// with at most 16 MiB in any one collection. IDs
+// and YAML nodes count toward the budget too. Active bounded read workers may
+// temporarily retain an evicted entry; no persistent plaintext index exists.
+const READ_CACHE_COLLECTIONS: usize = 64;
+const READ_CACHE_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+const READ_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const READ_CACHE_AGE: Duration = Duration::from_secs(4);
+
+type CollectionCacheEntry = (Instant, Arc<Mutex<Option<CollectionSnapshot>>>, usize);
+
+#[derive(Debug, Default)]
+struct CollectionReadCache {
+    entries: Mutex<HashMap<PathBuf, CollectionCacheEntry>>,
+    generation: AtomicU64,
+    #[cfg(test)]
+    source_reads: AtomicU64,
+}
+
+#[derive(Debug)]
+struct CollectionSnapshot {
+    started: Instant,
+    generation: u64,
+    ids: Vec<String>,
+    records: HashMap<String, Arc<(StoredRecord, Document)>>,
+    search: HashMap<String, (String, Arc<str>)>,
+    backlinks: HashMap<(String, String), BTreeSet<String>>,
+    bytes: usize,
+}
+
+impl CollectionReadCache {
+    fn collection(&self, path: PathBuf) -> Arc<Mutex<Option<CollectionSnapshot>>> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !entries.contains_key(&path)
+            && entries.len() >= READ_CACHE_COLLECTIONS
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (used, _, _))| *used)
+                .map(|(key, _)| key.clone())
+        {
+            entries.remove(&oldest);
+        }
+        let entry = entries
+            .entry(path)
+            .or_insert_with(|| (Instant::now(), Arc::default(), 0));
+        entry.0 = Instant::now();
+        Arc::clone(&entry.1)
+    }
+    fn account(&self, path: &Path, bytes: usize) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = entries.get_mut(path) {
+            entry.2 = bytes;
+        }
+        while entries.values().map(|entry| entry.2).sum::<usize>() > READ_CACHE_TOTAL_BYTES {
+            let oldest = entries
+                .iter()
+                .filter(|(key, _)| key.as_path() != path)
+                .min_by_key(|(_, entry)| entry.0)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(oldest) => {
+                    entries.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 /// Whether a read of a bundle record holds the audit lock.
@@ -639,6 +753,12 @@ impl Database {
             idempotency_key: None,
             journal: None,
             schemas: Arc::default(),
+            reads: Arc::default(),
+            cached_lists: false,
+            entry_only_lists: false,
+            read_cancelled: None,
+            request_models: None,
+            view_definitions: Arc::default(),
         };
         let database = database.with_default_actor();
         database.audit().ensure_layout()?;
@@ -705,6 +825,12 @@ impl Database {
             idempotency_key: None,
             journal: None,
             schemas: Arc::default(),
+            reads: Arc::default(),
+            cached_lists: false,
+            entry_only_lists: false,
+            read_cancelled: None,
+            request_models: None,
+            view_definitions: Arc::default(),
         };
         let database = database.with_default_actor();
         let audit = database.audit();
@@ -749,6 +875,7 @@ impl Database {
             return Ok(None);
         }
         let layout = RecordLayout::from_config(&config.collections)?;
+        self.invalidate_lists();
         Ok(Some(Self {
             config,
             layout,
@@ -806,6 +933,7 @@ impl Database {
         }
         self.actor = actor;
         self.principal = principal;
+        self.request_models = None;
         self.impersonated_by = None;
         Ok(self)
     }
@@ -840,6 +968,7 @@ impl Database {
         // What was authenticated is the operator, not the principal selected.
         database.authentication = None;
         database.principal = principal.to_owned();
+        database.request_models = None;
         database.actor = format!(
             "{} <{}>",
             user.name,
@@ -920,6 +1049,7 @@ impl Database {
         // What was authenticated is the operator, not the principal selected.
         database.authentication = None;
         database.principal = principal.to_owned();
+        database.request_models = None;
         database.actor = format!(
             "{} <{}>",
             target.name,
@@ -1096,6 +1226,11 @@ impl Database {
     /// by `cr access init`. An empty directory is not enough to enable RBAC,
     /// which keeps an interrupted bootstrap recoverable.
     pub fn access_enabled(&self) -> Result<bool> {
+        #[cfg(test)]
+        READ_POLICY_CALLS.with(|calls| {
+            let (users, principal, schema) = calls.get();
+            calls.set((users + 1, principal, schema));
+        });
         let directory = self.config.data_dir.join(USERS_COLLECTION);
         let Some(entries) = paths::list_directory(&self.root, &directory, "the users collection")?
         else {
@@ -1157,13 +1292,33 @@ impl Database {
         if !self.access_enabled()? {
             return Ok(None);
         }
-        let Some((mut user, policy_hash)) = self.user_unchecked_optional(&self.principal)? else {
+        let Some((user, policy_hash)) = self.user_unchecked_optional(&self.principal)? else {
             return Err(forbidden(format!(
                 "principal '{}' is not registered in the users collection",
                 self.principal
             )));
         };
-        if user.access.iter().any(|grant| &grant.resource == resource)
+        let record_owned = match resource {
+            AccessResource::Record { collection, .. } if collection != USERS_COLLECTION => {
+                self.record_access_policy(collection)?.is_some()
+            }
+            _ => false,
+        };
+        self.authorize_with_user(action, resource, &user, &policy_hash, record_owned)
+    }
+
+    /// Evaluate a policy already read for this operation. A collection scan
+    /// shares its principal and schema, but still checks each record's policy.
+    fn authorize_with_user(
+        &self,
+        action: AccessAction,
+        resource: &AccessResource,
+        user: &User,
+        policy_hash: &str,
+        record_owned: bool,
+    ) -> Result<Option<AccessDecision>> {
+        let mut without_deleted_grant;
+        let user = if user.access.iter().any(|grant| &grant.resource == resource)
             && let AccessResource::Record { collection, id } = resource
             && collection == USERS_COLLECTION
             && !self.user_record_exists_unchecked(id)?
@@ -1172,16 +1327,19 @@ impl Database {
             // authorizing a resource that no longer exists. Broader grants
             // still evaluate normally, and explicit ID reuse is the boundary
             // at which this resource can exist again.
-            user.access.retain(|grant| &grant.resource != resource);
-        }
+            without_deleted_grant = user.clone();
+            without_deleted_grant
+                .access
+                .retain(|grant| &grant.resource != resource);
+            &without_deleted_grant
+        } else {
+            user
+        };
         let decision = match resource {
-            AccessResource::Record { collection, id }
-                if collection != USERS_COLLECTION
-                    && self.record_access_policy(collection)?.is_some() =>
-            {
+            AccessResource::Record { collection, id } if record_owned => {
                 let record_access = self.record_access_unchecked_optional(collection, id)?;
                 if action == AccessAction::Create {
-                    user.decision(&self.principal, &self.actor, action, resource, &policy_hash)
+                    user.decision(&self.principal, &self.actor, action, resource, policy_hash)
                 } else if let Some(access) = record_access {
                     let resource_policy_hash = record_access_hash(&access)?;
                     user.record_owned_decision(
@@ -1190,7 +1348,7 @@ impl Database {
                         action,
                         resource,
                         &access,
-                        &policy_hash,
+                        policy_hash,
                         &resource_policy_hash,
                     )
                 } else if let Some(decision) = user
@@ -1198,7 +1356,7 @@ impl Database {
                     .iter()
                     .any(|grant| grant.role == Role::Owner && grant.resource.contains(resource))
                     .then(|| {
-                        user.decision(&self.principal, &self.actor, action, resource, &policy_hash)
+                        user.decision(&self.principal, &self.actor, action, resource, policy_hash)
                     })
                     .flatten()
                 {
@@ -1221,7 +1379,7 @@ impl Database {
                     None
                 }
             }
-            _ => user.decision(&self.principal, &self.actor, action, resource, &policy_hash),
+            _ => user.decision(&self.principal, &self.actor, action, resource, policy_hash),
         };
         decision
             .map(|mut decision| {
@@ -1297,15 +1455,16 @@ impl Database {
         }
     }
 
-    fn user_can_read_record_audit(
+    fn user_can_read_record_audit_with_policy(
         &self,
         user: &User,
         policy_hash: &str,
         collection: &str,
         id: &str,
+        record_owned: bool,
     ) -> Result<bool> {
         let resource = AccessResource::record(collection, id);
-        if self.record_access_policy(collection)?.is_some() {
+        if record_owned {
             let Some(access) = self.record_access_unchecked_optional(collection, id)? else {
                 return Ok(user
                     .access
@@ -1355,6 +1514,11 @@ impl Database {
     }
 
     fn user_unchecked_optional(&self, id: &str) -> Result<Option<(User, String)>> {
+        #[cfg(test)]
+        READ_POLICY_CALLS.with(|calls| {
+            let (users, principal, schema) = calls.get();
+            calls.set((users, principal + 1, schema));
+        });
         let path = self.record_path(USERS_COLLECTION, id)?;
         if paths::entry_kind(&self.root, &path, &record_label(USERS_COLLECTION, id))?.is_none() {
             return Ok(None);
@@ -1826,6 +1990,11 @@ impl Database {
 
     /// List the user registry for owners and access managers.
     pub fn users(&self) -> Result<Vec<(String, User)>> {
+        self.users_preview(usize::MAX)
+    }
+
+    /// A bounded registry preview for the owner console's perspective picker.
+    pub(crate) fn users_preview(&self, limit: usize) -> Result<Vec<(String, User)>> {
         self.authorize(AccessAction::ReadAccess, &AccessResource::Database)?;
         let mut users = Vec::new();
         for id in self.user_ids_unchecked()? {
@@ -1833,6 +2002,9 @@ impl Database {
                 continue;
             };
             users.push((id, user));
+            if users.len() >= limit {
+                break;
+            }
         }
         Ok(users)
     }
@@ -2176,6 +2348,7 @@ impl Database {
             user.email.as_deref().unwrap_or(&principal)
         );
         database.principal = principal;
+        database.request_models = None;
         database.authentication = Some(authentication);
         Ok(database)
     }
@@ -2889,60 +3062,261 @@ impl Database {
         filters: &[Assignment],
         audited_states: &mut Option<Arc<AuditedRecordStates>>,
     ) -> Result<Vec<Record>> {
+        self.list_scan(collection, filters, audited_states, None, None)
+    }
+
+    fn list_scan(
+        &self,
+        collection: &str,
+        filters: &[Assignment],
+        audited_states: &mut Option<Arc<AuditedRecordStates>>,
+        candidates: Option<&BTreeSet<String>>,
+        maximum: Option<usize>,
+    ) -> Result<Vec<Record>> {
         validate_component(collection, "collection")?;
         let directory = self.config.data_dir.join(collection);
         let label = collection_label(collection);
-        let Some(entries) = paths::list_directory(&self.root, &directory, &label)? else {
-            return Ok(Vec::new());
+        let cache_key = self.list_cache_key(collection);
+        let schema = self.collection_schema(collection)?;
+        let policy = EncryptionPolicy::from_schema(schema.as_ref())?;
+        // Protected collections always read current stored ciphertext and
+        // current keys. User records are also an authorization source.
+        let cache = (self.cached_lists && collection != USERS_COLLECTION && policy.is_empty())
+            .then(|| self.reads.collection(cache_key.clone()));
+        let mut cached = cache.as_ref().map(|cache| {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        let generation = self.reads.generation.load(AtomicOrdering::Acquire);
+        if let Some(cached) = cached.as_mut()
+            && cached.as_ref().is_some_and(|snapshot| {
+                snapshot.started.elapsed() >= READ_CACHE_AGE || snapshot.generation != generation
+            })
+        {
+            **cached = None;
+        }
+        let identifiers = match cached.as_ref().and_then(|cached| cached.as_ref()) {
+            Some(snapshot) => snapshot.ids.clone(),
+            None => {
+                let started = Instant::now();
+                let Some(entries) = paths::list_directory(&self.root, &directory, &label)? else {
+                    return Ok(Vec::new());
+                };
+                let mut ids = Vec::new();
+                for entry in entries {
+                    let CollectionEntry::Record(id) =
+                        self.layout
+                            .collection_entry(collection, &entry.name, entry.kind)?
+                    else {
+                        continue;
+                    };
+                    if self.layout.stores_record_as(collection, entry.kind) {
+                        ids.push(id);
+                    }
+                }
+                ids.sort();
+                let bytes = ids.iter().map(|id| id.len() + 64).sum();
+                if bytes <= READ_CACHE_BYTES
+                    && let Some(cached) = cached.as_mut()
+                {
+                    **cached = Some(CollectionSnapshot {
+                        started,
+                        generation,
+                        ids: ids.clone(),
+                        records: HashMap::new(),
+                        search: HashMap::new(),
+                        backlinks: HashMap::new(),
+                        bytes,
+                    });
+                }
+                ids
+            }
+        };
+        // The descriptor lasts one scan, never across reconciliation. Child
+        // reads retain O_NOFOLLOW and regular-file checks.
+        let scan_directory = if self.layout.entry(collection).is_none() {
+            paths::open_directory_optional(&self.root, &directory, &label)?
+        } else {
+            None
         };
 
-        let mut identifiers = Vec::new();
-        for entry in entries {
-            // The name decides whether this claims to be a record, and the
-            // kind decides whether it is usable as one — in that order, as in
-            // `record_files` and `cr check`, so a `.md` name that cannot be an
-            // ID is refused rather than quietly listed.
-            let CollectionEntry::Record(id) =
-                self.layout
-                    .collection_entry(collection, &entry.name, entry.kind)?
-            else {
-                continue;
-            };
-            if !self.layout.stores_record_as(collection, entry.kind) {
-                continue;
-            }
-            identifiers.push(id);
+        if identifiers.is_empty() {
+            return Ok(Vec::new());
         }
-        identifiers.sort();
+        // These policies belong to this scan only. The next list reads them
+        // again, so direct edits and changes of perspective take effect then.
+        // Re-reading them for every record made a list scan the entire users
+        // directory once per record, as well as reopening the same schema.
+        let user = if self.access_enabled()? {
+            let Some(user) = self.user_unchecked_optional(&self.principal)? else {
+                return Ok(Vec::new());
+            };
+            Some(user)
+        } else {
+            None
+        };
+        let encryption_context = if policy.is_empty() {
+            None
+        } else {
+            self.encryption_context_optional()?
+        };
+        let mut decryption = crate::encryption::DecryptionSession::default();
+        let record_owned = collection != USERS_COLLECTION
+            && CollectionAccessPolicy::from_schema(schema.as_ref())?.is_some();
 
-        identifiers
+        let result = identifiers
             .into_iter()
             .filter_map(|id| {
-                match self.can_access(AccessAction::Read, &AccessResource::record(collection, &id))
+                if candidates.is_some_and(|candidates| !candidates.contains(&id)) {
+                    return None;
+                }
+                if self
+                    .read_cancelled
+                    .as_ref()
+                    .is_some_and(|cancelled| cancelled.load(AtomicOrdering::Relaxed))
                 {
-                    Ok(true) => {}
-                    Ok(false) => return None,
-                    Err(error) => return Some(Err(error)),
+                    return Some(Err(anyhow!("read request cancelled")));
+                }
+                if let Some((user, policy_hash)) = &user {
+                    match self.authorize_with_user(
+                        AccessAction::Read,
+                        &AccessResource::record(collection, &id),
+                        user,
+                        policy_hash,
+                        record_owned,
+                    ) {
+                        Ok(_) => {}
+                        Err(error)
+                            if matches!(
+                                DomainError::of(&error),
+                                Some(DomainError::Forbidden(_) | DomainError::NotFound(_))
+                            ) =>
+                        {
+                            return None;
+                        }
+                        Err(error) => return Some(Err(error)),
+                    }
                 }
                 (|| {
-                    // A bundle folder with nothing in it is not a record.
-                    let Some(stored) =
-                        self.read_stored_optional(collection, &id, Reading::Snapshot)?
-                    else {
-                        return Ok(None);
+                    let existing = cached
+                        .as_ref()
+                        .and_then(|cached| cached.as_ref())
+                        .and_then(|snapshot| snapshot.records.get(&id))
+                        .cloned();
+                    let source = match existing {
+                        Some(source) => source,
+                        None => {
+                            #[cfg(test)]
+                            self.reads
+                                .source_reads
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                            let stored = if let Some(directory) = &scan_directory {
+                                paths::read_child_to_string_optional(
+                                    directory,
+                                    OsStr::new(&format!("{id}.md")),
+                                    &record_label(collection, &id),
+                                )?
+                                .map(|raw| StoredRecord {
+                                    version: record_hash(raw.as_bytes()),
+                                    raw,
+                                    files: BundleFiles::new(),
+                                })
+                            } else if self.entry_only_lists {
+                                paths::read_to_string_optional(
+                                    &self.root,
+                                    &self.record_path(collection, &id)?,
+                                    &record_label(collection, &id),
+                                )?
+                                .map(|raw| StoredRecord {
+                                    version: record_hash(raw.as_bytes()),
+                                    raw,
+                                    files: BundleFiles::new(),
+                                })
+                            } else {
+                                self.read_stored_optional(collection, &id, Reading::Snapshot)?
+                            };
+                            let Some(mut stored) = stored else {
+                                return Ok(None);
+                            };
+                            let document = parse_record(collection, &id, &stored.raw)?;
+                            // A list returns only file versions, never asset text.
+                            for file in stored.files.values_mut() {
+                                file.text = None;
+                            }
+                            let source = Arc::new((stored, document));
+                            if !document_has_encrypted_storage(&source.1)
+                                && let Some(snapshot) =
+                                    cached.as_mut().and_then(|cached| cached.as_mut())
+                            {
+                                let references = relation_references(&source.1.attributes);
+                                let bytes = source.0.raw.capacity()
+                                    + source.1.body.capacity()
+                                    + source
+                                        .1
+                                        .attributes
+                                        .iter()
+                                        .map(|(key, value)| {
+                                            yaml_memory(key) + yaml_memory(value) + 64
+                                        })
+                                        .sum::<usize>()
+                                    + source
+                                        .0
+                                        .files
+                                        .keys()
+                                        .map(|path| path.len() + 256)
+                                        .sum::<usize>()
+                                    + references
+                                        .iter()
+                                        .map(|(relation, collection, target)| {
+                                            relation.len()
+                                                + collection.len()
+                                                + target.len()
+                                                + id.len()
+                                                + 256
+                                        })
+                                        .sum::<usize>()
+                                    + id.len()
+                                    + 512;
+                                if snapshot.bytes.saturating_add(bytes) <= READ_CACHE_BYTES {
+                                    snapshot.bytes += bytes;
+                                    for (_, collection, target) in references {
+                                        snapshot
+                                            .backlinks
+                                            .entry((collection, target))
+                                            .or_default()
+                                            .insert(id.clone());
+                                    }
+                                    snapshot.records.insert(id.clone(), Arc::clone(&source));
+                                }
+                            }
+                            source
+                        }
                     };
-                    let document = self.parse_logical_record_with_audited_cache(
-                        collection,
-                        &id,
-                        &stored.raw,
-                        audited_states,
-                    )?;
+                    let (stored, stored_document) = &*source;
+                    let document = if policy.is_empty() {
+                        self.reveal_document_with_policy_cached(
+                            collection,
+                            &id,
+                            stored_document,
+                            &policy,
+                            audited_states,
+                        )?
+                    } else {
+                        policy.reveal_in_session(
+                            encryption_context.as_ref().map(EncryptionContext::id),
+                            collection,
+                            &id,
+                            stored_document,
+                            &mut decryption,
+                        )?
+                    };
                     Ok(Some(record_from_document(
                         collection,
                         &id,
                         self.record_path(collection, &id)?,
                         document,
-                        stored.version,
+                        stored.version.clone(),
                         &stored.files,
                     )))
                 })()
@@ -2958,7 +3332,12 @@ impl Database {
                     })
                     .unwrap_or(true)
             })
-            .collect()
+            .take(maximum.unwrap_or(usize::MAX))
+            .collect();
+        if let Some(snapshot) = cached.as_ref().and_then(|cached| cached.as_ref()) {
+            self.reads.account(&cache_key, snapshot.bytes);
+        }
+        result
     }
 
     pub fn search(
@@ -2979,17 +3358,67 @@ impl Database {
         let mut audited_states = None;
         for collection in collections {
             for record in self.list_with_audited_cache(&collection, filters, &mut audited_states)? {
-                let raw_document = Document {
-                    attributes: record.attributes.clone(),
-                    body: record.body.clone(),
-                }
-                .render()?;
-                if query.matches(&record, &raw_document)? {
+                if self.matches_search(&record, query)? {
                     matches.push(record);
                 }
             }
         }
         Ok(matches)
+    }
+
+    pub(crate) fn matches_search(&self, record: &Record, query: &SearchQuery) -> Result<bool> {
+        if !query.needs_document() {
+            return query.matches(record, "");
+        }
+        let key = self.list_cache_key(&record.collection);
+        let cache = self
+            .cached_lists
+            .then(|| self.reads.collection(key.clone()));
+        let mut cached = cache.as_ref().map(|cache| {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        let snapshot = cached
+            .as_mut()
+            .and_then(|cached| cached.as_mut())
+            .filter(|snapshot| {
+                snapshot.started.elapsed() < READ_CACHE_AGE
+                    && snapshot.generation == self.reads.generation.load(AtomicOrdering::Acquire)
+            });
+        if let Some((version, rendered)) = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.search.get(&record.id))
+            && version == &record.version
+        {
+            return query.matches(record, rendered);
+        }
+        let rendered: Arc<str> = Arc::from(
+            Document {
+                attributes: record.attributes.clone(),
+                body: record.body.clone(),
+            }
+            .render()?,
+        );
+        if let Some(snapshot) = snapshot {
+            // A protected plaintext document never belongs in this cache.
+            if snapshot.records.get(&record.id).is_some_and(|source| {
+                source.0.version == record.version
+                    && source.1.attributes == record.attributes
+                    && source.1.body == record.body
+            }) {
+                let bytes = rendered.len() + record.id.len() + 128;
+                if snapshot.bytes.saturating_add(bytes) <= READ_CACHE_BYTES {
+                    snapshot.bytes += bytes;
+                    snapshot.search.insert(
+                        record.id.clone(),
+                        (record.version.clone(), Arc::clone(&rendered)),
+                    );
+                    self.reads.account(&key, snapshot.bytes);
+                }
+            }
+        }
+        query.matches(record, &rendered)
     }
 
     /// Every readable record that refers to `collection/id`, with the
@@ -3025,7 +3454,14 @@ impl Database {
         let mut backlinks = Vec::new();
         let mut audited_states = None;
         for source in sources {
-            for record in self.list_with_audited_cache(&source, filters, &mut audited_states)? {
+            let candidates = self.backlink_candidates(&source, collection, id);
+            for record in self.list_scan(
+                &source,
+                filters,
+                &mut audited_states,
+                candidates.as_ref(),
+                None,
+            )? {
                 let relations = referring_relations(&record.attributes, collection, id, relation);
                 if !relations.is_empty() {
                     backlinks.push(Backlink { record, relations });
@@ -3035,7 +3471,53 @@ impl Database {
         Ok(backlinks)
     }
 
+    fn backlink_candidates(
+        &self,
+        source: &str,
+        collection: &str,
+        id: &str,
+    ) -> Option<BTreeSet<String>> {
+        if !self.cached_lists {
+            return None;
+        }
+        let key = self.list_cache_key(source);
+        let cache = self.reads.collection(key);
+        let cached = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = cached.as_ref()?;
+        if snapshot.started.elapsed() >= READ_CACHE_AGE
+            || snapshot.generation != self.reads.generation.load(AtomicOrdering::Acquire)
+            || snapshot.records.len() != snapshot.ids.len()
+        {
+            return None;
+        }
+        Some(
+            snapshot
+                .backlinks
+                .get(&(collection.to_owned(), id.to_owned()))
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(crate) fn relation_suggestions(
+        &self,
+        collection: &str,
+        maximum: usize,
+        audited_states: &mut Option<Arc<AuditedRecordStates>>,
+    ) -> Result<Vec<Record>> {
+        self.list_scan(collection, &[], audited_states, None, Some(maximum))
+    }
+
     pub fn collection_models(&self) -> Result<Vec<CollectionModel>> {
+        if let Some(models) = &self.request_models
+            && let Some(models) = &*models
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Ok(models.clone());
+        }
         let mut models: BTreeMap<String, Option<serde_json::Value>> = self
             .collection_names()?
             .into_iter()
@@ -3112,12 +3594,14 @@ impl Database {
         }
 
         if self.access_enabled()? {
-            let user = self.current_user()?.ok_or_else(|| {
-                forbidden(format!(
-                    "principal '{}' is not registered in the users collection",
-                    self.principal
-                ))
-            })?;
+            let (user, policy_hash) =
+                self.user_unchecked_optional(&self.principal)?
+                    .ok_or_else(|| {
+                        forbidden(format!(
+                            "principal '{}' is not registered in the users collection",
+                            self.principal
+                        ))
+                    })?;
             let mut visible = BTreeMap::new();
             for (name, schema) in models {
                 let has_record_grant = user.status == UserStatus::Active
@@ -3127,13 +3611,19 @@ impl Database {
                             AccessResource::Record { collection, .. } if collection == &name
                         )
                     });
-                let has_record_owned_visibility = user.status == UserStatus::Active
-                    && CollectionAccessPolicy::from_schema(schema.as_ref())?.is_some()
-                    && self.collection_has_readable_record(&name)?;
                 if has_record_grant
-                    || has_record_owned_visibility
                     || self
-                        .can_access(AccessAction::Discover, &AccessResource::collection(&name))?
+                        .authorize_with_user(
+                            AccessAction::Discover,
+                            &AccessResource::collection(&name),
+                            &user,
+                            &policy_hash,
+                            false,
+                        )
+                        .is_ok()
+                    || (user.status == UserStatus::Active
+                        && CollectionAccessPolicy::from_schema(schema.as_ref())?.is_some()
+                        && self.collection_has_readable_record(&name, &user, &policy_hash)?)
                 {
                     visible.insert(name, schema);
                 }
@@ -3141,14 +3631,20 @@ impl Database {
             models = visible;
         }
 
-        Ok(models
+        let result: Vec<_> = models
             .into_iter()
             .map(|(name, schema)| CollectionModel {
                 entry: self.layout.entry(&name).map(str::to_owned),
                 name,
                 schema,
             })
-            .collect())
+            .collect();
+        if let Some(models) = &self.request_models {
+            *models
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
+        }
+        Ok(result)
     }
 
     pub fn validate_record_attributes(&self, collection: &str, attributes: &Mapping) -> Result<()> {
@@ -3621,10 +4117,27 @@ impl Database {
             .is_empty())
     }
 
-    fn collection_has_readable_record(&self, collection: &str) -> Result<bool> {
+    fn collection_has_readable_record(
+        &self,
+        collection: &str,
+        user: &User,
+        policy_hash: &str,
+    ) -> Result<bool> {
         for id in self.collection_record_ids(collection, Reading::Snapshot)? {
-            if self.can_access(AccessAction::Read, &AccessResource::record(collection, &id))? {
-                return Ok(true);
+            match self.authorize_with_user(
+                AccessAction::Read,
+                &AccessResource::record(collection, &id),
+                user,
+                policy_hash,
+                true,
+            ) {
+                Ok(_) => return Ok(true),
+                Err(error)
+                    if matches!(
+                        DomainError::of(&error),
+                        Some(DomainError::Forbidden(_) | DomainError::NotFound(_))
+                    ) => {}
+                Err(error) => return Err(error),
             }
         }
         Ok(false)
@@ -5087,6 +5600,28 @@ impl Database {
     }
 
     pub fn audit_recent(&self, limit: usize, filter: AuditFilter<'_>) -> Result<Vec<AuditEntry>> {
+        self.audit_window(limit, 0, None, filter)
+    }
+
+    pub(crate) fn audit_window(
+        &self,
+        limit: usize,
+        offset: usize,
+        before: Option<u64>,
+        filter: AuditFilter<'_>,
+    ) -> Result<Vec<AuditEntry>> {
+        let requested = limit
+            .checked_add(offset)
+            .ok_or_else(|| invalid("audit pagination window is too large"))?;
+        let project = |mut history: AuditHistory| {
+            history.entries = history
+                .entries
+                .into_iter()
+                .skip(offset)
+                .take(if limit == 0 { usize::MAX } else { limit })
+                .collect();
+            self.reveal_audit_history(history)
+        };
         if filter.id.is_some() && filter.collection.is_none() {
             return Err(invalid("an audit record ID requires a collection"));
         }
@@ -5136,15 +5671,24 @@ impl Database {
                             self.principal
                         )));
                     };
-                    let history = audit.recent_history_where(limit, filter, |entry| {
-                        self.user_can_read_record_audit(
-                            &user,
-                            &policy_hash,
-                            &entry.payload.record.collection,
-                            &entry.payload.record.id,
-                        )
-                    })?;
-                    return self.reveal_audit_history(history);
+                    let mut visible = HashMap::new();
+                    let history =
+                        audit.recent_history_before(requested, before, filter, |entry| {
+                            let record = &entry.payload.record;
+                            if let Some(visible) = visible.get(&record.id) {
+                                return Ok(*visible);
+                            }
+                            let allowed = self.user_can_read_record_audit_with_policy(
+                                &user,
+                                &policy_hash,
+                                &record.collection,
+                                &record.id,
+                                true,
+                            )?;
+                            visible.insert(record.id.clone(), allowed);
+                            Ok(allowed)
+                        })?;
+                    return project(history);
                 }
                 self.authorize(
                     AccessAction::ReadAudit,
@@ -5153,7 +5697,12 @@ impl Database {
             }
             (None, None) => {
                 if self.owner_access_allowed(&AccessResource::Database)? {
-                    return self.reveal_audit_history(audit.recent_history(limit, filter)?);
+                    return project(audit.recent_history_before(
+                        requested,
+                        before,
+                        filter,
+                        |_| Ok(true),
+                    )?);
                 }
                 let Some((user, policy_hash)) = self.user_unchecked_optional(&self.principal)?
                 else {
@@ -5162,7 +5711,9 @@ impl Database {
                         self.principal
                     )));
                 };
-                let history = audit.recent_history_where(limit, filter, |entry| {
+                let mut visible = HashMap::new();
+                let mut policies = HashMap::new();
+                let history = audit.recent_history_before(requested, before, filter, |entry| {
                     if entry.payload.record.collection == USERS_COLLECTION {
                         if entry.payload.record.id == self.principal {
                             return Ok(true);
@@ -5177,18 +5728,32 @@ impl Database {
                             )
                             .is_some());
                     }
-                    self.user_can_read_record_audit(
+                    let record = &entry.payload.record;
+                    let key = (record.collection.clone(), record.id.clone());
+                    if let Some(visible) = visible.get(&key) {
+                        return Ok(*visible);
+                    }
+                    if !policies.contains_key(&record.collection) {
+                        policies.insert(
+                            record.collection.clone(),
+                            self.record_access_policy(&record.collection)?.is_some(),
+                        );
+                    }
+                    let allowed = self.user_can_read_record_audit_with_policy(
                         &user,
                         &policy_hash,
-                        &entry.payload.record.collection,
-                        &entry.payload.record.id,
-                    )
+                        &record.collection,
+                        &record.id,
+                        policies[&record.collection],
+                    )?;
+                    visible.insert(key, allowed);
+                    Ok(allowed)
                 })?;
-                return self.reveal_audit_history(history);
+                return project(history);
             }
             (None, Some(_)) => unreachable!(),
         }
-        self.reveal_audit_history(audit.recent_history(limit, filter)?)
+        project(audit.recent_history_before(requested, before, filter, |_| Ok(true))?)
     }
 
     /// When each readable record in a collection was created and last changed.
@@ -5251,8 +5816,15 @@ impl Database {
             )));
         };
         let mut readable = BTreeMap::new();
+        let record_owned = self.record_access_policy(collection)?.is_some();
         for (id, record) in activity {
-            if self.user_can_read_record_audit(&user, &policy_hash, collection, &id)? {
+            if self.user_can_read_record_audit_with_policy(
+                &user,
+                &policy_hash,
+                collection,
+                &id,
+                record_owned,
+            )? {
                 readable.insert(id, record);
             }
         }
@@ -5663,6 +6235,11 @@ impl Database {
     }
 
     fn collection_schema(&self, collection: &str) -> Result<Option<serde_json::Value>> {
+        #[cfg(test)]
+        READ_POLICY_CALLS.with(|calls| {
+            let (users, principal, schema) = calls.get();
+            calls.set((users, principal, schema + 1));
+        });
         if collection == USERS_COLLECTION {
             return Ok(Some(users_schema()));
         }
@@ -5755,11 +6332,16 @@ impl Database {
         collection: &str,
         id: &str,
     ) -> Result<Option<RecordAccess>> {
-        if !self.record_exists(collection, id, Reading::Snapshot)? {
+        // Access lives in the entry's front matter. Hashing every asset in
+        // a bundle to decide whether its entry is readable makes permission
+        // checks proportional to unrelated binary file sizes.
+        let path = self.record_path(collection, id)?;
+        let Some(raw) =
+            paths::read_to_string_optional(&self.root, &path, &record_label(collection, id))?
+        else {
             return Ok(None);
-        }
-        let record = self.read_stored(collection, id, Reading::Snapshot)?;
-        let stored = parse_record(collection, id, &record.raw)?;
+        };
+        let stored = parse_record(collection, id, &raw)?;
         RecordAccess::from_attributes_optional(&stored.attributes)
     }
 
@@ -6171,6 +6753,165 @@ impl Database {
         )
         .with_layout(&self.layout)
         .with_journal_cache(self.journal.as_deref())
+        .with_read_invalidation(&self.reads.generation)
+    }
+
+    /// Check a batch with current principal and collection policies, shared
+    /// only within this operation. Record-owned ACLs still read current entries.
+    pub(crate) fn cached_view(
+        &self,
+        name: &str,
+        serialized: &str,
+        parse: impl FnOnce() -> Result<crate::ViewDefinition>,
+    ) -> Result<crate::ViewDefinition> {
+        let mut definitions = self
+            .view_definitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((content, definition)) = definitions.get(name)
+            && content == serialized
+        {
+            return Ok(definition.clone());
+        }
+        let definition = parse()?;
+        if serialized.len() > 64 * 1024 {
+            definitions.remove(name);
+            return Ok(definition);
+        }
+        if definitions.len() >= 256 {
+            definitions.clear();
+        }
+        definitions.insert(name.to_owned(), (serialized.to_owned(), definition.clone()));
+        Ok(definition)
+    }
+
+    pub(crate) fn current_read_policy_version(&self, collection: &str) -> Result<String> {
+        let user = if self.access_enabled()? {
+            self.user_unchecked_optional(&self.principal)?
+                .map(|(_, hash)| hash)
+        } else {
+            None
+        };
+        Ok(serde_json::to_string(&(
+            self.principal(),
+            user,
+            self.collection_schema(collection)?,
+        ))?)
+    }
+
+    pub(crate) fn access_allowed_many(
+        &self,
+        action: AccessAction,
+        resources: &[AccessResource],
+    ) -> Result<Vec<bool>> {
+        if !self.access_enabled()? {
+            return Ok(vec![true; resources.len()]);
+        }
+        let Some((user, policy_hash)) = self.user_unchecked_optional(&self.principal)? else {
+            return Ok(vec![false; resources.len()]);
+        };
+        let mut policies = HashMap::new();
+        resources
+            .iter()
+            .map(|resource| {
+                let collection = match resource {
+                    AccessResource::Record { collection, .. }
+                    | AccessResource::Collection { collection } => Some(collection.as_str()),
+                    _ => None,
+                };
+                let owned = match collection {
+                    Some(collection) if collection != USERS_COLLECTION => {
+                        if !policies.contains_key(collection) {
+                            policies.insert(
+                                collection.to_owned(),
+                                self.record_access_policy(collection)?.is_some(),
+                            );
+                        }
+                        policies[collection]
+                    }
+                    _ => false,
+                };
+                match self.authorize_with_user(action, resource, &user, &policy_hash, owned) {
+                    Ok(_) => Ok(true),
+                    Err(error)
+                        if matches!(
+                            DomainError::of(&error),
+                            Some(DomainError::Forbidden(_) | DomainError::NotFound(_))
+                        ) =>
+                    {
+                        Ok(false)
+                    }
+                    Err(error) => Err(error),
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn with_server_cache(self) -> Self {
+        let database = self.with_journal_cache();
+        database
+            .journal
+            .as_ref()
+            .expect("journal cache was attached")
+            .serve();
+        database
+    }
+
+    pub(crate) fn checkpoint_after_drain(&self) -> Result<()> {
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.checkpoint_journal_cache(true);
+        Ok(())
+    }
+
+    fn list_cache_key(&self, collection: &str) -> PathBuf {
+        let directory = self.config.data_dir.join(collection);
+        if self.entry_only_lists && self.layout.entry(collection).is_some() {
+            directory.join(".cr-list-entry-only")
+        } else {
+            directory
+        }
+    }
+
+    pub(crate) fn with_entry_only_lists(mut self) -> Self {
+        self.entry_only_lists = true;
+        self
+    }
+
+    /// Hydrate bundle versions only after selecting the response page.
+    /// Markdown list snapshots already carry their exact source version.
+    pub(crate) fn hydrate_list_page(&self, records: Vec<Record>) -> Result<Vec<Record>> {
+        records
+            .into_iter()
+            .filter_map(|record| {
+                if self.layout.entry(&record.collection).is_none() {
+                    return Some(Ok(record));
+                }
+                match self.get(&record.collection, &record.id) {
+                    Ok(current) => Some(Ok(current)),
+                    Err(error)
+                        if matches!(
+                            DomainError::of(&error),
+                            Some(DomainError::Forbidden(_) | DomainError::NotFound(_))
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn with_cached_lists(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.cached_lists = true;
+        self.request_models = Some(Arc::default());
+        self.read_cancelled = Some(cancelled);
+        self
+    }
+
+    pub(crate) fn invalidate_lists(&self) {
+        self.reads.generation.fetch_add(1, AtomicOrdering::AcqRel);
     }
 
     /// Keep the verified journal between reads instead of walking it from the
@@ -6858,8 +7599,33 @@ fn validate_schema_instance(check: &SchemaCheck) -> Result<()> {
 /// Judge attributes against a schema and describe, rather than refuse, whatever
 /// does not fit.
 fn schema_instance_violations(check: &SchemaCheck) -> Result<Vec<SchemaViolation>> {
-    let validator = jsonschema::validator_for(&check.schema)
-        .map_err(|error| anyhow!("could not compile {}: {error}", check.label))?;
+    // Exact schema content is the key; callers still read and validate the
+    // current schema before reaching here. Keep compilation bounded and
+    // shared across repeated validations, including a multi-record write.
+    static VALIDATORS: std::sync::OnceLock<Mutex<BTreeMap<String, Arc<jsonschema::Validator>>>> =
+        std::sync::OnceLock::new();
+    let key = serde_json::to_string(&check.schema)?;
+    let validator = {
+        let mut validators = VALIDATORS
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(validator) = validators.get(&key) {
+            Arc::clone(validator)
+        } else {
+            let validator = Arc::new(
+                jsonschema::validator_for(&check.schema)
+                    .map_err(|error| anyhow!("could not compile {}: {error}", check.label))?,
+            );
+            if key.len() <= 64 * 1024 {
+                if validators.len() >= 32 {
+                    validators.clear();
+                }
+                validators.insert(key, Arc::clone(&validator));
+            }
+            validator
+        }
+    };
     let instance = serde_json::to_value(&check.attributes)
         .context("front matter cannot be represented as JSON for schema validation")?;
     if check.redact_values {
@@ -7089,8 +7855,337 @@ fn validate_relative_path(path: &Path, label: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Database, validate_component, validate_relative_path};
+    use super::{Database, READ_POLICY_CALLS, validate_component, validate_relative_path};
     use std::path::Path;
+
+    fn cached(database: &Database) -> Database {
+        database
+            .clone()
+            .with_journal_cache()
+            .with_cached_lists(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )))
+    }
+
+    fn expire(database: &Database, collection: &str) {
+        let cache = database
+            .reads
+            .collection(database.config.data_dir.join(collection));
+        let mut snapshot = cache.lock().unwrap();
+        snapshot.as_mut().unwrap().started -= std::time::Duration::from_secs(6);
+    }
+
+    #[test]
+    fn list_cache_reconciles_exact_content_and_ids_but_details_and_saves_are_current() {
+        use crate::{Assignment, DomainError};
+        use std::{fs, sync::atomic::Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::init(root.path()).unwrap();
+        database.create("items", "one", &[], "old").unwrap();
+        let reader = cached(&database);
+        let original = reader.list("items", &[]).unwrap().remove(0);
+        assert_eq!(reader.reads.source_reads.load(Ordering::Relaxed), 1);
+        let path = root.path().join("records/items/one.md");
+        let times = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, "---\nname: changed\n---\nnew").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(times))
+            .unwrap();
+        assert_eq!(reader.list("items", &[]).unwrap()[0].body, "old");
+        assert_eq!(reader.get("items", "one").unwrap().body, "new");
+        let condition = crate::RecordPrecondition::version(original.version).unwrap();
+        let error = reader
+            .update_conditionally(
+                "items",
+                "one",
+                &["name=saved".parse::<Assignment>().unwrap()],
+                &[],
+                None,
+                Some(&condition),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                DomainError::of(&error),
+                Some(DomainError::PreconditionFailed(_))
+            ),
+            "{error}"
+        );
+        fs::rename(&path, root.path().join("records/items/two.md")).unwrap();
+        expire(&reader, "items");
+        let records = reader.list("items", &[]).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "two");
+        assert_eq!(records[0].body, "new");
+        fs::remove_file(root.path().join("records/items/two.md")).unwrap();
+        expire(&reader, "items");
+        assert!(reader.list("items", &[]).unwrap().is_empty());
+        // A normal cooperating write invalidates shared clones immediately.
+        database.create("items", "three", &[], "committed").unwrap();
+        assert_eq!(reader.list("items", &[]).unwrap()[0].id, "three");
+    }
+
+    #[test]
+    fn cached_sources_coalesce_concurrent_fills_and_honor_cancellation() {
+        use std::{
+            fs,
+            sync::{
+                Arc, Barrier,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::init(root.path()).unwrap();
+        fs::create_dir_all(root.path().join("records/items")).unwrap();
+        for index in 0..100 {
+            fs::write(
+                root.path().join(format!("records/items/{index:03}.md")),
+                "---\nname: item\n---\nnotes",
+            )
+            .unwrap();
+        }
+        let reader = cached(&database);
+        let barrier = Arc::new(Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let reader = reader.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    assert_eq!(reader.list("items", &[]).unwrap().len(), 100);
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(reader.reads.source_reads.load(Ordering::Relaxed), 100);
+        let cancelled = reader.with_cached_lists(Arc::new(AtomicBool::new(true)));
+        assert!(
+            cancelled
+                .list("items", &[])
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+    }
+
+    #[test]
+    fn cached_private_sources_use_current_user_grants_record_acls_and_schema() {
+        use crate::{AccessResource, CollectionAccessPolicy, RecordVisibility, Role, UserKind};
+        use std::fs;
+        let root = tempfile::tempdir().unwrap();
+        let owner = Database::init(root.path())
+            .unwrap()
+            .with_actor("Owner <owner@example.com>")
+            .unwrap();
+        owner.initialize_access(None, None).unwrap();
+        owner
+            .add_user("reader@example.com", "Reader", None, UserKind::Human)
+            .unwrap();
+        owner
+            .grant_access(
+                "reader@example.com",
+                AccessResource::collection("private"),
+                Role::Viewer,
+            )
+            .unwrap();
+        owner
+            .set_record_access_policy("private", CollectionAccessPolicy::record_owned())
+            .unwrap();
+        owner.create("private", "one", &[], "Secret").unwrap();
+        owner
+            .set_record_visibility("private", "one", RecordVisibility::Shared)
+            .unwrap();
+        let reader = cached(&owner.impersonate("reader@example.com").unwrap());
+        assert_eq!(reader.list("private", &[]).unwrap().len(), 1);
+        let file = root.path().join("records/private/one.md");
+        let public = fs::read_to_string(&file).unwrap();
+        fs::write(
+            &file,
+            public.replace("visibility: shared", "visibility: private"),
+        )
+        .unwrap();
+        assert!(reader.list("private", &[]).unwrap().is_empty());
+        fs::write(&file, &public).unwrap();
+        assert_eq!(reader.list("private", &[]).unwrap().len(), 1);
+        let user = root.path().join("records/users/reader@example.com.md");
+        let active = fs::read_to_string(&user).unwrap();
+        fs::write(&user, active.replace("status: active", "status: disabled")).unwrap();
+        assert!(reader.list("private", &[]).unwrap().is_empty());
+        fs::write(&user, active).unwrap();
+        fs::write(root.path().join(".cr/schemas/private.json"), "not JSON").unwrap();
+        assert!(reader.list("private", &[]).is_err());
+    }
+
+    #[test]
+    fn cached_backlink_candidates_check_permissions_and_reload_changed_relations() {
+        use crate::Assignment;
+        use std::fs;
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::init(root.path()).unwrap();
+        database
+            .create(
+                "items",
+                "source",
+                &["relations.parent=[{collection: items, id: target}]"
+                    .parse::<Assignment>()
+                    .unwrap()],
+                "notes",
+            )
+            .unwrap();
+        database.create("items", "target", &[], "target").unwrap();
+        let reader = cached(&database);
+        reader.list("items", &[]).unwrap();
+        assert_eq!(
+            reader
+                .backlink_candidates("items", "items", "target")
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["source"]
+        );
+        assert_eq!(
+            reader
+                .backlinks("items", "target", None, None, &[])
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::write(
+            root.path().join("records/items/source.md"),
+            "---\nname: source\n---\nnotes",
+        )
+        .unwrap();
+        expire(&reader, "items");
+        assert!(
+            reader
+                .backlinks("items", "target", None, None, &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn serve_checkpoints_once_after_drain_and_resumes_the_verified_tail() {
+        use crate::JournalVerification;
+        use std::fs;
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::init(root.path())
+            .unwrap()
+            .with_journal_verification(JournalVerification::Resume);
+        database.create("items", "one", &[], "first").unwrap();
+        let cache_path = root.path().join(".cr/cache/verified-journal.json");
+        let checkpoint = fs::read(&cache_path).unwrap();
+        let served = database.with_server_cache();
+        served.update("items", "one", &[], Some("second")).unwrap();
+        assert_eq!(fs::read(&cache_path).unwrap(), checkpoint);
+        assert_eq!(
+            served
+                .audit_recent(1, crate::AuditFilter::default())
+                .unwrap()[0]
+                .payload
+                .sequence,
+            2
+        );
+        served.checkpoint_after_drain().unwrap();
+        assert_ne!(fs::read(&cache_path).unwrap(), checkpoint);
+        let reopened = Database::discover(Some(root.path()))
+            .unwrap()
+            .with_journal_verification(JournalVerification::Resume);
+        assert_eq!(
+            reopened
+                .audit_recent(0, crate::AuditFilter::default())
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(reopened.get("items", "one").unwrap().body, "second");
+    }
+
+    #[test]
+    fn collection_scans_read_shared_policies_once_and_reload_them_next_time() {
+        use crate::{AccessResource, Role, UserKind};
+
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::init(root.path())
+            .unwrap()
+            .with_actor("Owner <owner@example.com>")
+            .unwrap();
+        database.initialize_access(None, None).unwrap();
+        database
+            .add_user("reader@example.com", "Reader", None, UserKind::Human)
+            .unwrap();
+        database
+            .grant_access(
+                "reader@example.com",
+                AccessResource::collection("items"),
+                Role::Viewer,
+            )
+            .unwrap();
+        let reader = database.impersonate("reader@example.com").unwrap();
+        for id in ["item-000", "item-042"] {
+            database.create("items", id, &[], "Notes").unwrap();
+        }
+        for index in 0..160 {
+            std::fs::write(
+                root.path()
+                    .join(format!("records/items/item-{index:03}.md")),
+                "---\nname: Item\n---\nNotes",
+            )
+            .unwrap();
+        }
+
+        READ_POLICY_CALLS.set((0, 0, 0));
+        assert_eq!(reader.list("items", &[]).unwrap().len(), 160);
+        assert_eq!(READ_POLICY_CALLS.get(), (1, 1, 1));
+        READ_POLICY_CALLS.set((0, 0, 0));
+        assert_eq!(reader.record_activity("items").unwrap().len(), 2);
+        assert_eq!(READ_POLICY_CALLS.get(), (1, 1, 1));
+
+        // The same open perspective must observe revoked collection access,
+        // while still honoring a grant for one individual record.
+        database
+            .revoke_access("reader@example.com", &AccessResource::collection("items"))
+            .unwrap();
+        database
+            .grant_access(
+                "reader@example.com",
+                AccessResource::record("items", "item-042"),
+                Role::Viewer,
+            )
+            .unwrap();
+        READ_POLICY_CALLS.set((0, 0, 0));
+        let records = reader.list("items", &[]).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["item-042"]
+        );
+        assert_eq!(READ_POLICY_CALLS.get(), (1, 1, 1));
+        assert_eq!(
+            reader
+                .record_activity("items")
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["item-042"]
+        );
+
+        // A changed schema is read even after a successful scan. A persistent
+        // policy cache would hide this invalid replacement.
+        let schema = root.path().join(".cr/schemas/items.json");
+        std::fs::write(&schema, r#"{"type":"invalid"}"#).unwrap();
+        assert!(reader.list("items", &[]).is_err());
+        std::fs::remove_file(schema).unwrap();
+        assert_eq!(reader.list("items", &[]).unwrap().len(), 1);
+    }
 
     #[test]
     fn cached_schemas_observe_direct_edits_removal_and_unsafe_replacements() {

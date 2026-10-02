@@ -10,7 +10,7 @@ use axum::{
 use std::str::FromStr;
 
 use cr::{
-    Assignment, Database,
+    Assignment, Database, JournalVerification,
     server::{ServerConfig, router},
 };
 use http_body_util::BodyExt;
@@ -108,6 +108,61 @@ async fn json_request(
 }
 
 const IDEMPOTENCY_KEY: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+#[tokio::test]
+async fn concurrent_idempotent_updates_commit_once_and_replay_after_later_edits() {
+    let (_temporary, database) = test_database("concurrent-server-idempotency");
+    database
+        .create(
+            "items",
+            "one",
+            &[Assignment::from_str("stage=new").unwrap()],
+            "Original\n",
+        )
+        .unwrap();
+    let app = router(
+        database
+            .clone()
+            .with_journal_verification(JournalVerification::Resume),
+        ServerConfig::default(),
+    )
+    .unwrap();
+    let uri = "/api/v1/collections/items/records/one";
+    let headers = [("idempotency-key", IDEMPOTENCY_KEY)];
+    let payload = json!({"front_matter": {"stage": "offer"}});
+    let responses = futures_util::future::join_all(
+        (0..14).map(|_| json_request(&app, Method::PATCH, uri, payload.clone(), &headers)),
+    )
+    .await;
+    let original = &responses[0];
+    for response in &responses {
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, original.body);
+        assert_eq!(
+            response.headers[header::ETAG],
+            original.headers[header::ETAG]
+        );
+    }
+    assert_eq!(database.audit_head().unwrap().sequence, 2);
+
+    database
+        .update(
+            "items",
+            "one",
+            &[Assignment::from_str("stage=closed").unwrap()],
+            None,
+        )
+        .unwrap();
+    let replay = json_request(&app, Method::PATCH, uri, payload, &headers).await;
+    assert_eq!(replay.status, StatusCode::OK);
+    assert_eq!(replay.body, original.body);
+    assert_eq!(replay.headers[header::ETAG], original.headers[header::ETAG]);
+    assert_eq!(database.audit_head().unwrap().sequence, 3);
+    assert_eq!(
+        database.get("items", "one").unwrap().attributes["stage"],
+        "closed"
+    );
+}
 
 #[tokio::test]
 async fn rest_idempotency_replays_exact_results_and_rejects_semantic_reuse() {
@@ -2451,4 +2506,140 @@ async fn rest_count_route_counts_groups_and_summarizes() {
         "countRecords"
     );
     assert!(openapi["components"]["schemas"]["CountSummary"].is_object());
+}
+
+#[tokio::test]
+async fn web_writes_invalidate_lists_and_cached_versions_do_not_overwrite_external_edits() {
+    let (_temporary, database) = test_database("list-cache-writes");
+    database
+        .create(
+            "items",
+            "one",
+            &["name=Original".parse().unwrap()],
+            "original",
+        )
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let listed = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/items/records",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK);
+    let version = listed.json()["data"][0]["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let patched = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/items/records/one",
+        json!({"front_matter":{"name":"Web edit"}}),
+        &[],
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK);
+    let listed = request(
+        &app,
+        Method::GET,
+        "/api/v1/collections/items/records",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(listed.json()["data"][0]["front_matter"]["name"], "Web edit");
+    assert_ne!(listed.json()["data"][0]["version"], version);
+    let current = listed.json()["data"][0]["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fs::write(
+        database.root().join("records/items/one.md"),
+        "---\nname: External edit\n---\nexternal",
+    )
+    .unwrap();
+    let etag = format!("\"{current}\"");
+    let refused = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/collections/items/records/one",
+        json!({"front_matter":{"name":"Stale save"}}),
+        &[("if-match", &etag)],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        database.get("items", "one").unwrap().attributes["name"].as_str(),
+        Some("External edit")
+    );
+}
+
+#[tokio::test]
+async fn audit_sequence_cursors_match_offset_pages_and_survive_later_appends() {
+    let (_temporary, database) = test_database("audit-cursors");
+    database.create("items", "one", &[], "first").unwrap();
+    for index in 0..8 {
+        database
+            .update(
+                "items",
+                "one",
+                &[format!("index={index}").parse().unwrap()],
+                None,
+            )
+            .unwrap();
+    }
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let first = request(&app, Method::GET, "/api/v1/audit/log?limit=3", None, &[])
+        .await
+        .json();
+    let before = first["data"][2]["sequence"].as_u64().unwrap();
+    let offset = request(
+        &app,
+        Method::GET,
+        "/api/v1/audit/log?limit=3&offset=3",
+        None,
+        &[],
+    )
+    .await
+    .json();
+    let cursor = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/audit/log?limit=3&before_sequence={before}"),
+        None,
+        &[],
+    )
+    .await
+    .json();
+    assert_eq!(cursor["data"], offset["data"]);
+    database
+        .update("items", "one", &["index=9".parse().unwrap()], None)
+        .unwrap();
+    let after = request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/audit/log?limit=3&before_sequence={before}"),
+        None,
+        &[],
+    )
+    .await
+    .json();
+    assert_eq!(after["data"], cursor["data"]);
+    assert!(
+        request(
+            &app,
+            Method::GET,
+            "/api/v1/audit/log?before_sequence=0",
+            None,
+            &[]
+        )
+        .await
+        .json()["data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
