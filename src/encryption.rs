@@ -123,6 +123,13 @@ struct Keyring {
     keys: HashMap<String, Zeroizing<Vec<u8>>>,
 }
 
+/// Keys are scoped to one read operation and zeroized when it finishes.
+/// Never shared with the server source cache or another request.
+#[derive(Debug, Default)]
+pub(crate) struct DecryptionSession {
+    keys: Option<Result<Keyring>>,
+}
+
 #[derive(Debug)]
 struct Envelope {
     key_id: String,
@@ -303,6 +310,23 @@ impl EncryptionPolicy {
         id: &str,
         stored: &Document,
     ) -> Result<Document> {
+        self.reveal_in_session(
+            context,
+            collection,
+            id,
+            stored,
+            &mut DecryptionSession::default(),
+        )
+    }
+
+    pub(crate) fn reveal_in_session(
+        &self,
+        context: Option<&str>,
+        collection: &str,
+        id: &str,
+        stored: &Document,
+        session: &mut DecryptionSession,
+    ) -> Result<Document> {
         if self.is_empty() {
             if stored
                 .attributes
@@ -320,13 +344,13 @@ impl EncryptionPolicy {
         logical
             .attributes
             .remove(Value::String(MANIFEST_KEY.to_owned()));
-        let mut keyring = None;
         for path in &self.fields {
             let Some(value) = yaml_get(&stored.attributes, path) else {
                 continue;
             };
             let envelope = field_envelope(value)?;
-            let keys = keyring
+            let keys = session
+                .keys
                 .get_or_insert_with(|| Keyring::from_environment(false))
                 .as_ref()
                 .map_err(clone_public_error)?;
@@ -339,7 +363,8 @@ impl EncryptionPolicy {
         }
         if self.body {
             let envelope = body_envelope(&stored.body)?;
-            let keys = keyring
+            let keys = session
+                .keys
                 .get_or_insert_with(|| Keyring::from_environment(false))
                 .as_ref()
                 .map_err(clone_public_error)?;

@@ -8,7 +8,7 @@
 //! both ascending, decide what none of the keys does, so every ordering is
 //! total and a page boundary never depends on the order records were read in.
 //!
-//! Within a key, values compare with [`compare_yaml_values`] — numbers
+//! Within a key, values compare with [`crate::value::compare_yaml_values`] — numbers
 //! numerically with NaN after every other number, strings lexicographically,
 //! other types by a stable rank — and a record without the field sorts after
 //! every record with it in either direction, so reversing a key never floats
@@ -24,12 +24,11 @@ use std::{cmp::Ordering, fmt, str::FromStr};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use yaml_serde::Value;
 
 use crate::{
     database::Record,
     error::invalid,
-    value::{compare_yaml_values, get_path, parse_path},
+    value::{PreparedYaml, get_path, parse_path},
 };
 
 /// The most keys one sort may have.
@@ -300,35 +299,68 @@ where
     if parts.is_empty() {
         return Ok(());
     }
-    items.sort_by(|left, right| {
-        let (left, right) = (record(left), record(right));
-        parts
-            .iter()
-            .map(|(part, direction)| {
-                let direction = *direction;
-                match part {
-                    Part::Id => direction.apply(left.id.cmp(&right.id)),
-                    Part::Collection => direction.apply(left.collection.cmp(&right.collection)),
-                    Part::Path => direction.apply(left.path.cmp(&right.path)),
-                    Part::History(field) => {
-                        let sequence = |record: &Record| {
-                            history.as_ref().and_then(|history| history(record, *field))
-                        };
-                        present_first(sequence(left), sequence(right), direction, Ord::cmp)
-                    }
-                    Part::Field(path) => present_first(
-                        get_path(&left.attributes, path),
-                        get_path(&right.attributes, path),
-                        direction,
-                        |left: &&Value, right: &&Value| compare_yaml_values(left, right),
+    enum Prepared<'a> {
+        Text(&'a str),
+        Path(&'a std::path::Path),
+        History(Option<u64>),
+        Field(Option<PreparedYaml<'a>>),
+    }
+    let mut order = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let record = record(item);
+            let prepared = parts
+                .iter()
+                .map(|(part, _)| match part {
+                    Part::Id => Prepared::Text(&record.id),
+                    Part::Collection => Prepared::Text(&record.collection),
+                    Part::Path => Prepared::Path(&record.path),
+                    Part::History(field) => Prepared::History(
+                        history.as_ref().and_then(|history| history(record, *field)),
                     ),
+                    Part::Field(path) => {
+                        Prepared::Field(get_path(&record.attributes, path).map(PreparedYaml::new))
+                    }
+                })
+                .collect::<Vec<_>>();
+            (index, prepared, &record.collection, &record.id)
+        })
+        .collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        left.1
+            .iter()
+            .zip(&right.1)
+            .zip(&parts)
+            .map(|((left, right), (_, direction))| match (left, right) {
+                (Prepared::Text(left), Prepared::Text(right)) => direction.apply(left.cmp(right)),
+                (Prepared::Path(left), Prepared::Path(right)) => direction.apply(left.cmp(right)),
+                (Prepared::History(left), Prepared::History(right)) => {
+                    present_first(*left, *right, *direction, Ord::cmp)
                 }
+                (Prepared::Field(left), Prepared::Field(right)) => {
+                    present_first(left.as_ref(), right.as_ref(), *direction, |left, right| {
+                        left.compare(right)
+                    })
+                }
+                _ => unreachable!("the same sort part prepares the same type"),
             })
             .find(|ordering| ordering.is_ne())
             .unwrap_or(Ordering::Equal)
-            .then_with(|| left.collection.cmp(&right.collection))
-            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| left.2.cmp(right.2))
+            .then_with(|| left.3.cmp(right.3))
     });
+    let mut destinations = vec![0; items.len()];
+    for (destination, (source, _, _, _)) in order.into_iter().enumerate() {
+        destinations[source] = destination;
+    }
+    for source in 0..items.len() {
+        while destinations[source] != source {
+            let target = destinations[source];
+            items.swap(source, target);
+            destinations.swap(source, target);
+        }
+    }
     Ok(())
 }
 

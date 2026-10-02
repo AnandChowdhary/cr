@@ -14,15 +14,35 @@ without buffering. Normal browser connections use the local console or
 Cloudflare Access session; native `EventSource` cannot attach a custom bearer
 header, so bearer-authenticated clients must use a streaming HTTP client.
 
-Every connection begins with `event: reset` and `data: {}`: fetch the current
-query to recover changes missed while disconnected. `event: change` carries a
-JSON array of affected collection names, such as `["tasks"]`. Only changes to
-the principal's readable records are reported, including deletion or revoked
-visibility. No record IDs, contents, or database-wide sequence are exposed.
-`event: unavailable` means the client should reconnect and reauthenticate;
-the stream then closes. Periodic comment frames keep idle connections alive.
-This feed observes committed record changes and has no replay cursor; use
-the audit endpoints for durable history.
+Use `GET /api/v1/events?collection=tasks` to subscribe to one currently visible
+collection, including external file edits. Its initial `event: reset` carries
+`data: {"generation":"<opaque token>"}`. Compare the token with the page's
+`data-live-generation`; query again only when they differ. Reconnecting repeats
+this check, covering changes between page rendering and subscription. Hidden
+collections are refused. Without `collection`, the legacy feed starts with
+`event: reset` and `data: {}` and requires a fresh query on each connection;
+that feed observes audited changes.
+
+`event: change` carries a JSON array of affected collection names, such as
+`["tasks"]`. Only changes to readable records or their permissions are
+reported, including deletion or revoked visibility. No record IDs, contents,
+or database-wide sequence are exposed. `event: unavailable` means reconnect
+and reauthenticate; the stream then closes. Periodic comments keep idle
+connections alive. This feed has no replay cursor; use audit endpoints for
+durable history. Source reconciliation never accepts edits into the journal.
+
+## List freshness
+
+Web lists, search candidates, backlinks, and derived counts reuse bounded
+source snapshots. External edits may take up to five seconds to appear;
+writes through this server invalidate snapshots immediately. Current
+permissions filter every request. Record details, schemas, authentication,
+encryption context/keys, mutation preconditions, and saves read current data.
+Bundle metadata scans read entries first, then hydrate exact supporting-file
+versions only for returned JSON list records. A cached list version can cause
+a legitimate `412` if the source changed before saving. CLI reads do not use
+this presentation cache. See [serve performance](serve-performance.md) for
+resource bounds and cold/oversized-collection trade-offs.
 
 ## Authentication and identity
 
@@ -157,6 +177,14 @@ It must contain 16–128 visible-ASCII bytes; callers should generate it with at
 least 128 bits of randomness. An exact retry returns the original status and
 JSON result without adding history; mismatched reuse is `409
 idempotency_conflict`.
+
+The server indexes scoped retry identities in its verified in-memory history.
+After the first verified replay, a new key does not replay the whole chain;
+an existing key reads its original event and returns the original result,
+including a bundle's historical supporting-file hashes. The index is rebuilt
+from verified events after restart and is not persisted as a separate source
+of retry decisions. Current authorization and journal integrity checks still
+apply to every retry.
 
 ## CRUD requests
 
@@ -627,3 +655,18 @@ Every response, the JSON API's, `/health`'s, and `/static`'s included, also
 carries `X-Content-Type-Options: nosniff`, so a browser never runs an answer as
 a script or applies it as a stylesheet unless its `Content-Type` says it is
 one.
+
+## Audit pagination
+
+`GET /api/v1/audit/log` accepts `limit`, `offset`, the existing collection,
+record, agent, and session filters, and an optional `before_sequence` cursor.
+Use the last returned event's `sequence` to continue toward older events:
+
+```sh
+curl 'http://127.0.0.1:3000/api/v1/audit/log?limit=50&before_sequence=1000'
+```
+
+The cursor is exclusive and remains stable when newer events are appended.
+`before_sequence=0` returns an empty page. Offsets remain supported; a sequence
+cursor avoids scanning an increasingly large skipped prefix. Every history
+page still verifies the journal and checks current audit visibility.

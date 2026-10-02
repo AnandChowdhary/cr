@@ -494,10 +494,11 @@ impl Database {
             names.push(name);
         }
         names.sort();
+        let access_enabled = self.access_enabled()?;
         for name in names {
             let mut view = self.read_view(&name)?;
             let presentation = presentations.get(&view.collection);
-            if !self.access_enabled()? || presentation.is_some() {
+            if !access_enabled || presentation.is_some() {
                 view.icon = presentation.and_then(|presentation| presentation.icon.clone());
                 views.insert(name, view);
             }
@@ -520,10 +521,15 @@ impl Database {
                 Err(error) if is_missing(&error) => return Ok(None),
                 Err(error) => return Err(error),
             };
-        let stored: StoredViewDefinition = yaml_serde::from_str(&serialized)
-            .with_context(|| DomainError::Invalid(format!("view '{name}' is not valid YAML")))?;
-        let sort = validate_stored(name, &stored)?;
-        Ok(Some(to_public(name, stored, sort, true)))
+        self.cached_view(name, &serialized, || {
+            let stored: StoredViewDefinition =
+                yaml_serde::from_str(&serialized).with_context(|| {
+                    DomainError::Invalid(format!("view '{name}' is not valid YAML"))
+                })?;
+            let sort = validate_stored(name, &stored)?;
+            Ok(to_public(name, stored, sort, true))
+        })
+        .map(Some)
     }
 }
 

@@ -128,7 +128,7 @@ async fn the_document_names_every_view_and_leaves_the_counting_to_the_page() {
     // The region says it is incomplete, and asks for its numbers on load.
     let region = body
         .split_once(&format!(
-            "<div id=\"{VIEW_INDEX_REGION}\" aria-busy=\"true\" hx-get=\"{SUMMARY_URL}\" hx-trigger=\"load\" hx-swap=\"outerHTML\">"
+            "<div id=\"{VIEW_INDEX_REGION}\" data-refresh-url=\"{SUMMARY_URL}\" data-refresh-perspective=\"\" aria-busy=\"true\" hx-get=\"{SUMMARY_URL}\" hx-trigger=\"load\" hx-swap=\"outerHTML\">"
         ))
         .expect("the index region does not ask for its numbers")
         .1;
@@ -182,7 +182,7 @@ async fn the_region_is_the_counted_document_cut_down() {
         .expect("the region carries no total");
     let (rows, total) = rest.split_at(total_at);
 
-    assert!(rows.starts_with(&format!("<div id=\"{VIEW_INDEX_REGION}\">")));
+    assert!(rows.starts_with(&format!("<div id=\"{VIEW_INDEX_REGION}\" data-refresh-url=\"{SUMMARY_URL}\" data-refresh-perspective=\"\">")));
     assert!(
         !rows.contains("hx-trigger"),
         "the counted region asks again"
@@ -222,7 +222,7 @@ async fn an_empty_database_has_nothing_to_count() {
     assert!(
         document
             .body
-            .contains(&format!("<div id=\"{VIEW_INDEX_REGION}\"></div>"))
+            .contains(&format!("<div id=\"{VIEW_INDEX_REGION}\" data-refresh-url=\"{SUMMARY_URL}\" data-refresh-perspective=\"\"></div>"))
     );
     assert!(!document.body.contains("hx-trigger=\"load\""));
     assert!(!document.body.contains("Count records"));
@@ -239,4 +239,87 @@ async fn the_landing_page_ignores_stray_parameters_but_not_a_wrong_summary() {
 
     let unknown = get(&app, "/?summary=everything", &[]).await;
     assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn counts_revalidate_current_permissions_before_returning_not_modified() {
+    let (_temporary, database) = database_with_views("index-revalidation");
+    let database = database.with_actor("Owner <owner@example.com>").unwrap();
+    database
+        .initialize_access(Some("Owner"), Some("owner@example.com"))
+        .unwrap();
+    database
+        .add_user("reader@example.com", "Reader", None, cr::UserKind::Human)
+        .unwrap();
+    let resource = cr::AccessResource::collection("deals");
+    database
+        .grant_access("reader@example.com", resource.clone(), cr::Role::Viewer)
+        .unwrap();
+    let app = router(database.clone(), ServerConfig::default()).unwrap();
+    let cookie = "cr_perspective=reader%40example.com";
+    let headers = [
+        ("hx-request", "true"),
+        ("hx-target", VIEW_INDEX_REGION),
+        ("cookie", cookie),
+    ];
+    let first = get(&app, SUMMARY_URL, &headers).await;
+    assert_eq!(first.status, StatusCode::OK);
+    let etag = first.headers[header::ETAG].to_str().unwrap();
+    let conditional = [
+        ("hx-request", "true"),
+        ("hx-target", VIEW_INDEX_REGION),
+        ("cookie", cookie),
+        ("if-none-match", etag),
+    ];
+    let unchanged = get(&app, SUMMARY_URL, &conditional).await;
+    assert_eq!(unchanged.status, StatusCode::NOT_MODIFIED);
+    assert!(unchanged.body.is_empty());
+    assert!(
+        unchanged.headers[header::VARY]
+            .to_str()
+            .unwrap()
+            .contains("HX-Target")
+    );
+    assert!(
+        unchanged.headers[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("no-store")
+    );
+    database
+        .revoke_access("reader@example.com", &resource)
+        .unwrap();
+    let revoked = get(&app, SUMMARY_URL, &conditional).await;
+    assert_eq!(revoked.status, StatusCode::OK);
+    assert!(!revoked.body.contains("Open deals"));
+    assert!(!revoked.body.contains("cr-view-count\">3<"));
+}
+
+#[tokio::test]
+async fn all_views_bounds_rows_and_keeps_every_saved_view_reachable() {
+    let (_temporary, database) = database_with_views("index-large");
+    for index in 0..250 {
+        std::fs::write(database.root().join(format!(".cr/views/saved-{index:03}.yaml")),
+            format!("version: 1\ntitle: Saved {index:03}\ncollection: deals\nfilters: []\ncolumns: []\npage_size: 25\n")).unwrap();
+    }
+    let app = router(database, ServerConfig::default()).unwrap();
+    let first = get(&app, "/", &[]).await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(
+        first.body.matches("class=\"cr-view-row group\"").count(),
+        100
+    );
+    assert!(!first.body.contains("Saved 249</h2>"));
+    assert!(first.body.contains("Next"));
+    let next = get(&app, "/?offset=200", &[]).await;
+    assert_eq!(next.body.matches("class=\"cr-view-row group\"").count(), 52);
+    assert!(next.body.contains("Saved 249</h2>"));
+    assert!(next.body.contains("Previous"));
+    let search = get(&app, "/?q=Saved+249", &[]).await;
+    assert_eq!(
+        search.body.matches("class=\"cr-view-row group\"").count(),
+        1
+    );
+    assert!(search.body.contains("Saved 249</h2>"));
+    assert!(search.body.contains("q=Saved%20249") || search.body.contains("q=Saved+249"));
 }

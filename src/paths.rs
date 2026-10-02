@@ -190,6 +190,36 @@ pub(crate) fn open_file(root: &Path, relative: &Path, label: &str) -> Result<Fil
     open_regular_file(&directory, name, label)
 }
 
+/// Read one regular child through a directory verified for this scan.
+/// The caller supplies an ID-derived single filename, never a path.
+pub(crate) fn read_child_to_string_optional(
+    directory: &Directory,
+    name: &OsStr,
+    label: &str,
+) -> Result<Option<String>> {
+    if Path::new(name).components().count() != 1
+        || !matches!(
+            Path::new(name).components().next(),
+            Some(Component::Normal(_))
+        )
+    {
+        return Err(anyhow!("a child filename must have one normal component"));
+    }
+    let result = (|| {
+        let mut file = open_regular_file(directory, name, label)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("could not read {label}"))?;
+        String::from_utf8(bytes)
+            .with_context(|| DomainError::Invalid(format!("{label} is not valid UTF-8")))
+    })();
+    match result {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if is_missing(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Read `relative` beneath `root` exactly, through a verified descriptor.
 pub(crate) fn read(root: &Path, relative: &Path, label: &str) -> Result<Vec<u8>> {
     let mut file = open_file(root, relative, label)?;

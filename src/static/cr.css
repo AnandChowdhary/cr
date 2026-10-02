@@ -1289,13 +1289,13 @@ a.cr-lane-more:hover { background: var(--cr-gray-100); color: var(--cr-gray-900)
    than hidden, so it can still be tabbed to. */
 .cr-card-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 8px; margin-top: 7px; font-size: 0.68rem; }
 .cr-card-foot .cr-time { font-size: 0.68rem; }
-.cr-kanban-move { margin-left: auto; }
+.cr-kanban-move { margin-left: auto; color: var(--cr-gray-500); font-size: 0.68rem; font-weight: 600; text-align: right; }
 .cr-kanban-move[open] { flex-basis: 100%; }
 .cr-kanban-move summary { cursor: pointer; list-style: none; color: var(--cr-gray-500); font-size: 0.68rem; font-weight: 600; text-align: right; }
 .cr-kanban-move summary::-webkit-details-marker { display: none; }
 .cr-kanban-move[open] summary { margin-bottom: 6px; }
 @media (hover: hover) {
-  .cr-kanban-card:not(:hover):not(:focus-within) .cr-kanban-move:not([open]) summary { opacity: 0; }
+  .cr-kanban-card:not(:hover):not(:focus-within) .cr-kanban-move { opacity: 0; }
 }
 
 /* The record form: fields straight on the page with a label above each

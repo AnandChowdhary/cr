@@ -614,10 +614,9 @@ Every existing record page shows its newest activity beside the form as a short 
 
 On wide screens, record fields and their newest activity share a two-column
 workspace so policy and provenance stay visible while editing. At smaller
-widths, activity returns to the normal document flow. Kanban cards use compact
-label/value rows and keep drag-and-drop as the fast path; the native move form
-is folded under **Move card…** until it is needed, preserving the no-JavaScript
-fallback without making every card several controls taller.
+widths, activity returns to the normal document flow. Kanban cards keep drag-and-drop as the fast path. **Move…** opens a searchable,
+paged native move form, so keyboard and touch users can move a card without
+loading every possible destination into every card.
 
 ## Create saved views
 
@@ -655,30 +654,30 @@ cr view create interviews \
 
 ## Live updates
 
-Tables and Kanban boards refresh automatically while the tab is visible. One
-Server-Sent Events connection is shared across the tab's views. The server
-checks the committed audit journal once a second, including changes from
-separate CLI commands, agents, and sync adapters, and the browser batches
-relevant notifications for 300 ms before fetching the current results. The
-same query recalculates filtering, ordering, pagination, and lane counts; the
-sidebar, search box, and filter panel stay in place. Board and lane scroll
-positions are retained, and background swaps do not add browser history.
+Tables and Kanban boards refresh automatically while the tab is visible. The
+Server-Sent Events subscription follows the current collection and checks
+source snapshots and current permissions once a second. External file/CLI
+edits can take up to five seconds to appear in lists and counts; writes through
+this server invalidate them immediately. The browser batches changes for
+300 ms before querying again. Filtering, ordering, pagination, and lane counts
+are recalculated; the sidebar and query controls stay in place. Board/lane
+scroll positions are retained and background swaps do not add browser history.
+All views refreshes its counts with conditional requests, returning no new
+markup when the result is unchanged.
 
 The heading shows **Live**, **Updates pending**, or **Reconnecting…**. Updates
-wait while a card is being dragged, a move control is open, results have
-keyboard focus or selected text, or a form has unsaved changes. Hidden tabs
-close the stream and refresh when shown again. Reconnecting also refreshes
-the current results, so missed notifications cannot leave a view stale.
-Background failures keep the page in place and retry instead of navigating
-away to sign in. Without JavaScript, ordinary navigation still fetches fresh
-data.
+wait during dragging, focused controls, text selection, or unsaved edits.
+Hidden tabs close the stream and reconcile when shown again. Page/reset
+generations also reconcile reconnects and changes between rendering and
+subscription, without fetching unchanged results a second time. Background
+failures leave the page in place. Native navigation uses the same bounded
+presentation cache; permissions and saves always use current data.
 
-The stream exposes only collection names affected by changes to records the
-current principal can read, including records removed from that readable set.
-It rechecks authentication and permissions while connected. Direct filesystem
-edits become live notifications after an explicit `cr save`; watching never
-accepts edits into the journal automatically. Schema and saved-view definition
-edits still take effect on the next query or navigation.
+The stream exposes only visible collection names and an opaque generation,
+with current authentication and permissions rechecked while connected. Direct
+filesystem edits can refresh the page without `cr save`; reconciliation never
+accepts those edits into the audit journal. Schema and saved-view definition
+edits take effect on the next query or navigation.
 
 ## Create a Kanban pipeline
 
@@ -717,9 +716,23 @@ cr view create hiring-pipeline \
   --page-size 200
 ```
 
-If the grouping field has an `enum` in the collection's JSON Schema, lanes follow that declared order and empty stages remain visible. Other observed values are added deterministically; records without the field appear under **Unassigned**. `--sort-by` controls the default card order inside every lane; the page controls can override or clear it for the current URL. Drag a card to another lane, or use its move selector and button. Both interactions submit the same CSRF-protected form, set or remove the chosen front matter field, validate the complete record, and append the normal field-level audit event.
+If the grouping field has an `enum` in the collection's JSON Schema, lanes follow that declared order and empty stages remain visible. Other observed values are added deterministically; records without the field appear under **Unassigned**. `--sort-by` controls the default card order inside every lane; the page controls can override or clear it for the current URL. Drag a card to another lane, or open **Move…** and choose its destination. Both interactions submit the same CSRF-protected form, set or remove the chosen front matter field, validate the complete record, and append the normal field-level audit event.
 
-A board is not paged like a table. Each lane shows up to the view's page size of its own records, in the board's order, and its heading counts every record it holds in the view, beside a dot in its state's colour (the same words colour it as colour a badge). A lane holding more than it shows ends in **Show N more**, which shows more of every lane — twice as many, up to the server's `--max-page-size` — by swapping the board alone; past that most, the lane says how many are left for a filter to reach. Under the board, one line says how many records of the whole it shows. The board fits the window: each lane is at most as tall as the window leaves room for, and its cards scroll inside it under a heading that stays put, so a lane of a hundred cards neither stretches the page nor pushes the lanes beside it out of view. Like the sidebar's list, a lane's cards fade at its foot while more are hidden below and under its heading once some have scrolled up past it, where the browser supports scroll-driven animations. Lanes are 272 pixels wide, and a board wider than the workspace scrolls sideways, fading at an edge while there are lanes beyond it, as a table does.
+A board shows at most **50 lanes and 200 cards** at once, with each lane also
+limited by the view's page size. Its heading counts every matching record in
+that lane. **Previous lanes** and **Next lanes** reach further populated lanes.
+**Show more in this lane** narrows the board to that lane and doubles its card
+limit, up to the server's `--max-page-size`; **All lanes** returns to the board.
+The global 200-card bound still applies. Beyond that limit, search/filter the
+view to reach more records. Empty schema lanes remain visible when they fit
+without displacing populated lanes or Unassigned.
+
+The board fits the window. Each lane's cards scroll under its pinned heading;
+lanes are 272 pixels wide and a wide board scrolls sideways. **Move…** opens a
+searchable list of at most 200 destinations per page, including a native next
+page link. It submits the same CSRF-protected, current-version mutation as
+dragging. This keeps thousands of grouping values from making each card carry
+thousands of options.
 
 A card is compact: its title in at most two lines, its record ID shortened in the middle on one quiet line under it (or the ID alone, as the title, for a record without one), then a row of the values it holds. A state is its coloured badge and any other value a small chip; an empty value is left out rather than shown as a dash. Values carry no labels, which would repeat down every card in a lane: each chip names its field in its tooltip and to a screen reader. The card's last line says when its record was created, or last updated when the board is ordered by **Updated**.
 
@@ -817,7 +830,26 @@ You can edit these files directly. The server reloads them on each request. Pers
 
 Every response includes `Server-Timing: app;dur=<milliseconds>`, measuring server processing through response creation, including authentication and waits for database work. For an event stream this measures opening the response, not its lifetime. In your browser's Network panel, select the slow page request and compare this value with the request's total time. A large `app` duration points to server work; a small duration beside a much longer request points to time outside the handler, such as the proxy or network. The existing `X-Request-Id` identifies the request in error logs.
 
-The server reuses verified journal state, an in-memory history index, and validated schemas across navigation. It continues to check current permissions and file contents. Listing and searching still read matching records, and a task's relations panel scans readable collections, so database size and filesystem latency can still affect navigation. Use a release build for representative measurements (`cargo build --release` when building from source).
+The server shares bounded parsed source snapshots, canonical document-search
+text, reverse-link indexes, compiled schema validators, and verified audit
+history. All views and Users are searchable and paged at 100 rows; the sidebar
+shows up to 100 saved views. Large owner perspective pickers accept any
+registered principal as text. Directory browsing pages 200 entries. Existing
+record forms defer their relations panel until it is revealed, with a native
+**Load linked records** link and at most 500 target suggestions.
+
+Cold or oversized collection reads remain sequential; requests can fill
+different collections concurrently through bounded workers. Filtering, exact
+counts, and ordering still visit their candidates, and private-record ACLs
+stay current. Scoped idempotency lookups reuse verified history. Serve writes
+keep the disposable verified walk in memory and checkpoint after graceful
+drain; a crash can require more replay on restart without losing committed
+audit history. Use a release build for representative measurements.
+
+The [serve scalability review](serve-performance.md) records all findings,
+implemented fixes, measured results, freshness semantics, and remaining
+trade-offs. Record details, permission checks, mutation preconditions, and
+saves bypass the presentation cache.
 
 ## How pages are rendered
 

@@ -225,7 +225,9 @@ async fn every_mutating_form_is_native_or_carries_the_boosted_contract() {
     // handler in `cr.js` builds and submits a form, and `form.submit()` fires no
     // submit event for htmx to intercept.
     let (_, board) = get(&app, "/pipeline", &[]).await;
-    assert!(board.contains(r#"action="/pipeline/records/alpha/move""#));
+    assert!(board.contains(r#"href="/pipeline/records/alpha/move""#));
+    let (_, picker) = get(&app, "/pipeline/records/alpha/move", &[]).await;
+    assert!(picker.contains(r#"action="/pipeline/records/alpha/move" hx-boost="false""#));
     assert!(board.contains("data-kanban-lane"));
 }
 

@@ -167,6 +167,7 @@ struct AppState {
     /// The walk that fills the verified journal, which readiness reports on.
     journal_warm_up: Arc<JournalWarmUp>,
     live_updates: Arc<live::Updates>,
+    read_workers: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -691,6 +692,7 @@ struct BrowserPage {
     parent: Option<PathBuf>,
     crumbs: Vec<BrowserCrumb>,
     item: BrowserItem,
+    paging: Option<(usize, usize)>,
 }
 
 /// A document that explains its directory — a README, or an agent skill's
@@ -870,6 +872,7 @@ struct BrowseQuery {
     path: Option<String>,
     sort_field: Option<BrowseSortField>,
     sort_direction: Option<ViewSortDirection>,
+    offset: Option<usize>,
 }
 
 /// The file an edit or delete page acts on, and the browse page it was opened
@@ -1003,6 +1006,12 @@ struct ViewQuery {
     before: Option<String>,
     offset: Option<usize>,
     notice: Option<String>,
+    /// Restrict a board to one lane when loading more cards.
+    lane: Option<String>,
+    #[serde(skip)]
+    live_generation: Option<String>,
+    #[serde(skip)]
+    live_scope_key: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -1280,6 +1289,8 @@ fn saved_filter_group_matches(
 struct ViewsHomeQuery {
     #[serde(default)]
     summary: ViewIndexSummary,
+    q: Option<String>,
+    offset: Option<usize>,
 }
 
 /// Whether the view index document counts the records itself.
@@ -1711,7 +1722,7 @@ struct HtmlViewEditForm {
     page_size: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum KanbanTarget {
     Value { value: String },
@@ -1768,6 +1779,7 @@ struct AuditLogParameters {
     session: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
+    before_sequence: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2150,7 +2162,7 @@ fn application(
     // Every request is derived from this one database, so they all resume the
     // same verified journal rather than each re-hashing it from the first
     // event. The startup check below is the walk that fills it.
-    let database = database.with_journal_cache();
+    let database = database.with_server_cache();
     // A malformed or linked records directory is stored-state corruption, not
     // a reason to make the HTTP application impossible to construct. Defer a
     // classified conflict to the request that touches it, as the rest of the
@@ -2213,6 +2225,7 @@ fn application(
         csrf_token: Arc::from(random_token()?),
         journal_warm_up,
         live_updates,
+        read_workers: Arc::new(tokio::sync::Semaphore::new(8)),
     };
     let protected = Router::new()
         .route("/openapi.json", get(openapi))
@@ -2249,7 +2262,7 @@ fn application(
             "/{view}/records/{id}/files/{*path}",
             get(edit_record_file).post(save_record_file),
         )
-        .route("/{view}/records/{id}/move", post(move_kanban_card))
+        .route("/{view}/records/{id}/move", get(kanban_move_form).post(move_kanban_card))
         .route("/{view}/records/{id}/relations", post(link_record_form))
         .route(
             "/{view}/records/{id}/relations/remove",
@@ -2367,7 +2380,7 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
     let mut signals = ShutdownSignals::listen()?;
     // Given here rather than left to `router`, so the warm-up below fills the
     // cache every request will read.
-    let database = database.with_journal_cache();
+    let database = database.with_server_cache();
     let journal = database.clone();
     let warm_up = Arc::<JournalWarmUp>::default();
     let cloudflare_access = config.cloudflare_access.clone();
@@ -2395,7 +2408,7 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
     // page finds it verified instead of walking it. A request that arrives
     // sooner waits on this walk rather than starting its own, and `/ready`
     // answers `journal_warming` until it returns.
-    warm_up.start(journal);
+    warm_up.start(journal.clone());
     // Likewise the Cloudflare Access keys, so the first sign-in does not wait
     // for them, and a team domain that does not exist is reported now rather
     // than by the first person who tries. Not fatal: Cloudflare may be
@@ -2433,6 +2446,8 @@ pub async fn serve(database: Database, config: ServerConfig) -> Result<()> {
     tokio::select! {
         result = server.as_mut() => {
             result.context("HTTP server failed")?;
+            tokio::task::spawn_blocking(move || journal.checkpoint_after_drain()).await
+                .map_err(|error| anyhow!(error).context("journal checkpoint task failed"))??;
             log_shutdown(format_args!("state=stopped detail=\"every in-flight request finished\""));
             Ok(())
         }
@@ -2560,7 +2575,20 @@ async fn authorize(State(state): State<AppState>, request: Request<Body>, next: 
             Ok(identity) => identity,
             Err(error) => return refusal(&state, request.uri().path(), error),
         };
+    let mutating = !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
     let mut response = REQUEST_IDENTITY.scope(identity, next.run(request)).await;
+    if mutating {
+        // Invalidating generations never waits on a scan. A fill that started
+        // before a write cannot become a fresh snapshot after it commits.
+        state
+            .database
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .invalidate_lists();
+    }
     if state.access_controlled {
         response
             .headers_mut()
@@ -2646,15 +2674,14 @@ async fn request_identity(
                 "this server signs people in through Cloudflare Access and accepts no principal tokens; start it with --require-token as well to accept both",
             ));
         }
-        let database = state.database();
+        let state_for_database = state.clone();
         let presented = presented.to_owned();
-        let authenticated =
-            tokio::task::spawn_blocking(move || database.authenticate_token(&presented))
-                .await
-                .map_err(|error| {
-                    ApiError::internal(anyhow!(error).context("database task failed"))
-                })?
-                .map_err(ApiError::from_domain)?;
+        let authenticated = tokio::task::spawn_blocking(move || {
+            state_for_database.database().authenticate_token(&presented)
+        })
+        .await
+        .map_err(|error| ApiError::internal(anyhow!(error).context("database task failed")))?
+        .map_err(ApiError::from_domain)?;
         return authenticated
             .map(|database| authenticated_identity(state, database))
             .ok_or_else(|| unauthorized("the principal token is not valid"));
@@ -2716,8 +2743,9 @@ async fn cloudflare_access_database(
         }
     };
     let access = Arc::clone(access);
-    let database = state.database();
+    let state_for_database = state.clone();
     tokio::task::spawn_blocking(move || {
+        let database = state_for_database.database();
         let verified = match access.verify(&assertion) {
             Ok(verified) => verified,
             Err(error @ AssertionError::Rejected(_)) => {
@@ -3183,13 +3211,55 @@ async fn views_home(
         // asking for it is asking for them.
         let summarize =
             query.summary == ViewIndexSummary::Inline || representation.wants(VIEW_INDEX_REGION);
-        let (views, index) = run_database(&state, &headers, move |database| {
-            let views = database.views()?;
-            let index = if summarize {
-                ViewIndex::summarize(database, &views)?
+        let (views, index) = run_metadata_database(&state, &headers, move |database| {
+            let all_views = database.views()?;
+            let q = query.q.clone().unwrap_or_default();
+            let pattern = q.to_lowercase();
+            let matching = navigation_order(&all_views)
+                .filter(|view| {
+                    view.title.to_lowercase().contains(&pattern)
+                        || view.name.to_lowercase().contains(&pattern)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let total = matching.len();
+            let start = query.offset.unwrap_or(0).min(total);
+            let views = matching
+                .into_iter()
+                .skip(start)
+                .take(100)
+                .collect::<Vec<_>>();
+            let mut index = if summarize {
+                ViewIndex::summarize(database, &views, &all_views)?
             } else {
                 ViewIndex::titles(database)?
             };
+            let url = |offset: usize, inline: bool| {
+                if offset == 0 && q.is_empty() {
+                    return if inline {
+                        VIEW_INDEX_SUMMARY_URL.to_owned()
+                    } else {
+                        "/".to_owned()
+                    };
+                }
+                let mut params = form_urlencoded::Serializer::new(String::new());
+                params
+                    .append_pair("q", &q)
+                    .append_pair("offset", &offset.to_string());
+                if inline {
+                    params.append_pair("summary", "inline");
+                }
+                format!("/?{}", params.finish())
+            };
+            index.home = Some(HomePaging {
+                start,
+                total,
+                q: q.clone(),
+                summary_url: url(start, true),
+                previous: (start > 0).then(|| url(start.saturating_sub(100), false)),
+                next: (start + 100 < total).then(|| url(start + 100, false)),
+                navigation: all_views.into_iter().take(100).collect(),
+            });
             Ok((views, index))
         })
         .await?;
@@ -3203,6 +3273,41 @@ async fn views_home(
         ))
     }
     .await;
+    if Representation::requested(&headers).wants(VIEW_INDEX_REGION) {
+        let markup = match result {
+            Ok(markup) => markup,
+            Err(error) => return html_result(Err(error)),
+        };
+        {
+            let tag = format!(
+                "W/\"{}\"",
+                hexadecimal(&Sha256::digest(markup.0.as_bytes()))
+            );
+            let unchanged = headers
+                .get_all(header::IF_NONE_MATCH)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(','))
+                .any(|value| value.trim() == tag);
+            let mut response = if unchanged {
+                StatusCode::NOT_MODIFIED.into_response()
+            } else {
+                html_result(Ok(markup))
+            };
+            response.headers_mut().insert(
+                header::ETAG,
+                HeaderValue::from_str(&tag).expect("hex digest is an entity tag"),
+            );
+            response
+                .headers_mut()
+                .insert(header::VARY, HeaderValue::from_static(HTML_VARY));
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            );
+            return response;
+        }
+    }
     html_result(result)
 }
 
@@ -3247,6 +3352,18 @@ struct ViewIndex {
     /// `None` in the document a browser is sent first, which leaves the
     /// numbers to a request for `VIEW_INDEX_REGION`.
     summary: Option<IndexSummary>,
+    home: Option<HomePaging>,
+}
+
+#[derive(Debug)]
+struct HomePaging {
+    start: usize,
+    total: usize,
+    q: String,
+    summary_url: String,
+    previous: Option<String>,
+    next: Option<String>,
+    navigation: Vec<ViewDefinition>,
 }
 
 /// The numbers in the view index, which are the part that reads every record.
@@ -3275,6 +3392,7 @@ impl ViewIndex {
         Ok(Self {
             collection_titles,
             summary: None,
+            home: None,
         })
     }
 
@@ -3284,7 +3402,11 @@ impl ViewIndex {
     /// does not verify leaves a dash where its numbers would be, and opening
     /// the view says why. The index is how a reader gets to that explanation,
     /// so it must not be what breaks.
-    fn summarize(database: &Database, views: &[ViewDefinition]) -> Result<Self> {
+    fn summarize(
+        database: &Database,
+        views: &[ViewDefinition],
+        all_views: &[ViewDefinition],
+    ) -> Result<Self> {
         let mut index = Self::titles(database)?;
         let activity = database.collections_activity().unwrap_or_default();
         let mut listings: BTreeMap<&str, Option<Vec<Record>>> = BTreeMap::new();
@@ -3326,9 +3448,18 @@ impl ViewIndex {
         index.summary = Some(IndexSummary {
             views: summaries,
             users,
-            records: listings
-                .values()
-                .map(|records| records.as_ref().map(Vec::len))
+            records: all_views
+                .iter()
+                .map(|view| view.collection.as_str())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|collection| match listings.get(collection) {
+                    Some(records) => records.as_ref().map(Vec::len),
+                    None => database
+                        .list_with_audited_cache(collection, &[], &mut audited_states)
+                        .ok()
+                        .map(|records| records.len()),
+                })
                 .sum(),
         });
         Ok(index)
@@ -3365,14 +3496,11 @@ async fn audit_view(
                 "collection is required when filtering by record ID",
             ));
         }
-        let requested = bounds
-            .offset
-            .checked_add(bounds.limit)
-            .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| ApiError::unprocessable("pagination window is too large"))?;
         let (entries, people) = run_database(&state, &headers, move |database| {
-            let entries = database.audit_recent(
-                requested,
+            let entries = database.audit_window(
+                bounds.limit + 1,
+                bounds.offset,
+                None,
                 AuditFilter {
                     collection: collection.as_deref(),
                     id: id.as_deref(),
@@ -3390,7 +3518,7 @@ async fn audit_view(
             Ok((entries, people))
         })
         .await?;
-        let page = paginate_unknown_total(entries, bounds);
+        let page = paginate_window(entries, bounds);
         let navigation = run_database(&state, &headers, Database::views).await?;
         let ui = ui_context(&state, &headers).await?;
         Ok(render_audit_view(
@@ -3415,18 +3543,42 @@ async fn audit_view(
 /// to read access policy, and offers no mutation at all. Editing a principal or
 /// its grants stays with `cr access` and the REST API, which enforce the
 /// reserved-field rules the browser forms cannot express.
-async fn users_view(State(state): State<AppState>, headers: HeaderMap) -> Response {
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsersQuery {
+    q: Option<String>,
+    offset: Option<usize>,
+}
+
+async fn users_view(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let result: ApiResult<Markup> = async {
+        let query: UsersQuery = parse_query(raw)?;
         let (users, navigation) = run_database(&state, &headers, |database| {
             let users = database.users()?;
             let navigation = database.views()?;
             Ok((users, navigation))
         })
         .await?;
+        let pattern = query.q.as_deref().unwrap_or("").to_lowercase();
+        let users = users
+            .into_iter()
+            .filter(|(id, user)| {
+                id.to_lowercase().contains(&pattern) || user.name.to_lowercase().contains(&pattern)
+            })
+            .collect::<Vec<_>>();
+        let total = users.len();
+        let offset = query.offset.unwrap_or(0).min(total);
+        let users = users.into_iter().skip(offset).take(100).collect::<Vec<_>>();
         let ui = ui_context(&state, &headers).await?;
         Ok(render_users_view(
             &Representation::requested(&headers),
             &users,
+            &query,
+            (offset, total),
             &navigation,
             ui.as_ref(),
             &request_csrf_token(&state),
@@ -3453,7 +3605,7 @@ async fn browse_view(
         let query: BrowseQuery = parse_query(raw)?;
         let sort = BrowseSort::requested(&query);
         let requested = query.path;
-        let page = tokio::task::spawn_blocking(move || {
+        let mut page = tokio::task::spawn_blocking(move || {
             browse_filesystem(&start, requested.as_deref(), sort)
         })
         .await
@@ -3461,6 +3613,12 @@ async fn browse_view(
             ApiError::internal(anyhow!(error).context("filesystem browser task failed"))
         })??;
         let mut documents = Vec::new();
+        if let BrowserItem::Directory(entries) = &mut page.item {
+            let total = entries.len();
+            let start = query.offset.unwrap_or(0).min(total);
+            page.paging = Some((start, total));
+            *entries = entries.drain(..).skip(start).take(200).collect();
+        }
         if let BrowserItem::Directory(entries) = &page.item {
             for (anchor, entry) in directory_documents(entries) {
                 let path = page.location.join(&entry.name);
@@ -3866,6 +4024,7 @@ fn browse_filesystem(
         parent,
         crumbs,
         item,
+        paging: None,
     })
 }
 
@@ -4260,9 +4419,12 @@ async fn view_records(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let result: ApiResult<Markup> = async {
+        let representation = Representation::requested(&headers);
+        let fragment = representation.wants(VIEW_TABLE_REGION);
         let mut query: ViewQuery = parse_query(raw)?;
         let ad_hoc_filters = view_filter_expressions(&query)?;
         let query_for_database = query.clone();
+        let live_key = Arc::clone(&state.csrf_token);
         let requested_view = view_name.clone();
         let (
             view,
@@ -4273,16 +4435,30 @@ async fn view_records(
             navigation,
             can_create,
             can_manage_views,
-        ) = run_database(&state, &headers, move |database| {
+            live_generation,
+            live_scope_key,
+        ) = run_metadata_database(&state, &headers, move |database| {
             let view = database.view(&requested_view)?;
             let predicates = ViewPredicates::parse(&view)?;
-            let mut records = match query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
-                Some(pattern) => {
-                    let search = SearchQuery::new(pattern, SearchTarget::Document, false, true)?;
-                    database.search(Some(&view.collection), &predicates.assignments, &search)?
-                }
-                None => database.list(&view.collection, &predicates.assignments)?,
-            };
+            let mut records = database.list(&view.collection, &[])?;
+            let activity = database.record_activity(&view.collection)?;
+            let live_generation =
+                live::generation(database, &view.collection, &records, &activity, &live_key)?;
+            let live_scope_key = principal_csrf_token(&live_key, database.principal()).to_string();
+            if let Some(pattern) = query_for_database.q.as_deref().filter(|q| !q.is_empty()) {
+                let search = SearchQuery::new(pattern, SearchTarget::Document, false, true)?;
+                let matches = records
+                    .into_iter()
+                    .map(|record| Ok(database.matches_search(&record, &search)?.then_some(record)))
+                    .collect::<Result<Vec<_>>>()?;
+                records = matches.into_iter().flatten().collect();
+            }
+            records.retain(|record| {
+                predicates
+                    .assignments
+                    .iter()
+                    .all(|filter| filter.matches(&record.attributes))
+            });
             records.retain(|record| predicates.matches(&record.attributes));
             let schema = database
                 .collection_models()?
@@ -4301,8 +4477,11 @@ async fn view_records(
             // One verified journal walk per page: the created and updated
             // columns are derived from history, and the sort default reads
             // them, so this is not optional work the renderer can skip.
-            let activity = database.record_activity(&view.collection)?;
-            let navigation = database.views()?;
+            let navigation = if fragment {
+                Vec::new()
+            } else {
+                database.views()?
+            };
             let can_create = can_create_in_collection(database, &view.collection)?;
             let can_manage_views = database.owner_access_allowed(&AccessResource::Database)?;
             Ok((
@@ -4314,41 +4493,80 @@ async fn view_records(
                 navigation,
                 can_create,
                 can_manage_views,
+                live_generation,
+                live_scope_key,
             ))
         })
         .await?;
 
-        // Making the default explicit in the query keeps the header
-        // indicator, the sort controls, and every generated link agreeing
-        // about what the page is actually ordered by, and spelling the
-        // requested sort back out drops the rows the panel left at "None".
-        let sort = query
-            .requested_sort()
-            .unwrap_or_else(|| view_default_sort(&view));
-        query.set_sort(&sort);
+        query.live_generation = Some(live_generation);
+        query.live_scope_key = Some(live_scope_key);
 
-        let available_columns = view_available_columns(&view, &records, schema.as_ref());
-        let columns =
-            selected_view_columns(&view, &query, &available_columns, schema.as_ref(), &records)?;
-        sort_view_records(&mut records, &query, &activity)?;
-        let bounds = page_bounds(
-            query
-                .limit
-                .or(Some(view.page_size.min(state.max_page_size))),
-            query.offset,
-            state.max_page_size,
-        )?;
-        let page = match (view.layout, view.group_by.as_deref()) {
-            (ViewLayout::Kanban, Some(group_by)) => {
-                paginate_board(records, bounds.limit, state.max_page_size, group_by)
-            }
-            _ => paginate_view(
-                records,
-                bounds.limit,
-                state.max_page_size,
-                view_position(&query, bounds.offset),
-            ),
-        };
+        let max_page_size = state.max_page_size;
+        let (view, query, activity, schema, columns, available_columns, page) =
+            run_render(&state, move || {
+                // Making the default explicit in the query keeps the header
+                // indicator, the sort controls, and every generated link agreeing
+                // about what the page is actually ordered by, and spelling the
+                // requested sort back out drops the rows the panel left at "None".
+                let sort = query
+                    .requested_sort()
+                    .unwrap_or_else(|| view_default_sort(&view));
+                query.set_sort(&sort);
+
+                let available_columns = view_available_columns(&view, &records, schema.as_ref());
+                let columns = selected_view_columns(
+                    &view,
+                    &query,
+                    &available_columns,
+                    schema.as_ref(),
+                    &records,
+                )?;
+                sort_view_records(&mut records, &query, &activity)?;
+                let bounds = page_bounds(
+                    query.limit.or(Some(view.page_size.min(max_page_size))),
+                    query.offset,
+                    max_page_size,
+                )?;
+                let page = match (view.layout, view.group_by.as_deref()) {
+                    (ViewLayout::Kanban, Some(group_by)) => {
+                        if let Some(lane) = &query.lane {
+                            let target: KanbanTarget =
+                                serde_json::from_str(lane).map_err(|error| {
+                                    ApiError::bad_request(
+                                        "invalid_kanban_target",
+                                        error.to_string(),
+                                    )
+                                })?;
+                            records
+                                .retain(|record| record_kanban_target(record, group_by) == target);
+                        }
+                        paginate_board_at(
+                            records,
+                            bounds.limit,
+                            max_page_size,
+                            group_by,
+                            bounds.offset,
+                        )
+                    }
+                    _ => paginate_view(
+                        records,
+                        bounds.limit,
+                        max_page_size,
+                        view_position(&query, bounds.offset),
+                    ),
+                };
+                Ok((
+                    view,
+                    query,
+                    activity,
+                    schema,
+                    columns,
+                    available_columns,
+                    page,
+                ))
+            })
+            .await?;
         // Only displayed Kanban cards have move controls. Checking every
         // matching record before pagination made even a table page perform
         // hundreds of authorization reads it never used.
@@ -4363,37 +4581,51 @@ async fn view_records(
                     )
                 })
                 .collect();
-            run_database(&state, &headers, move |database| {
-                let mut updatable = BTreeSet::new();
-                for (id, resource) in resources {
-                    if database.access_allowed(AccessAction::Update, &resource)? {
-                        updatable.insert(id);
-                    }
-                }
+            run_metadata_database(&state, &headers, move |database| {
+                let allowed = database.access_allowed_many(
+                    AccessAction::Update,
+                    &resources
+                        .iter()
+                        .map(|(_, resource)| resource.clone())
+                        .collect::<Vec<_>>(),
+                )?;
+                let updatable = resources
+                    .into_iter()
+                    .zip(allowed)
+                    .filter_map(|((id, _), allowed)| allowed.then_some(id))
+                    .collect();
                 Ok(updatable)
             })
             .await?
         } else {
             BTreeSet::new()
         };
-        let ui = ui_context(&state, &headers).await?;
-        Ok(render_view_records(
-            &Representation::requested(&headers),
-            &view,
-            &columns,
-            &available_columns,
-            &page,
-            &activity,
-            &query,
-            schema.as_ref(),
-            &request_csrf_token(&state),
-            &navigation,
-            ui.as_ref(),
-            can_create,
-            can_manage_views,
-            &updatable,
-            quick_filter.as_ref(),
-        ))
+        let ui = if fragment {
+            None
+        } else {
+            ui_context(&state, &headers).await?
+        };
+        let csrf = request_csrf_token(&state);
+        run_render(&state, move || {
+            Ok(render_view_records(
+                &representation,
+                &view,
+                &columns,
+                &available_columns,
+                &page,
+                &activity,
+                &query,
+                schema.as_ref(),
+                &csrf,
+                &navigation,
+                ui.as_ref(),
+                can_create,
+                can_manage_views,
+                &updatable,
+                quick_filter.as_ref(),
+            ))
+        })
+        .await
     }
     .await;
     html_result(result)
@@ -4881,6 +5113,8 @@ struct RecordPageQuery {
     notice: Option<String>,
     /// The editor asked for instead of the one the collection gives the form.
     editor: Option<RecordEditor>,
+    #[serde(default)]
+    relations: bool,
 }
 
 async fn edit_record_form(
@@ -4891,10 +5125,12 @@ async fn edit_record_form(
 ) -> Response {
     let result: ApiResult<Markup> = async {
         let query: RecordPageQuery = parse_query(raw)?;
+        let load_relations =
+            query.relations || Representation::requested(&headers).wants("relations");
         let requested_view = view_name.clone();
         let requested_id = id.clone();
         let (view, record, audit_entries, schema, navigation, permissions, relations) =
-            run_database(&state, &headers, move |database| {
+            run_metadata_database(&state, &headers, move |database| {
                 let view = database.view(&requested_view)?;
                 let record = database.get(&view.collection, &requested_id)?;
                 let audit_entries = database.audit_recent(
@@ -4908,7 +5144,8 @@ async fn edit_record_form(
                     update: database.access_allowed(AccessAction::Update, &resource)?,
                     delete: database.access_allowed(AccessAction::Delete, &resource)?,
                 };
-                let relations = record_relations(database, &record, &navigation);
+                let relations =
+                    load_relations.then(|| record_relations(database, &record, &navigation));
                 Ok((
                     view,
                     record,
@@ -4920,6 +5157,17 @@ async fn edit_record_form(
                 ))
             })
             .await?;
+        if Representation::requested(&headers).wants("relations") {
+            return Ok(render_record_relations(
+                &view,
+                &record,
+                relations
+                    .as_ref()
+                    .expect("relation requests load the panel"),
+                permissions,
+                &request_csrf_token(&state),
+            ));
+        }
         let ui = ui_context(&state, &headers).await?;
         Ok(render_record_form(
             &Representation::requested(&headers),
@@ -4932,7 +5180,7 @@ async fn edit_record_form(
             &navigation,
             ui.as_ref(),
             permissions,
-            Some(&relations),
+            relations.as_ref(),
             query.notice.as_deref(),
             query.editor,
         ))
@@ -5318,9 +5566,7 @@ async fn reject_record_form(
                         .ok()
                 })
                 .unwrap_or_default();
-            let relations = record
-                .as_ref()
-                .map(|record| record_relations(database, record, &navigation));
+            let relations = None;
             Ok((
                 view,
                 record,
@@ -5509,6 +5755,76 @@ async fn change_relation_form(
     result.unwrap_or_else(html_error)
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MoveQuery {
+    q: Option<String>,
+    offset: Option<usize>,
+}
+
+async fn kanban_move_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Segments((view_name, id)): Segments<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let result: ApiResult<Markup> = async {
+        let query: MoveQuery = parse_query(raw)?;
+        let csrf = request_csrf_token(&state);
+        let ui = ui_context(&state, &headers).await?;
+        run_read_database(&state, &headers, move |database| {
+            let view = database.view(&view_name)?;
+            let record = database.get(&view.collection, &id)?;
+            if view.layout != ViewLayout::Kanban { return Err(DomainError::Invalid("this view is not a Kanban board".into()).into()); }
+            if !database.access_allowed(AccessAction::Update, &AccessResource::record(&view.collection, &id))? {
+                return Err(DomainError::Forbidden("this perspective cannot move this record".into()).into());
+            }
+            let field = view.group_by.as_deref().context("Kanban group field is missing")?;
+            let schema = collection_schema(database, &view.collection)?;
+            let records = database.list(&view.collection, &[])?;
+            let mut options = BTreeMap::new();
+            for value in kanban_schema_values(schema.as_ref(), field) {
+                options.insert(serialize_yaml_value(&value), display_value(&value, property_definition(schema.as_ref(), field), None));
+            }
+            for record in &records {
+                if let Some(value) = record.field(field)? {
+                    options.insert(serialize_yaml_value(value), display_value(value, property_definition(schema.as_ref(), field), None));
+                }
+            }
+            let pattern = query.q.as_deref().unwrap_or("").to_lowercase();
+            let options = options.into_iter().filter(|(_, label)| label.to_lowercase().contains(&pattern)).collect::<Vec<_>>();
+            let offset = query.offset.unwrap_or(0).min(options.len());
+            let action = kanban_move_url(&view, &id);
+            let content = html! {
+                h1 class="text-lg font-semibold" { "Move " (&record.id) }
+                form method="get" action=(&action) class="flex gap-2" {
+                    input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Find a lane";
+                    button type="submit" { "Find lane" }
+                }
+                form method="post" action=(&action) hx-boost=(UNBOOSTED) class="mt-4 flex gap-2" {
+                    input type="hidden" name="_csrf" value=(&csrf);
+                    select name="target" aria-label="Move to lane" {
+                        option value=(kanban_target_json(&KanbanTarget::Unset)) { "Unassigned" }
+                        @for (value, label) in options.iter().skip(offset).take(200) {
+                            option value=(kanban_target_json(&KanbanTarget::Value { value: value.clone() })) { (label) }
+                        }
+                    }
+                    button type="submit" { "Move" }
+                }
+                @if offset + 200 < options.len() {
+                    @let mut next = form_urlencoded::Serializer::new(String::new());
+                    @let _ = next.append_pair("q", query.q.as_deref().unwrap_or("")).append_pair("offset", &(offset + 200).to_string());
+                    a href=(format!("{action}?{}", next.finish())) { "More lanes" }
+                }
+                a href=(format!("/{}", encode_segment(&view.name))) { "Back to board" }
+            };
+            let navigation = database.views()?;
+            Ok(page_layout("Move card", &action, &navigation, content, ui.as_ref(), &csrf))
+        }).await
+    }.await;
+    html_result(result)
+}
+
 async fn move_kanban_card(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5653,7 +5969,7 @@ async fn identity(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<IdentityResponse>> {
-    let database = request_database(&state, &headers)?;
+    let database = request_database_async(&state, &headers).await?;
     let attribution: Attribution = database.attribution().clone();
     Ok(Json(IdentityResponse {
         actor: database.actor().to_owned(),
@@ -5737,7 +6053,7 @@ async fn list_records(
     let filter = parse_filter(query.filter)?;
     let projection = parse_projection(&query.select)?;
     let sort = parse_sort(&query.sort, query.direction)?;
-    let records = run_database(&state, &headers, move |database| {
+    let page = run_metadata_database(&state, &headers, move |database| {
         let mut records = database.list(&collection, &filters)?;
         records.retain(|record| {
             expressions
@@ -5746,10 +6062,13 @@ async fn list_records(
                 && filter.as_ref().is_none_or(|filter| filter.matches(record))
         });
         sort_records(&mut records, &sort)?;
-        Ok(records)
+        let mut page = paginate(records, bounds);
+        page.data = database.hydrate_list_page(page.data)?;
+        page.pagination.returned = page.data.len();
+        Ok(page)
     })
     .await?;
-    record_page_response(paginate(records, bounds), projection.as_ref())
+    record_page_response(page, projection.as_ref())
 }
 
 /// Count a collection's records, optionally per value of a field, with sums,
@@ -5772,7 +6091,7 @@ async fn count_records(
         &query.max,
     )
     .map_err(ApiError::from_domain)?;
-    let summary = run_database(&state, &headers, move |database| {
+    let summary = run_metadata_database(&state, &headers, move |database| {
         let mut records = database.list(&collection, &filters)?;
         records.retain(|record| {
             expressions
@@ -6080,7 +6399,7 @@ async fn list_backlinks(
     let projection = parse_projection(&query.select)?;
     let sort = parse_sort(&query.sort, query.direction)?;
     let (from, relation) = (query.from, query.relation);
-    let backlinks = run_database(&state, &headers, move |database| {
+    let backlinks = run_read_database(&state, &headers, move |database| {
         let mut backlinks = database.backlinks(
             &collection,
             &id,
@@ -6199,7 +6518,7 @@ async fn search_records(
     )
     .map_err(ApiError::from_domain)?;
     let collection = parameters.collection;
-    let records = run_database(&state, &headers, move |database| {
+    let records = run_read_database(&state, &headers, move |database| {
         let mut records = database.search(collection.as_deref(), &filters, &query)?;
         records.retain(|record| {
             expressions
@@ -6295,14 +6614,11 @@ async fn audit_log(
 ) -> ApiResult<Json<Page<crate::AuditEntry>>> {
     let parameters: AuditLogParameters = parse_query(raw)?;
     let bounds = page_bounds(parameters.limit, parameters.offset, state.max_page_size)?;
-    let requested = bounds
-        .offset
-        .checked_add(bounds.limit)
-        .and_then(|value| value.checked_add(1))
-        .ok_or_else(|| ApiError::unprocessable("pagination window is too large"))?;
     let entries = run_database(&state, &headers, move |database| {
-        database.audit_recent(
-            requested,
+        database.audit_window(
+            bounds.limit + 1,
+            bounds.offset,
+            parameters.before_sequence,
             AuditFilter {
                 collection: parameters.collection.as_deref(),
                 id: parameters.id.as_deref(),
@@ -6312,7 +6628,8 @@ async fn audit_log(
         )
     })
     .await?;
-    Ok(Json(paginate_unknown_total(entries, bounds)))
+    let page = paginate_window(entries, bounds);
+    Ok(Json(page))
 }
 
 async fn audit_head(
@@ -7349,15 +7666,17 @@ fn openapi_paths() -> JsonValue {
             { "name": "collection", "in": "query", "schema": { "type": "string" } },
             { "name": "id", "in": "query", "schema": { "type": "string" } },
             { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
-            { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } }
+            { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+            { "name": "before_sequence", "in": "query", "description": "Return older visible events than this sequence; use the last returned sequence to continue without a deep offset.", "schema": { "type": "integer", "minimum": 0 } }
         ], "responses": ok("#/components/schemas/AuditPage") } },
         "/api/v1/events": { "get": {
             "operationId": "watchChanges",
-            "description": "A best-effort Server-Sent Events feed for live views. reset requests a fresh query on every connection; change carries an array of collections whose readable records changed; unavailable closes the feed. No record contents, identifiers, global sequence, or replay cursor are exposed. Authentication is rechecked while connected.",
+            "description": "A best-effort Server-Sent Events feed. With collection, reset carries an opaque generation to compare with the page and direct file edits are reconciled within the web list freshness window. Unscoped reset requests a fresh query and observes audited changes. change carries an array of collections whose readable records or permissions changed; unavailable closes the feed. No record contents, identifiers, global sequence, or replay cursor are exposed. Authentication is rechecked while connected.",
+            "parameters": [{ "name": "collection", "in": "query", "description": "Subscribe to one currently visible collection, including external source edits.", "schema": { "type": "string" } }],
             "responses": { "200": {
                 "description": "Permission-filtered change notifications with periodic keep-alive comments",
                 "content": { "text/event-stream": { "schema": { "type": "string" } } }
-            }, "400": error_response(), "401": error_response(), "403": error_response(), "500": error_response() }
+            }, "400": error_response(), "401": error_response(), "403": error_response(), "404": error_response(), "500": error_response() }
         } },
         "/api/v1/audit/head": { "get": { "operationId": "getAuditHead", "responses": ok("#/components/schemas/AuditHead") } },
         "/api/v1/audit/verify": { "get": { "operationId": "verifyAudit", "parameters": [
@@ -7494,7 +7813,10 @@ fn render_views_home(
         representation,
         "Database views",
         "/",
-        views,
+        index
+            .home
+            .as_ref()
+            .map_or(views, |home| home.navigation.as_slice()),
         html! {
             (page_bar(
                 &[],
@@ -7502,14 +7824,14 @@ fn render_views_home(
                 "All views",
                 html! {
                     span class="cr-page-meta" {
-                        (count_noun(views.len(), "view", "views"))
+                        (count_noun(index.home.as_ref().map_or(views.len(), |home| home.total), "view", "views"))
                         (view_index_total(views, index, OutOfBand::No))
                         @if deferred {
                             // Nothing will ask for the region without a script, so
                             // offer the document that has the numbers in it.
                             noscript {
                                 span class="mx-1.5 text-gray-300" aria-hidden="true" { "·" }
-                                a href=(VIEW_INDEX_SUMMARY_URL) class="underline hover:text-gray-900" { "Count records" }
+                                a href=(index.home.as_ref().map_or(VIEW_INDEX_SUMMARY_URL, |home| home.summary_url.as_str())) class="underline hover:text-gray-900" { "Count records" }
                             }
                         }
                     }
@@ -7525,6 +7847,10 @@ fn render_views_home(
                         "."
                     }
                 }
+            }
+            form method="get" action="/" class="mb-3 flex gap-2" {
+                input type="search" name="q" value=(index.home.as_ref().map_or("", |home| home.q.as_str())) aria-label="Find a view" placeholder="Find a view";
+                button type="submit" class="cr-button" { "Search" }
             }
             (region)
         },
@@ -7551,8 +7877,10 @@ fn view_index_region(
     let users = index.summary.as_ref().map(|summary| &summary.users);
     html! {
         div id=(VIEW_INDEX_REGION)
+            data-refresh-url=(index.home.as_ref().map_or(VIEW_INDEX_SUMMARY_URL, |home| home.summary_url.as_str()))
+            data-refresh-perspective=(ui.map_or("", |ui| ui.selected.as_str()))
             aria-busy=[deferred.then_some("true")]
-            hx-get=[deferred.then_some(VIEW_INDEX_SUMMARY_URL)]
+            hx-get=[deferred.then_some(index.home.as_ref().map_or(VIEW_INDEX_SUMMARY_URL, |home| home.summary_url.as_str()))]
             hx-trigger=[deferred.then_some("load")]
             hx-swap=[deferred.then_some("outerHTML")]
         {
@@ -7631,6 +7959,15 @@ fn view_index_region(
                             }
                             span class="cr-view-arrow" aria-hidden="true" { "→" }
                         }
+                    }
+                }
+            }
+            @if let Some(home) = &index.home {
+                @if home.total > 100 {
+                    nav aria-label="View pages" class="mt-4 flex gap-3 text-xs" {
+                        @if let Some(previous) = &home.previous { a href=(previous) { "Previous views" } }
+                        span { "Showing " (home.start + 1) "–" ((home.start + views.len()).min(home.total)) " of " (home.total) }
+                        @if let Some(next) = &home.next { a href=(next) { "Next views" } }
                     }
                 }
             }
@@ -7772,10 +8109,13 @@ fn render_access_grant(grant: &crate::AccessGrant) -> Markup {
 fn render_users_view(
     representation: &Representation,
     users: &[(String, User)],
+    query: &UsersQuery,
+    paging: (usize, usize),
     views: &[ViewDefinition],
     ui: Option<&UiContext>,
     csrf_token: &str,
 ) -> Markup {
+    let (offset, total) = paging;
     // Profile metadata is optional and usually absent, so the column only
     // appears when some principal actually carries it.
     let show_profile = users.iter().any(|(_, user)| !user.profile.is_empty());
@@ -7792,7 +8132,7 @@ fn render_users_view(
                 "Users",
                 html! {
                     span class="cr-page-meta" {
-                        (count_noun(users.len(), "principal", "principals"))
+                        (count_noun(total, "principal", "principals"))
                         span class="mx-1.5 text-gray-300" aria-hidden="true" { "·" }
                         "read-only"
                     }
@@ -7807,6 +8147,22 @@ fn render_users_view(
                 " collection. CR owns its schema and history, so it is read-only here: register a principal, change a role, or disable an identity with "
                 code class="rounded bg-gray-100 px-1.5 py-0.5 text-xs" { "cr access" }
                 " or the REST API."
+            }
+            form method="get" action="/users" class="mb-3 flex gap-2" {
+                input type="search" name="q" value=(query.q.as_deref().unwrap_or("")) aria-label="Find a user";
+                button type="submit" class="cr-button" { "Search" }
+            }
+            @if total > 100 {
+                @let url = |offset: usize| {
+                    let mut params = form_urlencoded::Serializer::new(String::new());
+                    params.append_pair("q", query.q.as_deref().unwrap_or("")).append_pair("offset", &offset.to_string());
+                    format!("/users?{}", params.finish())
+                };
+                nav aria-label="User pages" class="mb-3 flex gap-3 text-xs" {
+                    @if offset > 0 { a href=(url(offset.saturating_sub(100))) { "Previous users" } }
+                    span { "Showing " (offset + 1) "–" ((offset + users.len()).min(total)) " of " (total) }
+                    @if offset + 100 < total { a href=(url(offset + 100)) { "Next users" } }
+                }
             }
             div class="cr-table-shell" {
                 div class="overflow-x-auto" {
@@ -8026,7 +8382,17 @@ fn render_browse_view(
                             (entries.len()) " entries · directories first · hidden files included"
                         }
                     }
-                    @for document in documents {
+                    @if let Some((start, total)) = page.paging {
+                @if total > 200 {
+                    nav aria-label="Directory pages" class="my-3 flex gap-3 text-xs" {
+                        @let base = sort.carry(&browse_url(&page.location.to_string_lossy()));
+                        @if start > 0 { a href=(format!("{base}&offset={}", start.saturating_sub(200))) { "Previous files" } }
+                        span { "Showing " (start + 1) "–" ((start + 200).min(total)) " of " (total) }
+                        @if start + 200 < total { a href=(format!("{base}&offset={}", start + 200)) { "Next files" } }
+                    }
+                }
+            }
+            @for document in documents {
                         section id=(document.anchor) aria-label=(&document.name) class="mt-6" {
                             @match &document.preview {
                                 Ok(file) => {
@@ -10232,7 +10598,7 @@ fn view_results(
         .filter(|column| Some(column.as_str()) != title_field)
         .collect::<Vec<_>>();
     html! {
-        div id=(VIEW_TABLE_REGION) data-live-collection=(&view.collection) data-live-key=(csrf_token) {
+        div id=(VIEW_TABLE_REGION) data-live-collection=(&view.collection) data-live-key=(query.live_scope_key.as_deref().unwrap_or(csrf_token)) data-live-generation=[query.live_generation.as_deref()] {
             (render_active_filters(view, query, page, schema))
             @if view.layout == ViewLayout::Kanban {
                 (render_kanban_board(view, columns, page, activity, query, schema, csrf_token, updatable))
@@ -11295,25 +11661,8 @@ fn render_kanban_board(
                                         (render_timestamp(Some(time)))
                                     }
                                     @if can_move {
-                                        details class="cr-kanban-move" {
-                                            summary { "Move…" }
-                                            form method="post" action=(kanban_move_url(view, &record.id)) hx-boost=(UNBOOSTED) class="flex items-center gap-2" {
-                                                input type="hidden" name="_csrf" value=(csrf_token);
-                                                label class="min-w-0 flex-1" {
-                                                    span class="sr-only" { "Move " (&record.id) " to" }
-                                                    select name="target" aria-label=(format!("Move {} to", record.id)) class="w-full rounded-lg border border-gray-300 bg-white px-2 py-1.5 text-xs outline-none ring-indigo-500 focus:ring-2" {
-                                                        @for option_lane in &lanes {
-                                                            @if option_lane.target == lane.target {
-                                                                option value=(kanban_target_json(&option_lane.target)) selected { (&option_lane.label) }
-                                                            } @else {
-                                                                option value=(kanban_target_json(&option_lane.target)) { (&option_lane.label) }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                button type="submit" class="cr-button cr-button-primary cr-button-small" { "Move" }
-                                            }
-                                        }
+                                        a class="cr-kanban-move" aria-label=(format!("Move {} to another lane", record.id)) href=(kanban_move_url(view, &record.id)) { "Move…" }
+
                                     }
                                     }
                                     }
@@ -11321,10 +11670,23 @@ fn render_kanban_board(
                             }
                         }
                         @if lane_total > lane.records.len() {
-                            (render_lane_more(view, query, page, lane_index, lane_total - lane.records.len()))
+                            (render_lane_more(view, query, page, lane_index, &lane.target, lane_total - lane.records.len()))
                         }
                     }
                 }
+            }
+        }
+        nav aria-label="Board lanes" class="flex items-center gap-3 text-xs" {
+            @if query.lane.is_some() {
+                @let mut all = query.clone();
+                @let _ = all.lane.take();
+                a href=(view_page_url(view, &all, page.limit, ViewPosition::Start)) { "All lanes" }
+            }
+            @if page.start > 0 {
+                a href=(view_page_url(view, query, page.limit, ViewPosition::Offset(page.start.saturating_sub(MAX_BOARD_LANES)))) { "Previous lanes" }
+            }
+            @if page.lanes.as_ref().is_some_and(|lanes| lanes.len() > page.start + MAX_BOARD_LANES) {
+                a href=(view_page_url(view, query, page.limit, ViewPosition::Offset(page.start + MAX_BOARD_LANES))) { "Next lanes" }
             }
         }
         p class="mt-1 text-xs text-gray-500" data-board-summary="true" {
@@ -11360,14 +11722,17 @@ fn render_lane_more(
     query: &ViewQuery,
     page: &ViewPage,
     lane: usize,
+    target: &KanbanTarget,
     hidden: usize,
 ) -> Markup {
     let more = page.limit.saturating_mul(2).min(page.max_limit);
+    let mut next = query.clone();
+    next.lane = Some(kanban_target_json(target));
     html! {
-        @if more > page.limit {
-            a id=(format!("cr-lane-more-{lane}")) href=(view_page_url(view, query, more, ViewPosition::Start)) class="cr-lane-more"
+        @if more > page.limit || query.lane.is_none() {
+            a id=(format!("cr-lane-more-{lane}")) href=(view_page_url(view, &next, more, ViewPosition::Start)) class="cr-lane-more"
                 hx-target=(VIEW_TABLE_TARGET.as_str()) hx-swap=(VIEW_TABLE_SWAP_FROM_INSIDE) hx-push-url="true" {
-                "Show " (hidden.min(more - page.limit)) " more"
+                "Show more in this lane"
             }
         } @else {
             p class="cr-lane-more" { (hidden) " more not shown; filter the board to reach them" }
@@ -11383,7 +11748,10 @@ fn kanban_lanes<'a>(
     let mut lane_values = Vec::new();
     let mut known = BTreeSet::new();
     let definition = property_definition(schema, group_by);
-    for value in kanban_schema_values(schema, group_by) {
+    for value in kanban_schema_values(schema, group_by)
+        .into_iter()
+        .take(MAX_BOARD_LANES)
+    {
         let serialized = serialize_yaml_value(&value);
         if known.insert(serialized.clone()) {
             lane_values.push((serialized, display_value(&value, definition, None)));
@@ -11404,6 +11772,24 @@ fn kanban_lanes<'a>(
         }
     }
     lane_values.extend(observed);
+    // Empty enum lanes must never displace a populated lane or Unassigned.
+    let present = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .field(group_by)
+                .ok()
+                .flatten()
+                .map(serialize_yaml_value)
+        })
+        .collect::<BTreeSet<_>>();
+    let budget = MAX_BOARD_LANES - usize::from(has_unassigned);
+    while lane_values.len() > budget {
+        let empty = lane_values
+            .iter()
+            .rposition(|(value, _)| !present.contains(value));
+        lane_values.remove(empty.unwrap_or(lane_values.len() - 1));
+    }
 
     let mut lanes = lane_values
         .into_iter()
@@ -11421,6 +11807,11 @@ fn kanban_lanes<'a>(
         });
     }
 
+    let positions = lanes
+        .iter()
+        .enumerate()
+        .map(|(index, lane)| (lane.target.clone(), index))
+        .collect::<BTreeMap<_, _>>();
     for record in records {
         let target = match record.field(group_by).ok().flatten() {
             Some(value) => KanbanTarget::Value {
@@ -11428,8 +11819,8 @@ fn kanban_lanes<'a>(
             },
             None => KanbanTarget::Unset,
         };
-        if let Some(lane) = lanes.iter_mut().find(|lane| lane.target == target) {
-            lane.records.push(record);
+        if let Some(index) = positions.get(&target) {
+            lanes[*index].records.push(record);
         }
     }
     lanes
@@ -12721,9 +13112,31 @@ fn record_relations(
             CollectionPresentation::from_schema(model.schema.as_ref()).title(&model.name),
         );
         schemas.insert(model.name.clone(), model.schema.clone());
-        if let Ok(records) = database.list_with_audited_cache(&model.name, &[], &mut audited_states)
+        let remaining = RELATION_SUGGESTION_LIMIT.saturating_sub(readable.len());
+        if remaining > 0
+            && let Ok(records) =
+                database.relation_suggestions(&model.name, remaining, &mut audited_states)
         {
             readable.extend(records);
+        }
+    }
+    let backlinks = database
+        .backlinks(&record.collection, &record.id, None, None, &[])
+        .unwrap_or_default();
+    for (_, collection, id) in relation_references(&record.attributes) {
+        if !readable
+            .iter()
+            .any(|other| other.collection == collection && other.id == id)
+            && let Ok(other) = database.get(&collection, &id)
+        {
+            readable.push(other);
+        }
+    }
+    for backlink in &backlinks {
+        if !readable.iter().any(|other| {
+            other.collection == backlink.record.collection && other.id == backlink.record.id
+        }) {
+            readable.push(backlink.record.clone());
         }
     }
     let index: BTreeMap<(&str, &str), &Record> = readable
@@ -12761,11 +13174,18 @@ fn record_relations(
     let mut relation_names: BTreeSet<String> =
         own.into_iter().map(|(relation, _, _)| relation).collect();
     let mut incoming = Vec::new();
+    for backlink in backlinks {
+        for relation in backlink.relations {
+            relation_names.insert(relation.clone());
+            incoming.push(describe(
+                &relation,
+                &backlink.record.collection,
+                &backlink.record.id,
+            ));
+        }
+    }
     for source in &readable {
-        for (relation, collection, id) in relation_references(&source.attributes) {
-            if collection == record.collection && id == record.id {
-                incoming.push(describe(&relation, &source.collection, &source.id));
-            }
+        for (relation, _, _) in relation_references(&source.attributes) {
             relation_names.insert(relation);
         }
     }
@@ -13389,6 +13809,12 @@ fn render_record_form(
                     aside id="audit-history" class="cr-record-activity scroll-mt-20" {
                         @if let Some(relations) = relations {
                             (render_record_relations(view, record, relations, permissions, csrf_token))
+                        } @else {
+                            @let href = format!("/{}/records/{}?relations=true", encode_segment(&view.name), encode_segment(&record.id));
+                            section id="relations" class="cr-relations" hx-get=(&href) hx-trigger="revealed" hx-target="this" hx-swap="outerHTML" {
+                                h2 class="cr-aside-heading" { "Relations" }
+                                a href=(format!("{href}#relations")) class="cr-aside-link" { "Load linked records" }
+                            }
                         }
                         @if !record.files.is_empty() {
                             (render_record_files(view, record))
@@ -13752,6 +14178,12 @@ fn perspective_control(ui: &UiContext, csrf_token: &str, id: &str) -> Markup {
             // button used to be inside `<noscript>`; it is now how everyone
             // switches, with or without JavaScript.
             div class="cr-perspective-choice" {
+                @if ui.users.len() > 100 {
+                    input id=(id) name="principal" value=(&ui.selected) list=(format!("{id}-suggestions")) aria-label="View as user";
+                    datalist id=(format!("{id}-suggestions")) {
+                        @for user in ui.users.iter().take(100) { option value=(&user.id) { (&user.name) } }
+                    }
+                } @else {
                 select id=(id) name="principal" aria-label="View as user" {
                     @for user in &ui.users {
                         option value=(&user.id) selected[user.id == ui.selected] {
@@ -13759,6 +14191,7 @@ fn perspective_control(ui: &UiContext, csrf_token: &str, id: &str) -> Markup {
                             @if user.status == UserStatus::Disabled { " (disabled)" }
                         }
                     }
+                }
                 }
                 button type="submit" class="cr-button" { "Switch" }
             }
@@ -13848,7 +14281,7 @@ fn sidebar_navigation(
                 }
                 @if views.iter().any(|view| view.saved) {
                     p class="cr-sidebar-label" { "Saved views" }
-                    @for view in navigation_order(views).filter(|view| view.saved) {
+                    @for view in navigation_order(views).filter(|view| view.saved).take(100) {
                         @let path = format!("/{}", encode_segment(&view.name));
                         a href=(&path) class=(if current_path == path { "cr-sidebar-link is-active" } else { "cr-sidebar-link" }) aria-current=[(current_path == path).then_some("page")] title=(&view.title) {
                             span class="cr-nav-glyph" aria-hidden="true" { (view_icon(view)) }
@@ -13973,7 +14406,7 @@ fn mobile_navigation(
                 a href="/" class=(if under_all_views(current_path, views) { "is-active" } else { "" }) aria-current=[(current_path == "/").then_some("page")] { (mobile_icon(HOME_ICON)) "All views" }
                 // The same entries as the desktop sidebar: saved views, then
                 // the internal registry, with collections on the index.
-                @for view in navigation_order(views).filter(|view| view.saved) {
+                @for view in navigation_order(views).filter(|view| view.saved).take(100) {
                     @let path = format!("/{}", encode_segment(&view.name));
                     a href=(&path) class=(if current_path == path { "is-active" } else { "" }) aria-current=[(current_path == path).then_some("page")] { (mobile_icon(view_icon(view))) (&view.title) }
                 }
@@ -15476,42 +15909,72 @@ fn paginate_view(
     }
 }
 
-/// Cut a Kanban board out of the ordered result: up to `limit` records from
-/// each lane, in order, and how many each lane holds.
-///
-/// A board used to be one page of the view, cut across all its lanes before
-/// they were filled, so a lane showed however many of the page's records fell
-/// into it: a queue of fifteen said six, and the next page moved every lane at
-/// once. Now each lane shows the first `limit` of its own records and says
-/// how many it has, and asking for more asks for more of every lane. Every
-/// record is already in memory for the ordering, so counting the lanes costs
-/// nothing more; what stays bounded is what is sent, at `limit` per lane.
-fn paginate_board(
+/// Count lanes once, page fifty lanes, and fill up to two hundred cards
+/// fairly across them. Each lane retains the view's record order and its
+/// independent page-size limit; loading more narrows to that lane.
+const MAX_BOARD_LANES: usize = 50;
+const MAX_BOARD_CARDS: usize = 200;
+
+fn record_kanban_target(record: &Record, group_by: &str) -> KanbanTarget {
+    match record.field(group_by).ok().flatten() {
+        Some(value) => KanbanTarget::Value {
+            value: serialize_yaml_value(value),
+        },
+        None => KanbanTarget::Unset,
+    }
+}
+
+fn paginate_board_at(
     records: Vec<Record>,
     limit: usize,
     max_limit: usize,
     group_by: &str,
+    offset: usize,
 ) -> ViewPage {
     let total = records.len();
     let mut lanes = BTreeMap::<Option<String>, usize>::new();
-    let records = records
-        .into_iter()
-        .filter(|record| {
-            let lane = record
-                .field(group_by)
-                .ok()
-                .flatten()
-                .map(serialize_yaml_value);
-            let shown = lanes.entry(lane).or_default();
-            *shown += 1;
-            *shown <= limit
-        })
-        .collect();
+    for record in &records {
+        let key = record
+            .field(group_by)
+            .ok()
+            .flatten()
+            .map(serialize_yaml_value);
+        *lanes.entry(key).or_default() += 1;
+    }
+    let start = if offset < lanes.len() { offset } else { 0 };
+    let selected = lanes
+        .keys()
+        .skip(start)
+        .take(MAX_BOARD_LANES)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut shown = BTreeMap::<Option<String>, usize>::new();
+    let mut candidates = Vec::new();
+    for record in records {
+        let key = record
+            .field(group_by)
+            .ok()
+            .flatten()
+            .map(serialize_yaml_value);
+        if !selected.contains(&key) {
+            continue;
+        }
+        let count = shown.entry(key).or_default();
+        if *count < limit {
+            candidates.push((*count, record));
+            *count += 1;
+        }
+    }
+    // Fill each lane fairly before adding another row to any lane.
+    candidates.sort_by_key(|(row, _)| *row);
+    candidates.truncate(MAX_BOARD_CARDS);
+    // Restore each lane's record order (the sort above is stable).
+    let records = candidates.into_iter().map(|(_, record)| record).collect();
     ViewPage {
         records,
         limit,
         max_limit,
-        start: 0,
+        start,
         total,
         next: None,
         previous: None,
@@ -15581,6 +16044,9 @@ fn view_query_string(query: &ViewQuery, limit: usize, position: ViewPosition<'_>
         for column in &query.column {
             serializer.append_pair("column", column);
         }
+    }
+    if let Some(lane) = &query.lane {
+        serializer.append_pair("lane", lane);
     }
     serializer.append_pair("limit", &limit.to_string());
     match position {
@@ -16387,8 +16853,22 @@ async fn method_not_allowed() -> ApiError {
     )
 }
 
-fn request_database(state: &AppState, headers: &HeaderMap) -> ApiResult<Database> {
+async fn request_database_async(state: &AppState, headers: &HeaderMap) -> ApiResult<Database> {
     let authenticated = authenticated_database();
+    let state = state.clone();
+    let headers = headers.clone();
+    tokio::task::spawn_blocking(move || {
+        request_database_with_identity(&state, &headers, authenticated)
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow!(error)))?
+}
+
+fn request_database_with_identity(
+    state: &AppState,
+    headers: &HeaderMap,
+    authenticated: Option<Database>,
+) -> ApiResult<Database> {
     let mut database = authenticated.clone().unwrap_or_else(|| state.database());
     // For an authenticated principal the header can only restyle how that
     // same principal is displayed: `with_actor` refuses any other principal
@@ -16497,20 +16977,30 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
     if !state.access_controlled {
         return Ok(None);
     }
+    let minimal = Representation::requested(headers).wants(VIEW_INDEX_REGION);
     let authenticated = authenticated_database();
-    let database = authenticated.clone().unwrap_or_else(|| state.database());
-    let selected = match &authenticated {
-        Some(database) => database.principal().to_owned(),
-        None => perspective_principal(headers)?.unwrap_or_else(|| database.principal().to_owned()),
-    };
+    let selected = perspective_principal(headers)?;
+    let state_for_database = state.clone();
     tokio::task::spawn_blocking(move || {
+        let database = authenticated
+            .clone()
+            .unwrap_or_else(|| state_for_database.database());
+        let selected = authenticated
+            .as_ref()
+            .map(|database| database.principal().to_owned())
+            .or(selected)
+            .unwrap_or_else(|| database.principal().to_owned());
         // The registry is the owner console's to list. An authenticated
         // principal reads its own user record, which it always may, and is
         // offered no one else to be.
-        let users = match &authenticated {
+        let mut users = match &authenticated {
             Some(database) => vec![(selected.clone(), database.user(&selected)?)],
-            None => database.users()?,
+            None if minimal => vec![(selected.clone(), database.user(&selected)?)],
+            None => database.users_preview(101)?,
         };
+        if !users.iter().any(|(id, _)| id == &selected) {
+            users.push((selected.clone(), database.user(&selected)?));
+        }
         let selected_user = users
             .iter()
             .find(|(id, _)| id == &selected)
@@ -16530,9 +17020,9 @@ async fn ui_context(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<U
             selected_database.owner_access_allowed(&AccessResource::Database)?;
         let can_read_users = selected_database
             .access_allowed(AccessAction::ReadAccess, &AccessResource::Database)?;
-        let can_browse_files = selected_database.owner_access_allowed(&AccessResource::Database)?;
-        let can_save_views = selected_database.owner_access_allowed(&AccessResource::Database)?;
-        let pins = if can_browse_files {
+        let can_browse_files = can_view_global_audit;
+        let can_save_views = can_view_global_audit;
+        let pins = if can_browse_files && !minimal {
             selected_database
                 .pins()
                 .map(|pins| resolve_pins(selected_database.root(), pins))
@@ -16845,11 +17335,79 @@ where
     T: Send + 'static,
     F: FnOnce(&Database) -> Result<T> + Send + 'static,
 {
-    let database = request_database(state, headers)?;
+    let database = request_database_async(state, headers).await?;
     tokio::task::spawn_blocking(move || operation(&database))
         .await
         .map_err(|error| ApiError::internal(anyhow!(error).context("database task failed")))?
         .map_err(ApiError::from_domain)
+}
+
+/// Dropping an abandoned read request tells an already-running scan to stop.
+/// Mutations use run_database/run_idempotent_database and always finish.
+struct CancelRead(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for CancelRead {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+async fn run_render<T, F>(state: &AppState, operation: F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> ApiResult<T> + Send + 'static,
+{
+    let permit = Arc::clone(&state.read_workers)
+        .acquire_owned()
+        .await
+        .map_err(|error| ApiError::internal(anyhow!(error)))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow!(error).context("render task failed")))?
+}
+
+async fn run_metadata_database<T, F>(
+    state: &AppState,
+    headers: &HeaderMap,
+    operation: F,
+) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Database) -> Result<T> + Send + 'static,
+{
+    run_read_database(state, headers, move |database| {
+        operation(&database.clone().with_entry_only_lists())
+    })
+    .await
+}
+
+async fn run_read_database<T, F>(
+    state: &AppState,
+    headers: &HeaderMap,
+    operation: F,
+) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Database) -> Result<T> + Send + 'static,
+{
+    let permit = Arc::clone(&state.read_workers)
+        .acquire_owned()
+        .await
+        .map_err(|error| ApiError::internal(anyhow!(error)))?;
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_on_drop = CancelRead(Arc::clone(&cancelled));
+    let database = request_database_async(state, headers)
+        .await?
+        .with_cached_lists(cancelled);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation(&database)
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow!(error).context("database read failed")))?
+    .map_err(ApiError::from_domain)
 }
 
 async fn run_idempotent_database<T, F>(
@@ -16861,7 +17419,7 @@ where
     T: Send + 'static,
     F: FnOnce(&Database) -> Result<T> + Send + 'static,
 {
-    let mut database = request_database(state, headers)?;
+    let mut database = request_database_async(state, headers).await?;
     if let Some(key) = single_header(
         headers,
         IDEMPOTENCY_HEADER,
@@ -17049,6 +17607,25 @@ fn paginate<T>(items: Vec<T>, bounds: PageBounds) -> Page<T> {
     }
 }
 
+/// Paginate a database window that has already skipped its offset.
+fn paginate_window<T>(items: Vec<T>, bounds: PageBounds) -> Page<T> {
+    let mut page = paginate_unknown_total(
+        items,
+        PageBounds {
+            offset: 0,
+            ..bounds
+        },
+    );
+    page.pagination.offset = bounds.offset;
+    page.pagination.next_offset = page
+        .pagination
+        .has_more
+        .then_some(bounds.offset.saturating_add(page.pagination.returned));
+    page.pagination.previous_offset =
+        (bounds.offset > 0).then_some(bounds.offset.saturating_sub(bounds.limit));
+    page
+}
+
 fn paginate_unknown_total<T>(items: Vec<T>, bounds: PageBounds) -> Page<T> {
     let has_more = items.len() > bounds.offset.saturating_add(bounds.limit);
     let data: Vec<_> = items
@@ -17134,6 +17711,33 @@ mod tests {
     use anyhow::anyhow;
     use axum::http::StatusCode;
     use serde_json::json;
+
+    #[test]
+    fn empty_enum_lanes_do_not_displace_populated_or_unassigned_records() {
+        let records = (1..=50)
+            .map(|index| crate::Record {
+                collection: "items".into(),
+                id: index.to_string(),
+                path: Default::default(),
+                version: String::new(),
+                body: String::new(),
+                files: Vec::new(),
+                attributes: if index == 50 {
+                    Default::default()
+                } else {
+                    yaml_serde::from_str(&format!("status: {index}")).unwrap()
+                },
+            })
+            .collect::<Vec<_>>();
+        let schema = json!({"properties":{"status":{"enum":(0..50).collect::<Vec<_>>()}}});
+        let lanes = super::kanban_lanes(&records, "status", Some(&schema));
+        assert_eq!(lanes.len(), 50);
+        assert_eq!(
+            lanes.iter().map(|lane| lane.records.len()).sum::<usize>(),
+            50
+        );
+        assert!(lanes.iter().all(|lane| !lane.records.is_empty()));
+    }
 
     fn replaced(before: &str, after: &str) -> String {
         render_audit_changes(
@@ -17287,7 +17891,7 @@ mod tests {
 
         // One walk for the activity, and one replay every listing shares.
         reset_verify_chain_calls();
-        let index = ViewIndex::summarize(&database, &views).unwrap();
+        let index = ViewIndex::summarize(&database, &views, &views).unwrap();
         assert_eq!(verify_chain_calls(), 2);
         assert_eq!(index.summary.unwrap().records, Some(12));
 
@@ -17296,11 +17900,11 @@ mod tests {
         // append: only the new event is verified.
         let served = database.with_journal_cache();
         reset_verify_chain_calls();
-        ViewIndex::summarize(&served, &views).unwrap();
+        ViewIndex::summarize(&served, &views, &views).unwrap();
         assert_eq!(verify_chain_calls(), 1);
         served.create("alpha", "three", &[], "").unwrap();
         reset_verify_chain_calls();
-        let index = ViewIndex::summarize(&served, &views).unwrap();
+        let index = ViewIndex::summarize(&served, &views, &views).unwrap();
         assert_eq!(verify_chain_calls(), 0);
         assert_eq!(index.summary.unwrap().records, Some(13));
     }

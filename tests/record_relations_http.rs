@@ -53,7 +53,15 @@ async fn request(
     body: Option<String>,
     cookie: Option<&str>,
 ) -> TestResponse {
-    let mut builder = Request::builder().method(method).uri(uri);
+    let uri = if method == Method::GET && uri.contains("/records/") {
+        format!(
+            "{uri}{}relations=true",
+            if uri.contains('?') { "&" } else { "?" }
+        )
+    } else {
+        uri.to_owned()
+    };
+    let mut builder = Request::builder().method(method).uri(&uri);
     if body.is_some() {
         builder = builder.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
     }
@@ -497,4 +505,37 @@ async fn records_are_named_and_tables_read_like_the_form() {
     // Times are relative, with the exact instant kept in the markup.
     assert!(table.body.contains(r#"class="cr-time">just now</time>"#));
     assert!(table.body.contains(r#" UTC" class="cr-time""#));
+}
+
+#[tokio::test]
+async fn the_initial_form_defers_relations_with_a_native_fallback() {
+    let (_temporary, database) = crm("relations-deferred");
+    let app = router(database, ServerConfig::default()).unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/deals/records/renewal")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Load linked records"));
+    assert!(body.contains("hx-trigger=\"revealed\""));
+    assert!(body.contains("relations=true"));
+    assert!(!body.contains("Link a record"));
+    let loaded = request(&app, Method::GET, "/deals/records/renewal", None, None).await;
+    assert!(loaded.body.contains("Link a record"));
 }

@@ -596,18 +596,23 @@ const liveResults = (() => {
       dirty = false;
       return;
     }
-    if (connection && connectionKey !== results.dataset.liveKey) close();
+    const scopeKey = `${results.dataset.liveKey}:${results.dataset.liveCollection}`;
+    if (connection && connectionKey !== scopeKey) close();
     if (!connection && !retry) {
       state = 'Connecting…';
-      connectionKey = results.dataset.liveKey;
-      const source = new EventSource('/api/v1/events');
+      connectionKey = scopeKey;
+      const source = new EventSource(`/api/v1/events?collection=${encodeURIComponent(results.dataset.liveCollection)}`);
       connection = source;
       source.addEventListener('open', () => {
         if (source !== connection) return;
         state = 'Live';
         status();
       });
-      source.addEventListener('reset', () => { if (source === connection) invalidate(); });
+      source.addEventListener('reset', (event) => {
+        if (source !== connection) return;
+        const generation = JSON.parse(event.data).generation;
+        if (!generation || generation !== region()?.dataset.liveGeneration) invalidate();
+      });
       source.addEventListener('change', (event) => {
         if (source !== connection) return;
         if (JSON.parse(event.data).includes(region()?.dataset.liveCollection)) invalidate();
@@ -653,6 +658,63 @@ const liveResults = (() => {
   document.addEventListener('toggle', () => schedule(), true);
   document.addEventListener('visibilitychange', enhance);
   window.addEventListener('pagehide', close);
+  window.addEventListener('pageshow', enhance);
+  return enhance;
+})();
+
+// The home index has several collections and no single results subscription.
+// Poll its permission-filtered counts once a second, using conditional responses
+// to avoid resending unchanged rows. Combined with the four-second source TTL,
+// direct filesystem edits become observable within the five-second budget.
+const liveIndex = (() => {
+  let timer = null;
+  let request = null;
+  let etag = null;
+  let scope = null;
+  const userRequests = new Set();
+  const region = () => document.getElementById('cr-view-index');
+  const enhance = () => {
+    window.clearTimeout(timer);
+    timer = null;
+    const index = region();
+    if (!index || document.hidden || !window.htmx?.swap) { request?.abort(); return; }
+    timer = window.setTimeout(refresh, 1000);
+  };
+  const refresh = async () => {
+    timer = null;
+    const index = region();
+    if (!index || document.hidden || request || userRequests.size > 0 || hasUnsavedChanges()
+      || index.contains(document.activeElement)
+      || ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) { enhance(); return; }
+    const page = window.location.href;
+    const url = index.dataset.refreshUrl;
+    const currentScope = `${page}:${url}:${index.dataset.refreshPerspective}`;
+    if (scope !== currentScope) { scope = currentScope; etag = null; }
+    const controller = new AbortController();
+    request = controller;
+    try {
+      const headers = { 'HX-Request': 'true', 'HX-Target': 'cr-view-index' };
+      if (etag) headers['If-None-Match'] = etag;
+      const response = await fetch(url, { headers, cache: 'no-store', redirect: 'error', signal: controller.signal });
+      if (response.status === 304) return;
+      if (!response.ok) throw new Error('Counts refresh failed');
+      const html = await response.text();
+      if (controller.signal.aborted || index !== region() || page !== window.location.href || userRequests.size > 0) return;
+      const parsed = new DOMParser().parseFromString(html, 'text/html');
+      if (!parsed.getElementById('cr-view-index') || parsed.getElementById('main-content')) return;
+      etag = response.headers.get('ETag');
+      window.htmx.swap(index, parsed.body.innerHTML, { swapStyle: 'outerHTML' });
+    } catch (error) {
+      // A background failure leaves navigation and any form untouched.
+    } finally {
+      if (request === controller) request = null;
+      enhance();
+    }
+  };
+  document.addEventListener('htmx:beforeRequest', (event) => { userRequests.add(event.detail.xhr); request?.abort(); });
+  document.addEventListener('htmx:afterRequest', (event) => { userRequests.delete(event.detail.xhr); enhance(); });
+  document.addEventListener('visibilitychange', enhance);
+  window.addEventListener('pagehide', () => { window.clearTimeout(timer); request?.abort(); });
   window.addEventListener('pageshow', enhance);
   return enhance;
 })();
@@ -847,6 +909,7 @@ const enhanceAll = () => {
   enhanceViewLayout();
   enhanceKanbanBoard();
   liveResults();
+  liveIndex();
 };
 
 enhanceAll();

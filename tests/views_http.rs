@@ -1183,9 +1183,11 @@ async fn kanban_cards_show_their_values_as_chips_without_labels_or_blanks() {
     assert!(
         board
             .text()
-            .contains(r#"<details class="cr-kanban-move"><summary>Move…</summary>"#)
+            .contains(&format!(r#"class="cr-kanban-move" aria-label="Move {long} to another lane" href="/board/records/{long}/move">Move…</a>"#))
     );
-    assert!(stylesheet(&app, &board).await.contains(".cr-kanban-card:not(:hover):not(:focus-within) .cr-kanban-move:not([open]) summary { opacity: 0; }"));
+    assert!(stylesheet(&app, &board).await.contains(
+        ".cr-kanban-card:not(:hover):not(:focus-within) .cr-kanban-move { opacity: 0; }"
+    ));
 }
 
 #[tokio::test]
@@ -1344,9 +1346,9 @@ async fn kanban_lanes_count_their_whole_lane_and_offer_more_of_it() {
     assert!(lane("Unassigned").contains(r#"<span class="cr-lane-count">1</span>"#));
     // More of every lane is one swap away.
     assert!(done.contains(
-        r#"<a id="cr-lane-more-1" href="/board?filter_match=all&amp;sort_field=%24created_at&amp;sort_direction=desc&amp;limit=4" class="cr-lane-more""#
+        r#"<a id="cr-lane-more-1" href="/board?filter_match=all&amp;sort_field=%24created_at&amp;sort_direction=desc&amp;lane="#
     ));
-    assert!(done.contains(">Show 2 more</a>"));
+    assert!(done.contains(">Show more in this lane</a>"));
     assert!(
         board.text().contains(
             r#"data-board-summary="true">Showing 5 of 8 records, up to 2 in each lane</p>"#
@@ -1366,9 +1368,7 @@ async fn kanban_lanes_count_their_whole_lane_and_offer_more_of_it() {
     )
     .unwrap();
     let capped = request(&bounded, Method::GET, "/board", None, &[]).await;
-    assert!(capped.text().contains(
-        r#"<p class="cr-lane-more">3 more not shown; filter the board to reach them</p>"#
-    ));
+    assert!(capped.text().contains(">Show more in this lane</a>"));
 
     // The lane's dot takes its state's colour.
     assert!(done.starts_with("<h2>Done</h2>"));
@@ -3477,6 +3477,8 @@ async fn the_view_index_labels_collections_and_counts_what_each_view_shows() {
         "---\n: [\n---\n",
     )
     .unwrap();
+    // External presentation changes appear when the bounded source cache expires.
+    tokio::time::sleep(std::time::Duration::from_millis(4_100)).await;
     let degraded = request(&app, Method::GET, "/?summary=inline", None, &[]).await;
     assert_eq!(degraded.status, StatusCode::OK);
     let degraded_index = degraded
@@ -5908,4 +5910,112 @@ async fn a_save_with_no_form_to_go_back_to_still_gets_the_error_page() {
     assert!(!missing.text().contains(SAVE_VIEW_FORM));
 
     assert_eq!(view_files(&database), before, "a refused save wrote a view");
+}
+
+#[tokio::test]
+async fn large_boards_bound_lanes_cards_and_move_options_and_page_every_lane() {
+    let (_temporary, database) = test_database("bounded-board");
+    database
+        .create(
+            "tasks",
+            "0000",
+            &[
+                "name=Task 0".parse().unwrap(),
+                "index=0".parse().unwrap(),
+                "status=queued".parse().unwrap(),
+            ],
+            "notes",
+        )
+        .unwrap();
+    for index in 1..5_000 {
+        fs::write(
+            database.root().join(format!("records/tasks/{index:04}.md")),
+            format!(
+                "---\nname: Task {index}\nindex: {index}\nstatus: {}\n---\nnotes",
+                if index % 2 == 0 { "queued" } else { "done" }
+            ),
+        )
+        .unwrap();
+    }
+    database
+        .create_view_with_layout(
+            "board",
+            None,
+            "tasks",
+            vec![],
+            vec![],
+            25,
+            ViewLayout::Kanban,
+            Some("index".into()),
+        )
+        .unwrap();
+    database
+        .create_view_with_layout(
+            "states",
+            None,
+            "tasks",
+            vec![],
+            vec![],
+            200,
+            ViewLayout::Kanban,
+            Some("status".into()),
+        )
+        .unwrap();
+    let app = router(database, ServerConfig::default()).unwrap();
+    let first = request(&app, Method::GET, "/board", None, &[]).await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(first.text().matches("data-kanban-lane=").count(), 50);
+    assert_eq!(first.text().matches("<article").count(), 50);
+    assert!(first.body.len() < 200_000);
+    assert!(first.text().contains("Next lanes"));
+    let second = request(&app, Method::GET, "/board?offset=50", None, &[]).await;
+    let cards = |body: &str| {
+        body.split("<article")
+            .skip(1)
+            .map(|card| card.split("</article>").next().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        cards(first.text())
+            .iter()
+            .all(|card| !cards(second.text()).contains(card))
+    );
+    let states = request(&app, Method::GET, "/states", None, &[]).await;
+    assert_eq!(states.text().matches("<article").count(), 200);
+    // Lane-specific loading stays within the global budget and preserves a
+    // native path back to all lanes.
+    let lane = serde_json::json!({"kind":"value", "value":"queued"}).to_string();
+    let uri = format!("/states?{}", form(&[("lane", &lane), ("limit", "200")]));
+    let selected = request(&app, Method::GET, &uri, None, &[]).await;
+    assert_eq!(selected.text().matches("<article").count(), 200);
+    assert!(selected.text().contains("All lanes"));
+    let picker = request(&app, Method::GET, "/board/records/0000/move", None, &[]).await;
+    assert_eq!(picker.status, StatusCode::OK);
+    assert!(picker.text().matches("<option").count() <= 201);
+    assert!(picker.text().contains("More lanes"));
+    let searched = request(
+        &app,
+        Method::GET,
+        "/board/records/0000/move?q=4999",
+        None,
+        &[],
+    )
+    .await;
+    assert!(searched.text().contains(">4999</option>"));
+    assert!(searched.text().matches("<option").count() <= 2);
+    let moved = request(
+        &app,
+        Method::POST,
+        "/board/records/0000/move",
+        Some(form(&[
+            ("_csrf", csrf(picker.text())),
+            (
+                "target",
+                &serde_json::json!({"kind":"value","value":"4999"}).to_string(),
+            ),
+        ])),
+        &[],
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::SEE_OTHER);
 }

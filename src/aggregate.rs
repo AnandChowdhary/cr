@@ -12,7 +12,7 @@
 //! present, non-null value, ordered exactly as `--sort` orders them, so they
 //! work on ISO dates and names as well as numbers.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::HashMap};
 
 use anyhow::Result;
 use serde_json::{Map, Number as JsonNumber, Value as JsonValue, json};
@@ -90,28 +90,31 @@ impl Aggregation {
     pub fn run(&self, records: &[Record]) -> Summary {
         let total = self.metrics(records.iter());
         let groups = self.by.as_ref().map(|by| {
-            let mut keys: Vec<Option<&Value>> = Vec::new();
+            // YAML values supply their own equality and hash, including
+            // tagged and structured values. Assign each record once rather
+            // than scanning all records again for every distinct group.
+            let mut positions: HashMap<Option<&Value>, usize> = HashMap::new();
+            let mut groups: Vec<(Option<&Value>, Vec<&Record>)> = Vec::new();
             for record in records {
                 let key = get_path(&record.attributes, &by.path);
-                if !keys.contains(&key) {
-                    keys.push(key);
-                }
+                let position = *positions.entry(key).or_insert_with(|| {
+                    groups.push((key, Vec::new()));
+                    groups.len() - 1
+                });
+                groups[position].1.push(record);
             }
             // Present values in the order `--sort` uses, and missing last.
-            keys.sort_by(|left, right| match (left, right) {
+            groups.sort_by(|(left, _), (right, _)| match (left, right) {
                 (Some(left), Some(right)) => compare_yaml_values(left, right),
                 (Some(_), None) => Ordering::Less,
                 (None, Some(_)) => Ordering::Greater,
                 (None, None) => Ordering::Equal,
             });
-            keys.into_iter()
-                .map(|key| Group {
+            groups
+                .into_iter()
+                .map(|(key, records)| Group {
                     key: key.cloned(),
-                    metrics: self.metrics(
-                        records
-                            .iter()
-                            .filter(|record| get_path(&record.attributes, &by.path) == key),
-                    ),
+                    metrics: self.metrics(records.into_iter()),
                 })
                 .collect()
         });
@@ -432,6 +435,74 @@ mod tests {
             files: Vec::new(),
         })
         .collect()
+    }
+
+    #[test]
+    fn groups_preserve_yaml_equality_numeric_metrics_and_encounter_order_ties() {
+        use yaml_serde::Value;
+        let values = [
+            "1",
+            "1.0",
+            "{a: 1, b: 2}",
+            "{b: 2, a: 1}",
+            "[1, two]",
+            "null",
+            "!tag tagged",
+            "true",
+        ];
+        let mut records = records();
+        for (index, value) in values.iter().cycle().take(80).enumerate() {
+            records.push(Record {
+                collection: "items".into(),
+                id: index.to_string(),
+                path: PathBuf::new(),
+                version: String::new(),
+                attributes: yaml_serde::from_str(&format!("stage: {value}\nvalue: {index}\n"))
+                    .unwrap(),
+                body: String::new(),
+                files: Vec::new(),
+            });
+        }
+        let aggregation = Aggregation::new(
+            Some("stage"),
+            &["value"],
+            &["value"],
+            &["value"],
+            &["value"],
+        )
+        .unwrap();
+        let mut keys: Vec<Option<&Value>> = Vec::new();
+        for record in &records {
+            let key = record.attributes.get("stage");
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys.sort_by(|left, right| match (left, right) {
+            (Some(left), Some(right)) => crate::value::compare_yaml_values(left, right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        });
+        let expected = keys
+            .into_iter()
+            .map(|key| super::Group {
+                key: key.cloned(),
+                metrics: aggregation.metrics(
+                    records
+                        .iter()
+                        .filter(|record| record.attributes.get("stage") == key),
+                ),
+            })
+            .collect();
+        let reference = super::Summary {
+            by: Some("stage".into()),
+            total: aggregation.metrics(records.iter()),
+            groups: Some(expected),
+        };
+        let actual = aggregation.run(&records);
+        assert_eq!(actual.table().unwrap(), reference.table().unwrap());
+        assert_eq!(actual.json().unwrap(), reference.json().unwrap());
     }
 
     #[test]

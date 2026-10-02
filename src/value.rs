@@ -361,6 +361,59 @@ pub fn compare_yaml_values(left: &Value, right: &Value) -> Ordering {
     }
 }
 
+/// A read-only sort key. Structured values are serialized once per row,
+/// rather than once for every comparison in O(n log n) sorting.
+#[derive(Debug)]
+pub(crate) enum PreparedYaml<'a> {
+    Null,
+    Bool(bool),
+    Number(&'a yaml_serde::Number),
+    String(&'a str),
+    Sequence(Vec<PreparedYaml<'a>>),
+    Other(u8, String),
+}
+
+impl<'a> PreparedYaml<'a> {
+    pub(crate) fn new(value: &'a Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Bool(value) => Self::Bool(*value),
+            Value::Number(value) => Self::Number(value),
+            Value::String(value) => Self::String(value),
+            Value::Sequence(value) => Self::Sequence(value.iter().map(Self::new).collect()),
+            other => Self::Other(value_type_rank(other), serialized_sort_value(other)),
+        }
+    }
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Null => 0,
+            Self::Bool(_) => 1,
+            Self::Number(_) => 2,
+            Self::String(_) => 3,
+            Self::Sequence(_) => 4,
+            Self::Other(rank, _) => *rank,
+        }
+    }
+    pub(crate) fn compare(&self, other: &Self) -> Ordering {
+        self.rank()
+            .cmp(&other.rank())
+            .then_with(|| match (self, other) {
+                (Self::Null, Self::Null) => Ordering::Equal,
+                (Self::Bool(left), Self::Bool(right)) => left.cmp(right),
+                (Self::Number(left), Self::Number(right)) => compare_numbers(left, right),
+                (Self::String(left), Self::String(right)) => left.cmp(right),
+                (Self::Sequence(left), Self::Sequence(right)) => left
+                    .iter()
+                    .zip(right)
+                    .map(|(left, right)| left.compare(right))
+                    .find(|ordering| ordering.is_ne())
+                    .unwrap_or_else(|| left.len().cmp(&right.len())),
+                (Self::Other(_, left), Self::Other(_, right)) => left.cmp(right),
+                _ => Ordering::Equal,
+            })
+    }
+}
+
 /// Numbers in numeric order, with NaN after every other number and equal to
 /// itself.
 ///
@@ -519,6 +572,41 @@ mod tests {
     };
     use std::{cmp::Ordering, str::FromStr};
     use yaml_serde::{Mapping, Value};
+
+    #[test]
+    fn prepared_sort_keys_preserve_every_yaml_type_and_nan_order() {
+        let values = [
+            "null",
+            "true",
+            "false",
+            "1",
+            "1.0",
+            "-2",
+            ".nan",
+            ".inf",
+            "a",
+            "[1, a]",
+            "[2, b]",
+            "[]",
+            "{a: 1, b: 2}",
+            "{b: 2, a: 1}",
+            "!one a",
+            "!two a",
+        ];
+        let values = values
+            .iter()
+            .map(|value| yaml_serde::from_str::<Value>(value).unwrap())
+            .collect::<Vec<_>>();
+        for left in &values {
+            for right in &values {
+                assert_eq!(
+                    super::PreparedYaml::new(left).compare(&super::PreparedYaml::new(right)),
+                    compare_yaml_values(left, right),
+                    "{left:?} versus {right:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn parses_typed_yaml_values() {

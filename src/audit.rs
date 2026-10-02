@@ -5,7 +5,10 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    sync::{
+        Arc, Mutex, MutexGuard, TryLockError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::SystemTime,
 };
 
@@ -25,8 +28,8 @@ use crate::{
     access::{AccessDecision, USERS_COLLECTION, principal_id},
     attribution::{Attribution, AuditAgent, AuditAuthorization, AuditIntent},
     bundle::{
-        BundleFiles, BundlePlan, PlanState, RecordLayout, Staged, apply_file_changes, content_hash,
-        file_changes, read_bundle, record_version, remove_staged_leftovers,
+        BundleFile, BundleFiles, BundlePlan, PlanState, RecordLayout, Staged, apply_file_changes,
+        content_hash, file_changes, read_bundle, record_version, remove_staged_leftovers,
     },
     database::{
         CollectionEntry, RECORDS_LABEL, collection_directory_name, record_label, validate_component,
@@ -1079,6 +1082,9 @@ pub(crate) struct JournalCache {
     resume: bool,
     /// Save the walk on disk after every append.
     save: bool,
+    /// A serve process keeps the disposable walk in memory and checkpoints
+    /// once after draining, rather than serializing all state per commit.
+    server: AtomicBool,
     /// Let a write start from the cached or saved walk while the journal has
     /// grown by fewer than this many events since that walk last verified
     /// every event from the first. `None` makes every write start from the
@@ -1108,8 +1114,13 @@ impl JournalCache {
             verified: Mutex::default(),
             resume,
             save: true,
+            server: AtomicBool::new(false),
             full_walk_after: resume.then_some(full_walk_after),
         }
+    }
+
+    pub(crate) fn serve(&self) {
+        self.server.store(true, Ordering::Relaxed);
     }
 
     fn lock(&self) -> MutexGuard<'_, Option<VerifiedJournal>> {
@@ -1234,6 +1245,22 @@ impl VerifiedJournal {
                     .and_then(|state| state.document.as_ref())
                     .and_then(audit_document_encryption_metadata)
             });
+            // A delete returns the pre-delete bundle; other retries return
+            // the files after their event. Retain versions only, never the
+            // supporting-file text carried for audit diffs.
+            let deleted_files = if history.is_some()
+                && entry.payload.idempotency.is_some()
+                && entry.payload.action == AuditAction::Delete
+            {
+                Some(
+                    states
+                        .get(&key)
+                        .map(|state| idempotency_file_versions(&state.files))
+                        .unwrap_or_default(),
+                )
+            } else {
+                None
+            };
             track_activity(activity, entry);
             replay_entry(states, entry)?;
             if let Some(history) = history.as_mut() {
@@ -1246,6 +1273,22 @@ impl VerifiedJournal {
                 // line, including when it extends an already verified prefix.
                 let length = lengths.next().expect("verified audit line").len();
                 let index = history.events.len();
+                if let Some(identity) = IdempotencyIdentity::from_payload(&entry.payload) {
+                    let files = deleted_files.unwrap_or_else(|| {
+                        states
+                            .get(&key)
+                            .map(|state| idempotency_file_versions(&state.files))
+                            .unwrap_or_default()
+                    });
+                    history.idempotency.insert(
+                        identity,
+                        IdempotencyLocation {
+                            event: index,
+                            hash: entry.hash.clone(),
+                            files,
+                        },
+                    );
+                }
                 history
                     .collections
                     .entry(key.0.clone())
@@ -1480,6 +1523,31 @@ struct HistoryIndex {
     events: Vec<HistoryLocation>,
     collections: HashMap<String, Vec<usize>>,
     records: HashMap<(String, String), Vec<usize>>,
+    idempotency: HashMap<IdempotencyIdentity, IdempotencyLocation>,
+}
+
+/// A retry's verified event and original supporting-file versions, without
+/// retaining its Markdown or supporting-file contents in memory or on disk.
+#[derive(Clone)]
+struct IdempotencyLocation {
+    event: usize,
+    hash: String,
+    files: BundleFiles,
+}
+
+fn idempotency_file_versions(files: &BundleFiles) -> BundleFiles {
+    files
+        .iter()
+        .map(|(path, file)| {
+            (
+                path.clone(),
+                BundleFile {
+                    hash: file.hash.clone(),
+                    text: None,
+                },
+            )
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -1536,6 +1604,19 @@ struct IdempotencyIdentity {
     key_hash: String,
 }
 
+impl IdempotencyIdentity {
+    fn from_payload(payload: &AuditPayload) -> Option<Self> {
+        let idempotency = payload.idempotency.as_ref()?;
+        Some(Self {
+            principal: idempotency.principal.clone(),
+            operation: idempotency.operation.clone(),
+            collection: payload.record.collection.clone(),
+            id: payload.record.id.clone(),
+            key_hash: idempotency.key_hash.clone(),
+        })
+    }
+}
+
 pub(crate) struct AuditLog<'a> {
     root: &'a Path,
     records_dir: &'a Path,
@@ -1547,6 +1628,7 @@ pub(crate) struct AuditLog<'a> {
     actor: &'a str,
     attribution: &'a Attribution,
     journal: Option<&'a JournalCache>,
+    read_generation: Option<&'a AtomicU64>,
 }
 
 pub(crate) struct AuditMutation<'a> {
@@ -1699,6 +1781,7 @@ impl<'a> AuditLog<'a> {
             actor,
             attribution,
             journal: None,
+            read_generation: None,
         }
     }
 
@@ -1749,6 +1832,11 @@ impl<'a> AuditLog<'a> {
 
     /// Answer [`Self::record_states`], [`Self::record_activity`] and
     /// [`Self::collections_activity`] from `journal` rather than a fresh walk.
+    pub(crate) fn with_read_invalidation(mut self, generation: &'a AtomicU64) -> Self {
+        self.read_generation = Some(generation);
+        self
+    }
+
     pub(crate) fn with_journal_cache(mut self, journal: Option<&'a JournalCache>) -> Self {
         self.journal = journal;
         self
@@ -2418,19 +2506,13 @@ impl<'a> AuditLog<'a> {
 
     /// Select recent history while reconstructing its exact encryption
     /// metadata in the same forward verification and semantic replay.
-    pub(crate) fn recent_history(
-        &self,
-        limit: usize,
-        filter: AuditFilter<'_>,
-    ) -> Result<AuditHistory> {
-        self.recent_history_where(limit, filter, |_| Ok(true))
-    }
-
     /// Find the committed result for one fully scoped retry identity.
     ///
-    /// Callers hold the audit lock. `verify_chain` both validates every event
-    /// and makes the journal itself authoritative; no disposable side index
-    /// can cause a replay or conflict by itself.
+    /// Callers hold the audit lock. With a journal cache, use its in-memory
+    /// index built from verified events and rechecked against current segments.
+    /// A saved walk does not contain this index: establish it with one full
+    /// replay before trusting any retry identity. Without a cache, replay the
+    /// chain as before. No on-disk side index can cause a replay or conflict.
     pub(crate) fn idempotency_result(
         &self,
         principal: &str,
@@ -2440,6 +2522,40 @@ impl<'a> AuditLog<'a> {
         key_hash: &str,
         request_hash: &str,
     ) -> Result<Option<(AuditIdempotencyResult, BundleFiles)>> {
+        if let Some(journal) = self.journal {
+            let history = self.verified_history(journal)?;
+            let identity = IdempotencyIdentity {
+                principal: principal.to_owned(),
+                operation: operation.to_owned(),
+                collection: collection.to_owned(),
+                id: id.to_owned(),
+                key_hash: key_hash.to_owned(),
+            };
+            let Some(indexed) = history.idempotency.get(&identity) else {
+                return Ok(None);
+            };
+            let location = &history.events[indexed.event];
+            let contents = self.read_segment_bytes(&location.segment)?;
+            let line = contents
+                .get(location.start..location.end)
+                .ok_or_else(|| audit_integrity("indexed idempotency event is no longer present"))?;
+            let stored = parse_line(line)?;
+            if stored.entry.hash != indexed.hash
+                || stored.entry.payload.sequence != indexed.event as u64 + 1
+                || IdempotencyIdentity::from_payload(&stored.entry.payload).as_ref()
+                    != Some(&identity)
+            {
+                return Err(audit_integrity("indexed idempotency event has changed"));
+            }
+            let stored = stored.entry.payload.idempotency.expect("indexed identity");
+            if stored.request_hash != request_hash {
+                return Err(idempotency_conflict(format!(
+                    "idempotency key was already used for a different {operation} request on record {collection}/{id}"
+                )));
+            }
+            return Ok(Some((stored.result, indexed.files.clone())));
+        }
+
         let mut result = None;
         let mut latest = AuditedRecordStates::new();
         let key = (collection.to_owned(), id.to_owned());
@@ -2518,6 +2634,29 @@ impl<'a> AuditLog<'a> {
         Ok(result)
     }
 
+    pub(crate) fn recent_history_before(
+        &self,
+        limit: usize,
+        before: Option<u64>,
+        filter: AuditFilter<'_>,
+        visible: impl FnMut(&AuditEntry) -> Result<bool>,
+    ) -> Result<AuditHistory> {
+        if let Some(journal) = self.journal {
+            let history = self.verified_history(journal)?;
+            return self.indexed_history(&history, limit, before, filter, visible);
+        }
+        self.recent_history_where(0, filter, visible)
+            .map(|mut history| {
+                history
+                    .entries
+                    .retain(|entry| before.is_none_or(|before| entry.payload.sequence < before));
+                if limit > 0 {
+                    history.entries.truncate(limit);
+                }
+                history
+            })
+    }
+
     /// The history equivalent of [`Self::recent_where`], with manifest
     /// transitions produced by the same verified replay rather than a second
     /// full journal scan.
@@ -2533,14 +2672,8 @@ impl<'a> AuditLog<'a> {
         mut visible: impl FnMut(&AuditEntry) -> Result<bool>,
     ) -> Result<AuditHistory> {
         if let Some(journal) = self.journal {
-            let snapshot = self.cached_journal(journal)?;
-            let history = match snapshot.history {
-                Some(history) => history,
-                // Persisted walks contain current state, not historical
-                // locations or transitions. Establish those once ourselves.
-                None => self.walk_fresh()?.history.expect("fresh history index"),
-            };
-            return self.indexed_history(&history, limit, filter, visible);
+            let history = self.verified_history(journal)?;
+            return self.indexed_history(&history, limit, None, filter, visible);
         }
         let mut entries = VecDeque::new();
         let mut encryption_transitions = HashMap::new();
@@ -2566,33 +2699,40 @@ impl<'a> AuditLog<'a> {
         })
     }
 
+    fn verified_history(&self, journal: &JournalCache) -> Result<Arc<HistoryIndex>> {
+        match self.cached_journal(journal)?.history {
+            Some(history) => Ok(history),
+            // Persisted walks contain current state, not historical locations,
+            // transitions, or original retry results. Establish them once.
+            None => Ok(self.walk_fresh()?.history.expect("fresh history index")),
+        }
+    }
+
     fn indexed_history(
         &self,
         history: &HistoryIndex,
         limit: usize,
+        before: Option<u64>,
         filter: AuditFilter<'_>,
         mut visible: impl FnMut(&AuditEntry) -> Result<bool>,
     ) -> Result<AuditHistory> {
-        let indices: Box<dyn Iterator<Item = usize> + '_> = match (filter.collection, filter.id) {
-            (Some(collection), Some(id)) => Box::new(
-                history
-                    .records
-                    .get(&(collection.to_owned(), id.to_owned()))
-                    .into_iter()
-                    .flatten()
-                    .rev()
-                    .copied(),
-            ),
-            (Some(collection), None) => Box::new(
-                history
-                    .collections
-                    .get(collection)
-                    .into_iter()
-                    .flatten()
-                    .rev()
-                    .copied(),
-            ),
-            _ => Box::new((0..history.events.len()).rev()),
+        let positions = match (filter.collection, filter.id) {
+            (Some(collection), Some(id)) => history
+                .records
+                .get(&(collection.to_owned(), id.to_owned()))
+                .map(Vec::as_slice),
+            (Some(collection), None) => history.collections.get(collection).map(Vec::as_slice),
+            _ => None,
+        };
+        let end = before
+            .map(|before| usize::try_from(before.saturating_sub(1)).unwrap_or(usize::MAX))
+            .unwrap_or(usize::MAX);
+        let indices: Box<dyn Iterator<Item = usize> + '_> = if filter.collection.is_some() {
+            let positions = positions.unwrap_or(&[]);
+            let boundary = positions.partition_point(|index| *index < end);
+            Box::new(positions[..boundary].iter().rev().copied())
+        } else {
+            Box::new((0..history.events.len().min(end)).rev())
         };
         let mut entries = Vec::new();
         let mut encryption_transitions = HashMap::new();
@@ -3459,6 +3599,13 @@ impl<'a> AuditLog<'a> {
     /// next command time and nothing else, so nothing here can fail the write
     /// that has already been committed.
     pub(crate) fn save_journal_cache(&self) {
+        if let Some(generation) = self.read_generation {
+            generation.fetch_add(1, Ordering::AcqRel);
+        }
+        self.checkpoint_journal_cache(false);
+    }
+
+    pub(crate) fn checkpoint_journal_cache(&self, draining: bool) {
         let Some(journal) = self.journal.filter(|journal| journal.save) else {
             return;
         };
@@ -3476,6 +3623,12 @@ impl<'a> AuditLog<'a> {
                 *verified = None;
                 return;
             }
+        }
+        // Advance the shared walk before the next admission clones it.
+        // Leaving it one event behind forces copy-on-write of every record's
+        // state when that cloned admission verifies the appended tail.
+        if !draining && journal.server.load(Ordering::Relaxed) {
+            return;
         }
         if let Ok(serialized) = cached.serialize() {
             drop(verified);
@@ -4349,15 +4502,8 @@ fn register_idempotency_identity(
     seen: &mut HashSet<IdempotencyIdentity>,
     payload: &AuditPayload,
 ) -> Result<()> {
-    let Some(idempotency) = payload.idempotency.as_ref() else {
+    let Some(identity) = IdempotencyIdentity::from_payload(payload) else {
         return Ok(());
-    };
-    let identity = IdempotencyIdentity {
-        principal: idempotency.principal.clone(),
-        operation: idempotency.operation.clone(),
-        collection: payload.record.collection.clone(),
-        id: payload.record.id.clone(),
-        key_hash: idempotency.key_hash.clone(),
     };
     if seen.insert(identity) {
         return Ok(());
@@ -4961,6 +5107,47 @@ mod tests {
     /// The hash stored beside those bytes in the fixture.
     const FUTURE_HASH: &str =
         "sha256:e34dfe8559e82230cc466d143f547b75f4de3b1aa4eb8a75b3c5ebb7e2dc28a0";
+
+    #[test]
+    fn serving_writes_advance_the_shared_walk_without_cloning_all_record_states() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = Database::init(temporary.path().join("serve-walk"))
+            .unwrap()
+            .with_journal_verification(JournalVerification::Resume)
+            .with_server_cache();
+        for index in 0..100 {
+            database
+                .create("items", &index.to_string(), &[], "notes")
+                .unwrap();
+        }
+        let audit = database.audit();
+        let cache = audit.journal.unwrap();
+        let states = {
+            let verified = cache.lock();
+            let verified = verified.as_ref().unwrap();
+            assert_eq!(verified.walk.entries(), 100);
+            std::sync::Arc::as_ptr(&verified.states)
+        };
+        for index in 0..14 {
+            database
+                .update(
+                    "items",
+                    "0",
+                    &[format!("index={index}").parse().unwrap()],
+                    None,
+                )
+                .unwrap();
+            let verified = cache.lock();
+            let verified = verified.as_ref().unwrap();
+            assert_eq!(verified.walk.entries(), 101 + index);
+            assert_eq!(
+                std::sync::Arc::as_ptr(&verified.states),
+                states,
+                "a plain serving update copied the complete record-state map"
+            );
+        }
+        assert!(!database.root().join(JOURNAL_CACHE_PATH).exists());
+    }
 
     fn attributed_payload() -> AuditPayload {
         AuditPayload {
@@ -5584,6 +5771,306 @@ mod tests {
 
     fn activity(database: &Database) -> CollectionsActivity {
         database.audit().collections_activity(|_| true).unwrap()
+    }
+
+    #[test]
+    fn keyed_writes_and_retries_reuse_verified_history_without_full_replays() {
+        let root = tempfile::tempdir().unwrap();
+        let (cached, _) = cached_and_uncached(root.path(), 2);
+        let writer = cached.with_journal_verification(JournalVerification::Resume);
+        for index in 0..20 {
+            writer
+                .create("items", &format!("item-{index}"), &[], "Original\n")
+                .unwrap();
+        }
+        for index in 0..14 {
+            let keyed = writer
+                .clone()
+                .with_idempotency_key(format!("keyed-write-regression-{index}"))
+                .unwrap();
+            let body = format!("Update {index}\n");
+            super::reset_verify_chain_calls();
+            let original = keyed.update("items", "item-0", &[], Some(&body)).unwrap();
+            assert_eq!(super::verify_chain_calls(), 0, "new key replayed history");
+            let replay = keyed.update("items", "item-0", &[], Some(&body)).unwrap();
+            assert_eq!(replay.version, original.version);
+            assert_eq!(replay.body, original.body);
+            assert_eq!(super::verify_chain_calls(), 0, "retry replayed history");
+            let error = keyed
+                .update("items", "item-0", &[], Some("Different\n"))
+                .unwrap_err();
+            assert_eq!(
+                DomainError::of(&error).map(DomainError::code),
+                Some("idempotency_conflict")
+            );
+            assert_eq!(super::verify_chain_calls(), 0, "conflict replayed history");
+        }
+        assert_eq!(writer.audit_head().unwrap().sequence, 34);
+    }
+
+    #[test]
+    fn indexed_idempotency_notices_external_events_and_preserves_original_bundle_files() {
+        use crate::FileChange;
+
+        let root = tempfile::tempdir().unwrap();
+        Database::init(root.path()).unwrap();
+        std::fs::write(
+            root.path().join(".cr/config.yaml"),
+            "version: 1\ndata_dir: records\ncollections:\n  items:\n    layout: bundle\naudit:\n  segment_max_events: 2\n",
+        )
+        .unwrap();
+        let writer = Database::discover(Some(root.path()))
+            .unwrap()
+            .with_actor("tester@example.com")
+            .unwrap();
+        let reader = writer.clone().with_journal_cache();
+        replayed(&reader);
+        let keyed = writer
+            .clone()
+            .with_idempotency_key("original-bundle-retry-key")
+            .unwrap();
+        let files = [FileChange::Write {
+            path: "notes.txt".to_owned(),
+            contents: b"Original file\n".to_vec(),
+        }];
+        let created = keyed
+            .create_with_files("items", "one", &[], "Original\n", &files)
+            .unwrap();
+        let updated = keyed
+            .update_with_files_conditionally(
+                "items",
+                "one",
+                &[],
+                &[],
+                Some("Updated\n"),
+                &[FileChange::Write {
+                    path: "notes.txt".to_owned(),
+                    contents: b"Updated file\n".to_vec(),
+                }],
+                None,
+            )
+            .unwrap();
+        let deleted = keyed.delete("items", "one").unwrap();
+        let second = keyed
+            .create_with_files("items", "two", &[], "Another\n", &files)
+            .unwrap();
+        writer.create("items", "one", &[], "Recreated\n").unwrap();
+
+        // The same raw key is independent for each operation and record.
+        let cached = reader
+            .clone()
+            .with_idempotency_key("original-bundle-retry-key")
+            .unwrap();
+        super::reset_verify_chain_calls();
+        for (actual, expected) in [
+            (
+                cached
+                    .create_with_files("items", "one", &[], "Original\n", &files)
+                    .unwrap(),
+                &created,
+            ),
+            (
+                cached
+                    .update_with_files_conditionally(
+                        "items",
+                        "one",
+                        &[],
+                        &[],
+                        Some("Updated\n"),
+                        &[FileChange::Write {
+                            path: "notes.txt".to_owned(),
+                            contents: b"Updated file\n".to_vec(),
+                        }],
+                        None,
+                    )
+                    .unwrap(),
+                &updated,
+            ),
+            (cached.delete("items", "one").unwrap(), &deleted),
+            (
+                cached
+                    .create_with_files("items", "two", &[], "Another\n", &files)
+                    .unwrap(),
+                &second,
+            ),
+        ] {
+            assert_eq!(actual.version, expected.version);
+            assert_eq!(actual.attributes, expected.attributes);
+            assert_eq!(actual.body, expected.body);
+            assert_eq!(actual.files, expected.files);
+        }
+        assert_eq!(super::verify_chain_calls(), 0);
+        let entry = writer
+            .audit_recent(10, AuditFilter::record("items", "one"))
+            .unwrap()
+            .into_iter()
+            .find(|entry| {
+                entry
+                    .payload
+                    .idempotency
+                    .as_ref()
+                    .is_some_and(|stored| stored.operation == "create")
+            })
+            .unwrap();
+        let stored = entry.payload.idempotency.unwrap();
+        super::reset_verify_chain_calls();
+        let unknown_hash = format!("sha256:{}", "0".repeat(64));
+        for (principal, operation, collection, id, key_hash) in [
+            (
+                "another@example.com",
+                "create",
+                "items",
+                "one",
+                stored.key_hash.as_str(),
+            ),
+            (
+                "tester@example.com",
+                "patch",
+                "items",
+                "one",
+                stored.key_hash.as_str(),
+            ),
+            (
+                "tester@example.com",
+                "create",
+                "other",
+                "one",
+                stored.key_hash.as_str(),
+            ),
+            (
+                "tester@example.com",
+                "create",
+                "items",
+                "missing",
+                stored.key_hash.as_str(),
+            ),
+            (
+                "tester@example.com",
+                "create",
+                "items",
+                "one",
+                unknown_hash.as_str(),
+            ),
+        ] {
+            assert!(
+                reader
+                    .audit()
+                    .idempotency_result(
+                        principal,
+                        operation,
+                        collection,
+                        id,
+                        key_hash,
+                        &stored.request_hash
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(super::verify_chain_calls(), 0);
+        assert_eq!(writer.audit_head().unwrap().sequence, 5);
+    }
+
+    #[test]
+    fn idempotency_index_is_rebuilt_once_after_resume_and_rechecks_tampered_segments() {
+        let root = tempfile::tempdir().unwrap();
+        let (cached, _) = cached_and_uncached(root.path(), 2);
+        let writer = cached.with_journal_verification(JournalVerification::Resume);
+        let keyed = writer
+            .clone()
+            .with_idempotency_key("resumed-original-result-key")
+            .unwrap();
+        let original = keyed.create("items", "one", &[], "Original\n").unwrap();
+        writer.create("items", "two", &[], "Second\n").unwrap();
+        writer.create("items", "three", &[], "Third\n").unwrap();
+
+        // Neither missing nor invented identities in a saved walk can decide
+        // retry semantics: the in-memory index comes from the real events.
+        let invented_hash = format!("sha256:{}", "f".repeat(64));
+        forge_saved_walk(root.path(), |journal| {
+            journal["walk"]["idempotency_identities"] = json!([{
+                "principal": "tester@example.com",
+                "operation": "create",
+                "collection": "items",
+                "id": "invented",
+                "key_hash": invented_hash,
+            }]);
+        });
+        let reader = writer
+            .clone()
+            .with_journal_verification(JournalVerification::Resume)
+            .with_idempotency_key("resumed-original-result-key")
+            .unwrap();
+        replayed(&reader);
+        super::reset_verify_chain_calls();
+        assert!(
+            reader
+                .audit()
+                .idempotency_result(
+                    "tester@example.com",
+                    "create",
+                    "items",
+                    "invented",
+                    &invented_hash,
+                    &format!("hmac-sha256:{}", "0".repeat(64)),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(super::verify_chain_calls(), 1);
+        super::reset_verify_chain_calls();
+        let replay = reader.create("items", "one", &[], "Original\n").unwrap();
+        assert_eq!(replay.version, original.version);
+        assert_eq!(super::verify_chain_calls(), 0);
+        super::reset_verify_chain_calls();
+        assert_eq!(
+            reader
+                .create("items", "one", &[], "Original\n")
+                .unwrap()
+                .version,
+            original.version
+        );
+        assert_eq!(super::verify_chain_calls(), 0);
+
+        for segment in reader.audit().segment_paths().unwrap() {
+            let path = root.path().join(segment);
+            let original_bytes = std::fs::read(&path).unwrap();
+            let mut changed = original_bytes.clone();
+            let at = changed
+                .windows(8)
+                .position(|window| window == b"\"hash\":\"")
+                .unwrap()
+                + 8;
+            changed[at] = if changed[at] == b'0' { b'1' } else { b'0' };
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            std::fs::write(&path, &changed).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            for _ in 0..2 {
+                assert!(reader.create("items", "one", &[], "Original\n").is_err());
+                assert!(
+                    reader
+                        .clone()
+                        .with_idempotency_key("previously-unseen-retry-key")
+                        .unwrap()
+                        .create("items", "new", &[], "New\n")
+                        .is_err()
+                );
+            }
+            assert!(!root.path().join("records/items/new.md").exists());
+            std::fs::write(&path, original_bytes).unwrap();
+            assert_eq!(
+                reader
+                    .create("items", "one", &[], "Original\n")
+                    .unwrap()
+                    .version,
+                original.version
+            );
+        }
     }
 
     #[test]
