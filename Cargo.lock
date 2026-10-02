@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "cr"
-version = "0.2.73"
+version = "0.2.74"
 dependencies = [
  "anyhow",
  "axum",
