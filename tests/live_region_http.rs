@@ -230,7 +230,7 @@ async fn a_results_swap_patches_the_regions_contents_and_leaves_the_element() {
         // region being swapped, or it would be destroyed by the very swap it
         // is reporting.
         let region_at = fragment
-            .find(&format!("<div id=\"{VIEW_TABLE_REGION}\">"))
+            .find(&format!("<div id=\"{VIEW_TABLE_REGION}\""))
             .unwrap();
         let patch_at = fragment.find(&format!("id=\"{ANNOUNCE_REGION}\"")).unwrap();
         assert!(region_at < patch_at, "{uri} nests the patch in the region");

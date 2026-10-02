@@ -473,6 +473,190 @@ const enhanceKanbanBoard = () => {
   });
 };
 
+// One notification connection for the tab, surviving boosted navigation and
+// results swaps. The stream invalidates collections; the existing HTML route
+// still decides membership, ordering, lane limits, counts and permissions.
+// A reset on every connection also closes the page-load/subscription race.
+const liveResults = (() => {
+  let connection = null;
+  let connectionKey = null;
+  let state = 'Connecting…';
+  let dirty = false;
+  let dragging = false;
+  let timer = null;
+  let retry = null;
+  let request = null;
+  const userRequests = new Set();
+  const region = () => document.getElementById('cr-view-table');
+  const status = () => {
+    const element = document.querySelector('[data-live-status]');
+    if (!element) return;
+    element.hidden = false;
+    element.textContent = dirty && state === 'Live' ? 'Updates pending' : state;
+  };
+  const interacting = () => {
+    const results = region();
+    const selection = window.getSelection();
+    return dragging || hasUnsavedChanges() || userRequests.size > 0
+      || results?.contains(document.activeElement)
+      || !!results?.querySelector('details[open]')
+      || (!!selection?.toString() && results?.contains(selection.anchorNode));
+  };
+  const cancelFetch = () => {
+    window.clearTimeout(timer);
+    timer = null;
+    request?.abort();
+  };
+  const schedule = (delay = 300) => {
+    status();
+    if (!dirty || !region() || document.hidden || interacting() || request || timer) return;
+    timer = window.setTimeout(refresh, delay);
+  };
+  const invalidate = () => {
+    dirty = true;
+    schedule();
+  };
+  const scrollContainers = '.cr-board-scroll, .cr-table-scroll, .cr-lane-cards';
+  const scrollKey = (element) => element.closest('[data-kanban-lane]')?.dataset.kanbanTarget ?? element.className;
+  const keepScroll = (results) => [...results.querySelectorAll(scrollContainers)]
+    .map((element) => ({
+      key: scrollKey(element),
+      left: element.scrollLeft,
+      top: element.scrollTop,
+    }));
+  const refresh = async () => {
+    timer = null;
+    if (!dirty || !region() || document.hidden || interacting() || request) return;
+    const results = region();
+    const url = window.location.href;
+    const controller = new AbortController();
+    request = controller;
+    dirty = false;
+    let failed = false;
+    try {
+      // fetch keeps background failures out of the navigation fallback below:
+      // an expired sign-in must not redirect somebody out of an unsaved form.
+      const response = await fetch(url, {
+        headers: { 'HX-Request': 'true', 'HX-Target': 'cr-view-table' },
+        cache: 'no-store',
+        redirect: 'error',
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error('Live refresh failed');
+      const html = await response.text();
+      if (controller.signal.aborted || results !== region() || url !== window.location.href) return;
+      if (document.hidden || interacting()) {
+        dirty = true;
+        return;
+      }
+      const documentFragment = new DOMParser().parseFromString(html, 'text/html');
+      const replacement = documentFragment.getElementById('cr-view-table');
+      if (!replacement || documentFragment.getElementById('main-content')
+        || replacement.dataset.liveCollection !== results.dataset.liveCollection
+        || replacement.dataset.liveKey !== results.dataset.liveKey) {
+        throw new Error('Live refresh did not return these results');
+      }
+      // Background updates stay quiet; user-initiated swaps still announce
+      // their counts through the page's live region.
+      documentFragment.getElementById('cr-announce')?.remove();
+      const scroll = keepScroll(results);
+      window.htmx.swap(results, documentFragment.body.innerHTML, { swapStyle: 'outerHTML' });
+      region()?.querySelectorAll(scrollContainers).forEach((element) => {
+        const saved = scroll.find((item) => item.key === scrollKey(element));
+        if (!saved) return;
+        element.scrollLeft = saved.left;
+        element.scrollTop = saved.top;
+      });
+      state = connection?.readyState === EventSource.OPEN ? 'Live' : 'Reconnecting…';
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        dirty = true;
+        failed = true;
+        state = 'Reconnecting…';
+      }
+    } finally {
+      if (request === controller) request = null;
+      schedule(failed ? 5000 : 300);
+      status();
+    }
+  };
+  const close = () => {
+    connection?.close();
+    connection = null;
+    connectionKey = null;
+    window.clearTimeout(retry);
+    retry = null;
+    cancelFetch();
+  };
+  const enhance = () => {
+    if (!window.EventSource || !window.htmx?.swap) return;
+    const results = region();
+    if (!results || document.hidden) {
+      close();
+      dirty = false;
+      return;
+    }
+    if (connection && connectionKey !== results.dataset.liveKey) close();
+    if (!connection && !retry) {
+      state = 'Connecting…';
+      connectionKey = results.dataset.liveKey;
+      const source = new EventSource('/api/v1/events');
+      connection = source;
+      source.addEventListener('open', () => {
+        if (source !== connection) return;
+        state = 'Live';
+        status();
+      });
+      source.addEventListener('reset', () => { if (source === connection) invalidate(); });
+      source.addEventListener('change', (event) => {
+        if (source !== connection) return;
+        if (JSON.parse(event.data).includes(region()?.dataset.liveCollection)) invalidate();
+      });
+      source.addEventListener('unavailable', () => {
+        if (source !== connection) return;
+        state = 'Reconnecting…';
+        status();
+      });
+      source.addEventListener('error', () => {
+        if (source !== connection) return;
+        state = 'Reconnecting…';
+        status();
+        // EventSource retries broken connections itself, but a refused HTTP
+        // response can close it permanently. Try a fresh authenticated request.
+        if (source.readyState === EventSource.CLOSED) {
+          source.close();
+          connection = null;
+          retry = window.setTimeout(() => { retry = null; enhance(); }, 15000);
+        }
+      });
+    }
+    status();
+    schedule();
+  };
+  document.addEventListener('htmx:beforeRequest', (event) => {
+    userRequests.add(event.detail.xhr);
+    // A user action wins any race against a refresh of the previous URL.
+    if (request) dirty = true;
+    cancelFetch();
+  });
+  document.addEventListener('htmx:afterRequest', (event) => {
+    userRequests.delete(event.detail.xhr);
+    schedule();
+  });
+  document.addEventListener('dragstart', (event) => {
+    if (!event.target.closest('[data-kanban-card]')) return;
+    dragging = true;
+  });
+  document.addEventListener('dragend', () => { dragging = false; schedule(); });
+  document.addEventListener('focusout', () => window.setTimeout(() => schedule(), 0));
+  document.addEventListener('selectionchange', () => schedule());
+  document.addEventListener('toggle', () => schedule(), true);
+  document.addEventListener('visibilitychange', enhance);
+  window.addEventListener('pagehide', close);
+  window.addEventListener('pageshow', enhance);
+  return enhance;
+})();
+
 // htmx configuration. It lives here rather than in a `<script>` block or a
 // `meta[name=htmx-config]` tag for the same reason the enhancements above do:
 // the pages' content security policy allows scripts from this origin and no
@@ -662,6 +846,7 @@ const enhanceAll = () => {
   enhanceFilterBuilder();
   enhanceViewLayout();
   enhanceKanbanBoard();
+  liveResults();
 };
 
 enhanceAll();

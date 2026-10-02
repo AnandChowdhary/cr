@@ -188,7 +188,7 @@ fn results(uri: &str, body: &str) -> Results {
         None => (controls, None),
     };
     assert!(
-        region.starts_with(&format!("<div id=\"{VIEW_TABLE_REGION}\">"))
+        region.starts_with(&format!("<div id=\"{VIEW_TABLE_REGION}\""))
             && region.ends_with("</div>"),
         "{uri} is not rooted at the region it replaces: {region:.120}"
     );

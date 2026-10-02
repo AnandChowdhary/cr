@@ -276,6 +276,36 @@ fn sigterm_and_sigint_each_drain_the_server_and_exit_cleanly() {
 }
 
 #[test]
+fn sigterm_closes_live_event_streams_without_waiting_for_the_client() {
+    let database = TestDatabase::new("live-shutdown");
+    let log = database.root().with_extension("log");
+    let mut server = Server::start(database.root(), log);
+    let mut stream = connect(server.address);
+    write!(
+        stream,
+        "GET /api/v1/events HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        server.address
+    )
+    .unwrap();
+    stream.flush().unwrap();
+    let head = read_head(&mut stream);
+    assert_eq!(status_of(&head), 200, "{head}");
+    let mut reader = BufReader::new(stream);
+    let mut received = String::new();
+    while !received.contains("event: reset") {
+        assert_ne!(
+            reader.read_line(&mut received).unwrap(),
+            0,
+            "feed ended before reset"
+        );
+    }
+    // Leave the socket open while shutdown drains its streaming response.
+    server.signal(libc::SIGTERM);
+    assert!(server.wait_for_exit().success(), "{}", server.log());
+    assert!(server.log().contains("cr shutdown state=stopped"));
+}
+
+#[test]
 fn sigterm_waits_for_an_in_flight_mutation_and_commits_it() {
     let database = TestDatabase::new("draining-shutdown");
     let log = database.root().with_extension("log");

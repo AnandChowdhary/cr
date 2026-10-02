@@ -3263,7 +3263,7 @@ async fn every_page_opens_with_one_compact_bar() {
     // then how many records it shows, with its controls in the same bar.
     let automatic = request(&app, Method::GET, "/deals", None, &[]).await;
     assert!(automatic.text().contains(
-        r#"<header class="cr-page-bar"><div class="cr-page-bar-title"><div class="cr-page-path"><nav aria-label="Breadcrumb" class="cr-crumbs"><a href="/"><span class="cr-crumb-label">Views</span></a><span class="cr-crumb-separator" aria-hidden="true">›</span></nav><h1 class="cr-page-title"><span class="cr-page-icon" aria-hidden="true">🗃️</span><span>Deals</span></h1></div><span class="cr-page-meta" data-view-summary="true"><span id="cr-view-count">1 record</span></span></div><div class="cr-page-actions">"#
+        r#"<header class="cr-page-bar"><div class="cr-page-bar-title"><div class="cr-page-path"><nav aria-label="Breadcrumb" class="cr-crumbs"><a href="/"><span class="cr-crumb-label">Views</span></a><span class="cr-crumb-separator" aria-hidden="true">›</span></nav><h1 class="cr-page-title"><span class="cr-page-icon" aria-hidden="true">🗃️</span><span>Deals</span></h1></div><span class="cr-page-meta" data-view-summary="true"><span id="cr-view-count">1 record</span><span class="cr-live-status" data-live-status="true" hidden>Connecting…</span></span></div><div class="cr-page-actions">"#
     ));
     let bar = automatic
         .text()

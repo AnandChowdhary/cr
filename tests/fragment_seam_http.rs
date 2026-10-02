@@ -273,7 +273,7 @@ async fn a_view_answers_its_results_region_without_the_controls_that_surround_it
     let table_region = results_region(&table_content);
     assert_is_a_fragment("/deals", table_region);
     assert!(
-        table_region.starts_with(&format!("<div id=\"{VIEW_TABLE_REGION}\">")),
+        table_region.starts_with(&format!("<div id=\"{VIEW_TABLE_REGION}\"")),
         "results fragment is not rooted at the region it replaces: {}",
         &table_region[..table_region.len().min(120)]
     );
