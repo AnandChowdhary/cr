@@ -178,6 +178,10 @@ expressions, projections, relationship traversal, and indexes—is tracked in
 ## Development
 
 `cr` requires Rust 1.89 or newer, declared as `rust-version` in `Cargo.toml`.
+Source builds download htmx and its license once per build cache and verify
+their pinned SHA-256 digests before embedding the script. See
+[offline source builds](docs/installation.md#offline-source-builds) to use
+predownloaded files. The installed binary and its UI work offline.
 
 Continuous integration runs these exact commands on Linux, so running them locally reproduces the pipeline:
 

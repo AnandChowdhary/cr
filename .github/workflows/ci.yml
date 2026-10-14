@@ -120,6 +120,11 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # Verify the source archive includes the build script and asset pins, so
+      # crate installs can prepare htmx just like a Git checkout does.
+      - name: Verify packaged source build
+        run: cargo package --locked
+
   msrv:
     name: msrv
     runs-on: ubuntu-latest
