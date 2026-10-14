@@ -148,6 +148,14 @@ records are folders of files; see [Bundle records](working-with-records.md#bundl
 `--file` reads SOURCE, a local file or `-` for standard input, and stores its
 bytes at PATH inside the record's folder.
 
+An `update` that would leave the record byte for byte as it is, bundle files
+included, records no event and writes nothing; it prints the record as a
+recorded update would, so its `version` is the one you read. It is refused for
+everything a recorded update is, including a stale `--expected-record-hash`.
+`--message` alone does not make it a change, and with `--idempotency-key` it is
+still recorded, so a retry returns that result. See
+[Update, link, and delete](working-with-records.md#update-link-and-delete).
+
 `CR_AGENT`, `CR_AUTHORIZATION`, and `CR_INTENT` supply ATTRIBUTION to every
 command, beneath the flags. `CR_HOOK_AGENT` and `CR_HOOK_AUTHORIZATION` are the
 layer a harness hook fills in, beneath those; see

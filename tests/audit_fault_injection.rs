@@ -286,10 +286,12 @@ fn a_pending_mutation_older_than_the_committed_head_is_refused() {
 
 /// Recovery of a mutation whose before-state and after-state are identical.
 ///
-/// A no-op update records an event with an empty change set, so hashing the
-/// record cannot decide whether the write landed. Committing is the only sound
-/// answer — both branches leave identical bytes on disk — and the point of the
-/// test is that the decision procedure is total rather than stuck.
+/// An unchanged update records nothing unless it carries an idempotency key,
+/// whose retry contract needs the event, so a keyed one records an event with
+/// an empty change set, and hashing the record cannot decide whether the write
+/// landed. Committing is the only sound answer — both branches leave identical
+/// bytes on disk — and the point of the test is that the decision procedure is
+/// total rather than stuck.
 #[test]
 fn a_mutation_with_identical_before_and_after_states_still_recovers() {
     let database = FaultDatabase::new("identical-states");
@@ -301,7 +303,15 @@ fn a_mutation_with_identical_before_and_after_states_still_recovers() {
     let interruption = database.interrupt(
         "items",
         "one",
-        &["update", "items", "one", "--set", "stage=screening"],
+        &[
+            "update",
+            "items",
+            "one",
+            "--set",
+            "stage=screening",
+            "--idempotency-key",
+            "identical-states-retry-key-0001",
+        ],
     );
     assert_eq!(interruption.before, interruption.after);
 
@@ -314,6 +324,18 @@ fn a_mutation_with_identical_before_and_after_states_still_recovers() {
     let record = run_success(database.command().args(["get", "items", "one", "--json"]));
     let record: Value = serde_json::from_str(&record).unwrap();
     assert_eq!(record["attributes"]["stage"], "screening");
+
+    // The recovered event answers the retry it exists for.
+    run_success(database.command().args([
+        "update",
+        "items",
+        "one",
+        "--set",
+        "stage=screening",
+        "--idempotency-key",
+        "identical-states-retry-key-0001",
+    ]));
+    assert_eq!(database.head_sequence(), 2);
 }
 
 /// Recovery appends into an existing partially filled segment, not only into a

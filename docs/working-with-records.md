@@ -70,6 +70,16 @@ in one update:
 cr update companies acme --unset industry --unset address.suite
 ```
 
+An update that changes nothing, such as setting a field to the value it
+already has, records nothing. When the result would be byte for byte the
+record as it is, `cr` writes no file and appends no audit event, and answers
+with the current record exactly as a recorded update would. It still checks
+everything first: an update you may not make is refused, and so is one whose
+`--expected-record-hash` no longer matches. A `--message` on its own is not a
+change. An update with `--idempotency-key` is the exception and is recorded
+anyway, because its event is what lets a retry return the same answer after
+the record has moved on.
+
 Add a named relation from one record to another:
 
 ```sh

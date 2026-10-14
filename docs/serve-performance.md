@@ -117,6 +117,10 @@ CLI processes against warm filesystem cache. The keyed update uses a fresh
 UUID on each invocation. Both backends run through the same binary, with the
 same record and history migrated between measurements.
 
+These measurements predate the legacy saved-walk retry index and unchanged-update
+optimizations merged in #136 and #137. They compare the backends at the time of
+the probe; the legacy timings are not a fresh comparison against those fixes.
+
 | Events / JSONL size | Keyed update, legacy → SQLite | History page of 20, legacy → SQLite | Get, legacy → SQLite |
 | --- | ---: | ---: | ---: |
 | 1,000 / 1.66 MB | 26.61 → 9.89 ms | 17.19 → 7.57 ms | 15.56 → 5.00 ms |

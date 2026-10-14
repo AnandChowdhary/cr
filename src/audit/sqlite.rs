@@ -907,8 +907,8 @@ mod tests {
             db.create("items", &i.to_string(), &[], "").unwrap();
         }
         VERIFY_CHAIN_CALLS.with(|calls| calls.set(0));
-        for _ in 0..130 {
-            db.update("items", "0", &[], None).unwrap();
+        for i in 0..130 {
+            db.update("items", "0", &[], Some(&i.to_string())).unwrap();
         }
         let fresh = Database::discover(Some(root.path())).unwrap();
         fresh.update("items", "0", &[], None).unwrap();

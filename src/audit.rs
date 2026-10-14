@@ -166,8 +166,9 @@ const CACHE_IGNORE_PATH: &str = ".cr/cache/.gitignore";
 const CACHE_IGNORE_LABEL: &str = "the cache's Git ignore file";
 /// Format version of the saved walk. It also names the `cr` release that
 /// wrote it, and any other release ignores it, because what a walk derives is
-/// only as good as the replay rules that derived it.
-const JOURNAL_CACHE_VERSION: u32 = 2;
+/// only as good as the replay rules that derived it. Version 3 added where
+/// each retry identity's event is ([`IdempotencyLocation`]).
+const JOURNAL_CACHE_VERSION: u32 = 3;
 const JOURNAL_CACHE_HASH_DOMAIN: &[u8] = b"cr:audit:journal-cache:v1\0";
 const VERIFIED_PREFIX_HASH_DOMAIN: &[u8] = b"cr:audit:verified-prefix:v1\0";
 
@@ -896,6 +897,10 @@ struct ChainWalk {
     expected_sequence: u64,
     previous_hash: Option<String>,
     previous_version: Option<u32>,
+    /// Not saved with the walk: a saved walk stores each identity once, as a
+    /// key of [`VerifiedJournal::retries`], and this set is rebuilt from
+    /// those keys, so the two cannot disagree.
+    #[serde(skip)]
     idempotency_identities: HashSet<IdempotencyIdentity>,
 }
 
@@ -1061,7 +1066,9 @@ pub enum JournalVerification {
 /// write walks from the first event again once the journal has grown past
 /// that by `full_walk_after` events (`audit.full_walk_after_events`, 64 by
 /// default). So every write verifies at least the events appended since the
-/// walk it resumes, and one write in that many verifies all of them.
+/// walk it resumes, and one write in that many verifies all of them. A keyed
+/// write asks whether its key was used of that same walk, which records where
+/// every retry identity's event is ([`AuditLog::idempotency_result`]).
 ///
 /// That extends the trade above by one file. The saved walk is derived state
 /// and as writable as the journal, so whoever can rewrite `.cr/` can write one
@@ -1076,7 +1083,12 @@ pub enum JournalVerification {
 ///   `full_walk_after` events later. That walk replays the real history, so
 ///   an event appended on a state only the forgery claimed is refused there,
 ///   by sequence, along with every write after it until the journal is
-///   repaired, and `cr audit verify` reports the same event.
+///   repaired, and `cr audit verify` reports the same event. That includes
+///   a retry key the forgery hides: a resumed write commits it again, and the
+///   full walk refuses that event as a duplicated identity.
+/// * A retry the walk does claim is read back from its segment and must be
+///   the event the walk names, so a forged walk can hide a retry's result
+///   but not change it, and cannot invent one.
 /// * Nothing that decides whether the journal is intact uses it: `cr audit
 ///   verify`, `cr check`, and their API routes walk the whole chain every
 ///   time. [`JournalVerification::Full`] (`--verify-audit`) makes any other
@@ -1189,6 +1201,10 @@ struct VerifiedJournal {
     walk: ChainWalk,
     states: Arc<AuditedRecordStates>,
     activity: Arc<CollectionsActivity>,
+    /// Where the event of every retry identity the walk verified is, with
+    /// the supporting-file versions its result carries. Saved with the walk,
+    /// so a keyed write answers from it rather than from a full replay.
+    retries: Arc<IdempotencyIndex>,
     /// In-memory locations and manifest transitions, built only from a full
     /// verified replay. Saved walks deliberately omit this derived index.
     history: Option<Arc<HistoryIndex>>,
@@ -1212,6 +1228,7 @@ impl VerifiedJournal {
             walk: ChainWalk::new(),
             states: Arc::default(),
             activity: Arc::default(),
+            retries: Arc::default(),
             history: Some(Arc::default()),
             sealed: Vec::new(),
             tail: None,
@@ -1224,6 +1241,7 @@ impl VerifiedJournal {
         JournalSnapshot {
             states: Arc::clone(&self.states),
             activity: Arc::clone(&self.activity),
+            retries: Arc::clone(&self.retries),
             history: self.history.clone(),
             head: AuditHead {
                 sequence: self.walk.entries(),
@@ -1239,6 +1257,8 @@ impl VerifiedJournal {
         // snapshot, which is what lets a snapshot be read without a lock.
         let states = Arc::make_mut(&mut self.states);
         let activity = Arc::make_mut(&mut self.activity);
+        // Copied, like the maps above, only once a keyed event extends it.
+        let retries = &mut self.retries;
         let history = self.history.as_mut().map(Arc::make_mut);
         let segment = Arc::new(path.to_path_buf());
         let mut offset = from.unwrap_or(0);
@@ -1255,24 +1275,36 @@ impl VerifiedJournal {
                     .and_then(|state| state.document.as_ref())
                     .and_then(audit_document_encryption_metadata)
             });
+            let identity = IdempotencyIdentity::from_payload(&entry.payload);
             // A delete returns the pre-delete bundle; other retries return
             // the files after their event. Retain versions only, never the
             // supporting-file text carried for audit diffs.
-            let deleted_files = if history.is_some()
-                && entry.payload.idempotency.is_some()
-                && entry.payload.action == AuditAction::Delete
-            {
-                Some(
+            let deleted_files = (identity.is_some() && entry.payload.action == AuditAction::Delete)
+                .then(|| {
                     states
                         .get(&key)
                         .map(|state| idempotency_file_versions(&state.files))
-                        .unwrap_or_default(),
-                )
-            } else {
-                None
-            };
+                        .unwrap_or_default()
+                });
             track_activity(activity, entry);
             replay_entry(states, entry)?;
+            if let Some(identity) = identity {
+                let files = deleted_files.unwrap_or_else(|| {
+                    states
+                        .get(&key)
+                        .map(|state| idempotency_file_versions(&state.files))
+                        .unwrap_or_default()
+                });
+                // The walk has just refused a second event for this identity.
+                Arc::make_mut(retries).insert(
+                    identity,
+                    IdempotencyLocation {
+                        sequence: entry.payload.sequence,
+                        hash: entry.hash.clone(),
+                        files,
+                    },
+                );
+            }
             if let Some(history) = history.as_mut() {
                 let after = states
                     .get(&key)
@@ -1283,22 +1315,6 @@ impl VerifiedJournal {
                 // line, including when it extends an already verified prefix.
                 let length = lengths.next().expect("verified audit line").len();
                 let index = history.events.len();
-                if let Some(identity) = IdempotencyIdentity::from_payload(&entry.payload) {
-                    let files = deleted_files.unwrap_or_else(|| {
-                        states
-                            .get(&key)
-                            .map(|state| idempotency_file_versions(&state.files))
-                            .unwrap_or_default()
-                    });
-                    history.idempotency.insert(
-                        identity,
-                        IdempotencyLocation {
-                            event: index,
-                            hash: entry.hash.clone(),
-                            files,
-                        },
-                    );
-                }
                 history
                     .collections
                     .entry(key.0.clone())
@@ -1358,11 +1374,14 @@ impl VerifiedJournal {
     fn serialize(&self) -> Result<Vec<u8>> {
         let mut records = self.states.iter().collect::<Vec<_>>();
         records.sort_by(|left, right| left.0.cmp(right.0));
+        let mut retries = self.retries.iter().collect::<Vec<_>>();
+        retries.sort_unstable_by_key(|(_, location)| location.sequence);
         let body = serde_json::to_string(&StoredJournalRef {
             walk: &self.walk,
             last_full_walk: self.last_full_walk,
             records,
             activity: &self.activity,
+            retries,
             sealed: &self.sealed,
             tail: self.tail.as_ref().map(|(path, prefix)| StoredTail {
                 path: path.clone(),
@@ -1398,16 +1417,22 @@ impl VerifiedJournal {
         let journal = serde_json::from_str::<StoredJournal>(stored.journal.get()).ok()?;
         let records = journal.records.len();
         let states = journal.records.into_iter().collect::<AuditedRecordStates>();
+        let identities = journal.retries.len();
+        let retries = journal.retries.into_iter().collect::<IdempotencyIndex>();
+        let mut walk = journal.walk;
         if states.len() != records
-            || journal.walk.expected_sequence == 0
-            || journal.last_full_walk > journal.walk.entries()
+            || retries.len() != identities
+            || walk.expected_sequence == 0
+            || journal.last_full_walk > walk.entries()
         {
             return None;
         }
+        walk.idempotency_identities = retries.keys().cloned().collect();
         Some(Self {
-            walk: journal.walk,
+            walk,
             states: Arc::new(states),
             activity: Arc::new(journal.activity),
+            retries: Arc::new(retries),
             history: None,
             sealed: journal.sealed,
             tail: journal.tail.map(|tail| {
@@ -1487,6 +1512,7 @@ struct StoredJournalRef<'a> {
     last_full_walk: u64,
     records: Vec<(&'a (String, String), &'a AuditedRecordState)>,
     activity: &'a CollectionsActivity,
+    retries: Vec<(&'a IdempotencyIdentity, &'a IdempotencyLocation)>,
     sealed: &'a [(PathBuf, SegmentStamp)],
     tail: Option<StoredTail>,
 }
@@ -1497,6 +1523,7 @@ struct StoredJournal {
     last_full_walk: u64,
     records: Vec<((String, String), AuditedRecordState)>,
     activity: CollectionsActivity,
+    retries: Vec<(IdempotencyIdentity, IdempotencyLocation)>,
     sealed: Vec<(PathBuf, SegmentStamp)>,
     tail: Option<StoredTail>,
 }
@@ -1522,6 +1549,7 @@ struct UnverifiedSegment {
 struct JournalSnapshot {
     states: Arc<AuditedRecordStates>,
     activity: Arc<CollectionsActivity>,
+    retries: Arc<IdempotencyIndex>,
     history: Option<Arc<HistoryIndex>>,
     head: AuditHead,
 }
@@ -1533,15 +1561,25 @@ struct HistoryIndex {
     events: Vec<HistoryLocation>,
     collections: HashMap<String, Vec<usize>>,
     records: HashMap<(String, String), Vec<usize>>,
-    idempotency: HashMap<IdempotencyIdentity, IdempotencyLocation>,
 }
+
+/// Every retry identity a walk verified, and where its event is.
+type IdempotencyIndex = HashMap<IdempotencyIdentity, IdempotencyLocation>;
 
 /// A retry's verified event and original supporting-file versions, without
 /// retaining its Markdown or supporting-file contents in memory or on disk.
-#[derive(Clone)]
+///
+/// Nothing here is believed on its own: a hit reads the event back from its
+/// segment and requires it to be this one ([`AuditLog::indexed_retry`]).
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct IdempotencyLocation {
-    event: usize,
+    /// The event's sequence, which names its segment and its line there.
+    sequence: u64,
+    /// The event's hash, as the walk verified it.
     hash: String,
+    /// The record's supporting files as the result returns them: after the
+    /// event, or before it for a delete. Hashes only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     files: BundleFiles,
 }
 
@@ -1771,6 +1809,14 @@ impl Admission {
         self.states()
             .get(&(collection.to_owned(), id.to_owned()))
             .is_some_and(|state| state.hash.is_none())
+    }
+
+    /// Whether this process walked the journal from its first event for this
+    /// admission, and nothing has been appended since, rather than resuming a
+    /// walk that was saved: a walk worth leaving for the next command even
+    /// when the write it admitted appends nothing.
+    pub(crate) fn walked_from_first_event(&self) -> bool {
+        self.journal.walked && self.journal.last_full_walk == self.journal.walk.entries()
     }
 }
 
@@ -2290,6 +2336,13 @@ impl<'a> AuditLog<'a> {
         }
     }
 
+    /// Refuse what [`Self::commit`] refuses for its signing key or signed
+    /// checkpoint, for a write that changes nothing and so commits nothing.
+    pub(crate) fn assert_signable(&self, entry: &PreparedEntry) -> Result<()> {
+        self.append_signer(entry.parsed.sequence.saturating_sub(1))
+            .map(drop)
+    }
+
     /// Apply one prepared mutation and append its event, which must still
     /// extend the chain exactly as the walk it was prepared against left it.
     pub fn commit<F>(&self, mut entry: PreparedEntry, target: &Path, apply: F) -> Result<()>
@@ -2674,15 +2727,16 @@ impl<'a> AuditLog<'a> {
         self.recent_where(limit, filter, |_| Ok(true))
     }
 
-    /// Select recent history while reconstructing its exact encryption
-    /// metadata in the same forward verification and semantic replay.
     /// Find the committed result for one fully scoped retry identity.
     ///
-    /// Callers hold the audit lock. With a journal cache, use its in-memory
-    /// index built from verified events and rechecked against current segments.
-    /// A saved walk does not contain this index: establish it with one full
-    /// replay before trusting any retry identity. Without a cache, replay the
-    /// chain as before. No on-disk side index can cause a replay or conflict.
+    /// Callers hold the audit lock. With a journal cache, answer from the
+    /// retry index of the walk the write would be admitted on (see
+    /// [`Self::retry_index`]), which a saved walk carries, so neither a new
+    /// key nor a retry replays the chain. A hit is read back from its segment
+    /// and must still be the event the walk verified; one that is not, from
+    /// a walk resumed from a saved one, is decided by a walk from the first
+    /// event instead, as any saved walk that does not continue is. Without a
+    /// cache, replay the chain as before.
     pub(crate) fn idempotency_result(
         &self,
         principal: &str,
@@ -2706,7 +2760,6 @@ impl<'a> AuditLog<'a> {
             );
         }
         if let Some(journal) = self.journal {
-            let history = self.verified_history(journal)?;
             let identity = IdempotencyIdentity {
                 principal: principal.to_owned(),
                 operation: operation.to_owned(),
@@ -2714,29 +2767,30 @@ impl<'a> AuditLog<'a> {
                 id: id.to_owned(),
                 key_hash: key_hash.to_owned(),
             };
-            let Some(indexed) = history.idempotency.get(&identity) else {
+            let (retries, resumed) = self.retry_index(journal)?;
+            let Some(location) = retries.get(&identity) else {
                 return Ok(None);
             };
-            let location = &history.events[indexed.event];
-            let contents = self.read_segment_bytes(&location.segment)?;
-            let line = contents
-                .get(location.start..location.end)
-                .ok_or_else(|| audit_integrity("indexed idempotency event is no longer present"))?;
-            let stored = parse_line(line)?;
-            if stored.entry.hash != indexed.hash
-                || stored.entry.payload.sequence != indexed.event as u64 + 1
-                || IdempotencyIdentity::from_payload(&stored.entry.payload).as_ref()
-                    != Some(&identity)
-            {
-                return Err(audit_integrity("indexed idempotency event has changed"));
-            }
-            let stored = stored.entry.payload.idempotency.expect("indexed identity");
+            let (stored, files) = match self.indexed_retry(&identity, location) {
+                Ok(stored) => (stored, location.files.clone()),
+                Err(_) if resumed => {
+                    let walked = self.walk_fresh()?;
+                    let Some(location) = walked.retries.get(&identity) else {
+                        return Ok(None);
+                    };
+                    (
+                        self.indexed_retry(&identity, location)?,
+                        location.files.clone(),
+                    )
+                }
+                Err(error) => return Err(error),
+            };
             if stored.request_hash != request_hash {
                 return Err(idempotency_conflict(format!(
                     "idempotency key was already used for a different {operation} request on record {collection}/{id}"
                 )));
             }
-            return Ok(Some((stored.result, indexed.files.clone())));
+            return Ok(Some((stored.result, files)));
         }
 
         let mut result = None;
@@ -2778,6 +2832,82 @@ impl<'a> AuditLog<'a> {
             Ok(())
         })?;
         Ok(result)
+    }
+
+    /// The retry identities verified by the walk a keyed write would be
+    /// admitted on, and whether that walk was resumed from a saved one.
+    ///
+    /// That is the walk [`Self::admit`] makes, so a lookup trusts exactly the
+    /// identities the event is then prepared against: the cached or saved walk
+    /// brought up to date while a write may resume it, and otherwise a walk
+    /// from the first event, which is left cached for the admission to resume.
+    /// A cache that never resumes a saved walk holds only walks this process
+    /// verified, and answers from its own, as it does for reads.
+    fn retry_index(&self, journal: &JournalCache) -> Result<(Arc<IdempotencyIndex>, bool)> {
+        if !journal.resume {
+            return Ok((self.cached_journal(journal)?.retries, false));
+        }
+        let walk = match self.resumed_admission() {
+            Some(walk) => walk,
+            None => self.walk_fresh()?,
+        };
+        Ok((walk.retries, !walk.walked))
+    }
+
+    /// The idempotency metadata of the event `location` names, once it is
+    /// found to be the event a walk verified for `identity`: the same hash,
+    /// sequence and identity, and a result whose version the indexed files
+    /// reproduce.
+    fn indexed_retry(
+        &self,
+        identity: &IdempotencyIdentity,
+        location: &IdempotencyLocation,
+    ) -> Result<AuditIdempotency> {
+        let stored = self
+            .stored_event(location.sequence)?
+            .ok_or_else(|| audit_integrity("indexed idempotency event is no longer present"))?;
+        let payload = stored.entry.payload;
+        if stored.entry.hash != location.hash
+            || payload.sequence != location.sequence
+            || IdempotencyIdentity::from_payload(&payload).as_ref() != Some(identity)
+        {
+            return Err(audit_integrity("indexed idempotency event has changed"));
+        }
+        let stored = payload.idempotency.expect("indexed identity");
+        if record_version(stored.result.markdown.as_bytes(), &location.files)
+            != stored.result.version
+        {
+            return Err(audit_integrity("indexed idempotency event has changed"));
+        }
+        Ok(stored)
+    }
+
+    /// The event stored at `sequence`, found by the segment it falls in and
+    /// its line there, or `None` when no segment holds a line for it.
+    ///
+    /// A segment is named by its first sequence and holds one event per line,
+    /// in order, which is what every walk verifies; whoever reads the event
+    /// still checks it is the one they expect.
+    fn stored_event(&self, sequence: u64) -> Result<Option<StoredEntry>> {
+        let paths = self.segment_paths()?;
+        let mut starts = Vec::with_capacity(paths.len());
+        for path in &paths {
+            starts.push(segment_start(path)?);
+        }
+        let Some(index) = starts
+            .partition_point(|start| *start <= sequence)
+            .checked_sub(1)
+        else {
+            return Ok(None);
+        };
+        let Ok(line) = usize::try_from(sequence - starts[index]) else {
+            return Ok(None);
+        };
+        let contents = self.read_segment_bytes(&paths[index])?;
+        match contents.split(|byte| *byte == b'\n').nth(line) {
+            Some(line) if !line.is_empty() => parse_line(line).map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// Return recent events that satisfy both the caller's filter and a
@@ -2903,8 +3033,8 @@ impl<'a> AuditLog<'a> {
     fn verified_history(&self, journal: &JournalCache) -> Result<Arc<HistoryIndex>> {
         match self.cached_journal(journal)?.history {
             Some(history) => Ok(history),
-            // Persisted walks contain current state, not historical locations,
-            // transitions, or original retry results. Establish them once.
+            // Persisted walks contain current state and retry locations, not
+            // historical locations or transitions. Establish them once.
             None => Ok(self.walk_fresh()?.history.expect("fresh history index")),
         }
     }
@@ -6309,7 +6439,7 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_index_is_rebuilt_once_after_resume_and_rechecks_tampered_segments() {
+    fn a_saved_walk_cannot_invent_a_retry_or_hide_a_tampered_segment() {
         let root = tempfile::tempdir().unwrap();
         let (cached, _) = cached_and_uncached(root.path(), 2);
         let writer = cached.with_journal_verification(JournalVerification::Resume);
@@ -6321,17 +6451,20 @@ mod tests {
         writer.create("items", "two", &[], "Second\n").unwrap();
         writer.create("items", "three", &[], "Third\n").unwrap();
 
-        // Neither missing nor invented identities in a saved walk can decide
-        // retry semantics: the in-memory index comes from the real events.
+        // An identity a saved walk invents is not a retry: the event it names
+        // is read back, does not carry it, and a walk from the first event
+        // decides instead, replacing the forgery for the commands after it.
         let invented_hash = format!("sha256:{}", "f".repeat(64));
         forge_saved_walk(root.path(), |journal| {
-            journal["walk"]["idempotency_identities"] = json!([{
+            let location = journal["retries"][0][1].clone();
+            assert_eq!(location["sequence"], 1);
+            journal["retries"] = json!([[{
                 "principal": "tester@example.com",
                 "operation": "create",
                 "collection": "items",
                 "id": "invented",
                 "key_hash": invented_hash,
-            }]);
+            }, location]]);
         });
         let reader = writer
             .clone()
@@ -6962,6 +7095,239 @@ mod tests {
     fn create_items_result(database: &Database, index: usize) -> anyhow::Result<Record> {
         let assignment: Assignment = format!("value={index}").parse().unwrap();
         database.create("items", &format!("item-{index}"), &[assignment], "")
+    }
+
+    /// [`process`] with a retry key, as `cr --idempotency-key` runs.
+    fn keyed(root: &std::path::Path, verification: JournalVerification, key: &str) -> Database {
+        process(root, verification)
+            .with_idempotency_key(key)
+            .unwrap()
+    }
+
+    fn update_item_1(database: &Database, value: &str) -> anyhow::Result<Record> {
+        let assignment: Assignment = format!("value={value}").parse().unwrap();
+        database.update("items", "item-1", &[assignment], None)
+    }
+
+    #[test]
+    fn a_keyed_write_resuming_a_saved_walk_does_not_replay_the_chain() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, uncached) = cached_and_uncached(root.path(), 2);
+        create_items(&process(root.path(), JournalVerification::Resume), 0..5);
+        let resumed = |key| keyed(root.path(), JournalVerification::Resume, key);
+        let verified = |key| keyed(root.path(), JournalVerification::Full, key);
+        let key = "resumed-keyed-write-key";
+
+        // A new key, its retry, and the key reused for another request, each
+        // in a process of its own that resumes the walk the last write saved.
+        let (original, count) = walks(|| update_item_1(&resumed(key), "keyed"));
+        let original = original.unwrap();
+        assert_eq!(count, 0, "a new key replayed the chain");
+        let (replay, count) = walks(|| update_item_1(&resumed(key), "keyed"));
+        let replay = replay.unwrap();
+        assert_eq!(count, 0, "a retry replayed the chain");
+        assert_eq!(replay.version, original.version);
+        assert_eq!(replay.attributes, original.attributes);
+        assert_eq!(replay.body, original.body);
+        let (conflict, count) = walks(|| update_item_1(&resumed(key), "different"));
+        assert_eq!(count, 0, "a conflicting retry replayed the chain");
+        assert_eq!(
+            DomainError::of(&conflict.unwrap_err()).map(DomainError::code),
+            Some("idempotency_conflict")
+        );
+        assert_eq!(head(&uncached), 6, "a retry appended an event");
+
+        // `--verify-audit` still walks from the first event: for a new key,
+        // once to answer the lookup and once more for the write's admission.
+        let (written, count) =
+            walks(|| update_item_1(&verified("verified-keyed-write-key"), "verified"));
+        written.unwrap();
+        assert_eq!(count, 2);
+        let (replay, count) = walks(|| update_item_1(&verified(key), "keyed"));
+        assert_eq!(replay.unwrap().version, original.version);
+        assert_eq!(count, 1);
+        assert_eq!(head(&uncached), 7);
+    }
+
+    /// A database whose `items` are bundles, with a new segment every two
+    /// events.
+    fn bundled(root: &std::path::Path) {
+        legacy_database(root).unwrap();
+        std::fs::write(
+            root.join(".cr/config.yaml"),
+            "version: 1\ndata_dir: records\ncollections:\n  items:\n    layout: bundle\naudit:\n  segment_max_events: 2\n",
+        )
+        .unwrap();
+    }
+
+    fn notes(contents: &str) -> [crate::FileChange; 1] {
+        [crate::FileChange::Write {
+            path: "notes.txt".to_owned(),
+            contents: contents.as_bytes().to_vec(),
+        }]
+    }
+
+    fn create_bundle(database: &Database) -> anyhow::Result<Record> {
+        database.create_with_files("items", "one", &[], "Original\n", &notes("Original file\n"))
+    }
+
+    fn assert_same_result(actual: &Record, expected: &Record) {
+        assert_eq!(actual.version, expected.version);
+        assert_eq!(actual.attributes, expected.attributes);
+        assert_eq!(actual.body, expected.body);
+        assert_eq!(actual.files, expected.files);
+    }
+
+    #[test]
+    fn a_saved_walk_returns_a_retry_s_original_supporting_files() {
+        let root = tempfile::tempdir().unwrap();
+        bundled(root.path());
+        let resumed = |key| keyed(root.path(), JournalVerification::Resume, key);
+        let update = |database: &Database| {
+            database.update_with_files_conditionally(
+                "items",
+                "one",
+                &[],
+                &[],
+                Some("Updated\n"),
+                &notes("Updated file\n"),
+                None,
+            )
+        };
+        let created = create_bundle(&resumed("bundle-create-key")).unwrap();
+        let updated = update(&resumed("bundle-update-key")).unwrap();
+        let deleted = resumed("bundle-delete-key").delete("items", "one").unwrap();
+        assert!(!deleted.files.is_empty());
+        // The record's files now answer none of the retries below.
+        process(root.path(), JournalVerification::Resume)
+            .create_with_files("items", "one", &[], "Again\n", &notes("Again\n"))
+            .unwrap();
+
+        let (actual, count) = walks(|| create_bundle(&resumed("bundle-create-key")));
+        assert_same_result(&actual.unwrap(), &created);
+        assert_eq!(count, 0, "create");
+        let (actual, count) = walks(|| update(&resumed("bundle-update-key")));
+        assert_same_result(&actual.unwrap(), &updated);
+        assert_eq!(count, 0, "update");
+        let (actual, count) = walks(|| resumed("bundle-delete-key").delete("items", "one"));
+        assert_same_result(&actual.unwrap(), &deleted);
+        assert_eq!(count, 0, "delete");
+    }
+
+    #[test]
+    fn a_forged_retry_location_is_not_believed_and_a_changed_one_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        bundled(root.path());
+        let key = "forged-location-key";
+        let created = create_bundle(&keyed(root.path(), JournalVerification::Resume, key)).unwrap();
+        process(root.path(), JournalVerification::Resume)
+            .create("items", "two", &[], "Two\n")
+            .unwrap();
+        let saved = std::fs::read(saved_walk(root.path())).unwrap();
+
+        // Each forgery names an event that is not the retry's, or files its
+        // result's version does not cover. The event read back says so, and
+        // a walk from the first event answers instead.
+        type Forge = fn(&mut serde_json::Value, &serde_json::Value);
+        let forgeries: [(&str, Forge); 4] = [
+            ("another event's hash", |location, head| {
+                location["hash"] = head["previous_hash"].clone();
+            }),
+            ("another event", |location, head| {
+                location["sequence"] = head["expected_sequence"]
+                    .as_u64()
+                    .map(|next| next - 1)
+                    .into();
+                location["hash"] = head["previous_hash"].clone();
+            }),
+            ("other files", |location, _| {
+                location["files"]["notes.txt"]["hash"] = record_hash(b"forged").into();
+            }),
+            ("no files", |location, _| {
+                location.as_object_mut().unwrap().remove("files");
+            }),
+        ];
+        for (which, forge) in forgeries {
+            std::fs::write(saved_walk(root.path()), &saved).unwrap();
+            forge_saved_walk(root.path(), |journal| {
+                let head = journal["walk"].clone();
+                forge(&mut journal["retries"][0][1], &head);
+            });
+            let retry = keyed(root.path(), JournalVerification::Resume, key);
+            let (actual, count) = walks(|| create_bundle(&retry));
+            assert_same_result(&actual.unwrap(), &created);
+            assert_eq!(count, 1, "{which} was believed");
+        }
+
+        // A walk this process verified itself is not walked again: an index
+        // entry that no longer names its event is refused.
+        let verifier = keyed(root.path(), JournalVerification::Full, key);
+        replayed(&verifier);
+        {
+            let audit = verifier.audit();
+            let mut cache = audit.journal.unwrap().lock();
+            let walk = cache.as_mut().unwrap();
+            let head = walk.walk.previous_hash.clone().unwrap();
+            let location = std::sync::Arc::make_mut(&mut walk.retries)
+                .values_mut()
+                .next()
+                .unwrap();
+            location.hash = head;
+        }
+        let (refused, count) = walks(|| create_bundle(&verifier));
+        let error = refused.unwrap_err();
+        assert_eq!(count, 0);
+        assert_eq!(
+            DomainError::of(&error).map(DomainError::code),
+            Some("audit_integrity_failed")
+        );
+        assert!(
+            format!("{error:#}").contains("indexed idempotency event has changed"),
+            "{error:#}"
+        );
+    }
+
+    /// The bound `JournalCache` states, for retries: a forged saved walk that
+    /// hides a used key lets a resumed write commit that key a second time,
+    /// and the next write that walks from the first event refuses the journal
+    /// at that event, as `cr audit verify` does.
+    #[test]
+    fn a_saved_walk_that_hides_a_retry_steers_writes_only_until_the_next_full_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, uncached) = cached_and_uncached(root.path(), 2);
+        full_walk_after(root.path(), 3);
+        create_items(&uncached, 0..3);
+        let key = "hidden-retry-key";
+        // Walks from the first event, since nothing is saved yet.
+        update_item_1(
+            &keyed(root.path(), JournalVerification::Resume, key),
+            "keyed",
+        )
+        .unwrap();
+        update_item_1(&process(root.path(), JournalVerification::Resume), "other").unwrap();
+        assert_eq!(head(&uncached), 5);
+        forge_saved_walk(root.path(), |journal| {
+            journal["retries"] = json!([]);
+        });
+
+        let retry = keyed(root.path(), JournalVerification::Resume, key);
+        let (retried, count) = walks(|| update_item_1(&retry, "keyed"));
+        retried.unwrap();
+        assert_eq!(count, 0);
+
+        // Three events since the last full walk: this write walks from the
+        // first event and refuses the journal at the second use of the key.
+        let writer = process(root.path(), JournalVerification::Resume);
+        let (refused, count) = walks(|| create_items_result(&writer, 3));
+        assert_eq!(count, 1);
+        let refused = format!(
+            "{:#}",
+            refused.expect_err("a full walk accepted a reused key")
+        );
+        let duplicated = "inconsistent at sequence 6: idempotency identity is duplicated";
+        assert!(refused.contains(duplicated), "{refused}");
+        let error = uncached.audit_verify(None).expect_err("verify accepted it");
+        assert!(format!("{error:#}").contains(duplicated), "{error:#}");
     }
 
     #[test]
