@@ -35,14 +35,17 @@ fn init(root: &Path) -> Database {
     open(root)
 }
 
-/// Every file under `root`, with its bytes.
+/// Every file under `root`, with its bytes, but the audit lock.
+///
+/// The lock file is created by whatever first takes the lock and is always
+/// empty; it says nothing about the database.
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn walk(directory: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
         for entry in fs::read_dir(directory).unwrap() {
             let entry = entry.unwrap();
             if entry.file_type().unwrap().is_dir() {
                 walk(&entry.path(), files);
-            } else {
+            } else if !entry.path().ends_with(".cr/audit/lock") {
                 files.insert(entry.path(), fs::read(entry.path()).unwrap());
             }
         }

@@ -765,7 +765,39 @@ impl Database {
         Ok(database)
     }
 
+    /// Open the database at `explicit_root`, or the nearest one above the
+    /// working directory, and finish or discard a mutation a crash left
+    /// pending before returning it.
+    ///
+    /// Recovery verifies the journal from the first event, since nothing is
+    /// attached to resume from; the CLI opens with
+    /// [`Self::discover_with_journal_verification`] instead.
     pub fn discover(explicit_root: Option<&Path>) -> Result<Self> {
+        let database = Self::located(explicit_root)?;
+        database.audit().recover_interrupted()?;
+        Ok(database)
+    }
+
+    /// [`Self::discover`] with [`Self::with_journal_verification`] attached
+    /// before recovery, so that recovering an interrupted mutation resumes
+    /// the walk the last write saved, as a write does, saves it, and leaves it
+    /// for the command that follows.
+    ///
+    /// Recovery runs only when there is a pending file, and only then waits
+    /// for the audit lock: a command that finds none goes on without it. See
+    /// [`AuditLog::recover_interrupted`] for why that leaves every reader
+    /// what it had.
+    pub fn discover_with_journal_verification(
+        explicit_root: Option<&Path>,
+        verification: JournalVerification,
+    ) -> Result<Self> {
+        let database = Self::located(explicit_root)?.with_journal_verification(verification);
+        database.audit().recover_interrupted()?;
+        Ok(database)
+    }
+
+    /// The database [`Self::discover`] finds, before any recovery.
+    fn located(explicit_root: Option<&Path>) -> Result<Self> {
         // A missing root and a root without `.cr` are the same answer to the
         // caller. As in `init`, the root itself stays beneath the message.
         let no_database = || DomainError::NotFound("no database found; run 'cr init' first".into());
@@ -832,11 +864,7 @@ impl Database {
             request_models: None,
             view_definitions: Arc::default(),
         };
-        let database = database.with_default_actor();
-        let audit = database.audit();
-        let _lock = audit.lock()?;
-        audit.recover_pending()?;
-        Ok(database)
+        Ok(database.with_default_actor())
     }
 
     pub fn root(&self) -> &Path {
@@ -996,10 +1024,11 @@ impl Database {
             )));
         }
 
-        let audit = self.audit();
-        let _lock = audit.lock()?;
-        audit.recover_pending()?;
-        let states = audit.record_states()?;
+        // Read as any other read is, without the audit lock: opening the
+        // database recovered whatever a crash left pending, and both policies
+        // must still be what that verified walk says. A write to either user
+        // landing in between can refuse the delegation, never widen it.
+        let states = self.audit().record_states()?;
 
         // Validate and authorize the operator before looking up the target.
         // This keeps missing and drifted target identities private from callers
@@ -5873,6 +5902,12 @@ impl Database {
     ///
     /// The keys must come from outside the database: a flag, the environment,
     /// or a request. See [`TrustedKeys`] for why nothing inside it can name one.
+    ///
+    /// The walk always starts from the first event. Once everything has
+    /// verified, it is saved as a write saves its walk, so the commands after
+    /// it resume from it: after upgrading `cr`, which ignores a walk an
+    /// earlier release saved, this is how to pay for the one full walk at a
+    /// moment of your choosing rather than in whichever command comes next.
     pub fn audit_verify_trusting(
         &self,
         expected_head: Option<&str>,
@@ -5882,7 +5917,9 @@ impl Database {
         let _lock = audit.lock()?;
         audit.recover_pending()?;
         self.authorize_owner(&AccessResource::Database)?;
-        audit.verify_trusting(expected_head, trusted)
+        let verification = audit.verify_trusting(expected_head, trusted)?;
+        audit.checkpoint_journal_cache(false);
+        Ok(verification)
     }
 
     pub fn audit_baseline(&self) -> Result<usize> {

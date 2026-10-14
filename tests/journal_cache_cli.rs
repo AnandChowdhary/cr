@@ -206,3 +206,32 @@ fn a_damaged_saved_walk_is_ignored_rather_than_believed() {
     assert_eq!(saved["version"], 2);
     assert_eq!(saved["cr"], env!("CARGO_PKG_VERSION"));
 }
+
+#[test]
+fn audit_verify_saves_the_walk_it_verified_and_a_read_after_it_writes_nothing() {
+    let database = seeded("saved-walk-verify");
+    // A walk another release saved is ignored, as it is after every upgrade,
+    // and only a write used to replace it.
+    let path = database.root.join(SAVED_WALK);
+    let mut saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    saved["cr"] = "0.0.0".into();
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let verification = run_success(database.command().args(["audit", "verify"]));
+    assert!(
+        verification.contains("Verified 5 audit events"),
+        "{verification}"
+    );
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["cr"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(saved["journal"]["last_full_walk"], 5);
+
+    let before = snapshot(&database.root);
+    run_success(
+        database
+            .command()
+            .args(["get", "deals", "deal-3", "--json"]),
+    );
+    run_success(database.command().args(["list", "deals"]));
+    assert_eq!(snapshot(&database.root), before, "a read changed .cr/");
+}

@@ -420,10 +420,13 @@ fn a_second_signal_still_lets_a_started_mutation_commit() {
     let log = database.root().with_extension("log");
     let mut server = Server::start(database.root(), log);
 
-    // Startup recovery took this lock once, so the file exists.
+    // Created here if nothing has taken the lock yet: startup takes it only
+    // to recover an interrupted mutation, and this database has none.
     let lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .create(true)
+        .truncate(false)
         .open(database.root().join(".cr/audit/lock"))
         .unwrap();
     let inode = lock.metadata().unwrap().ino();
