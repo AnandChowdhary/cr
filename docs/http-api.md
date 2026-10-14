@@ -251,6 +251,13 @@ curl -X PUT http://127.0.0.1:3000/api/v1/collections/deals/records/acme-renewal 
 without writing, and `X-CR-Approved-Changes` remains an independent guard over
 the resulting audit change set.
 
+A `PATCH` or `PUT` that would leave the record byte for byte as it is records
+no audit event and writes nothing. It answers `200` with the current record and
+an unchanged `ETag`, exactly as a recorded one would, and is refused for the
+same reasons, a failed `If-Match` included. With an `Idempotency-Key` it is
+still recorded, so a retry returns that result. Saving the record form without
+changing anything likewise records nothing.
+
 Create a relation, remove it, or delete a record:
 
 ```sh
