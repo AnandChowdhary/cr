@@ -1810,13 +1810,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     // Before `--as`, so the delegation check and the command it delegates
     // share one verified walk of the journal.
-    let database = Database::discover(cli.database.as_deref())?.with_journal_verification(
+    let database = Database::discover_with_journal_verification(
+        cli.database.as_deref(),
         if cli.verify_audit {
             JournalVerification::Full
         } else {
             JournalVerification::Resume
         },
-    );
+    )?;
     let database = match cli.actor {
         Some(actor) => database.with_actor(actor)?,
         None => database,

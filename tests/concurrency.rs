@@ -1,6 +1,12 @@
 mod common;
 
-use std::{fs, process::Stdio};
+use std::{
+    fs,
+    path::Path,
+    process::{Child, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use common::{
     TestDatabase, chain,
@@ -361,4 +367,162 @@ fn a_hard_killed_sync_leaves_no_stale_lock_and_a_verifiable_database() {
         verification.contains("Verified 2 audit events"),
         "unexpected verification: {verification}"
     );
+}
+
+/// Hold the audit lock as a `cr` command inside the section it guards does.
+fn hold_audit_lock(root: &Path) -> fs::File {
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".cr/audit/lock"))
+        .unwrap();
+    lock.lock().expect("the test can hold the audit lock");
+    lock
+}
+
+/// What `child` printed, once it has exited by itself within `limit`.
+fn finished_within(mut child: Child, limit: Duration, what: &str) -> Output {
+    let deadline = Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("{what} was still running after {limit:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{what} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+/// A read with nothing to recover does not queue behind whoever holds the
+/// audit lock, however long they hold it.
+///
+/// Every command used to take the lock when it opened the database, to
+/// recover a mutation a crash might have left, so one slow writer, or one
+/// recovery that never finished in the time a caller allowed, stopped every
+/// read behind it. Only a pending file makes the lock worth waiting for.
+#[test]
+fn a_read_with_nothing_to_recover_does_not_wait_for_the_audit_lock() {
+    const OWNER: &str = "Owner <owner@example.com>";
+    let database = TestDatabase::new("read-without-lock");
+    let as_owner = || {
+        let mut command = database.command();
+        command.env("CR_ACTOR", OWNER);
+        command
+    };
+    run_success(as_owner().args([
+        "access",
+        "init",
+        "--name",
+        "Owner",
+        "--email",
+        "owner@example.com",
+    ]));
+    run_success(as_owner().args(["create", "deals", "acme", "--set", "stage=open"]));
+    run_success(as_owner().args([
+        "user",
+        "add",
+        "bob@example.com",
+        "--name",
+        "Bob",
+        "--email",
+        "bob@example.com",
+    ]));
+    run_success(as_owner().args([
+        "access",
+        "grant",
+        "bob@example.com",
+        "viewer",
+        "collection:deals",
+    ]));
+
+    let lock = hold_audit_lock(database.root());
+    for arguments in [
+        &["get", "deals", "acme", "--json"][..],
+        &["list", "deals"],
+        &["--as", "bob@example.com", "get", "deals", "acme", "--json"],
+    ] {
+        let reader = as_owner()
+            .args(arguments)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let what = format!("'{}' while the audit lock was held", arguments.join(" "));
+        let output = finished_within(reader, Duration::from_secs(60), &what);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("acme"),
+            "{what}"
+        );
+    }
+    drop(lock);
+}
+
+/// A read that finds a pending file still waits for the lock and recovers
+/// the interrupted mutation before it reads, so it answers with the state
+/// the journal is about to record rather than beside it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_read_that_finds_an_interrupted_mutation_waits_and_recovers_it_first() {
+    use std::os::unix::fs::MetadataExt;
+
+    let database = FaultDatabase::new("read-recovers-first");
+    run_success(
+        database
+            .command()
+            .args(["create", "items", "one", "--set", "stage=screening"]),
+    );
+    let interruption = database.interrupt(
+        "items",
+        "one",
+        &["update", "items", "one", "--set", "stage=hired"],
+    );
+    database.restore(&interruption, "items", "one", Point::RecordReplaced);
+
+    let lock = hold_audit_lock(database.root());
+    let reader = database
+        .command()
+        .args(["get", "items", "one", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Linux lists a process blocked in `flock` in `/proc/locks` as
+    // `1: -> FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF`.
+    let pid = reader.id().to_string();
+    let inode = format!(":{}", lock.metadata().unwrap().ino());
+    let waiting = |line: &str| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        fields.get(1) == Some(&"->")
+            && fields.get(5) == Some(&pid.as_str())
+            && fields.get(6).is_some_and(|file| file.ends_with(&inode))
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !fs::read_to_string("/proc/locks")
+        .unwrap()
+        .lines()
+        .any(waiting)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the read did not wait for the audit lock"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(database.read_pending().is_some());
+
+    drop(lock);
+    let output = finished_within(reader, Duration::from_secs(60), "the read");
+    let record: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(record["attributes"]["stage"], "hired");
+    assert!(database.read_pending().is_none());
+    assert_eq!(database.head_sequence(), 2);
 }

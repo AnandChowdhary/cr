@@ -79,10 +79,11 @@ each of those would make every command slower with every change ever recorded.
 
 So each command that appends an event saves its verified walk of the journal in
 `.cr/cache/verified-journal.json`, and the next command resumes from it,
-verifying only the events appended since. Whether an older segment still is
-what was verified is judged from its file identity, size, and modification and
-change times; the newest segment is compared with the digest of what was
-verified. Anything that does not match, and a missing, damaged, or
+verifying only the events appended since. Recovering a write that a crash or a
+kill interrupted resumes and saves it in the same way. Whether an older segment
+still is what was verified is judged from its file identity, size, and
+modification and change times; the newest segment is compared with the digest
+of what was verified. Anything that does not match, and a missing, damaged, or
 other-release file, sends the command back to the first event. Reads never
 write the file, and `.cr/cache/` can be deleted at any time.
 
@@ -109,8 +110,11 @@ retry reads back only the event that recorded it, which must still be the one
 the walk verified.
 
 Nothing that verifies the journal uses the saved walk: `audit verify` and
-`check` start from the first event every time. To have any other command, write
-or read, start from the first event too, pass the global `--verify-audit`:
+`check` start from the first event every time. A successful `audit verify` then
+saves the walk it made. A walk saved by another release of `cr` is ignored, so
+after upgrading, run `cr audit verify` once to pay for that full walk when you
+choose rather than in whichever command comes next. To have any other command,
+write or read, start from the first event too, pass the global `--verify-audit`:
 
 ```sh
 cr --verify-audit get deals acme-renewal

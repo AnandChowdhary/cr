@@ -1241,8 +1241,16 @@ impl VerifiedJournal {
     }
 
     /// Verify one segment's `contents` from the line boundary `from`, or from
-    /// its first line for a segment no walk has seen.
-    fn verify(&mut self, path: &Path, contents: &[u8], from: Option<usize>) -> Result<()> {
+    /// its first line for a segment no walk has seen, and with
+    /// `check_approvals` each event's approved change set as `cr audit
+    /// verify` does.
+    fn verify(
+        &mut self,
+        path: &Path,
+        contents: &[u8],
+        from: Option<usize>,
+        check_approvals: bool,
+    ) -> Result<()> {
         // Copies the maps only when a reader still holds the previous
         // snapshot, which is what lets a snapshot be read without a lock.
         let states = Arc::make_mut(&mut self.states);
@@ -1254,7 +1262,10 @@ impl VerifiedJournal {
         let mut offset = from.unwrap_or(0);
         let mut lengths = contents[offset..].split_inclusive(|byte| *byte == b'\n');
         let mut history = history;
-        let mut visitor = |entry: &AuditEntry, _: &str| {
+        let mut visitor = |entry: &AuditEntry, payload: &str| {
+            if check_approvals {
+                verify_approved_changes(entry, payload)?;
+            }
             let key = (
                 entry.payload.record.collection.clone(),
                 entry.payload.record.id.clone(),
@@ -1348,7 +1359,7 @@ impl VerifiedJournal {
         self.tail = None;
         for (index, segment) in segments.into_iter().enumerate() {
             if segment.verified != Some(segment.contents.len()) {
-                self.verify(&segment.path, &segment.contents, segment.verified)?;
+                self.verify(&segment.path, &segment.contents, segment.verified, false)?;
             }
             if index == last {
                 self.tail = Some((segment.path, VerifiedPrefix::Bytes(segment.contents)));
@@ -1953,6 +1964,19 @@ impl<'a> AuditLog<'a> {
         (current && since < limit).then_some(resumed)
     }
 
+    /// Leave the walk `admission` made in the attached cache, and on disk
+    /// where the cache saves, without appending anything to it: the walk a
+    /// write saves after its append, one append short.
+    ///
+    /// For pending recovery, which decides only after this whether it appends
+    /// at all. Like [`Self::save_journal_cache`], it cannot fail the command.
+    fn keep_walk(&self, admission: &Admission) {
+        if let Some(cache) = self.journal {
+            *cache.lock() = Some(admission.journal.clone());
+        }
+        self.checkpoint_journal_cache(false);
+    }
+
     /// Prepare one event against a walk of the whole journal made here.
     pub fn prepare(&self, mutation: AuditMutation<'_>) -> Result<PreparedEntry> {
         let admission = self.admit()?;
@@ -2388,20 +2412,52 @@ impl<'a> AuditLog<'a> {
     /// that instant only delays a writer, which waits for it rather than
     /// giving up.
     pub(crate) fn interrupted_mutation(&self) -> Result<bool> {
-        let pending = Path::new(PENDING_PATH);
-        if paths::entry_kind(self.root, pending, PENDING_LABEL)?.is_none() {
+        if !self.pending_exists()? {
             return Ok(false);
         }
         match paths::try_lock_existing(self.root, Path::new(LOCK_PATH), LOCK_LABEL)? {
             LockState::Held => Ok(false),
             // Looked for again under the lock: the writer that owned the file
             // may have finished between the two looks.
-            LockState::Free(_lock) => {
-                Ok(paths::entry_kind(self.root, pending, PENDING_LABEL)?.is_some())
-            }
+            LockState::Free(_lock) => self.pending_exists(),
         }
     }
 
+    /// Finish or discard an interrupted mutation before a command goes on,
+    /// taking the audit lock only when a pending file says there may be one.
+    ///
+    /// Every command that opens a database calls this. Without a pending file
+    /// there is nothing to recover, and nothing to wait for: a reader that
+    /// does not hold the lock already meets every write that starts after it
+    /// looked, and every write recovers under its own lock before it changes
+    /// anything. With one, the file may belong to a writer committing right
+    /// now, so this waits for the lock, and [`Self::recover_pending`] looks
+    /// again under it and recovers whatever is still there.
+    pub(crate) fn recover_interrupted(&self) -> Result<()> {
+        if !self.pending_exists()? {
+            return Ok(());
+        }
+        let _lock = self.lock()?;
+        self.recover_pending()
+    }
+
+    fn pending_exists(&self) -> Result<bool> {
+        Ok(paths::entry_kind(self.root, Path::new(PENDING_PATH), PENDING_LABEL)?.is_some())
+    }
+
+    /// Finish or discard the mutation a pending file describes. Call it while
+    /// holding [`Self::lock`].
+    ///
+    /// Recovery verifies the journal as a write does, through
+    /// [`Self::admit`]: resuming the walk the attached cache holds or the last
+    /// write saved, while a write may, and verifying only what was appended
+    /// since; otherwise walking from the first event. It saves that walk
+    /// before deciding anything, and appends a committed event to it as a
+    /// write appends its own, so it walks the journal at most once, and a
+    /// recovery killed after its walk still leaves the next command a walk to
+    /// resume. A recovery that walks from the first event on every attempt and
+    /// is killed before it finishes would otherwise leave every command after
+    /// it to start that walk again.
     pub fn recover_pending(&self) -> Result<()> {
         let Some(serialized) =
             paths::read_optional(self.root, Path::new(PENDING_PATH), PENDING_LABEL)?
@@ -2459,8 +2515,8 @@ impl<'a> AuditLog<'a> {
         // Recovery is a write path too. Refuse to append or bless a pending
         // event on top of a journal whose change sets no longer reproduce the
         // states they claim, and name the guilty committed sequence first.
-        let (mut states, mut chain) = self.states(false)?;
-        self.verify_legacy_representation_heads(&states)?;
+        let admission = self.admit()?;
+        self.keep_walk(&admission);
         let head = self.load_head()?;
 
         if let Some(head) = head.as_ref() {
@@ -2518,7 +2574,20 @@ impl<'a> AuditLog<'a> {
             {
                 bail!("audit event does not extend the current chain head");
             }
-            register_idempotency_identity(&mut chain.idempotency_identities, &payload)?;
+            // Checked here, in this order, before the append checks them
+            // again, so a refusal reads as it always has. Replaying one event
+            // touches only its own record's state.
+            register_idempotency_identity(
+                &mut admission.journal.walk.idempotency_identities.clone(),
+                &payload,
+            )?;
+            let record = (collection.clone(), id.clone());
+            let mut states = admission
+                .states()
+                .get(&record)
+                .map(|state| (record, state.clone()))
+                .into_iter()
+                .collect::<AuditedRecordStates>();
             replay_entry(
                 &mut states,
                 &AuditEntry {
@@ -2527,10 +2596,9 @@ impl<'a> AuditLog<'a> {
                 },
             )?;
             let change_digest = change_set_hash(&pending.payload)?;
-            // Walked again rather than handed the walk above: recovery runs
-            // once after a crash, so sharing would save nothing that matters,
-            // and the one path that appends an event some other process
-            // prepared stays exactly as it was.
+            // Appended to the walk above, exactly as a write appends the event
+            // it prepared: the journal on disk is checked against that walk
+            // rather than walked again.
             self.append(
                 &PreparedEntry {
                     hash: pending.hash,
@@ -2539,7 +2607,7 @@ impl<'a> AuditLog<'a> {
                     change_digest,
                     admission: None,
                 },
-                None,
+                Some(admission),
             )?;
             self.clear_pending()?;
             return Ok(());
@@ -2995,7 +3063,8 @@ impl<'a> AuditLog<'a> {
         &self,
         expected_head: Option<&str>,
     ) -> Result<(AuditVerification, VerifiedRecordHashes)> {
-        let (verification, latest) = self.verify_with_record_states(expected_head)?;
+        let (verification, latest) =
+            self.verify_with_record_states_trusting(expected_head, None)?;
         let latest_hashes = latest
             .iter()
             .map(|(record, state)| (record.clone(), state.hash.clone()))
@@ -3012,14 +3081,28 @@ impl<'a> AuditLog<'a> {
         expected_head: Option<&str>,
     ) -> Result<(AuditVerification, AuditedRecordStates)> {
         self.verify_with_record_states_trusting(expected_head, None)
+            .map(|(verification, latest)| (verification, Arc::unwrap_or_clone(latest)))
     }
 
     fn verify_with_record_states_trusting(
         &self,
         expected_head: Option<&str>,
         trusted: Option<&TrustedKeys>,
-    ) -> Result<(AuditVerification, AuditedRecordStates)> {
-        let (latest, state) = self.states(true)?;
+    ) -> Result<(AuditVerification, Arc<AuditedRecordStates>)> {
+        // Always from the first event. With a cache attached the walk is the
+        // one a write makes, approvals checked as well, and is left in the
+        // cache, so that the caller can save what it verified for the
+        // commands after it to resume.
+        let (latest, state) = match self.journal {
+            Some(_) => {
+                let walked = self.walk_fresh_checking(true)?;
+                (walked.states, walked.walk.finish())
+            }
+            None => {
+                let (latest, state) = self.states(true)?;
+                (Arc::new(latest), state)
+            }
+        };
         self.verify_legacy_representation_heads(&latest)?;
 
         let signature = match trusted {
@@ -3644,7 +3727,7 @@ impl<'a> AuditLog<'a> {
             }
         }
         *verified = None;
-        let walked = self.walk_journal(&paths)?;
+        let walked = self.walk_journal(&paths, false)?;
         let snapshot = walked.snapshot();
         *verified = Some(walked);
         Ok(snapshot)
@@ -3659,9 +3742,16 @@ impl<'a> AuditLog<'a> {
     /// descends from one at most [`JournalCache::full_walk_after`] events
     /// back.
     fn walk_fresh(&self) -> Result<VerifiedJournal> {
+        self.walk_fresh_checking(false)
+    }
+
+    /// [`Self::walk_fresh`], and with `check_approvals` each event's approved
+    /// change set too, as `cr audit verify` checks it: that walk is then one a
+    /// write could have made, and can be saved like one.
+    fn walk_fresh_checking(&self, check_approvals: bool) -> Result<VerifiedJournal> {
         let walked = self
             .segment_paths()
-            .and_then(|paths| self.walk_journal(&paths));
+            .and_then(|paths| self.walk_journal(&paths, check_approvals));
         if let Some(journal) = self.journal {
             *journal.lock() = walked.as_ref().ok().cloned();
         }
@@ -3687,7 +3777,7 @@ impl<'a> AuditLog<'a> {
             if self.extend_journal(&mut journal, &paths)? {
                 Ok(journal)
             } else {
-                self.walk_journal(&paths)
+                self.walk_journal(&paths, false)
             }
         });
         if checked.is_err()
@@ -3702,13 +3792,13 @@ impl<'a> AuditLog<'a> {
     /// [`Self::extend_journal`] needs to resume where this stopped.
     ///
     /// Segments are read one at a time, and only the newest is kept.
-    fn walk_journal(&self, paths: &[PathBuf]) -> Result<VerifiedJournal> {
+    fn walk_journal(&self, paths: &[PathBuf], check_approvals: bool) -> Result<VerifiedJournal> {
         #[cfg(test)]
         VERIFY_CHAIN_CALLS.with(|calls| calls.set(calls.get() + 1));
         let mut journal = VerifiedJournal::new();
         for (index, path) in paths.iter().enumerate() {
             let (stamp, contents) = self.read_stamped_segment(path)?;
-            journal.verify(path, &contents, None)?;
+            journal.verify(path, &contents, None, check_approvals)?;
             if index + 1 == paths.len() {
                 journal.tail = Some((path.clone(), VerifiedPrefix::Bytes(contents)));
             } else {
@@ -7013,6 +7103,151 @@ mod tests {
         let (states, count) = walks(|| replayed(&reader));
         assert_eq!(count, 1);
         assert_eq!(states, replayed(&uncached));
+    }
+
+    /// Leave what a create of `id` killed before its append leaves: the
+    /// pending file and, when it `landed`, the record, but no event.
+    fn interrupt_create(database: &Database, id: &str, landed: bool) {
+        let audit = database.audit();
+        let _lock = audit.lock().unwrap();
+        let (entry, rendered, target) = prepare_item(&audit, id);
+        store_pending(&audit, &entry, target.clone());
+        if landed {
+            paths::write_new(audit.root, &target, rendered.as_bytes(), "the record").unwrap();
+        }
+    }
+
+    /// Open the database as a `cr` command does, recovery included.
+    fn open(root: &std::path::Path, verification: JournalVerification) -> anyhow::Result<Database> {
+        Database::discover_with_journal_verification(Some(root), verification)
+    }
+
+    /// The number of events the walk saved on disk has verified.
+    fn saved_events(root: &std::path::Path) -> u64 {
+        let saved = std::fs::read(saved_walk(root)).unwrap();
+        super::VerifiedJournal::deserialize(&saved)
+            .expect("a usable saved walk")
+            .walk
+            .entries()
+    }
+
+    #[test]
+    fn recovery_resumes_the_saved_walk_and_saves_the_one_it_appends_to() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, uncached) = cached_and_uncached(root.path(), 2);
+        create_items(&process(root.path(), JournalVerification::Resume), 0..5);
+        for (id, landed) in [("item-5", true), ("item-6", false)] {
+            let before = head(&uncached);
+            interrupt_create(&uncached, id, landed);
+            let (recovered, count) =
+                walks(|| open(root.path(), JournalVerification::Resume).unwrap());
+            assert_eq!(count, 0, "{id}: recovery walked from the first event");
+            assert!(!root.path().join(PENDING_PATH).exists(), "{id}");
+            assert_eq!(head(&uncached), before + u64::from(landed), "{id}");
+            assert_eq!(saved_events(root.path()), head(&uncached), "{id}");
+
+            // The command goes on from the walk recovery left it, and the
+            // next one from the walk it saved.
+            let (states, count) = walks(|| replayed(&recovered));
+            assert_eq!((count, &states), (0, &replayed(&uncached)), "{id}");
+            let reader = process(root.path(), JournalVerification::Resume);
+            let (states, count) = walks(|| replayed(&reader));
+            assert_eq!((count, &states), (0, &replayed(&uncached)), "{id}");
+        }
+    }
+
+    #[test]
+    fn recovery_with_no_walk_to_resume_walks_once_and_saves_that_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, uncached) = cached_and_uncached(root.path(), 2);
+        create_items(&uncached, 0..5);
+        assert!(!saved_walk(root.path()).exists());
+
+        // Opened as a library opens it, with nothing to save the walk to,
+        // recovery still walks once rather than once to decide and again to
+        // append.
+        interrupt_create(&uncached, "item-5", true);
+        let (_, count) = walks(|| Database::discover(Some(root.path())).unwrap());
+        assert_eq!(count, 1);
+        assert_eq!(head(&uncached), 6);
+        assert!(!saved_walk(root.path()).exists());
+
+        interrupt_create(&uncached, "item-6", true);
+        let (_, count) = walks(|| open(root.path(), JournalVerification::Resume).unwrap());
+        assert_eq!(count, 1);
+        assert_eq!(head(&uncached), 7);
+        assert_eq!(saved_events(root.path()), 7);
+        let writer = process(root.path(), JournalVerification::Resume);
+        let (_, count) = walks(|| create_items(&writer, 7..8));
+        assert_eq!(
+            count, 0,
+            "the write after recovery walked from the first event"
+        );
+
+        // `--verify-audit` walks from the first event despite a saved walk.
+        interrupt_create(&uncached, "item-8", true);
+        let (_, count) = walks(|| open(root.path(), JournalVerification::Full).unwrap());
+        assert_eq!(count, 1);
+        assert_eq!(head(&uncached), 9);
+        assert_eq!(saved_events(root.path()), 9);
+    }
+
+    #[test]
+    fn a_refused_recovery_still_leaves_the_walk_it_verified_for_the_next_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, uncached) = cached_and_uncached(root.path(), 2);
+        create_items(&uncached, 0..5);
+        interrupt_create(&uncached, "item-5", false);
+        std::fs::write(root.path().join("records/items/item-5.md"), "neither\n").unwrap();
+
+        // The walk is saved before the decision, so a recovery that is
+        // refused, or killed, after its walk does not cost the next attempt
+        // a walk of its own.
+        for attempt in [1, 0] {
+            let (opened, count) = walks(|| open(root.path(), JournalVerification::Resume));
+            let Err(error) = opened else {
+                panic!("recovery was not refused");
+            };
+            let error = format!("{error:#}");
+            assert!(error.contains("matches neither state"), "{error}");
+            assert_eq!(count, attempt);
+            assert_eq!(saved_events(root.path()), 5);
+        }
+        assert!(root.path().join(PENDING_PATH).exists());
+    }
+
+    #[test]
+    fn verification_saves_the_walk_it_verified_for_the_next_command() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, uncached) = cached_and_uncached(root.path(), 2);
+        full_walk_after(root.path(), 3);
+        create_items(&uncached, 0..5);
+        let verifier = process(root.path(), JournalVerification::Resume);
+        let (verification, count) = walks(|| verifier.audit_verify(None).unwrap());
+        assert_eq!((count, verification.entries), (1, 5));
+
+        // What a write that walked from the first event would have saved, one
+        // event earlier: its last full walk is now.
+        let saved = std::fs::read(saved_walk(root.path())).unwrap();
+        let saved = super::VerifiedJournal::deserialize(&saved).unwrap();
+        assert_eq!((saved.walk.entries(), saved.last_full_walk), (5, 5));
+        let reader = process(root.path(), JournalVerification::Resume);
+        let (states, count) = walks(|| (replayed(&reader), activity(&reader)));
+        assert_eq!(count, 0);
+        assert_eq!(states, (replayed(&uncached), activity(&uncached)));
+        let mut counts = Vec::new();
+        for index in 5..9 {
+            let writer = process(root.path(), JournalVerification::Resume);
+            counts.push(walks(|| create_items(&writer, index..index + 1)).1);
+        }
+        assert_eq!(counts, [0, 0, 0, 1]);
+
+        // Nothing is saved from a verification that fails.
+        std::fs::remove_file(saved_walk(root.path())).unwrap();
+        std::fs::write(root.path().join("records/items/item-0.md"), "edited\n").unwrap();
+        let verifier = process(root.path(), JournalVerification::Resume);
+        assert!(verifier.audit_verify(None).is_err());
+        assert!(!saved_walk(root.path()).exists());
     }
 
     #[test]
