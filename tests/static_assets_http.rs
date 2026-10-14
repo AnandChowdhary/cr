@@ -102,21 +102,21 @@ fn stylesheet_path(html: &str) -> String {
 /// Spelled out rather than derived: the point of a content-addressed name is
 /// that these exact bytes are what every browser caches for a year under this
 /// exact URL, so re-pinning htmx has to be a commit that changes a failing
-/// assertion. `sha256sum src/static/htmx-2.0.10.min.js` is the whole digest
+/// assertion. `sha256sum src/static/htmx-4.0.0.min.js` is the whole digest
 /// this truncates, and `src/server.rs` records it beside `HTMX_SCRIPT`.
-const HTMX_ASSET: &str = "/static/htmx-2.0.10-71ea67185bfa8c98.min.js";
+const HTMX_ASSET: &str = "/static/htmx-4.0.0-e484d9171a9db30a.min.js";
 
 /// The bytes the binary compiles in, read the same way `src/server.rs` reads
 /// them, so the assertions below compare what is served against what is
 /// committed rather than against a copy of it.
-const HTMX_SOURCE: &str = include_str!("../src/static/htmx-2.0.10.min.js");
+const HTMX_SOURCE: &str = include_str!("../src/static/htmx-4.0.0.min.js");
 
 /// Committed beside the script because a vendored dependency whose terms a
 /// reader has to leave the tree to find is worse than one they can read in
 /// place. 0BSD imposes no condition on redistribution, so this file is a
 /// courtesy rather than compliance — which is exactly why a test has to keep it
 /// from being deleted as dead weight.
-const HTMX_LICENSE: &str = include_str!("../src/static/htmx-2.0.10.LICENSE.txt");
+const HTMX_LICENSE: &str = include_str!("../src/static/htmx-4.0.0.LICENSE.txt");
 
 /// The committed output of `scripts/tailwind.sh`, which the binary serves.
 const TAILWIND_SOURCE: &str = include_str!("../src/static/tailwind.css");
@@ -248,8 +248,8 @@ async fn the_asset_route_cannot_be_walked_outside_the_binary() {
         "/static/src%2Fstatic%2Fcr.js",
         "/static/cr.js",
         "/static/htmx.min.js",
-        "/static/htmx-2.0.10.min.js",
-        "/static/htmx-2.0.10.LICENSE.txt",
+        "/static/htmx-4.0.0.min.js",
+        "/static/htmx-4.0.0.LICENSE.txt",
         "/static/tailwind.css",
         "/static/tailwind.input.css",
         "/static/tailwindcss-4.3.3.LICENSE.txt",
@@ -352,10 +352,10 @@ async fn htmx_is_served_from_the_binary_at_the_exact_vendored_release() {
     // htmx's own idea of which release this is, so a file renamed to a version
     // it is not cannot pass. The digest in the URL pins the bytes; this pins
     // the claim the name makes about them.
-    assert!(asset.text().contains("version:\"2.0.10\""));
+    assert!(asset.text().contains("version=\"4.0.0\""));
     // No CDN and no npm tree: the bytes come from `include_str!`, so they are in
     // the binary and the UI works with no network at all.
-    assert!(asset.body.len() > 40_000, "htmx looks truncated");
+    assert!(asset.body.len() > 30_000, "htmx looks truncated");
 
     // 0BSD grants redistribution with no conditions attached, so nothing has to
     // be reproduced anywhere for this to be lawful. The text is committed so a

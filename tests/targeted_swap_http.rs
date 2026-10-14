@@ -40,8 +40,8 @@
 //! watching survives the swap. It states the same range the pager prints, which
 //! is asserted here by taking the numbers out of both.
 //!
-//! **Back and forward still get documents.** `cr.js` sets `historyCacheSize` to
-//! zero, so every restore is a real request, and a restore swaps into `<body>`:
+//! **Back and forward still get documents.** htmx 4 has no history cache in
+//! core, so every restore is a real request, and a restore swaps into `<body>`:
 //! answering one with a region would delete the navigation.
 
 use std::str::FromStr;
@@ -506,11 +506,6 @@ async fn back_and_forward_through_swapped_states_get_documents() {
     let (_temporary, database) = database_with_deals("swap-history");
     let app = router(database, ServerConfig::default()).unwrap();
 
-    assert!(
-        UI_SCRIPT.contains("historyCacheSize = 0"),
-        "cr.js no longer refuses to write rendered pages into sessionStorage"
-    );
-
     // With no history cache every back and forward is a real request, and htmx
     // swaps its answer into `<body>` whatever the answer claims to be. A region
     // there would delete the sidebar, the progress bar and the skip link, and the
@@ -628,15 +623,12 @@ async fn a_failed_swap_leaves_the_table_alone_instead_of_pasting_an_error_page_i
     let (_temporary, database) = database_with_deals("swap-errors");
     let app = router(database, ServerConfig::default()).unwrap();
 
-    // htmx does not swap a failed response unless something says to, and the one
-    // clause in `cr.js` that says so for a `GET` now checks the target as well as
-    // the boost: these controls are boosted elements that override `hx-target`, and
-    // htmx keeps calling their requests boosted, so "boosted" alone stopped meaning
-    // "replacing the whole body" the moment they shipped. Without the second
-    // condition a re-sort of a view someone has just deleted would paste a whole
-    // rendered error document — doctype, sidebar and all — inside the table.
+    // htmx 4 swaps errors by default. cr.js permits an HTML error document only
+    // when the target is the body; otherwise a failed sort would put a whole
+    // document inside the table. Refused forms have their own explicit marker.
     assert!(
-        UI_SCRIPT.contains("boosted && target === document.body && requestConfig.verb === 'get'"),
+        UI_SCRIPT
+            .contains("isHtml && ctx.target === document.body && ctx.request.method === 'GET'"),
         "cr.js no longer distinguishes a whole-page boost from a targeted swap"
     );
 
@@ -647,16 +639,14 @@ async fn a_failed_swap_leaves_the_table_alone_instead_of_pasting_an_error_page_i
     // Cloudflare Access, say — whose expired session redirects every request to
     // a sign-in page on another origin: a page load follows that redirect and
     // comes back signed in, and an htmx request fails without a response
-    // (`htmx:sendError`). See `loadInstead` in `cr.js`.
+    // (`htmx:error`). See `loadInstead` in `cr.js`.
     assert!(
-        UI_SCRIPT.contains(
-            "!event.detail.shouldSwap && xhr.status >= 400 && requestConfig.verb === 'get'"
-        ),
+        UI_SCRIPT.contains("if (ctx.request.method === 'GET') loadInstead(ctx)"),
         "cr.js leaves a refused GET doing nothing"
     );
     assert!(
-        UI_SCRIPT.contains("document.addEventListener('htmx:sendError'")
-            && UI_SCRIPT.contains("detail.pathInfo?.finalRequestPath"),
+        UI_SCRIPT.contains("document.addEventListener('htmx:error'")
+            && UI_SCRIPT.contains("ctx.request?.action"),
         "cr.js leaves a GET that got no response doing nothing"
     );
 

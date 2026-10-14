@@ -30,7 +30,7 @@ categories = [
 # that is already committed, are meaningless to a downstream consumer.
 #
 # `src/static/` is the deliberate exception to that instinct: the vendored htmx
-# release is ~50 KiB of minified JavaScript and the compiled Tailwind sheet
+# release is ~36 KiB of minified JavaScript and the compiled Tailwind sheet
 # another ~30 KiB, which looks like exactly the kind of weight the line above
 # trims, but `src/server.rs` pulls both in with `include_str!`, so excluding
 # them would publish a crate that does not compile.
@@ -63,8 +63,8 @@ hmac = "0.13.0"
 # schema declaring draft-07 - where `format` asserts by default, unlike the
 # 2020-12 schemas in `examples/` - would go on validating and stop refusing
 # anything. `tests/database_cli.rs` guards that.
-jsonschema = { version = "0.57.0", default-features = false, features = ["idna"] }
-libc = "0.2.189"
+jsonschema = { version = "0.58.6", default-features = false, features = ["idna"] }
+libc = "0.2.190"
 maud = { version = "0.27.0", features = ["axum"] }
 percent-encoding = "2.3.2"
 regex = "1.13.1"
@@ -73,24 +73,24 @@ regex = "1.13.1"
 # RSA implementation; the pure-Rust `rsa` crate would also fail
 # `cargo audit --deny warnings` on RUSTSEC-2023-0071.
 ring = "0.17.14"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_html_form = "0.4.1"
-serde_json = { version = "1.0.151", features = ["raw_value"] }
-sha2 = "0.11.0"
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+sha2 = "0.11.1"
 # The line diffs a bundle record's text files are audited with. Only `text` is
 # needed; the default `std` feature exists for its byte-string (`bstr`) support.
 similar = { version = "3.2.0", default-features = false, features = ["text"] }
 tempfile = "3.27.0"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
-tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.3", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 # The one request `cr` makes on its own: `cr serve --cloudflare-access` fetches
 # the team's signing keys over HTTPS, and nothing else does. `rustls` with its
 # bundled web PKI roots, not the default `gzip` as well, since the key set is
 # a few kilobytes.
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 yaml_serde = "0.10.7"
-zeroize = "1.9.0"
+zeroize = "1.9.1"
 
 [dev-dependencies]
 http-body-util = "0.1.5"

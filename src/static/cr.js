@@ -14,11 +14,11 @@
 // that ran once at first paint would leave every subsequent page inert: a
 // filter panel that will not add rows, a board that will not accept a drop.
 // `enhanceAll` therefore runs once at the bottom of this file and again on
-// every `htmx:load`, the event htmx fires for each element it inserts.
+// every `htmx:after:process`, the event htmx fires for each element it inserts.
 //
 // That means it runs several times per navigation — a body swap inserts the
 // skip link, the progress bar and the shell as separate nodes, and each one
-// gets its own `htmx:load` — so binding has to be idempotent. `claim` hands
+// gets its own `htmx:after:process` — so binding has to be idempotent. `claim` hands
 // out each element exactly once, recording what it has already handed out in a
 // WeakSet. A WeakSet specifically, and not a `data-` attribute: htmx can
 // snapshot the body as HTML for its history, so a marker written into the DOM
@@ -210,7 +210,7 @@ const announce = (message) => {
 // The success banner a mutation redirects to, said once.
 //
 // `claim` is what makes it once: the banner is a node, this runs on every
-// `htmx:load` a navigation produces, and the same banner must not be announced
+// `htmx:after:process` a navigation produces, and the same banner must not be announced
 // twice because the sidebar happened to be inserted after it. A new navigation
 // renders a new node, which is a new claim and a new announcement.
 //
@@ -367,7 +367,7 @@ const enhanceRowLinks = () => {
 // document, so a click on the sidebar in the middle of an edit used to throw
 // the edit away without a word. A record form becomes unsaved at its first
 // change and saved again when it is submitted. While a form on the page is
-// unsaved, a request htmx is about to make asks first (see `htmx:confirm`
+// unsaved, a request htmx is about to make asks first (see `htmx:config:request`
 // below), and leaving the page any other way — a reload, a native form post,
 // closing the tab — gets the browser's own `beforeunload` prompt.
 //
@@ -560,7 +560,7 @@ const liveResults = (() => {
       // their counts through the page's live region.
       documentFragment.getElementById('cr-announce')?.remove();
       const scroll = keepScroll(results);
-      window.htmx.swap(results, documentFragment.body.innerHTML, { swapStyle: 'outerHTML' });
+      await window.htmx.swap({ target: results, text: documentFragment.body.innerHTML, swap: 'outerHTML' });
       region()?.querySelectorAll(scrollContainers).forEach((element) => {
         const saved = scroll.find((item) => item.key === scrollKey(element));
         if (!saved) return;
@@ -638,14 +638,14 @@ const liveResults = (() => {
     status();
     schedule();
   };
-  document.addEventListener('htmx:beforeRequest', (event) => {
-    userRequests.add(event.detail.xhr);
+  document.addEventListener('htmx:before:request', (event) => {
+    userRequests.add(event.detail.ctx);
     // A user action wins any race against a refresh of the previous URL.
     if (request) dirty = true;
     cancelFetch();
   });
-  document.addEventListener('htmx:afterRequest', (event) => {
-    userRequests.delete(event.detail.xhr);
+  document.addEventListener('htmx:finally:request', (event) => {
+    userRequests.delete(event.detail.ctx);
     schedule();
   });
   document.addEventListener('dragstart', (event) => {
@@ -703,7 +703,7 @@ const liveIndex = (() => {
       const parsed = new DOMParser().parseFromString(html, 'text/html');
       if (!parsed.getElementById('cr-view-index') || parsed.getElementById('main-content')) return;
       etag = response.headers.get('ETag');
-      window.htmx.swap(index, parsed.body.innerHTML, { swapStyle: 'outerHTML' });
+      await window.htmx.swap({ target: index, text: parsed.body.innerHTML, swap: 'outerHTML' });
     } catch (error) {
       // A background failure leaves navigation and any form untouched.
     } finally {
@@ -711,111 +711,45 @@ const liveIndex = (() => {
       enhance();
     }
   };
-  document.addEventListener('htmx:beforeRequest', (event) => { userRequests.add(event.detail.xhr); request?.abort(); });
-  document.addEventListener('htmx:afterRequest', (event) => { userRequests.delete(event.detail.xhr); enhance(); });
+  document.addEventListener('htmx:before:request', (event) => { userRequests.add(event.detail.ctx); request?.abort(); });
+  document.addEventListener('htmx:finally:request', (event) => { userRequests.delete(event.detail.ctx); enhance(); });
   document.addEventListener('visibilitychange', enhance);
   window.addEventListener('pagehide', () => { window.clearTimeout(timer); request?.abort(); });
   window.addEventListener('pageshow', enhance);
   return enhance;
 })();
 
-// htmx configuration. It lives here rather than in a `<script>` block or a
-// `meta[name=htmx-config]` tag for the same reason the enhancements above do:
-// the pages' content security policy allows scripts from this origin and no
-// inline ones, and a configuration nobody can read in a JavaScript file is a
-// configuration nobody maintains. This runs before htmx reads any of these
-// settings, because both scripts are deferred — so they run in document order,
-// htmx first — and htmx applies its configuration on DOMContentLoaded, which is
-// after every deferred script.
+// Keep the inheritance and unlimited request timeout used by the existing markup.
+// htmx 4 re-fetches history by default and keeps no rendered pages in storage.
+// Indicator CSS is disabled by the head's htmx-config meta tag, which htmx reads
+// in its constructor, before this deferred script runs. JavaScript expressions
+// are unused; the page's CSP continues to forbid inline scripts and eval.
 if (window.htmx) {
-  // Otherwise htmx injects a <style> element for the `htmx-indicator` class it
-  // ships. Nothing here uses that class — the progress bar is styled in the
-  // server's own sheet from htmx's `htmx-request` class — and the policy
-  // refuses an inline <style>, so all the injection would produce is an error
-  // in the console.
-  window.htmx.config.includeIndicatorStyles = false;
-
-  // htmx evaluates JavaScript written in attributes for `hx-on`, for trigger
-  // filters such as `click[ctrlKey]`, and for `js:` values in `hx-vals`. None of
-  // those appears in any page, and the policy grants no `'unsafe-eval'`, so the
-  // browser would refuse them anyway. Saying so here makes htmx refuse them
-  // itself, with its own `htmx:evalDisallowedError` rather than a syntax error
-  // that does not say why.
-  window.htmx.config.allowEval = false;
-
-  // Do not keep visited pages in sessionStorage. htmx's history cache would
-  // make the back button instant, but it writes rendered pages — records,
-  // audit entries, whoever the operator was impersonating at the time — into
-  // per-tab storage that outlives the response, while the server deliberately
-  // sends `Cache-Control: no-store` on every rendered page and adds
-  // `Vary: Cookie` whenever access control is on. Storing them anyway would
-  // quietly contradict that. With the cache off, htmx re-requests the page on
-  // back and forward, which is still a body swap rather than a reload, still
-  // shows the progress bar, and for a database on the same machine costs a
-  // round trip nobody can see.
-  window.htmx.config.historyCacheSize = 0;
-
-  // Because the cache is off, every back and forward is one of those
-  // re-requests, and htmx would by default label it `HX-Request: true` while
-  // still expecting a whole document to swap into <body>. That header now
-  // means something to the server — with an `HX-Target` naming a region it
-  // renders, it answers with that region alone — and a fragment swapped into
-  // <body> on a history restore would silently delete the sidebar. Turning the
-  // label off makes a restore indistinguishable from an ordinary navigation,
-  // which is exactly what it is.
-  //
-  // Belt and braces, in both directions. htmx sends no `HX-Target` on a
-  // restore, so the server would answer with a document even if this were
-  // `true`, and `Representation::requested` in `src/server.rs` additionally
-  // refuses a fragment to any request carrying `HX-History-Restore-Request`.
-  // Three independent reasons, because the failure is silent: a restore that
-  // landed a fragment in <body> would leave a page with no navigation and
-  // nothing left to boost from.
-  window.htmx.config.historyRestoreAsHxRequest = false;
+  window.htmx.config.implicitInheritance = true;
+  window.htmx.config.defaultTimeout = 0;
 }
 
-// Two things htmx would otherwise drop on the floor, because it ignores the body
-// of a response that is not a success.
-//
-// The first is a boosted navigation that lands on an error page. The server
-// answers a request for a record that no longer exists with a rendered 404 page,
-// and without this a click on a stale link would leave the previous page on
-// screen and look like the click was never registered. Allowing the swap
-// restores what the browser would have done, including the URL — htmx decides
-// whether to push history before this event and applies it only if the swap
-// happens.
-//
-// "Boosted" is not on its own enough to identify that case, which is why the
-// target is checked as well. A view's pagination, sort, filter and search
-// controls are boosted elements that override `hx-target` to replace the results
-// region alone, and htmx still reports those requests as boosted; without the
-// second condition a failed re-sort would paste a whole rendered error document —
-// doctype, sidebar and all — inside the table it was supposed to replace. htmx
-// resolves a boosted element with no `hx-target` to `<body>`, so comparing
-// against it is the same test htmx itself used to pick the target.
-//
-// The second is a refused form submission. The server answers one with the form
-// itself: the same values, escaped, in the controls they were typed into, with
-// the reason at the top and beside each field the schema located. Its status is
-// the status of the refusal — 422 for a schema violation, 412 for a record that
-// changed underneath the form, 409 for an identity already taken — so the server
-// marks exactly those answers with `CR-Form-Invalid` rather than making this
-// listener keep a list of statuses in step with the routes. Nothing else sends
-// that header, which makes this clause as narrow as the one above it: every
-// other failed request still swaps nothing and leaves the page as it was.
-document.addEventListener('htmx:beforeSwap', (event) => {
-  const { boosted, requestConfig, target, xhr } = event.detail;
-  const isHtml = (xhr.getResponseHeader('content-type') || '').startsWith('text/html');
-  if (boosted && target === document.body && requestConfig.verb === 'get' && xhr.status >= 400 && isHtml) {
-    event.detail.shouldSwap = true;
-  }
-  if (isHtml && xhr.getResponseHeader('CR-Form-Invalid') === 'true') {
-    event.detail.shouldSwap = true;
-  }
-  // Anything else that failed is loaded as a page instead; see `loadInstead`.
-  if (!event.detail.shouldSwap && xhr.status >= 400 && requestConfig.verb === 'get') {
-    loadInstead(event.detail);
-  }
+// htmx 4 sends a tag#id target descriptor. Keep cr's existing HTTP contract:
+// a bare region id, or no target for a whole document. History restores also
+// carry HX-History-Restore-Request, which the server always answers in full.
+document.addEventListener('htmx:before:request', (event) => {
+  const { ctx } = event.detail;
+  if (ctx.target?.id) ctx.request.headers['HX-Target'] = ctx.target.id;
+  else delete ctx.request.headers['HX-Target'];
+});
+
+// htmx 4 swaps error responses by default. Only an HTML page targeting the body
+// or a refused form marked by the server belongs in its target. A failed GET
+// targeting a region becomes a full navigation so a proxy's sign-in or error
+// page cannot replace the table. Other failed writes leave the form in place.
+document.addEventListener('htmx:before:response', (event) => {
+  const { ctx } = event.detail;
+  if (ctx.response.status < 400) return;
+  const isHtml = (ctx.response.headers.get('content-type') || '').startsWith('text/html');
+  if (isHtml && ctx.target === document.body && ctx.request.method === 'GET') return;
+  if (isHtml && ctx.response.headers.get('CR-Form-Invalid') === 'true') return;
+  event.preventDefault();
+  if (ctx.request.method === 'GET') loadInstead(ctx);
 });
 
 // A click outside an open filter panel or "Save as view" closes it, as a
@@ -833,15 +767,12 @@ document.addEventListener('click', (event) => {
   });
 });
 
-// The unsaved-edits guard's two prompts. `htmx:confirm` fires before every
-// request htmx makes — a boosted link or form, a targeted swap, the navigation
-// that follows a save — and cancels it when prevented. The form's own
-// submission is let through, because it is how the changes get saved; so is
-// anything once the reader has chosen to discard them. A link inside the form,
-// such as Cancel or "Edit as YAML", is a navigation like any other and asks.
-document.addEventListener('htmx:confirm', (event) => {
+// Guard every request before it is issued. htmx 4's confirm event only fires
+// for hx-confirm, so config:request is the cancellable seam for unsaved edits.
+// A form submission saves its own changes; following a link inside it does not.
+document.addEventListener('htmx:config:request', (event) => {
   if (!hasUnsavedChanges()) return;
-  const source = event.detail.elt;
+  const source = event.detail.ctx.sourceElement;
   if (source instanceof HTMLFormElement && unsavedForms.has(source)) return;
   if (window.confirm('You have unsaved changes. Leave without saving them?')) {
     unsavedForms.clear();
@@ -856,39 +787,23 @@ window.addEventListener('beforeunload', (event) => {
   event.returnValue = '';
 });
 
-// A request htmx could not complete. Behind an authenticating proxy —
-// Cloudflare Access, an OAuth proxy, a corporate gateway — an expired session
-// turns every request into a redirect to a sign-in page on another origin. A
-// page load follows that redirect and comes back signed in; an htmx request
-// cannot, because to XMLHttpRequest a cross-origin redirect is a network error,
-// and htmx answers a network error by doing nothing at all: no swap, no new
-// URL, no message. "Apply", a re-sort, a page turn, even a sidebar link
-// looked dead until the page was reloaded by hand.
-//
-// So a GET htmx could not complete becomes the page load it stands in for.
-// Every htmx GET here is an ordinary link or `method="get"` form underneath,
-// so the URL it asked for is a page the server renders whole, and loading it is
-// exactly what the click does with no JavaScript. That covers both ways a GET
-// fails: no response at all (`htmx:sendError`), and an error status htmx
-// declines to swap into a region (the `htmx:beforeSwap` listener above) — a
-// proxy's 401, or the server refusing a filter it cannot read, whose error page
-// now says why instead of nothing happening.
-//
-// A failed write is not retried as a page load, which would either resend it
-// or drop it. The only writes htmx makes are the record form and "Save as
-// view", whose fields are still on screen, so the reader is told, and the
-// record form counts as unsaved again.
-const loadInstead = (detail) => {
-  const path = detail.pathInfo?.finalRequestPath;
+// A cross-origin sign-in redirect fails as a same-origin fetch. A GET can be
+// loaded as a page so the browser follows the sign-in flow. A failed write is
+// never replayed: keep its input and tell the reader to sign in before retrying.
+const loadInstead = (ctx) => {
+  const path = ctx.request?.action;
   if (path) window.location.assign(new URL(path, window.location.href).href);
 };
 
-document.addEventListener('htmx:sendError', (event) => {
-  if (event.detail.requestConfig?.verb === 'get') {
-    loadInstead(event.detail);
+document.addEventListener('htmx:error', (event) => {
+  const { ctx } = event.detail;
+  // Swap/processing errors also use this event; only handle a missing response.
+  if (!ctx || ctx.response) return;
+  if (ctx.request.method === 'GET') {
+    loadInstead(ctx);
     return;
   }
-  const form = event.detail.elt?.closest?.('form');
+  const form = ctx.sourceElement?.closest?.('form');
   if (form && form.id === 'cr-record-form') unsavedForms.add(form);
   window.alert('The server could not be reached, so nothing was saved. What you typed is still in the form. If your sign-in has expired, sign in again in another tab, then save.');
 });
@@ -913,4 +828,4 @@ const enhanceAll = () => {
 };
 
 enhanceAll();
-document.addEventListener('htmx:load', enhanceAll);
+document.addEventListener('htmx:after:process', enhanceAll);
