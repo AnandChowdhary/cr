@@ -103,6 +103,11 @@ audit:
   full_walk_after_events: 1
 ```
 
+A write with `--idempotency-key` resumes it too. The saved walk records where
+the event of every key already used is, so a new key costs nothing extra and a
+retry reads back only the event that recorded it, which must still be the one
+the walk verified.
+
 Nothing that verifies the journal uses the saved walk: `audit verify` and
 `check` start from the first event every time. To have any other command, write
 or read, start from the first event too, pass the global `--verify-audit`:
@@ -115,8 +120,10 @@ The saved walk is as writable as the journal. Someone who can rewrite `.cr/`
 can make a command believe a different replayed state, and a write build on
 it, until the next write that walks from the first event. That write, like
 `audit verify`, then refuses the journal at the first event that was built on
-the forgery. The saved walk does not hide an altered segment, short of a
-rewrite that also restores the segment's change time
+the forgery. A forgery that hides a used retry key lets a write commit that key
+again, which that walk refuses as a duplicated identity; no forgery can change
+what a retry returns. The saved walk does not hide an altered segment, short of
+a rewrite that also restores the segment's change time
 ([the trade](architecture.md#the-verified-journal) the server has always made).
 
 ## Anchor the head in Git
