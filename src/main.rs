@@ -706,6 +706,9 @@ enum Command {
     ///
     /// In `users`, ordinary updates are limited to `profile.*` and the target
     /// principal's own `name`; lifecycle and access fields stay managed.
+    ///
+    /// An update that would leave the record byte for byte as it is writes
+    /// nothing and records no audit event, unless it has an idempotency key.
     Update {
         collection: String,
         id: String,

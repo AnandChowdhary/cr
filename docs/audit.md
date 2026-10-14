@@ -1,6 +1,6 @@
 # Audit history and integrity
 
-Every successful `create`, `update`, `link`, `delete`, direct `save`, and changed sync upsert/delete writes an attributed event.
+Every successful `create`, `update`, `link`, `delete`, direct `save`, and changed sync upsert/delete writes an attributed event. An `update` that would leave the record byte for byte as it is writes nothing, unless it carries an idempotency key.
 
 ![The global audit log filtered to one CRM deal, with a field-level change expanded](screenshots/audit-log.jpg)
 
@@ -93,13 +93,21 @@ journal on disk is still what it verified — older segments by their file
 identity, size, and times and the newest byte for byte — rather than walking it
 again. Once 64 events have been appended since a write last verified every
 event from the first, the next write does that instead, so one write in 64 pays
-for a full walk and the rest pay for the events since. Change the interval in
+for a full walk and the rest pay for the events since. An update that changes
+nothing appends no event and leaves the saved walk as it was, unless it was
+the write that walked from the first event, which it saves as an append would
+so that the next write resumes it. Change the interval in
 `.cr/config.yaml`; `1` makes every write walk from the first event:
 
 ```yaml
 audit:
   full_walk_after_events: 1
 ```
+
+A write with `--idempotency-key` resumes it too. The saved walk records where
+the event of every key already used is, so a new key costs nothing extra and a
+retry reads back only the event that recorded it, which must still be the one
+the walk verified.
 
 Nothing that verifies the journal uses the saved walk: `audit verify` and
 `check` start from the first event every time. A successful `audit verify` then
@@ -116,8 +124,10 @@ The saved walk is as writable as the journal. Someone who can rewrite `.cr/`
 can make a command believe a different replayed state, and a write build on
 it, until the next write that walks from the first event. That write, like
 `audit verify`, then refuses the journal at the first event that was built on
-the forgery. The saved walk does not hide an altered segment, short of a
-rewrite that also restores the segment's change time
+the forgery. A forgery that hides a used retry key lets a write commit that key
+again, which that walk refuses as a duplicated identity; no forgery can change
+what a retry returns. The saved walk does not hide an altered segment, short of
+a rewrite that also restores the segment's change time
 ([the trade](architecture.md#the-verified-journal) the server has always made).
 
 ## Anchor the head in Git

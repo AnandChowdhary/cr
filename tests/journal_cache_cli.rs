@@ -203,8 +203,64 @@ fn a_damaged_saved_walk_is_ignored_rather_than_believed() {
     );
     let saved: serde_json::Value =
         serde_json::from_slice(&fs::read(database.root.join(SAVED_WALK)).unwrap()).unwrap();
-    assert_eq!(saved["version"], 2);
+    assert_eq!(saved["version"], 3);
     assert_eq!(saved["cr"], env!("CARGO_PKG_VERSION"));
+}
+
+/// Rewrite the saved walk's body with `forge` and seal it with a digest that
+/// matches, as anybody who can write `.cr/` could.
+fn forge_saved_walk(root: &Path, forge: impl FnOnce(&mut serde_json::Value)) {
+    let path = root.join(SAVED_WALK);
+    let mut file: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    forge(&mut file["journal"]);
+    let body = serde_json::to_string(&file["journal"]).unwrap();
+    let digest = common::chain::digest(b"cr:audit:journal-cache:v1\0", body.as_bytes());
+    fs::write(
+        &path,
+        format!(
+            r#"{{"version":{},"cr":{},"digest":"{digest}","journal":{body}}}"#,
+            file["version"], file["cr"]
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_retry_answers_from_the_saved_walk_and_does_not_believe_a_forged_location() {
+    const KEY: &str = "saved-walk-retry-key";
+    let database = seeded("saved-walk-retry");
+    let update = |value: &str| {
+        let mut command = database.command();
+        command.args(["update", "deals", "deal-1", "--set"]);
+        command.arg(format!("value={value}"));
+        command.args(["--idempotency-key", KEY, "--json"]);
+        command
+    };
+    let original = run_success(&mut update("9"));
+
+    // The walk that write saved says where its event is, and not the key.
+    let saved = fs::read_to_string(database.root.join(SAVED_WALK)).unwrap();
+    assert!(!saved.contains(KEY));
+    let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    let retries = saved["journal"]["retries"].as_array().unwrap();
+    assert_eq!(retries.len(), 1);
+    assert_eq!(retries[0][1]["sequence"], 6);
+
+    let before = snapshot(&database.root);
+    assert_eq!(run_success(&mut update("9")), original);
+    let refused = run_failure(&mut update("10"));
+    assert!(
+        refused.contains("idempotency key was already used for a different update request"),
+        "{refused}"
+    );
+    assert_eq!(snapshot(&database.root), before, "a retry changed .cr/");
+
+    // A location naming another event is not believed: the event read back
+    // is not the retry's, and a walk from the first event answers instead.
+    forge_saved_walk(&database.root, |journal| {
+        journal["retries"][0][1]["sequence"] = 1.into();
+    });
+    assert_eq!(run_success(&mut update("9")), original);
 }
 
 #[test]
