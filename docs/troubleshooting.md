@@ -2,8 +2,9 @@
 
 ## Slow commands as audit history grows
 
-For format-1 databases, fresh retry lookups and recovery can replay all audit
-history while holding the writer lock. Stop CR writers, back up the database,
+For format-1 databases, writes and recovery can replay all audit history while
+holding the writer lock when no usable saved walk exists or a full walk is due.
+Stop CR writers, back up the database,
 and run `cr audit migrate` to use persistent SQLite indexes. Ordinary SQLite
 writes and single-record recovery avoid those scans; explicit `audit verify`
 and `check` still inspect all history. See [migration](audit.md#sqlite-audit-storage-and-migration).

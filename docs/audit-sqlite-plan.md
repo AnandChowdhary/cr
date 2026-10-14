@@ -237,7 +237,7 @@ turn record scans into SQL queries or promise a fixed production latency.
 
 ## Delivery evidence
 
-- Complete suite: **928 passed, 0 failed, 1 pre-existing ignored test** across
+- Complete suite: **947 passed, 0 failed, 1 pre-existing ignored test** across
   78 test targets. Existing domain, CLI, HTTP, HTML, encryption, signing, sync,
   and bundle coverage uses SQLite by default; explicit storage/forgery fixtures
   continue to exercise legacy JSONL.

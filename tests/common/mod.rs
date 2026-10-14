@@ -33,6 +33,7 @@ impl TestDatabase {
             "version: 1\ndata_dir: records\n",
         )
         .unwrap();
+        std::fs::create_dir_all(database.root.join(".cr/audit/segments")).unwrap();
         run_success(database.command().args(["audit", "head"]));
         database
     }
@@ -112,5 +113,6 @@ pub fn init_legacy(root: impl AsRef<Path>) -> anyhow::Result<cr::Database> {
         root.join(".cr/config.yaml"),
         "version: 1\ndata_dir: records\n",
     )?;
+    std::fs::create_dir_all(root.join(".cr/audit/segments"))?;
     cr::Database::discover(Some(root))
 }
