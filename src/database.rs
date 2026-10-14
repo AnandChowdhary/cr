@@ -4683,6 +4683,7 @@ impl Database {
         // audited state from here on, and the event it prepares, all come
         // from it.
         let admission = audit.admit()?;
+        let walked_from_first_event = admission.walked_from_first_event();
         let before = self.reveal_document_with_audited_states(
             collection,
             id,
@@ -4754,6 +4755,24 @@ impl Database {
             return Ok(MutationOutcome::Previewed(
                 self.reveal_preview(event.into_preview())?,
             ));
+        }
+        // An update whose result is byte for byte the record it read, bundle
+        // files included, records nothing. By now it has been authorized, its
+        // preconditions hold, and preparing the event checked the record
+        // against its audited state and any approved digest; the signing
+        // check is the one refusal of a commit left, so the record as it
+        // stands is the answer. A message alone is not a change. A keyed
+        // update still records: its event is what makes a retry return this
+        // result rather than apply again to whatever the record has become.
+        if record.version == before_version && idempotency.is_none() {
+            audit.assert_signable(&event)?;
+            // A walk from the first event is still left for the next command,
+            // as an append would have left it, so a run of unchanged updates
+            // pays for one full walk rather than one each.
+            if walked_from_first_event {
+                audit.checkpoint_journal_cache(false);
+            }
+            return Ok(MutationOutcome::Applied(record));
         }
         self.commit_replacement(
             &audit,
@@ -8213,6 +8232,65 @@ mod tests {
         assert!(database.get("items", "one").is_ok());
         std::fs::create_dir(&path).unwrap();
         assert!(database.get("items", "one").is_err());
+    }
+
+    #[test]
+    fn unchanged_updates_leave_one_full_walk_behind_and_write_nothing_else() {
+        use crate::{Assignment, JournalVerification};
+        use std::{fs, os::unix::fs::MetadataExt};
+
+        let root = tempfile::tempdir().unwrap();
+        Database::init(root.path()).unwrap();
+        fs::write(
+            root.path().join(".cr/config.yaml"),
+            "version: 1\ndata_dir: records\naudit:\n  full_walk_after_events: 2\n",
+        )
+        .unwrap();
+        // Each call is a new `cr` process: nothing in memory, and whatever
+        // walk the last write saved on disk.
+        let process = || {
+            Database::discover(Some(root.path()))
+                .unwrap()
+                .with_journal_verification(JournalVerification::Resume)
+        };
+        let set = |database: &Database, value: &str| {
+            let assignment: Assignment = format!("stage={value}").parse().unwrap();
+            crate::audit::reset_verify_chain_calls();
+            database
+                .update("items", "one", &[assignment], None)
+                .unwrap();
+            crate::audit::verify_chain_calls()
+        };
+        let saved = root.path().join(".cr/cache/verified-journal.json");
+        // Every save replaces the file, so its inode says whether one happened.
+        let saved_walk = || fs::metadata(&saved).unwrap().ino();
+
+        process().create("items", "one", &[], "").unwrap();
+        // One event since the walk from the first event the create made.
+        assert_eq!(set(&process(), "open"), 0);
+        // Two: the next write walks from the first event. An unchanged one
+        // leaves that walk for the next command exactly as an append would,
+        // rather than leaving every unchanged update after it to walk again.
+        let before = saved_walk();
+        assert_eq!(set(&process(), "open"), 1);
+        assert_ne!(saved_walk(), before);
+        // One that resumes the saved walk writes nothing at all.
+        let walk = saved_walk();
+        assert_eq!(set(&process(), "open"), 0);
+        assert_eq!(saved_walk(), walk);
+        // The cadence counts events, and unchanged updates add none.
+        assert_eq!(set(&process(), "won"), 0);
+        assert_eq!(set(&process(), "won"), 0);
+        assert_eq!(set(&process(), "lost"), 0);
+        assert_eq!(set(&process(), "lost"), 1);
+        assert_eq!(set(&process(), "lost"), 0);
+        // An unchanged update that found no saved walk leaves one too.
+        fs::remove_file(&saved).unwrap();
+        assert_eq!(set(&process(), "lost"), 1);
+        let walk = saved_walk();
+        assert_eq!(set(&process(), "lost"), 0);
+        assert_eq!(saved_walk(), walk);
+        assert_eq!(process().audit_head().unwrap().sequence, 4);
     }
 
     #[test]

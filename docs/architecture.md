@@ -293,6 +293,8 @@ Version 1 and 2 could hash bytes they did not retain: baselines, direct filesyst
 
 The same replay runs before every mutation and pending-mutation recovery. A journal that already contains an inconsistent change set therefore refuses the write before a pending file, record replacement, or innocent later event can be created. The typed failure is `DomainError::AuditIntegrity`, exposed as `409 audit_integrity_failed`, and names the guilty sequence without a path or field value.
 
+An update whose rendered result is byte for byte the record it read, a bundle's files included, stops after that preparation: it has been authorized, its preconditions hold, and preparing its event against the replay proved the record is its audited state and checked any approved digest, so it answers with the record and writes nothing. An event would hold an empty change set and cost the lock, a commit, and a complete `after_snapshot`, and every later walk of the journal would pay for it again. A message alone is not a change. A keyed update is still committed, because [audited idempotency](#audited-idempotency) answers a retry from the event; without one, a retry after a later change would apply the update again.
+
 ### The audit anchor
 
 The newest event is the one weak point of a hash chain: every other event is pinned by the `previous_hash` of the event after it, and the last one has no successor. `audit head` and `audit verify --expected-head` have always been the mitigation, and their weakness was never cryptographic — it was that using them is a manual step, so nobody did.

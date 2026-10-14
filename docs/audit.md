@@ -1,6 +1,6 @@
 # Audit history and integrity
 
-Every successful `create`, `update`, `link`, `delete`, direct `save`, and changed sync upsert/delete writes an attributed event.
+Every successful `create`, `update`, `link`, `delete`, direct `save`, and changed sync upsert/delete writes an attributed event. An `update` that would leave the record byte for byte as it is writes nothing, unless it carries an idempotency key.
 
 ![The global audit log filtered to one CRM deal, with a field-level change expanded](screenshots/audit-log.jpg)
 
@@ -92,7 +92,10 @@ journal on disk is still what it verified — older segments by their file
 identity, size, and times and the newest byte for byte — rather than walking it
 again. Once 64 events have been appended since a write last verified every
 event from the first, the next write does that instead, so one write in 64 pays
-for a full walk and the rest pay for the events since. Change the interval in
+for a full walk and the rest pay for the events since. An update that changes
+nothing appends no event and leaves the saved walk as it was, unless it was
+the write that walked from the first event, which it saves as an append would
+so that the next write resumes it. Change the interval in
 `.cr/config.yaml`; `1` makes every write walk from the first event:
 
 ```yaml
