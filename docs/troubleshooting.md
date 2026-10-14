@@ -48,6 +48,21 @@ cr save collection/id --message 'Explain the change'
 cr audit verify
 ```
 
+## Commands are slow after upgrading `cr`
+
+Each command resumes the verified walk of the audit journal that the last write
+saved under `.cr/cache/`, but not one an earlier release saved, so after an
+upgrade every read walks the whole journal again until something saves a new
+one. Pay for that once, with no deadline on it, before the commands that have
+one:
+
+```sh
+cr audit verify
+```
+
+It verifies the journal from the first event and saves the walk it made, and
+the commands after it resume from that.
+
 ## Something is wrong and you do not know what
 
 Run `cr check`. It reports every problem it can find in one pass instead of failing on the first one, and its warnings tell you which of them `cr save` would resolve on its own.
