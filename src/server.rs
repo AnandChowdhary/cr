@@ -2939,7 +2939,7 @@ async fn ready(State(state): State<AppState>) -> Response {
 /// body of every page that needed them, which meant the browser re-parsed them
 /// on every navigation, no page could ever declare `script-src 'self'`, and
 /// the JavaScript sat in a Rust file where no editor or linter understood it.
-/// Embedding keeps the single-binary, no-build-step, works-offline property
+/// Embedding keeps the single-binary, works-offline property
 /// that ruled out a CDN in the first place.
 const UI_SCRIPT: &str = include_str!("static/cr.js");
 
@@ -2957,35 +2957,15 @@ static UI_SCRIPT_NAME: LazyLock<String> =
 static UI_SCRIPT_PATH: LazyLock<String> =
     LazyLock::new(|| format!("/static/{}", UI_SCRIPT_NAME.as_str()));
 
-/// htmx, vendored into the binary rather than fetched from a CDN.
-///
-/// These are the bytes of `dist/htmx.min.js` from the published `htmx.org`
-/// 4.0.0 npm tarball — byte for byte what
-/// `unpkg.com/htmx.org@4.0.0/dist/htmx.min.js` serves — with a SHA-256 of
-/// `e484d9171a9db30a39c8f16e3d709d4137f3211c659f8e6125816635033d593f`. The
-/// digest is written down because 36 KiB of minified JavaScript is not
-/// something a reviewer can read in a diff, while "these are exactly the bytes
-/// upstream published" is something they can check in one command. It is not
-/// only a comment: the served URL below embeds that digest's first eight bytes
-/// and `tests/static_assets_http.rs` asserts the whole name, so re-pinning htmx
-/// is necessarily a deliberate commit that updates a failing assertion rather
-/// than a silent file swap.
-///
-/// htmx is 0BSD, whose entire grant is "Permission to use, copy, modify, and/or
-/// distribute this software for any purpose with or without fee is hereby
-/// granted" followed by a warranty disclaimer. It attaches no condition at all:
-/// no notice to reproduce, no attribution to carry, nothing this binary or its
-/// output has to say in order to redistribute the file. That is also why the
-/// minified file has no license header to preserve — upstream ships it without
-/// one. The upstream text is committed beside it as
-/// `src/static/htmx-4.0.0.LICENSE.txt` regardless, because a vendored
-/// dependency whose terms a reader has to leave the tree to find is worse than
-/// one they can read in place.
-const HTMX_SCRIPT: &str = include_str!("static/htmx-4.0.0.min.js");
+/// htmx, fetched and checksum-verified by `build.rs`, then embedded verbatim.
+/// The version, URLs, and full digests live in `build/assets.rs`. Its upstream
+/// 0BSD license is downloaded and verified too; release archives carry both
+/// files in `third-party/`. Browsers only request the embedded, same-origin copy.
+const HTMX_SCRIPT: &str = include_str!(concat!(env!("OUT_DIR"), "/third-party/htmx-4.0.0.min.js"));
 
-/// The vendored release, carried in the served name so the version a page is
+/// The pinned release, carried in the served name so the version a page is
 /// running is legible in a browser's network panel without hashing anything.
-const HTMX_VERSION: &str = "4.0.0";
+const HTMX_VERSION: &str = env!("CR_HTMX_VERSION");
 
 /// `htmx-<version>-<digest>.min.js`, content addressed like `cr-<digest>.js`.
 ///

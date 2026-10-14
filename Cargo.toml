@@ -29,13 +29,10 @@ categories = [
 # CI configuration, and `scripts/tailwind.sh`, which regenerates a stylesheet
 # that is already committed, are meaningless to a downstream consumer.
 #
-# `src/static/` is the deliberate exception to that instinct: the vendored htmx
-# release is ~36 KiB of minified JavaScript and the compiled Tailwind sheet
-# another ~30 KiB, which looks like exactly the kind of weight the line above
-# trims, but `src/server.rs` pulls both in with `include_str!`, so excluding
-# them would publish a crate that does not compile.
-# Shipping it is also the point — it is what lets `cargo install cr` produce a
-# binary whose UI needs no network.
+# `src/static/` contains first-party assets and the compiled Tailwind sheet,
+# all embedded in the binary. `build.rs` and `build/assets.rs` fetch and verify
+# htmx during source builds, including `cargo install --git` and crate installs.
+# Neither building nor running the UI needs Node; the running UI is offline.
 exclude = ["/docs/screenshots/", "/.github/", "/scripts/"]
 
 [dependencies]
@@ -91,6 +88,13 @@ tokio = { version = "1.53.3", features = ["macros", "net", "rt-multi-thread", "s
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 yaml_serde = "0.10.7"
 zeroize = "1.9.1"
+
+[build-dependencies]
+# Reuse the runtime's HTTPS client and digest implementation for pinned assets;
+# source installs need no extra tools such as curl, Node, or npm.
+anyhow = "1.0.104"
+sha2 = "0.11.1"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 http-body-util = "0.1.5"

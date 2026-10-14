@@ -1,12 +1,18 @@
 # Releasing cr
 
-Every push to `main` that changes `src/`, `Cargo.toml`, or `Cargo.lock` is
+Every push to `main` that changes `src/`, `build/`, `build.rs`, `Cargo.toml`, or `Cargo.lock` is
 released by [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 Documentation and CI changes are not. A release builds every target in the
 [install table](installation.md#download-a-release) and attaches
 `cr-<tag>-<target>.tar.gz` archives, `SHA256SUMS`, and one build-provenance
 attestation covering every archive. Its notes are generated from the pull
 requests merged since the previous release.
+
+Each build fetches htmx and its license using `build/assets.rs`'s versioned URLs
+and SHA-256 pins. The script is embedded in the binary; its downloaded bytes
+and license, plus Tailwind's license, ship under `third-party/` in every archive.
+Updating htmx means updating those pins and the filename assertions in the
+static asset tests, without committing upstream files.
 
 ## Choosing the version
 
@@ -34,13 +40,14 @@ The workflow fails before publishing if:
 - a binary reports a version other than the tag's;
 - a glibc build requires glibc newer than 2.35;
 - the musl build is not static;
-- any target fails to build.
+- any target fails to build;
+- an upstream asset cannot be downloaded or does not match its pinned digest.
 
 A tag whose build failed stays on `main` without a release. The next change
 takes the next patch number. To publish the failed version anyway, rerun it
 by hand as below.
 
-A pull request that changes the workflow, `Cargo.toml`, or `Cargo.lock` runs
+A pull request that changes the workflow, `build/`, `build.rs`, `Cargo.toml`, or `Cargo.lock` runs
 the same builds and checks as a dry run, without publishing anything.
 
 ## Editing notes

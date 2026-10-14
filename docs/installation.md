@@ -40,7 +40,9 @@ The checksum proves the download is intact. The attestation proves this
 repository's release workflow built the archive, so a matching file uploaded
 from anywhere else fails verification. Each archive holds the `cr` binary, the
 README, these guides under `docs/`, and the license in a directory with the
-archive's name. To move to a newer release later, see [Update cr](#update-cr).
+archive's name. `third-party/` contains the pinned htmx script, its 0BSD license,
+and Tailwind's MIT license. To move to a newer release later, see
+[Update cr](#update-cr).
 
 ## Build from source
 
@@ -66,6 +68,31 @@ cr --help
 ```
 
 During development, use `cargo run --` instead of the installed command—for example, `cargo run -- --help`.
+
+### Offline source builds
+
+A fresh source build (including `cargo install --git` or a packaged crate)
+downloads htmx 4.0.0 and its license from versioned HTTPS URLs on `unpkg.com`.
+The build verifies both files against the SHA-256 digests in `build/assets.rs`
+before embedding the script. Subsequent builds reuse the verified files in
+Cargo's build output. No Node, npm, or extra download tool is required. Release
+binaries already contain the script and make no asset requests to the internet.
+
+To build without network access, provide the two pinned files in a directory
+and set `CR_ASSET_DIR` to its absolute path. A matching release archive's
+`third-party/` directory already contains `htmx-4.0.0.min.js` and
+`htmx-4.0.0.LICENSE.txt`:
+
+```sh
+CR_ASSET_DIR=/absolute/path/to/third-party cargo build --locked --offline
+```
+
+Cargo dependencies must also be cached or vendored to use `--offline`.
+`CR_ASSET_DIR` forbids asset downloads: a missing file or checksum mismatch
+fails the build, even if a cached copy exists. The same checks apply to
+downloaded and cached files. Cargo's `--offline` flag alone controls Cargo's
+dependency resolution; set `CR_ASSET_DIR` to prevent the build script's HTTPS
+requests as well. Clearing Cargo's build output removes the default asset cache.
 
 ## Update cr
 

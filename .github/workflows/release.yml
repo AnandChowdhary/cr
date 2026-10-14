@@ -16,6 +16,8 @@ on:
       - src/**
       - Cargo.toml
       - Cargo.lock
+      - build.rs
+      - build/**
   # Attach binaries to a release whose tag predates this workflow, or finish
   # one whose publish job failed. Assets already on the release are never
   # replaced; delete one first to rebuild it.
@@ -34,6 +36,8 @@ on:
       - .github/workflows/release.yml
       - Cargo.toml
       - Cargo.lock
+      - build.rs
+      - build/**
 
 # Only the plan job, which pushes a release commit and tag, and the publish
 # job write, and each asks for exactly what it needs.
@@ -258,7 +262,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
 
-      - name: Build
+      # The Cargo build script fetches htmx and its license at pinned versions,
+      # verifies their SHA-256 digests, and embeds the script in the binary.
+      - name: Build with verified third-party assets
         run: cargo build --locked --release --target "$TARGET"
 
       - name: Check the binary
@@ -307,11 +313,13 @@ jobs:
       - name: Package
         run: |
           name="cr-$TAG-$TARGET"
-          mkdir -p "dist/$name/docs"
+          mkdir -p "dist/$name/docs" "dist/$name/third-party"
           cp "target/$TARGET/release/cr" README.md LICENSE "dist/$name/"
           cp docs/*.md "dist/$name/docs/"
-          chmod 0755 "dist/$name" "dist/$name/docs" "dist/$name/cr"
-          chmod 0644 "dist/$name/README.md" "dist/$name/LICENSE" "dist/$name/docs/"*.md
+          cp target/"$TARGET"/release/build/cr-*/out/third-party/* "dist/$name/third-party/"
+          cp src/static/tailwindcss-*.LICENSE.txt "dist/$name/third-party/"
+          chmod 0755 "dist/$name" "dist/$name/docs" "dist/$name/third-party" "dist/$name/cr"
+          chmod 0644 "dist/$name/README.md" "dist/$name/LICENSE" "dist/$name/docs/"*.md "dist/$name/third-party/"*
           if [ "$RUNNER_OS" = macOS ]; then
             COPYFILE_DISABLE=1 tar --no-mac-metadata --uid 0 --gid 0 --numeric-owner \
               -C dist -czf "dist/$name.tar.gz" "$name"
