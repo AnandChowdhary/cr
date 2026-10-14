@@ -191,7 +191,7 @@ async fn every_mutating_form_is_native_or_carries_the_boosted_contract() {
                     "{uri} boosts {form} without targeting it: {tag}"
                 );
                 assert!(
-                    tag.contains(r#"hx-disabled-elt="find button[type=submit]""#),
+                    tag.contains(r#"hx-disable="find button[type=submit]""#),
                     "{uri} boosts {form} without disabling its submit button: {tag}"
                 );
             }

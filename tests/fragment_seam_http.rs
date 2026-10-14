@@ -396,25 +396,17 @@ async fn nothing_short_of_an_htmx_request_naming_a_region_gets_a_fragment() {
     }
 }
 
-/// `cr.js` sets `htmx.config.historyRestoreAsHxRequest` to `false`, so a back or
-/// forward restore is not labelled as an htmx request in the first place, and
-/// htmx sends no `HX-Target` on one either. The server nevertheless refuses a
+/// htmx 4 re-fetches history and cr.js omits `HX-Target` for body swaps.
+/// The server nevertheless refuses a
 /// fragment to any request carrying `HX-History-Restore-Request`, because a
 /// restore replaces the contents of `<body>` with whatever it receives: a
 /// fragment there deletes the sidebar, the progress bar and the skip link, and
-/// the next navigation has nothing to boost from. Three independent reasons for
-/// one answer is the right number when the failure is silent and the check is a
-/// header lookup — and it means whoever turns that configuration back on does
-/// not also have to know that the server depended on it.
+/// the next navigation has nothing to boost from. The explicit server check
+/// keeps restores safe even for clients that send a region target.
 #[tokio::test]
 async fn a_history_restore_is_never_answered_with_a_fragment() {
     let (_temporary, database) = database_with_a_board("seam-history");
     let app = router(database, ServerConfig::default()).unwrap();
-
-    assert!(
-        UI_SCRIPT.contains("historyRestoreAsHxRequest = false"),
-        "cr.js no longer switches off the htmx-request label on history restores"
-    );
 
     for uri in PAGES {
         for region in [CONTENT_REGION, VIEW_TABLE_REGION] {
@@ -437,8 +429,6 @@ async fn a_history_restore_is_never_answered_with_a_fragment() {
         }
     }
 }
-
-const UI_SCRIPT: &str = include_str!("../src/static/cr.js");
 
 #[tokio::test]
 async fn html_answers_declare_every_header_their_representation_depends_on() {

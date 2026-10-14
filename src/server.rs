@@ -2960,10 +2960,10 @@ static UI_SCRIPT_PATH: LazyLock<String> =
 /// htmx, vendored into the binary rather than fetched from a CDN.
 ///
 /// These are the bytes of `dist/htmx.min.js` from the published `htmx.org`
-/// 2.0.10 npm tarball — byte for byte what
-/// `unpkg.com/htmx.org@2.0.10/dist/htmx.min.js` serves — with a SHA-256 of
-/// `71ea67185bfa8c98c39d31717c6fce5d852370fcdfd129db4543774d3145c0de`. The
-/// digest is written down because 50 KiB of minified JavaScript is not
+/// 4.0.0 npm tarball — byte for byte what
+/// `unpkg.com/htmx.org@4.0.0/dist/htmx.min.js` serves — with a SHA-256 of
+/// `e484d9171a9db30a39c8f16e3d709d4137f3211c659f8e6125816635033d593f`. The
+/// digest is written down because 36 KiB of minified JavaScript is not
 /// something a reviewer can read in a diff, while "these are exactly the bytes
 /// upstream published" is something they can check in one command. It is not
 /// only a comment: the served URL below embeds that digest's first eight bytes
@@ -2978,19 +2978,19 @@ static UI_SCRIPT_PATH: LazyLock<String> =
 /// output has to say in order to redistribute the file. That is also why the
 /// minified file has no license header to preserve — upstream ships it without
 /// one. The upstream text is committed beside it as
-/// `src/static/htmx-2.0.10.LICENSE.txt` regardless, because a vendored
+/// `src/static/htmx-4.0.0.LICENSE.txt` regardless, because a vendored
 /// dependency whose terms a reader has to leave the tree to find is worse than
 /// one they can read in place.
-const HTMX_SCRIPT: &str = include_str!("static/htmx-2.0.10.min.js");
+const HTMX_SCRIPT: &str = include_str!("static/htmx-4.0.0.min.js");
 
 /// The vendored release, carried in the served name so the version a page is
 /// running is legible in a browser's network panel without hashing anything.
-const HTMX_VERSION: &str = "2.0.10";
+const HTMX_VERSION: &str = "4.0.0";
 
 /// `htmx-<version>-<digest>.min.js`, content addressed like `cr-<digest>.js`.
 ///
 /// The version alone could not carry the `immutable` promise below: a
-/// re-published or locally patched 2.0.10 would keep the name and leave caches
+/// re-published or locally patched 4.0.0 would keep the name and leave caches
 /// on the old bytes for a year. The version is in the name for humans, the
 /// digest for correctness.
 static HTMX_SCRIPT_NAME: LazyLock<String> = LazyLock::new(|| {
@@ -3111,7 +3111,7 @@ static FAVICON_PATH: LazyLock<String> =
 ///   prevent. It waits for the drag to go through htmx too.
 ///
 /// The **perspective** form answers a switch with `303 See Other` back to `/`
-/// and a new cookie. An `XMLHttpRequest` follows that redirect invisibly, so a
+/// and a new cookie. A `fetch()` follows that redirect invisibly, so a
 /// boosted switch would swap the right page in while pushing `/perspective`
 /// into the address bar. The attribute used to be belt and braces here, because
 /// the `<select>` submitted itself with `form.submit()`, which fires no submit
@@ -10721,7 +10721,7 @@ fn render_save_view_control(
 /// `HX-Location` (`mutation_redirect`) and a refusal with this element again,
 /// marked `CR-Form-Invalid` (`reject_save_view_form`). It points `hx-target` at
 /// itself, which narrows the swap to the form, keeps the popover around it open,
-/// and names `SAVE_VIEW_FORM_REGION` in `HX-Target`. `hx-disabled-elt` is there
+/// and names `SAVE_VIEW_FORM_REGION` in `HX-Target`. `hx-disable` is there
 /// for the reason it is on the record form: a second click is a second
 /// submission, which would be refused as a name already taken by the first.
 fn render_save_view_form(
@@ -10751,7 +10751,7 @@ fn render_save_view_form(
     let group_by_diagnostics = form_diagnostics(rejection, GROUP_BY_CONTROL);
     html! {
         form id=(SAVE_VIEW_FORM_REGION) method="post" action=(action)
-            hx-target="this" hx-swap="outerHTML" hx-disabled-elt="find button[type=submit]" class="cr-save-view" {
+            hx-target="this" hx-swap="outerHTML" hx-disable="find button[type=submit]" class="cr-save-view" {
             input type="hidden" name="_csrf" value=(csrf_token);
             div class="cr-save-view-body" {
                 div {
@@ -13616,12 +13616,12 @@ fn render_record_form(
             // both narrows the answer — the breadcrumb, the heading and the
             // record's activity beside it are not re-rendered — and puts this
             // region's name in `HX-Target`, which is how the server knows a
-            // fragment is wanted. `hx-disabled-elt` covers the gap that makes a
+            // fragment is wanted. `hx-disable` covers the gap that makes a
             // double click dangerous here: an HTML form post deliberately sits
             // outside the `Idempotency-Key` contract the JSON API offers, so two
             // submissions really are two writes, and disabling the button for
             // the life of the request is what stops the second one.
-            hx-target="this" hx-swap="outerHTML" hx-disabled-elt="find button[type=submit]" {
+            hx-target="this" hx-swap="outerHTML" hx-disable="find button[type=submit]" {
             input type="hidden" name="_csrf" value=(csrf_token);
             @if let Some(version) = &expected_version {
                 input type="hidden" name="_expected_record_hash" value=(version);
@@ -14506,7 +14506,7 @@ static VIEW_TABLE_TARGET: LazyLock<String> = LazyLock::new(|| format!("#{VIEW_TA
 /// Both halves are spelled out because both would otherwise be wrong by
 /// default. A boosted element swaps `innerHTML` unless told otherwise — the
 /// response here is the region including its own root element, so it has to be
-/// `outerHTML` — and `htmx.config.scrollIntoViewOnBoost` already scrolls a
+/// `outerHTML` — and htmx already scrolls a
 /// boosted swap's target into view, which is behaviour inherited from the body
 /// swap this replaces rather than a decision about a page turn. Stating
 /// `show:top` makes it the decision it looks like: turning a page or re-sorting
@@ -14519,7 +14519,7 @@ const VIEW_TABLE_SWAP_FROM_INSIDE: &str = "outerHTML show:top";
 ///
 /// The filter and search controls sit in the page heading, and an open filter
 /// panel hangs below them. Scrolling the region to the top of the viewport —
-/// which is what `htmx.config.scrollIntoViewOnBoost` would do, because these
+/// which is what htmx would do, because these
 /// requests are still boosted — would push the panel that submitted them off
 /// the top of the screen, and a panel nobody can see is not meaningfully
 /// different from the panel that used to close on every apply.
@@ -14612,15 +14612,11 @@ const VIEW_INDEX_SUMMARY_URL: &str = "/?summary=inline";
 ///   the HTTP test suite — none of which send it — keep getting the page they
 ///   get today;
 /// * no `HX-History-Restore-Request`, because a restore swaps the response into
-///   `<body>` regardless of what it asked for, and a fragment there would
-///   silently delete the sidebar. `cr.js` sets `historyRestoreAsHxRequest` to
-///   `false` so a restore does not claim to be an htmx request in the first
-///   place, and htmx sends no `HX-Target` on one either, so this check is the
-///   third of three independent reasons a restore gets a document. It is here
-///   because it costs a header lookup and removes the coupling: whoever turns
-///   that configuration back on, for whatever reason, does not also have to
-///   know that this file depends on it;
-/// * an `HX-Target` naming a region *this route renders*. htmx sets that header
+///   `<body>` and a fragment there would silently delete the sidebar. htmx 4
+///   re-fetches history without caching rendered pages. `cr.js` omits the target
+///   header for body swaps too, but the explicit restore check keeps this safe
+///   even for clients that send a region target on a restore;
+/// * an `HX-Target` naming a region *this route renders*. `cr.js` sets that header
 ///   from the `id` of the element it will swap into, so the request states the
 ///   context the answer lands in, and the server can refuse to send a fragment
 ///   into a context it does not recognise. `hx-boost` targets `<body>`, which
@@ -14816,6 +14812,9 @@ fn page_layout(
                 // no particular order.
                 link rel="stylesheet" href=(TAILWIND_STYLESHEET_PATH.as_str());
                 link rel="stylesheet" href=(UI_STYLESHEET_PATH.as_str());
+                // Read during htmx construction, before either deferred script
+                // can configure it. Our progress bar uses cr.css instead.
+                meta name="htmx-config" content=r#"{"includeIndicatorCSS":false}"#;
                 // htmx is linked before `cr.js` because `cr.js` configures
                 // it, and two deferred scripts run in document order.
                 script src=(HTMX_SCRIPT_PATH.as_str()) defer {}
@@ -16659,7 +16658,7 @@ fn see_other(location: &str) -> Response {
 /// `303 See Other` it has always got: the `POST` is answered by a `GET` of the
 /// view, so a reload cannot repeat the write and the notice arrives in the URL.
 ///
-/// htmx gets `204 No Content` and `HX-Location`, because an `XMLHttpRequest`
+/// htmx gets `204 No Content` and `HX-Location`, because a `fetch()`
 /// follows a `303` invisibly. htmx would see only the redirect's *target*, swap
 /// that page's body in, and push the path that was posted to — `/deals/records`,
 /// which renders nothing on its own — into the address bar. `HX-Location` hands
@@ -16686,9 +16685,8 @@ fn mutation_redirect(representation: &Representation, location: &str) -> Respons
 
 /// The response header that tells htmx this answer is a form, not a page.
 ///
-/// htmx refuses to swap a response that is not a success unless something says
-/// otherwise, and the `htmx:beforeSwap` listener in `cr.js` says it for exactly
-/// the responses carrying this header. A header rather than a list of statuses
+/// The `htmx:before:response` listener in `cr.js` permits error responses to
+/// replace a form only when they carry this header. A header rather than a list of statuses
 /// in the browser, because the status of a refused write is the status of the
 /// *refusal* — `422` for a schema violation, `412` for a stale version, `409`
 /// for an identity already taken, `400` for YAML that does not parse — while the
@@ -16723,9 +16721,8 @@ fn html_result(result: ApiResult<Markup>) -> Response {
 
 /// The rendered error page, always as a whole document.
 ///
-/// Deliberately outside the fragment seam. htmx refuses to swap a non-2xx
-/// response unless something says otherwise, and the two things that do are
-/// both in the `htmx:beforeSwap` listener in `cr.js`: a boosted navigation
+/// Deliberately outside the fragment seam. `cr.js` permits an error response
+/// to swap in exactly two cases, both in its `htmx:before:response` listener: a navigation
 /// replacing the whole body, so a click on a link to a deleted record can land on
 /// the 404 page the browser would have shown, and a response carrying
 /// `CR-Form-Invalid`, which this page never does. A targeted request that fails
@@ -16799,8 +16796,8 @@ const HTML_VARY: &str = "Cookie, HX-Request, HX-Target, HX-History-Restore-Reque
 ///   images, fonts, frames, workers, and htmx's requests. This origin and
 ///   nothing else. With no `'unsafe-inline'` no inline script or event
 ///   handler runs and no `<style>` block or `style=` attribute applies, and
-///   with no `'unsafe-eval'` neither does `eval`, which `cr.js` also tells
-///   htmx not to use (`allowEval`).
+///   with no `'unsafe-eval'` neither does `eval`. No htmx attributes contain
+///   JavaScript expressions.
 /// * `object-src 'none'`: no plugin content, which the fallback would allow
 ///   from this origin and nothing here uses.
 /// * `base-uri 'none'`: no page uses `<base>`, and an injected one would

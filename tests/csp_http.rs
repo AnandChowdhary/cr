@@ -634,17 +634,16 @@ async fn htmx_is_configured_to_need_neither_inline_style_nor_eval() {
         .filter_map(|rest| rest.split('"').next())
         .find(|source| source.starts_with("/static/cr-"))
         .expect("the page links cr.js");
-    let script = get(&app, script).await.body;
-    // htmx would otherwise append a `<style>` element to the head for its
-    // `htmx-indicator` class, which the policy refuses.
-    assert!(script.contains("window.htmx.config.includeIndicatorStyles = false;"));
-    // The policy grants no `'unsafe-eval'`; htmx is told so, so a trigger
-    // filter or `hx-on` added later fails with htmx's own error.
-    assert!(script.contains("window.htmx.config.allowEval = false;"));
-    // Both are set before htmx reads them: `cr.js` runs after htmx, which
-    // applies its configuration on DOMContentLoaded.
+    assert_eq!(get(&app, script).await.status, StatusCode::OK);
+    // htmx 4 constructs its indicator sheet when the script first runs. A
+    // meta setting must precede that script; setting it later in cr.js is late.
+    let config_at = home
+        .body
+        .find(r#"<meta name="htmx-config" content="{&quot;includeIndicatorCSS&quot;:false}">"#)
+        .expect("indicator CSS is disabled before htmx construction");
     let htmx_at = home.body.find(r#"<script src="/static/htmx-"#).unwrap();
     let script_at = home.body.find(r#"<script src="/static/cr-"#).unwrap();
+    assert!(config_at < htmx_at);
     assert!(htmx_at < script_at);
 }
 
