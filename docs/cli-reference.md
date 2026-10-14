@@ -121,6 +121,7 @@ cr save --all [--message TEXT] [--json] [--preview] [ATTRIBUTION]
 cr audit log [COLLECTION] [ID] [--by-agent AGENT] [--by-session SESSION] [--limit N] [--json]
 cr audit verify [--expected-head HASH] [--trusted-key KEY|FILE]...
 cr audit head [--json]
+cr audit migrate [--json]
 cr audit anchor [--write] [--json]
 cr audit key generate PATH [--json]
 cr audit key show [PATH] [--json]
@@ -170,3 +171,8 @@ same values separated by commas. A failed signature check is
 [Sign checkpoints](audit.md#sign-checkpoints).
 
 Run `cr COMMAND --help` for complete command-specific help.
+
+`audit migrate` upgrades legacy JSONL audit storage to SQLite once, preserving
+exact events and unsaved files. Stop existing writers first and run as the
+database owner. New databases already use SQLite. See
+[storage and backup details](audit.md#sqlite-audit-storage-and-migration).

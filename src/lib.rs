@@ -39,8 +39,8 @@ pub use attribution::{
 };
 pub use audit::{
     AnchorReport, AnchorStatus, AnchorWrite, AuditAction, AuditAnchor, AuditChange, AuditEntry,
-    AuditFileChange, AuditFileOperation, AuditFilter, AuditHead, AuditSource, AuditVerification,
-    ChangePreview, JournalVerification, RecordActivity, SignatureStatus,
+    AuditFileChange, AuditFileOperation, AuditFilter, AuditHead, AuditMigration, AuditSource,
+    AuditVerification, ChangePreview, JournalVerification, RecordActivity, SignatureStatus,
 };
 pub use bundle::FileChange;
 pub use check::{

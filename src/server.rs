@@ -17879,7 +17879,7 @@ mod tests {
     /// so the number of walks is pinned here, and it does not grow with the
     /// number of collections.
     #[test]
-    fn the_view_index_walks_the_journal_a_fixed_number_of_times() {
+    fn the_sqlite_view_index_does_not_walk_audit_history() {
         let root = tempfile::tempdir().unwrap();
         let database = Database::init(root.path().join("database")).unwrap();
         for collection in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"] {
@@ -17889,19 +17889,18 @@ mod tests {
         }
         let views = database.views().unwrap();
 
-        // One walk for the activity, and one replay every listing shares.
+        // Activity and record ownership come from persisted SQLite projections.
         reset_verify_chain_calls();
         let index = ViewIndex::summarize(&database, &views, &views).unwrap();
-        assert_eq!(verify_chain_calls(), 2);
+        assert_eq!(verify_chain_calls(), 0);
         assert_eq!(index.summary.unwrap().records, Some(12));
 
-        // The server's database keeps the verified journal, so its first index
-        // walks it once and the next does not walk it at all, even after an
-        // append: only the new event is verified.
+        // Fresh and warm server readers both avoid replay, including after
+        // a mutation advances the persisted projections.
         let served = database.with_journal_cache();
         reset_verify_chain_calls();
         ViewIndex::summarize(&served, &views, &views).unwrap();
-        assert_eq!(verify_chain_calls(), 1);
+        assert_eq!(verify_chain_calls(), 0);
         served.create("alpha", "three", &[], "").unwrap();
         reset_verify_chain_calls();
         let index = ViewIndex::summarize(&served, &views, &views).unwrap();

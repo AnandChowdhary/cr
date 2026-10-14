@@ -209,10 +209,7 @@ fn set_env_round_trips_exact_strings_through_encrypted_create_and_update() {
     assert!(stored.contains("$cr_encrypted"));
     assert!(stored.contains("cr-encrypted:v1:"));
     assert!(!stored.contains(first));
-    let audit = fs::read_dir(database.root.join(".cr/audit/segments"))
-        .unwrap()
-        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
-        .collect::<String>();
+    let audit = common::chain::journal_text(&database.root);
     assert!(!audit.contains(first));
 
     let second = "null # remains a string after update";

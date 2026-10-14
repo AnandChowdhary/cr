@@ -270,9 +270,7 @@ fn real_http_server_keeps_encryption_transparent() {
         3
     );
 
-    let raw_audit =
-        std::fs::read_to_string(database.join(".cr/audit/segments/00000000000000000001.jsonl"))
-            .unwrap();
+    let raw_audit = common::chain::journal_text(&database);
     for plaintext in [
         "api-secret",
         "patch-secret",

@@ -65,7 +65,15 @@ fn head(database: &TestDatabase) -> u64 {
 
 #[test]
 fn an_unchanged_update_writes_nothing_and_answers_like_a_recorded_one() {
-    let database = TestDatabase::new("unchanged-update");
+    assert_unchanged_update_writes_nothing(TestDatabase::new("unchanged-update"));
+}
+
+#[test]
+fn a_legacy_unchanged_update_writes_nothing_and_answers_like_a_recorded_one() {
+    assert_unchanged_update_writes_nothing(TestDatabase::new_legacy("unchanged-update-legacy"));
+}
+
+fn assert_unchanged_update_writes_nothing(database: TestDatabase) {
     run_success(database.command().args([
         "create",
         "items",
@@ -77,8 +85,8 @@ fn an_unchanged_update_writes_nothing_and_answers_like_a_recorded_one() {
         "--body",
         "Notes\n",
     ]));
-    // A recorded update first, so the saved walk exists and is what an
-    // unchanged update would rewrite.
+    // A recorded update first, so the audit state (and the saved walk on the
+    // legacy backend) exists before checking that nothing is rewritten.
     run_success(
         database
             .command()
@@ -86,7 +94,10 @@ fn an_unchanged_update_writes_nothing_and_answers_like_a_recorded_one() {
     );
     let current = json(database.command().args(["get", "items", "one", "--json"]));
     let before = snapshot(&database.root);
-    assert!(before.contains_key(Path::new(".cr/cache/verified-journal.json")));
+    assert!(
+        before.contains_key(Path::new(".cr/audit.sqlite"))
+            || before.contains_key(Path::new(".cr/cache/verified-journal.json"))
+    );
 
     for arguments in [
         &["--set", "stage=screening"][..],
@@ -316,7 +327,7 @@ fn an_unchanged_bundle_update_writes_nothing_and_a_changed_file_still_records() 
     let database = TestDatabase::new("unchanged-bundle");
     fs::write(
         database.root.join(".cr/config.yaml"),
-        "version: 1\ncollections:\n  skills:\n    layout: bundle\n    entry: SKILL.md\n",
+        "version: 2\ncollections:\n  skills:\n    layout: bundle\n    entry: SKILL.md\n",
     )
     .unwrap();
     let sources = database.root.join("sources");

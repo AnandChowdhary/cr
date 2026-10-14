@@ -1,6 +1,6 @@
 # Serve scalability review and fixes
 
-Research and implementation date: 2026-10-02. The web app prioritizes quick navigation and bounded output. External edits may take up to five seconds to appear in list results and counts. Permissions, authentication, record details, schema validation, mutation preconditions, and saves continue to read current authoritative data.
+Original research and implementation date: 2026-10-02. Those measurements describe legacy format 1; see the SQLite audit measurements below for format 2. The web app prioritizes quick navigation and bounded output. External edits may take up to five seconds to appear in list results and counts. Permissions, authentication, record details, schema validation, mutation preconditions, and saves continue to read current authoritative data.
 
 ## What changed
 
@@ -99,3 +99,65 @@ Further sorted-ID/query indexes, cold-fill parallelism, persistent SQLite metada
 Synthetic probes and raw results are saved in ignored `.context/` workspace artifacts: `deep_scale_probe.py`, `deep_case_probe.py`, `deep_browser_probe.mjs`, `idempotency_write_benchmark.py`, the `final-*.jsonl` and `all-*.jsonl` results, and verification logs. They operate on synthetic databases and are not shipped with the repository.
 
 The completed change passes **906 tests**, `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --all --check`, `git diff --check`, JavaScript syntax checking, and the regenerated Tailwind stylesheet check. Release probes use `cargo build --release --locked`.
+
+
+## SQLite audit measurements (2026-10-14)
+
+Audit events and their operational indexes now persist in SQLite. New databases
+use format 2; existing databases opt in with `cr audit migrate`. Normal writes,
+retry lookups, history pages, and single-record recovery avoid rebuilding the
+whole journal. Explicit full verification remains linear and retains writer
+coordination. See [the implementation plan](audit-sqlite-plan.md) and
+[migration instructions](audit.md#sqlite-audit-storage-and-migration).
+
+A synthetic release-build probe on this Amazon Linux x86_64 workspace generated
+valid exact hashed history for one small record, with roughly 1 KiB of extra
+message metadata per event. Each cell below is the median of three separate
+CLI processes against warm filesystem cache. The keyed update uses a fresh
+UUID on each invocation. Both backends run through the same binary, with the
+same record and history migrated between measurements.
+
+These measurements predate the legacy saved-walk retry index, unchanged-update,
+and saved-walk recovery optimizations merged in #136, #137, and #138. They compare
+the backends at the time of the probe; the legacy timings are not a fresh
+comparison against those fixes.
+
+| Events / JSONL size | Keyed update, legacy → SQLite | History page of 20, legacy → SQLite | Get, legacy → SQLite |
+| --- | ---: | ---: | ---: |
+| 1,000 / 1.66 MB | 26.61 → 9.89 ms | 17.19 → 7.57 ms | 15.56 → 5.00 ms |
+| 10,000 / 16.64 MB | 124.46 → 9.41 ms | 126.10 → 5.08 ms | 121.60 → 5.15 ms |
+| 100,000 / 166.49 MB | 1,112.13 → 9.93 ms | 1,151.30 → 7.77 ms | 1,070.26 → 6.55 ms |
+
+Migration took 0.11, 1.06, and 10.17 seconds respectively, including independent
+source/destination verification. A trigger aborted event insertion after file
+publication; a fresh `get` recovered the pending SQLite mutation in 9.50, 6.11,
+and 10.06 ms respectively (one recovery sample per history size). These small
+samples demonstrate removal of history-dependent work, not production latency,
+p95/p99, cold-disk behavior, or many-record capacity. The original production
+investigation's journal and timing figures are a separate workload.
+
+Deterministic regression checks additionally perform 130 updates spanning the
+old 64-event verification cadence, then fresh-process-style reads/writes and
+history/activity lookups, asserting zero full replays. Explicit verification
+still performs independent replay. Migration and recovery tests cover exact
+legacy payload preservation, dirty files, encryption, bundles, signing,
+concurrent scoped retries, projection corruption, and interrupted cutover.
+
+On the 100,000-event SQLite fixture, an unkeyed update took 10.00 ms, global
+history of 20 events took 6.44 ms, and retrying an existing key returned the
+exact original result in 7.05 ms (three-process medians). A mixed run used
+12 client workers for 14 HTTP writes, 14 CLI writes, and 28 HTTP reads. All
+56 operations completed successfully in 0.216 seconds; the head advanced
+exactly 28 events and full verification passed afterward. HTTP write median
+was 45.17 ms, CLI write median 60.29 ms, and HTTP read median 11.15 ms. This is
+one short concurrency sample, not a sustained-load capacity estimate.
+
+A separate subprocess-kill probe interrupted migration after over 3 MB of
+uncommitted WAL had been written. Partial inserts rolled back, legacy reads
+still worked, and repeating migration then full verification preserved all
+100,003 source events.
+
+The probes and raw data are ignored workspace artifacts:
+`.context/benchmark_sqlite.py`, `.context/sqlite-benchmark/results.json`,
+`.context/sqlite_mixed_probe.py`, `.context/sqlite-benchmark/mixed-results.json`,
+and `.context/sqlite-killed-migration.log`.

@@ -1,5 +1,14 @@
 # TODO
 
+- [x] **P1 — Move audit history and operational indexes to SQLite.**
+  Format 2 stores exact events, head, pending intent, affected record state/activity,
+  retry identities, encryption transitions, and agent/principal indexes in bundled
+  SQLite. CLI/API/serve and Markdown storage retain their contracts. New databases
+  default to SQLite; `cr audit migrate` validates and imports legacy history once,
+  preserves hashes and dirty files, and retains source segments. Independent full
+  verification checks maintained projections; ordinary writes and recovery avoid
+  whole-history replay. See [the plan](docs/audit-sqlite-plan.md).
+
 This is the canonical backlog for `cr`. It records both desired capabilities and shortcuts or technical debt in the current implementation.
 
 ## Maintenance rule

@@ -227,7 +227,7 @@ fn a_symlinked_database_directory_is_refused() {
 #[test]
 fn the_audit_journal_cannot_be_relocated_by_a_link() {
     for target in [".cr/audit", ".cr/audit/segments"] {
-        let database = TestDatabase::new("linked-audit");
+        let database = TestDatabase::new_legacy("linked-audit");
         let parent = database.root.parent().unwrap().to_path_buf();
         let stolen = parent.join("stolen");
         fs::create_dir_all(&stolen).unwrap();

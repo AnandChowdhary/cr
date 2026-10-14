@@ -1,3 +1,4 @@
+mod common;
 use std::{fs, path::Path, str::FromStr};
 
 use axum::{
@@ -4468,7 +4469,8 @@ async fn html_error_pages_are_redacted_and_carry_a_request_id() {
 /// An HTML failure nobody can act on still says nothing beyond a request ID.
 #[tokio::test]
 async fn unclassified_html_failures_stay_generic() {
-    let (_temporary, database) = test_database("views-internal");
+    let temporary = tempfile::tempdir().unwrap();
+    let database = common::init_legacy(temporary.path().join("views-internal")).unwrap();
     let root = database.root().display().to_string();
     fs::write(
         database

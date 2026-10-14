@@ -89,7 +89,14 @@ fn check_with(mut command: Command, arguments: &[&str]) -> CheckRun {
 
 /// A small database with two collections and one honest relation.
 fn seeded() -> TestDatabase {
-    let database = TestDatabase::new("check");
+    seeded_backend(false)
+}
+fn seeded_backend(legacy: bool) -> TestDatabase {
+    let database = if legacy {
+        TestDatabase::new_legacy("check")
+    } else {
+        TestDatabase::new("check")
+    };
     run_success(
         database
             .command()
@@ -953,7 +960,7 @@ fn a_schema_violation_escalates_the_unsaved_edit_beside_it() {
 
 #[test]
 fn a_damaged_journal_is_reported_without_hiding_the_rest_of_the_database() {
-    let database = seeded();
+    let database = seeded_backend(true);
     // Delete the target so a dangling link exists, then corrupt the chain.
     fs::remove_file(record_path(&database, "companies", "acme")).unwrap();
     let segment = database

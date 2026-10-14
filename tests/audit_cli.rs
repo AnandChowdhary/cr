@@ -200,7 +200,7 @@ fn segment_byte_limit_bounds_the_active_segment() {
 
 #[test]
 fn verification_detects_record_and_log_tampering_and_checks_external_heads() {
-    let database = TestDatabase::new("audit-tampering");
+    let database = TestDatabase::new_legacy("audit-tampering");
     run_success(
         database
             .command()

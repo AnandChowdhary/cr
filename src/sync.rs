@@ -1939,7 +1939,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.unchanged, 3);
-        assert_eq!(crate::audit::verify_chain_calls(), 3);
+        assert_eq!(crate::audit::verify_chain_calls(), 0);
     }
 
     #[test]

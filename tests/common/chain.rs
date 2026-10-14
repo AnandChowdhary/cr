@@ -99,6 +99,26 @@ pub fn segment_paths(root: &Path) -> Vec<std::path::PathBuf> {
 
 /// Read the whole journal as stored events, in chain order.
 pub fn read_chain(root: &Path) -> Vec<StoredEvent> {
+    let config = fs::read_to_string(root.join(".cr/config.yaml")).unwrap_or_default();
+    if config.lines().any(|line| line == "version: 2") {
+        let db = rusqlite::Connection::open(root.join(".cr/audit.sqlite")).unwrap();
+        return db
+            .prepare("SELECT hash,payload FROM events ORDER BY sequence")
+            .unwrap()
+            .query_map([], |r| {
+                let hash: String = r.get(0)?;
+                let payload: String = r.get(1)?;
+                let parsed = serde_json::from_str(&payload).unwrap();
+                Ok(StoredEvent {
+                    hash,
+                    payload,
+                    parsed,
+                })
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+    }
     segment_paths(root)
         .into_iter()
         .flat_map(|path| {
@@ -189,4 +209,11 @@ pub fn reanchor(root: &Path) {
         root,
         &format!("{}\n", serde_json::to_string_pretty(&anchor).unwrap()),
     );
+}
+
+pub fn journal_text(root: &Path) -> String {
+    read_chain(root)
+        .iter()
+        .map(|event| stored_line(&event.hash, &event.payload))
+        .collect()
 }

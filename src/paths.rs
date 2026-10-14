@@ -22,6 +22,10 @@
 //! Platforms without `openat` fall back to checking each component with
 //! `symlink_metadata` before descending. That refuses the same planted links but
 //! keeps a check-then-use window, so the strong guarantee above is a Unix one.
+//!
+//! SQLite audit files use SQLite's VFS rather than these file primitives. Its
+//! NOFOLLOW and path preflight checks reject planted links, but do not provide
+//! this module's descriptor-relative protection against ancestor replacement.
 
 use std::{
     ffi::{OsStr, OsString},
