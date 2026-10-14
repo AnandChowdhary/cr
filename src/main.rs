@@ -1538,6 +1538,11 @@ enum SyncCommand {
 
 #[derive(Debug, Subcommand)]
 enum AuditCommand {
+    /// Migrate legacy JSONL audit history to indexed SQLite storage once.
+    Migrate {
+        #[arg(long)]
+        json: bool,
+    },
     /// Establish audit history for records that predate the audit journal.
     Baseline,
 
@@ -3019,6 +3024,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Command::Audit { command } => match command {
+            AuditCommand::Migrate { json } => {
+                let report = database.audit_migrate()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else if report.migrated {
+                    println!("Migrated {} audit events to SQLite", report.entries);
+                } else {
+                    println!(
+                        "Audit history already uses SQLite ({} events)",
+                        report.entries
+                    );
+                }
+            }
             AuditCommand::Baseline => {
                 let added = database.audit_baseline()?;
                 println!("Added {added} baseline audit events");

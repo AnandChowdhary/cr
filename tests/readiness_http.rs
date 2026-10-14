@@ -241,7 +241,7 @@ fn hold(path: &Path) -> File {
 
 #[tokio::test]
 async fn a_healthy_database_is_ready_once_its_journal_is_verified() {
-    let database = TestDatabase::new("ready-healthy");
+    let database = TestDatabase::new_legacy("ready-healthy");
     run_success(
         database
             .command()
@@ -326,18 +326,18 @@ async fn a_pending_mutation_is_not_ready_until_something_recovers_it() {
 
 #[tokio::test]
 async fn a_configuration_cr_cannot_load_is_not_ready() {
-    let database = TestDatabase::new("ready-config");
+    let database = TestDatabase::new_legacy("ready-config");
     let app = app(database.root());
     settled(&app).await.assert_ready();
 
-    // `cr init` writes no configuration, and none means the defaults.
+    // New databases persist their audit format in configuration.
     let config = database.root().join(".cr/config.yaml");
-    assert!(!config.exists());
+    assert!(config.exists());
     // The server keeps the last configuration that loaded, so it could go on
     // answering; the next `cr` command, and the next start, could not.
     for (contents, why) in [
         ("version: [\n", "not YAML"),
-        ("version: 2\ndata_dir: records\n", "an unsupported format"),
+        ("version: 99\ndata_dir: records\n", "an unsupported format"),
         (
             "version: 1\ndata_dir: records\nsurprise: true\n",
             "an unknown key",

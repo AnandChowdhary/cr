@@ -73,6 +73,7 @@ regex = "1.13.1"
 # RSA implementation; the pure-Rust `rsa` crate would also fail
 # `cargo audit --deny warnings` on RUSTSEC-2023-0071.
 ring = "0.17.14"
+rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_html_form = "0.4.1"
 serde_json = { version = "1.0.151", features = ["raw_value"] }

@@ -93,7 +93,7 @@ impl EncryptionContext {
 }
 
 /// The storage policy compiled from one collection's JSON Schema.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub(crate) struct EncryptionPolicy {
     fields: Vec<Vec<String>>,
     body: bool,
@@ -103,7 +103,7 @@ pub(crate) struct EncryptionPolicy {
 /// audit state. The policy is deliberately retained, not reduced to a boolean:
 /// a later schema marker move must never reinterpret an older envelope under a
 /// different authenticated path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub(crate) struct EncryptionStorageMetadata {
     pub policy: EncryptionPolicy,
     pub has_envelopes: bool,

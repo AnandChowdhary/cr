@@ -1701,7 +1701,8 @@ async fn every_public_error_mapping_is_typed_redacted_and_correlated() {
 
 #[tokio::test]
 async fn unexpected_failures_reveal_only_a_generic_message_and_a_request_id() {
-    let (_temporary, database) = test_database("server-internal");
+    let temporary = tempfile::tempdir().unwrap();
+    let database = common::init_legacy(temporary.path().join("server-internal")).unwrap();
     let root = database.root().display().to_string();
     // A journal whose last line was lost is an internal inconsistency no caller
     // can act on, so it must stay unclassified and redacted.

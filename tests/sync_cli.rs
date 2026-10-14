@@ -691,7 +691,23 @@ fn pause_child_between_audited_mutations(child: &mut std::process::Child, databa
             .open(database.root.join(".cr/audit/lock"))
             .unwrap();
         if lock.try_lock().is_ok() {
-            return;
+            let available = if database.root.join(".cr/audit.sqlite").exists() {
+                rusqlite::Connection::open(database.root.join(".cr/audit.sqlite"))
+                    .ok()
+                    .is_some_and(|connection| {
+                        let _ = connection.busy_timeout(Duration::ZERO);
+                        connection
+                            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                                row.get::<_, i64>(0)
+                            })
+                            .is_ok_and(|busy| busy == 0)
+                    })
+            } else {
+                true
+            };
+            if available {
+                return;
+            }
         }
         // SAFETY: this resumes the same child after the probe found it stopped
         // inside an audited mutation; no other process is addressed.

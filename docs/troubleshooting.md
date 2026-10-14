@@ -1,5 +1,20 @@
 # Troubleshooting
 
+## Slow commands as audit history grows
+
+For format-1 databases, fresh retry lookups and recovery can replay all audit
+history while holding the writer lock. Stop CR writers, back up the database,
+and run `cr audit migrate` to use persistent SQLite indexes. Ordinary SQLite
+writes and single-record recovery avoid those scans; explicit `audit verify`
+and `check` still inspect all history. See [migration](audit.md#sqlite-audit-storage-and-migration).
+
+## Missing or damaged SQLite audit storage
+
+Format 2 requires `.cr/audit.sqlite`. Restore a consistent complete backup;
+retained legacy segments are not current after the first SQLite write. Do not
+delete the file or change config to force a fallback. SQLite WAL sidecars may
+hold committed history, so never remove them from an active database.
+
 ## No database found
 
 Run commands inside the database directory, or pass its root explicitly:
@@ -64,6 +79,12 @@ Prefer changing the adapter to emit `upsert` or `delete` messages so future runs
 
 ## Backups and sensitive data
 
-Back up the whole database directory, not only `records/`; only `.cr/cache/` is safe to leave out, because `cr` rebuilds it. The `.cr/audit/` directory is necessary to verify history and reconcile direct edits, `.cr/encryption.json` is necessary to decrypt protected data, and `.cr/syncs/` plus `.cr/sync/state/` are needed to resume configured incremental imports. Include `.cr-audit-head.json`, and prefer a backup that keeps history—a Git remote rather than a mirror of the current directory—because a backup taken after a tamper is a copy of the tamper, while a history is a record of when it appeared.
+Back up the whole database directory, not only `records/`; only `.cr/cache/` is safe to leave out, because `cr` rebuilds it. The `.cr/audit.sqlite` file and its WAL sidecars (format 2), or `.cr/audit/segments/` (format 1), are necessary to verify history and reconcile direct edits, `.cr/encryption.json` is necessary to decrypt protected data, and `.cr/syncs/` plus `.cr/sync/state/` are needed to resume configured incremental imports. Include `.cr-audit-head.json`, and prefer a backup that keeps history—a Git remote rather than a mirror of the current directory—because a backup taken after a tamper is a copy of the tamper, while a history is a record of when it appeared.
 
 CRM and ATS records often contain personal or confidential information. Apply appropriate filesystem permissions, disk encryption, backup retention, and access controls.
+
+For SQLite backups, stop all CR processes before copying the complete directory.
+An active main database file alone is not a backup: committed events may still
+be in `audit.sqlite-wal`. Live backups need SQLite's backup API plus coordinated
+record-file capture. SQLite storage should be on a local filesystem supporting
+file locks and shared memory, not shared across machines through a network mount.

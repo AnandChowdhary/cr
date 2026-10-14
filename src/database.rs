@@ -59,7 +59,8 @@ use crate::{
 const CONFIG_PATH: &str = ".cr/config.yaml";
 const DATABASE_DIRECTORY: &str = ".cr";
 pub(crate) const SCHEMA_DIRECTORY: &str = ".cr/schemas";
-const CURRENT_FORMAT_VERSION: u32 = 1;
+const LEGACY_FORMAT_VERSION: u32 = 1;
+const CURRENT_FORMAT_VERSION: u32 = 2;
 const IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] = b"cr:idempotency:key:v1\0";
 const IDEMPOTENCY_REQUEST_HASH_DOMAIN: &[u8] = b"cr:idempotency:request:v2\0";
 const MIN_IDEMPOTENCY_KEY_BYTES: usize = 16;
@@ -138,7 +139,7 @@ impl Default for AuditConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            version: CURRENT_FORMAT_VERSION,
+            version: LEGACY_FORMAT_VERSION,
             data_dir: PathBuf::from("records"),
             audit: AuditConfig::default(),
             collections: BTreeMap::new(),
@@ -741,7 +742,10 @@ impl Database {
 
         let database = Self {
             root,
-            config: Config::default(),
+            config: Config {
+                version: CURRENT_FORMAT_VERSION,
+                ..Config::default()
+            },
             layout: RecordLayout::default(),
             actor: String::new(),
             principal: String::new(),
@@ -761,6 +765,13 @@ impl Database {
             view_definitions: Arc::default(),
         };
         let database = database.with_default_actor();
+        database.audit().initialize_sqlite()?;
+        paths::write_new(
+            &database.root,
+            Path::new(CONFIG_PATH),
+            yaml_serde::to_string(&database.config)?.as_bytes(),
+            "the database configuration",
+        )?;
         database.audit().ensure_layout()?;
         Ok(database)
     }
@@ -834,8 +845,10 @@ impl Database {
         };
         let database = database.with_default_actor();
         let audit = database.audit();
-        let _lock = audit.lock()?;
-        audit.recover_pending()?;
+        if !audit.uses_sqlite() || audit.has_pending()? {
+            let _lock = audit.lock()?;
+            audit.recover_pending()?;
+        }
         Ok(database)
     }
 
@@ -999,7 +1012,7 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        let states = audit.record_states()?;
+        let states = audit.collection_states(USERS_COLLECTION)?;
 
         // Validate and authorize the operator before looking up the target.
         // This keeps missing and drifted target identities private from callers
@@ -1761,7 +1774,7 @@ impl Database {
             )));
         }
         // The one walk of the journal this write makes.
-        let admission = audit.admit()?;
+        let admission = audit.admit_records(&[(USERS_COLLECTION, id)])?;
         if admission.is_tombstoned(USERS_COLLECTION, id) {
             if !options.reuse_deleted_id {
                 return Err(user_id_tombstoned(id));
@@ -1906,7 +1919,7 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        let states = audit.record_states()?;
+        let states = audit.collection_states(USERS_COLLECTION)?;
         let principal_state = states
             .get(&(USERS_COLLECTION.to_owned(), self.principal.clone()))
             .and_then(|state| state.document.as_ref().zip(state.hash.as_deref()))
@@ -2223,7 +2236,7 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        let states = audit.record_states()?;
+        let states = audit.collection_states(USERS_COLLECTION)?;
         let now = time::OffsetDateTime::now_utc();
         let mut found = None;
         for ((collection, principal), state) in states.iter() {
@@ -2295,7 +2308,7 @@ impl Database {
         let audit = self.audit();
         let _lock = audit.lock()?;
         audit.recover_pending()?;
-        let states = audit.record_states()?;
+        let states = audit.collection_states(USERS_COLLECTION)?;
         let mut found = None;
         for ((collection, principal), state) in states.iter() {
             if collection != USERS_COLLECTION {
@@ -2445,7 +2458,7 @@ impl Database {
     }
 
     fn has_database_owner_other_than(&self, excluded: &str) -> Result<bool> {
-        let states = self.audit().record_states()?;
+        let states = self.audit().collection_states(USERS_COLLECTION)?;
         for ((collection, id), state) in states.iter() {
             if collection != USERS_COLLECTION || id == excluded {
                 continue;
@@ -2737,7 +2750,7 @@ impl Database {
         let mut admission = None;
         if collection == USERS_COLLECTION
             && admission
-                .insert(audit.admit()?)
+                .insert(audit.admit_records(&[(collection, id)])?)
                 .is_tombstoned(collection, id)
         {
             if !reuse_deleted_user_id {
@@ -2776,7 +2789,7 @@ impl Database {
         let idempotency = self.audit_idempotency(idempotency.as_ref(), &record, &rendered)?;
         let admission = match admission {
             Some(admission) => admission,
-            None => audit.admit()?,
+            None => audit.admit_records(&[(collection, id)])?,
         };
         let no_files = BundleFiles::new();
         let event = audit.prepare_admitted(
@@ -3694,7 +3707,7 @@ impl Database {
         }
 
         let has_history = audit
-            .record_states()?
+            .collection_states(collection)?
             .keys()
             .any(|(record_collection, _)| record_collection == collection);
         if has_history || self.collection_has_record_files(collection)? {
@@ -4098,7 +4111,7 @@ impl Database {
         })?;
 
         let has_history = audit
-            .record_states()?
+            .collection_states(collection)?
             .keys()
             .any(|(record_collection, _)| record_collection == collection);
         if has_history || self.collection_has_record_files(collection)? {
@@ -4682,7 +4695,7 @@ impl Database {
         // The one walk of the journal this write makes. What it reads of the
         // audited state from here on, and the event it prepares, all come
         // from it.
-        let admission = audit.admit()?;
+        let admission = audit.admit_records(&[(collection, id)])?;
         let before = self.reveal_document_with_audited_states(
             collection,
             id,
@@ -4943,7 +4956,9 @@ impl Database {
                         error
                     }
                 })?;
-            let states = admission.insert(audit.admit()?).states();
+            let states = admission
+                .insert(audit.admit_records(&[(collection, id), (target_collection, target_id)])?)
+                .states();
             let target = parse_record(target_collection, target_id, &target_record.raw)?;
             self.reveal_document_with_audited_states(
                 target_collection,
@@ -4971,7 +4986,7 @@ impl Database {
         let before_stored = parse_record(collection, id, &before_raw)?;
         let admission = match admission {
             Some(admission) => admission,
-            None => audit.admit()?,
+            None => audit.admit_records(&[(collection, id), (target_collection, target_id)])?,
         };
         let before = self.reveal_document_with_audited_states(
             collection,
@@ -5265,7 +5280,7 @@ impl Database {
         // The one walk of the journal this write makes. What it reads of the
         // audited state from here on, and the event it prepares, all come
         // from it.
-        let admission = audit.admit()?;
+        let admission = audit.admit_records(&[(collection, id)])?;
         let document = self.reveal_document_with_audited_states(
             collection,
             id,
@@ -5597,6 +5612,62 @@ impl Database {
             audit.save_journal_cache();
         }
         Ok((entries, previews))
+    }
+
+    /// Migrate exact legacy audit events once, retaining the source segments.
+    pub fn audit_migrate(&self) -> Result<crate::audit::AuditMigration> {
+        let audit = self.audit();
+        let _lock = audit.lock()?;
+        audit.recover_pending()?;
+        self.authorize_owner(&AccessResource::Database)?;
+        if audit.uses_sqlite() {
+            let head = audit.migration_head()?;
+            return Ok(crate::audit::AuditMigration {
+                migrated: false,
+                entries: head.sequence,
+                head: head.hash,
+            });
+        }
+        // Older databases can omit config entirely. Persist their legacy
+        // selector before creating SQLite, so a failed import can still reopen
+        // the source without mistaking it for a damaged format-2 database.
+        if paths::entry_kind(
+            &self.root,
+            Path::new(CONFIG_PATH),
+            "the database configuration",
+        )?
+        .is_none()
+        {
+            paths::write_new(
+                &self.root,
+                Path::new(CONFIG_PATH),
+                yaml_serde::to_string(&load_config(&self.root)?)?.as_bytes(),
+                "the database configuration",
+            )?;
+        }
+        let report = audit.migrate_sqlite()?;
+        let mut config = load_config(&self.root)?;
+        config.version = CURRENT_FORMAT_VERSION;
+        let bytes = yaml_serde::to_string(&config)?;
+        match paths::entry_kind(
+            &self.root,
+            Path::new(CONFIG_PATH),
+            "the database configuration",
+        )? {
+            Some(_) => paths::write_replace(
+                &self.root,
+                Path::new(CONFIG_PATH),
+                bytes.as_bytes(),
+                "the database configuration",
+            )?,
+            None => paths::write_new(
+                &self.root,
+                Path::new(CONFIG_PATH),
+                bytes.as_bytes(),
+                "the database configuration",
+            )?,
+        }
+        Ok(report)
     }
 
     pub fn audit_recent(&self, limit: usize, filter: AuditFilter<'_>) -> Result<Vec<AuditEntry>> {
@@ -6467,8 +6538,20 @@ impl Database {
         policy: &EncryptionPolicy,
         audited_states: &mut Option<Arc<AuditedRecordStates>>,
     ) -> Result<Document> {
-        if needs_audited_encryption_ownership(policy) && audited_states.is_none() {
-            *audited_states = Some(self.audit().record_states()?);
+        if needs_audited_encryption_ownership(policy) {
+            if self.audit().uses_sqlite() {
+                let states = self.audit().record_states_for(&[(collection, id)])?;
+                return self.reveal_document_with_policy(
+                    collection,
+                    id,
+                    stored,
+                    policy,
+                    Some(&states),
+                );
+            }
+            if audited_states.is_none() {
+                *audited_states = Some(self.audit().record_states()?);
+            }
         }
         self.reveal_document_with_policy(collection, id, stored, policy, audited_states.as_deref())
     }
@@ -6582,7 +6665,9 @@ impl Database {
     }
 
     fn reveal_preview(&self, preview: ChangePreview) -> Result<ChangePreview> {
-        let states = self.audit().record_states()?;
+        let states = self
+            .audit()
+            .record_states_for(&[(&preview.record.collection, &preview.record.id)])?;
         self.reveal_preview_with_audited_states(preview, &states)
     }
 
@@ -6751,6 +6836,7 @@ impl Database {
             &self.actor,
             &self.attribution,
         )
+        .with_sqlite(self.config.version >= 2)
         .with_layout(&self.layout)
         .with_journal_cache(self.journal.as_deref())
         .with_read_invalidation(&self.reads.generation)
@@ -6955,6 +7041,10 @@ impl Database {
 
 /// Read and validate the configuration beneath `root`. A database without
 /// one uses the defaults.
+pub(crate) fn audit_format_version(root: &Path) -> Result<u32> {
+    Ok(load_config(root)?.version)
+}
+
 fn load_config(root: &Path) -> Result<Config> {
     // The configuration is a definition somebody wrote, so a file that
     // cannot be used is invalid, like a malformed schema or saved view.
@@ -6966,12 +7056,25 @@ fn load_config(root: &Path) -> Result<Config> {
         Some(serialized) => yaml_serde::from_str(&serialized).with_context(|| {
             DomainError::Invalid("the database configuration is not valid YAML".into())
         })?,
-        None => Config::default(),
+        None => {
+            if paths::entry_kind(
+                root,
+                Path::new(".cr/audit.sqlite"),
+                "the SQLite audit database",
+            )?
+            .is_some()
+            {
+                return Err(conflict(
+                    "SQLite audit storage exists but the database configuration is missing; restore the configuration",
+                ));
+            }
+            Config::default()
+        }
     };
 
-    if config.version != CURRENT_FORMAT_VERSION {
+    if config.version != LEGACY_FORMAT_VERSION && config.version != CURRENT_FORMAT_VERSION {
         return Err(invalid(format!(
-            "database format version {} is unsupported (expected {CURRENT_FORMAT_VERSION})",
+            "database format version {} is unsupported (expected {LEGACY_FORMAT_VERSION} or {CURRENT_FORMAT_VERSION})",
             config.version
         )));
     }
@@ -8074,7 +8177,13 @@ mod tests {
         use crate::JournalVerification;
         use std::fs;
         let root = tempfile::tempdir().unwrap();
-        let database = Database::init(root.path())
+        Database::init(root.path()).unwrap();
+        fs::write(
+            root.path().join(".cr/config.yaml"),
+            "version: 1\ndata_dir: records\n",
+        )
+        .unwrap();
+        let database = Database::discover(Some(root.path()))
             .unwrap()
             .with_journal_verification(JournalVerification::Resume);
         database.create("items", "one", &[], "first").unwrap();

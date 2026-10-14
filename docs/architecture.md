@@ -69,7 +69,24 @@ Research sources:
 - [Notion Markdown content API](https://developers.notion.com/guides/data-apis/working-with-markdown-content)
 - [Gmail `users.messages.get`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/get)
 
-## Version 1 layout
+## Audit storage formats
+
+New databases use format 2: `.cr/audit.sqlite` owns exact audit payloads,
+head, pending intent, per-record state/activity, scoped retry identities,
+historical encryption transitions, and agent/principal indexes. Markdown and
+all other configuration remain files. WAL transactions update these projections
+with each event. Ordinary commands use indexed state; independent verification
+streams exact payload bytes and checks the projections. The filesystem writer
+lock still coordinates Markdown, bundle staging, and checkpoint publication.
+See [SQLite storage and migration](audit.md#sqlite-audit-storage-and-migration)
+and [the detailed plan](audit-sqlite-plan.md).
+
+Format 1 remains readable and writable until explicit `cr audit migrate`.
+The layout and saved-walk implementation below describe that legacy backend.
+Format 2 keeps `.cr/audit/lock` and `.cr/audit/staged/`; migrated segments remain
+inactive backups. Format 2 never uses the legacy saved-walk cache.
+
+## Legacy version 1 layout
 
 ```text
 database-root/
@@ -437,9 +454,9 @@ value inherited from `CR_AGENT`; host bookkeeping that belongs to no
 conversation therefore does not need a synthetic session. Recording a delegate
 that cannot be queried answers none of the questions the record exists for.
 
-Segments rotate on configurable event-count and byte-size bounds. Appending atomically rewrites only the active bounded segment; verification and history reads stream segments and never require the complete journal in memory. `audit log` reads newest segments backward until its requested limit is satisfied.
+For legacy format 1, segments rotate on configurable event-count and byte-size bounds. Appending atomically rewrites only the active bounded segment; verification and history reads stream segments and never require the complete journal in memory. `audit log` reads newest segments backward until its requested limit is satisfied.
 
-Writers acquire `.cr/audit/lock`. Before changing a record, the CLI verifies the existing hash chain and confirms that the record's exact bytes match its last audited hash. That is the chain and not the full `audit verify`: a write replays sequence continuity and event hashes but not the per-record change sets, so a journal whose replay is already inconsistent keeps accepting writes and surfaces the inconsistency on the next `audit verify` rather than at the mutation. It then writes and flushes `.cr/audit/pending.json`, atomically changes or deletes the record, commits the event to a segment, and removes the pending file. Startup recovery handles the two possible atomic record states:
+Writers acquire `.cr/audit/lock`. Legacy writes verify or resume the hash chain and replay its semantic transitions, then confirm the record's exact bytes match its last audited hash. SQLite writes validate the new event against the committed head and affected record state; explicit verification independently checks all historical transitions. Format 1 then flushes `.cr/audit/pending.json`, atomically changes or deletes the record, commits the event to a segment, and removes the pending file. Format 2 uses the pending row and transactional append described above. Startup recovery handles the two possible atomic record states:
 
 - previous hash: the mutation did not land, so intent is discarded;
 - next hash: the mutation landed, so the audit event is committed.
@@ -456,9 +473,11 @@ Recovery classifies the folder against the plan. Every file at its before-state 
 
 A read that does not hold the audit lock — `get`, `list`, `search`, the API, the web pages — can meet a bundle write in progress. It skips a file named like a staged write, treats a file or folder that vanished or changed kind between listing and reading as absent, and treats a folder whose entry is not yet written as no record, so a reader never fails on a writer's intermediate state; it can, as with any multi-file change, see a mixture of the two states, whose version no event records. Everything that holds the lock — `status`, `save`, `check`, `audit verify`, and every write — refuses all three instead, since there no write is in progress: a file named like a staged write that recovery did not remove is not `cr`'s, and skipping it would hide a file from the audit.
 
-A single-record write verifies the chain once, after it takes the lock — from the first event, or by resuming the walk the last write saved (see [the verified journal](#the-verified-journal)) — and reads what it needs to know about the records it touches from that walk: the record's last audited hash, whether it once owned encrypted storage, a link target's audited version, and whether a user's ID was deleted. It used to walk the chain a second time immediately before appending. The lock has been held since the walk, so no cooperating writer can have appended in between, and the append instead checks that the journal on disk is still what the walk verified: every sealed segment at its path with the file identity, length, and modification and change times it had, the newest segment beginning with exactly the bytes verified, and anything after them verified by the walk's own rules. Anything already verified that has changed is judged by a walk from the first event instead. The head on disk must then still be the head the event was prepared on, and the event is replayed against its record's verified state before a byte is written, as before. That is the test a cached walk must pass before it is trusted ([the verified journal](#the-verified-journal)), with the newest segment compared byte for byte rather than by digest, so it makes that section's one trade over a much smaller window: a same-length rewrite of a sealed segment that also restores its change time, landing in the milliseconds between a write's walk and its append, gets the event appended rather than refused, and the next walk from the first event reports the rewrite. Bulk `save` has always relied on the same lock, with one walk for every record it accepts. Pending recovery still walks twice, once to decide and once to append, because it runs once, after a crash, and costs nothing worth saving. Walking from the first event, a write costs one walk's worth of time in proportion to history rather than two: on 2,300 events a release build's `update` went from about 470 ms to 240 ms, beside about 230 ms for the walk alone. Resuming, it costs the events appended since the walk it resumes.
+In legacy format 1, a single-record write verifies the chain once, after it takes the lock — from the first event, or by resuming the walk the last write saved (see [the verified journal](#the-verified-journal)) — and reads what it needs to know about the records it touches from that walk: the record's last audited hash, whether it once owned encrypted storage, a link target's audited version, and whether a user's ID was deleted. It used to walk the chain a second time immediately before appending. The lock has been held since the walk, so no cooperating writer can have appended in between, and the append instead checks that the journal on disk is still what the walk verified: every sealed segment at its path with the file identity, length, and modification and change times it had, the newest segment beginning with exactly the bytes verified, and anything after them verified by the walk's own rules. Anything already verified that has changed is judged by a walk from the first event instead. The head on disk must then still be the head the event was prepared on, and the event is replayed against its record's verified state before a byte is written, as before. That is the test a cached walk must pass before it is trusted ([the verified journal](#the-verified-journal)), with the newest segment compared byte for byte rather than by digest, so it makes that section's one trade over a much smaller window: a same-length rewrite of a sealed segment that also restores its change time, landing in the milliseconds between a write's walk and its append, gets the event appended rather than refused, and the next walk from the first event reports the rewrite. Bulk `save` has always relied on the same lock, with one walk for every record it accepts. Legacy pending recovery still walks twice, once to decide and once to append. SQLite recovery reads only the pending intent, head, and affected record state. Walking from the first event, a write costs one walk's worth of time in proportion to history rather than two: on 2,300 events a release build's `update` went from about 470 ms to 240 ms, beside about 230 ms for the walk alone. Resuming, it costs the events appended since the walk it resumes.
 
 ### The verified journal
+
+This section describes legacy format 1. Format 2 uses the persistent SQLite projections described above.
 
 Every read that needs audited state verifies the chain: reading or listing a plaintext collection replays it to check that no record once owned encrypted storage, a view's created and updated columns walk it, `--as` re-derives the operator's and the target's audited policy from it, and under RBAC every server request does the same for its principal. Done from the first event every time, each of those costs more with every write the database has ever had: a server did it several times per request, and a short-lived `cr get` spent its whole run on it.
 

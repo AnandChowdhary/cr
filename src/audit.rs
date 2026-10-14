@@ -1,3 +1,5 @@
+mod sqlite;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     ffi::OsStr,
@@ -45,7 +47,7 @@ use crate::{
 };
 
 /// Exact manifest ownership immediately before and after one verified event.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub(crate) struct AuditEncryptionTransition {
     pub before: Option<EncryptionStorageMetadata>,
     pub after: Option<EncryptionStorageMetadata>,
@@ -81,6 +83,14 @@ pub(crate) fn reset_verify_chain_calls() {
 #[cfg(test)]
 pub(crate) fn verify_chain_calls() -> usize {
     VERIFY_CHAIN_CALLS.with(Cell::get)
+}
+
+/// Result of the one-time audit storage migration.
+#[derive(Clone, Debug, Serialize)]
+pub struct AuditMigration {
+    pub migrated: bool,
+    pub entries: u64,
+    pub head: Option<String>,
 }
 
 /// Where the tamper-evident journal lives beneath the database root.
@@ -1627,6 +1637,7 @@ pub(crate) struct AuditLog<'a> {
     segment_max_bytes: u64,
     actor: &'a str,
     attribution: &'a Attribution,
+    sqlite: bool,
     journal: Option<&'a JournalCache>,
     read_generation: Option<&'a AtomicU64>,
 }
@@ -1780,9 +1791,118 @@ impl<'a> AuditLog<'a> {
             segment_max_bytes,
             actor,
             attribution,
+            sqlite: false,
             journal: None,
             read_generation: None,
         }
+    }
+
+    pub(crate) fn with_sqlite(mut self, enabled: bool) -> Self {
+        self.sqlite = enabled;
+        self
+    }
+
+    pub(crate) fn uses_sqlite(&self) -> bool {
+        self.sqlite
+    }
+
+    fn sqlite_store(&self) -> Result<sqlite::Store> {
+        sqlite::Store::open(self.root)
+    }
+
+    pub(crate) fn migrate_sqlite(&self) -> Result<AuditMigration> {
+        let (states, chain) = self.states(true)?;
+        self.verify_legacy_representation_heads(&states)?;
+        self.anchor_status(self.load_anchor()?.as_ref(), &chain)?;
+        if let Some(trusted) = TrustedKeys::from_environment()? {
+            self.judge_signature(self.load_signature()?.as_ref(), chain.entries, &trusted)?
+                .into_verified()?;
+        }
+        let relative = Path::new(sqlite::PATH);
+        let mut store =
+            if paths::entry_kind(self.root, relative, "the SQLite audit database")?.is_some() {
+                sqlite::Store::open(self.root)?
+            } else {
+                sqlite::Store::create(self.root, relative)?
+            };
+        let destination = store.chain()?;
+        if destination.entries > chain.entries {
+            return Err(conflict(
+                "the SQLite migration destination is ahead of legacy history",
+            ));
+        }
+        store.import(self)?;
+        let imported = store.chain()?;
+        if imported.entries != chain.entries || imported.head_hash != chain.head_hash {
+            return Err(conflict(
+                "the SQLite migration destination does not match legacy history",
+            ));
+        }
+        store.verified_states(true)?;
+        store.check_projections(&states)?;
+        Ok(AuditMigration {
+            migrated: true,
+            entries: chain.entries,
+            head: chain.head_hash,
+        })
+    }
+
+    pub(crate) fn migration_head(&self) -> Result<AuditHead> {
+        let (states, chain) = self.states(true)?;
+        self.verify_legacy_representation_heads(&states)?;
+        self.anchor_status(self.load_anchor()?.as_ref(), &chain)?;
+        Ok(AuditHead {
+            sequence: chain.entries,
+            hash: chain.head_hash,
+        })
+    }
+
+    pub(crate) fn initialize_sqlite(&self) -> Result<()> {
+        sqlite::Store::create(self.root, Path::new(sqlite::PATH))?;
+        paths::open_lock_file(self.root, Path::new(LOCK_PATH), LOCK_LABEL)?;
+        Ok(())
+    }
+
+    fn force_verification(&self) -> bool {
+        self.journal
+            .is_some_and(|journal| journal.save && !journal.resume)
+    }
+
+    pub(crate) fn has_pending(&self) -> Result<bool> {
+        if self.sqlite {
+            return Ok(self.sqlite_store()?.pending()?.is_some());
+        }
+        Ok(paths::entry_kind(self.root, Path::new(PENDING_PATH), PENDING_LABEL)?.is_some())
+    }
+
+    pub(crate) fn admit_records(&self, records: &[(&str, &str)]) -> Result<Admission> {
+        if self.sqlite && !self.force_verification() {
+            let admission = self.sqlite_store()?.admission(Some(records))?;
+            self.verify_legacy_representation_heads(admission.states())?;
+            return Ok(admission);
+        }
+        self.admit()
+    }
+
+    pub(crate) fn record_states_for(
+        &self,
+        records: &[(&str, &str)],
+    ) -> Result<Arc<AuditedRecordStates>> {
+        if self.sqlite && !self.force_verification() {
+            let admission = self.sqlite_store()?.admission(Some(records))?;
+            self.verify_legacy_representation_heads(admission.states())?;
+            return Ok(admission.journal.states);
+        }
+        self.record_states()
+    }
+
+    pub(crate) fn collection_states(&self, collection: &str) -> Result<Arc<AuditedRecordStates>> {
+        if self.sqlite && !self.force_verification() {
+            let states = self.sqlite_store()?.states(Some(collection))?;
+            self.verify_legacy_representation_heads(&states)?;
+            return Ok(Arc::new(states));
+        }
+        self.record_states()
     }
 
     /// Store the collections `layout` names as bundles.
@@ -1843,6 +1963,10 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn ensure_layout(&self) -> Result<()> {
+        if self.sqlite {
+            self.sqlite_store()?;
+            return Ok(());
+        }
         paths::create_directory_all(
             self.root,
             Path::new(SEGMENT_DIRECTORY),
@@ -1855,6 +1979,15 @@ impl<'a> AuditLog<'a> {
         self.ensure_layout()?;
         let lock = paths::open_lock_file(self.root, Path::new(LOCK_PATH), LOCK_LABEL)?;
         lock.lock().context("could not lock the audit journal")?;
+        // A process may have opened format 1 before waiting for migration.
+        // Recheck after acquiring writer coordination so it cannot append to
+        // retired segments after the new configuration has been published.
+        let version = crate::database::audit_format_version(self.root)?;
+        if (version >= 2) != self.sqlite {
+            return Err(conflict(
+                "audit storage changed while waiting; reopen the database and retry",
+            ));
+        }
         Ok(lock)
     }
 
@@ -1869,6 +2002,9 @@ impl<'a> AuditLog<'a> {
     /// copy of the walk is left there for the readers after it, and a walk
     /// that fails leaves nothing cached.
     pub(crate) fn admit(&self) -> Result<Admission> {
+        if self.sqlite && !self.force_verification() {
+            return self.sqlite_store()?.admission(None);
+        }
         let journal = match self.resumed_admission() {
             Some(journal) => journal,
             None => self.walk_fresh()?,
@@ -1909,7 +2045,7 @@ impl<'a> AuditLog<'a> {
 
     /// Prepare one event against a walk of the whole journal made here.
     pub fn prepare(&self, mutation: AuditMutation<'_>) -> Result<PreparedEntry> {
-        let admission = self.admit()?;
+        let admission = self.admit_records(&[(mutation.collection, mutation.id)])?;
         self.prepare_admitted(mutation, admission)
     }
 
@@ -1979,7 +2115,12 @@ impl<'a> AuditLog<'a> {
     /// Capture one verified generation for a locked multi-record filesystem
     /// reconciliation.
     pub(crate) fn reconciliation_snapshot(&self) -> Result<ReconciliationSnapshot> {
-        let (states, chain) = self.states(false)?;
+        let (states, chain) = if self.sqlite && !self.force_verification() {
+            let store = self.sqlite_store()?;
+            (store.states(None)?, store.chain()?)
+        } else {
+            self.states(false)?
+        };
         self.verify_legacy_representation_heads(&states)?;
         Ok(ReconciliationSnapshot { states, chain })
     }
@@ -2119,7 +2260,7 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn assert_current(&self, collection: &str, id: &str, contents: &[u8]) -> Result<()> {
-        let states = self.record_states()?;
+        let states = self.record_states_for(&[(collection, id)])?;
         Self::assert_current_in(&states, collection, id, contents)
     }
 
@@ -2335,6 +2476,15 @@ impl<'a> AuditLog<'a> {
     /// that instant only delays a writer, which waits for it rather than
     /// giving up.
     pub(crate) fn interrupted_mutation(&self) -> Result<bool> {
+        if self.sqlite {
+            if !self.has_pending()? {
+                return Ok(false);
+            }
+            return match paths::try_lock_existing(self.root, Path::new(LOCK_PATH), LOCK_LABEL)? {
+                LockState::Held => Ok(false),
+                LockState::Free(_lock) => self.has_pending(),
+            };
+        }
         let pending = Path::new(PENDING_PATH);
         if paths::entry_kind(self.root, pending, PENDING_LABEL)?.is_none() {
             return Ok(false);
@@ -2350,9 +2500,12 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn recover_pending(&self) -> Result<()> {
-        let Some(serialized) =
+        let serialized = if self.sqlite {
+            self.sqlite_store()?.pending()?
+        } else {
             paths::read_optional(self.root, Path::new(PENDING_PATH), PENDING_LABEL)?
-        else {
+        };
+        let Some(serialized) = serialized else {
             // A crash after staging a bundle write's contents and before
             // recording the write leaves contents nothing refers to.
             return self.clear_staged();
@@ -2406,7 +2559,16 @@ impl<'a> AuditLog<'a> {
         // Recovery is a write path too. Refuse to append or bless a pending
         // event on top of a journal whose change sets no longer reproduce the
         // states they claim, and name the guilty committed sequence first.
-        let (mut states, mut chain) = self.states(false)?;
+        let (mut states, mut chain) = if self.sqlite {
+            let store = self.sqlite_store()?;
+            let admission = store.admission(Some(&[(collection, id)]))?;
+            (
+                Arc::unwrap_or_clone(admission.journal.states),
+                store.chain()?,
+            )
+        } else {
+            self.states(false)?
+        };
         self.verify_legacy_representation_heads(&states)?;
         let head = self.load_head()?;
 
@@ -2416,6 +2578,14 @@ impl<'a> AuditLog<'a> {
                     bail!(
                         "audit event was committed but the record does not match its audited state"
                     );
+                }
+                if self.sqlite {
+                    let signer = self.append_signer(payload.sequence)?;
+                    let anchor = AuditAnchor::of(&head.entry);
+                    self.store_anchor(&anchor)?;
+                    if let Some(signer) = signer {
+                        self.sign_checkpoint(&signer, &anchor)?;
+                    }
                 }
                 self.clear_pending()?;
                 return Ok(());
@@ -2522,6 +2692,19 @@ impl<'a> AuditLog<'a> {
         key_hash: &str,
         request_hash: &str,
     ) -> Result<Option<(AuditIdempotencyResult, BundleFiles)>> {
+        if self.sqlite {
+            if self.force_verification() {
+                self.states(true)?;
+            }
+            return self.sqlite_store()?.idempotency_result(
+                principal,
+                operation,
+                collection,
+                id,
+                key_hash,
+                request_hash,
+            );
+        }
         if let Some(journal) = self.journal {
             let history = self.verified_history(journal)?;
             let identity = IdempotencyIdentity {
@@ -2610,6 +2793,12 @@ impl<'a> AuditLog<'a> {
         filter: AuditFilter<'_>,
         mut visible: impl FnMut(&AuditEntry) -> Result<bool>,
     ) -> Result<Vec<AuditEntry>> {
+        if self.sqlite {
+            return Ok(self
+                .sqlite_store()?
+                .history(limit, None, filter, visible)?
+                .entries);
+        }
         self.verify_chain(|_, _| Ok(()))?;
         let mut result = Vec::new();
         let paths = self.segment_paths()?;
@@ -2641,6 +2830,12 @@ impl<'a> AuditLog<'a> {
         filter: AuditFilter<'_>,
         visible: impl FnMut(&AuditEntry) -> Result<bool>,
     ) -> Result<AuditHistory> {
+        if self.sqlite {
+            if self.force_verification() {
+                self.states(true)?;
+            }
+            return self.sqlite_store()?.history(limit, before, filter, visible);
+        }
         if let Some(journal) = self.journal {
             let history = self.verified_history(journal)?;
             return self.indexed_history(&history, limit, before, filter, visible);
@@ -2671,6 +2866,12 @@ impl<'a> AuditLog<'a> {
         filter: AuditFilter<'_>,
         mut visible: impl FnMut(&AuditEntry) -> Result<bool>,
     ) -> Result<AuditHistory> {
+        if self.sqlite {
+            if self.force_verification() {
+                self.states(true)?;
+            }
+            return self.sqlite_store()?.history(limit, None, filter, visible);
+        }
         if let Some(journal) = self.journal {
             let history = self.verified_history(journal)?;
             return self.indexed_history(&history, limit, None, filter, visible);
@@ -2770,6 +2971,13 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn head(&self) -> Result<AuditHead> {
+        if self.sqlite && !self.force_verification() {
+            let chain = self.sqlite_store()?.chain()?;
+            return Ok(AuditHead {
+                sequence: chain.entries,
+                hash: chain.head_hash,
+            });
+        }
         let state = self.verify_chain(|_, _| Ok(()))?;
         Ok(AuditHead {
             sequence: state.entries,
@@ -2780,6 +2988,9 @@ impl<'a> AuditLog<'a> {
     /// A background observer needs the same up-to-date verified head as
     /// ordinary reads, rather than a new full-chain integrity audit per tick.
     pub(crate) fn cached_head(&self) -> Result<AuditHead> {
+        if self.sqlite {
+            return self.head();
+        }
         match self.journal {
             Some(journal) => Ok(self.cached_journal(journal)?.head),
             None => self.head(),
@@ -2807,6 +3018,10 @@ impl<'a> AuditLog<'a> {
     /// before lazily creating a context for a database initialized by an older
     /// CR version, including when the encrypted record was later deleted.
     pub(crate) fn contains_protected_storage(&self) -> Result<bool> {
+        if self.sqlite && !self.force_verification() {
+            return self.sqlite_store()?.contains_protected();
+        }
+
         Ok(self
             .encryption_storage_transitions()?
             .values()
@@ -3186,6 +3401,9 @@ impl<'a> AuditLog<'a> {
     /// [`Self::anchor_at`], so the first line of the first segment is that
     /// event.
     fn first_event_hash(&self) -> Result<Option<String>> {
+        if self.sqlite {
+            return Ok(self.sqlite_store()?.event(1)?.map(|event| event.entry.hash));
+        }
         let Some(path) = self.listed_segment_paths()?.into_iter().next() else {
             return Ok(None);
         };
@@ -3316,6 +3534,12 @@ impl<'a> AuditLog<'a> {
     /// sequence continuity, so the segment that starts at or before `sequence`
     /// is the only one that can contain it.
     fn anchor_at(&self, sequence: u64) -> Result<Option<AuditAnchor>> {
+        if self.sqlite {
+            return Ok(self
+                .sqlite_store()?
+                .event(sequence)?
+                .map(|event| AuditAnchor::of(&event.entry)));
+        }
         if sequence == 0 {
             return Ok(None);
         }
@@ -3379,6 +3603,14 @@ impl<'a> AuditLog<'a> {
     }
 
     pub fn record_states(&self) -> Result<Arc<AuditedRecordStates>> {
+        if self.sqlite && self.force_verification() {
+            return Ok(Arc::new(self.states(true)?.0));
+        }
+        if self.sqlite {
+            let states = self.sqlite_store()?.states(None)?;
+            self.verify_legacy_representation_heads(&states)?;
+            return Ok(Arc::new(states));
+        }
         let states = match self.journal {
             Some(journal) => self.cached_journal(journal)?.states,
             None => Arc::new(self.states(false)?.0),
@@ -3399,6 +3631,13 @@ impl<'a> AuditLog<'a> {
         &self,
         collection: &str,
     ) -> Result<BTreeMap<String, RecordActivity>> {
+        if self.sqlite {
+            return Ok(self
+                .sqlite_store()?
+                .activity_for(Some(collection), |_| true)?
+                .remove(collection)
+                .unwrap_or_default());
+        }
         Ok(self
             .collections_activity(|name| name == collection)?
             .remove(collection)
@@ -3412,6 +3651,9 @@ impl<'a> AuditLog<'a> {
         &self,
         include: impl Fn(&str) -> bool,
     ) -> Result<CollectionsActivity> {
+        if self.sqlite {
+            return self.sqlite_store()?.activity(include);
+        }
         if let Some(journal) = self.journal {
             return Ok(self
                 .cached_journal(journal)?
@@ -3442,6 +3684,10 @@ impl<'a> AuditLog<'a> {
     /// gone. `Err` is a newest segment that cannot be read or whose last event
     /// does not parse or match its own hash.
     pub(crate) fn probe_journal(&self) -> Result<JournalProbe> {
+        if self.sqlite {
+            self.sqlite_store()?.chain()?;
+            return Ok(JournalProbe::Consistent);
+        }
         let Some(journal) = self.journal else {
             return Ok(JournalProbe::Unverified);
         };
@@ -3471,6 +3717,12 @@ impl<'a> AuditLog<'a> {
     /// The last event of the newest segment, checked against nothing but its
     /// own hash.
     fn newest_event(&self) -> Result<Option<AuditEntry>> {
+        if self.sqlite {
+            let store = self.sqlite_store()?;
+            return Ok(store
+                .event(store.chain()?.entries)?
+                .map(|event| event.entry));
+        }
         let paths = self.listed_segment_paths()?;
         let Some(path) = paths.last() else {
             return Ok(None);
@@ -3529,6 +3781,16 @@ impl<'a> AuditLog<'a> {
     /// descends from one at most [`JournalCache::full_walk_after`] events
     /// back.
     fn walk_fresh(&self) -> Result<VerifiedJournal> {
+        if self.sqlite {
+            let (states, chain) = self.states(true)?;
+            let mut journal = VerifiedJournal::new();
+            journal.states = Arc::new(states);
+            journal.walk.expected_sequence = chain.entries + 1;
+            journal.walk.previous_hash = chain.head_hash;
+            journal.walk.previous_version = chain.head_version;
+            journal.walk.idempotency_identities = chain.idempotency_identities;
+            return Ok(journal);
+        }
         let walked = self
             .segment_paths()
             .and_then(|paths| self.walk_journal(&paths));
@@ -3606,6 +3868,9 @@ impl<'a> AuditLog<'a> {
     }
 
     pub(crate) fn checkpoint_journal_cache(&self, draining: bool) {
+        if self.sqlite {
+            return;
+        }
         let Some(journal) = self.journal.filter(|journal| journal.save) else {
             return;
         };
@@ -3749,6 +4014,10 @@ impl<'a> AuditLog<'a> {
     /// lifecycle. The complete verified chain is examined; a page or recent
     /// history limit can never make an identity appear unused.
     pub(crate) fn principal_has_external_history(&self, principal: &str) -> Result<bool> {
+        if self.sqlite && !self.force_verification() {
+            return self.sqlite_store()?.principal_used(principal);
+        }
+
         let mut used = false;
         self.verify_chain(|entry, _| {
             let access = entry.payload.access.as_ref();
@@ -3786,6 +4055,9 @@ impl<'a> AuditLog<'a> {
     /// With a journal cache attached, the unchecked replay is also left in the
     /// cache for the readers that follow, but it never starts from the cache.
     fn states(&self, check_approvals: bool) -> Result<(AuditedRecordStates, ChainState)> {
+        if self.sqlite {
+            return self.sqlite_store()?.verified_states(check_approvals);
+        }
         if !check_approvals && self.journal.is_some() {
             let walked = self.walk_fresh()?;
             return Ok((Arc::unwrap_or_clone(walked.states), walked.walk.finish()));
@@ -3838,6 +4110,9 @@ impl<'a> AuditLog<'a> {
     /// change set that does not apply is refused here even though preparation
     /// refuses them too.
     fn append(&self, entry: &PreparedEntry, admission: Option<Admission>) -> Result<()> {
+        if self.sqlite {
+            return self.append_sqlite(entry);
+        }
         let Some(admission) = admission else {
             let (states, chain) = self.states(false)?;
             let mut snapshot = ReconciliationSnapshot { states, chain };
@@ -3873,11 +4148,42 @@ impl<'a> AuditLog<'a> {
         Ok(())
     }
 
+    fn append_sqlite(&self, entry: &PreparedEntry) -> Result<()> {
+        let mut store = self.sqlite_store()?;
+        let head = store.chain()?;
+        let signer = self.append_signer(head.entries)?;
+        store.append(entry)?;
+        if let Some(generation) = self.read_generation {
+            generation.fetch_add(1, Ordering::AcqRel);
+        }
+        let anchor = AuditAnchor::at(entry.parsed.sequence, &entry.hash, &entry.parsed.timestamp);
+        self.store_anchor(&anchor)
+            .context("the audit event was committed but the audit anchor could not be updated")?;
+        if let Some(signer) = signer {
+            self.sign_checkpoint(&signer, &anchor)?;
+        }
+        Ok(())
+    }
+
     fn append_in_snapshot(
         &self,
         entry: &PreparedEntry,
         snapshot: &mut ReconciliationSnapshot,
     ) -> Result<()> {
+        if self.sqlite {
+            self.append_sqlite(entry)?;
+            replay_entry(
+                &mut snapshot.states,
+                &AuditEntry {
+                    hash: entry.hash.clone(),
+                    payload: entry.parsed.clone(),
+                },
+            )?;
+            snapshot.chain.entries = entry.parsed.sequence;
+            snapshot.chain.head_hash = Some(entry.hash.clone());
+            snapshot.chain.head_version = Some(entry.parsed.version);
+            return Ok(());
+        }
         register_idempotency_identity(&mut snapshot.chain.idempotency_identities, &entry.parsed)?;
         let head = self.load_head()?;
         let disk_sequence = head.as_ref().map_or(0, |head| head.entry.payload.sequence);
@@ -3962,6 +4268,16 @@ impl<'a> AuditLog<'a> {
     }
 
     fn load_head(&self) -> Result<Option<LoadedHead>> {
+        if self.sqlite {
+            let store = self.sqlite_store()?;
+            return Ok(store
+                .event(store.chain()?.entries)?
+                .map(|stored| LoadedHead {
+                    entry: stored.entry,
+                    segment_path: PathBuf::new(),
+                    segment_entries: 0,
+                }));
+        }
         let paths = self.segment_paths()?;
         let Some(path) = paths.last() else {
             return Ok(None);
@@ -4000,6 +4316,9 @@ impl<'a> AuditLog<'a> {
     where
         F: FnMut(&AuditEntry, &str) -> Result<()>,
     {
+        if self.sqlite {
+            return self.sqlite_store()?.stream(visitor);
+        }
         #[cfg(test)]
         VERIFY_CHAIN_CALLS.with(|calls| calls.set(calls.get() + 1));
         let mut walk = ChainWalk::new();
@@ -4196,6 +4515,10 @@ impl<'a> AuditLog<'a> {
     }
 
     fn clear_pending(&self) -> Result<()> {
+        if self.sqlite {
+            self.sqlite_store()?.clear_pending()?;
+            return self.clear_staged();
+        }
         let path = Path::new(PENDING_PATH);
         if paths::entry_kind(self.root, path, PENDING_LABEL)?.is_some() {
             paths::remove_file(self.root, path, PENDING_LABEL)?;
@@ -4204,6 +4527,9 @@ impl<'a> AuditLog<'a> {
     }
 
     fn store_pending(&self, pending: &PendingMutation) -> Result<()> {
+        if self.sqlite {
+            return self.sqlite_store()?.store_pending(pending);
+        }
         let bytes = serde_json::to_vec_pretty(pending)
             .context("could not serialize pending audit mutation")?;
         paths::write_new(self.root, Path::new(PENDING_PATH), &bytes, PENDING_LABEL)
@@ -5088,6 +5414,17 @@ mod tests {
     };
     use std::cell::Cell;
 
+    fn legacy_database(root: impl AsRef<std::path::Path>) -> anyhow::Result<Database> {
+        let root = root.as_ref();
+        Database::init(root)?;
+        std::fs::remove_file(root.join(".cr/audit.sqlite"))?;
+        std::fs::write(
+            root.join(".cr/config.yaml"),
+            "version: 1\ndata_dir: records\n",
+        )?;
+        Database::discover(Some(root))
+    }
+
     /// One audit event written by `cr` at `0ca95fb`, before `agent`,
     /// `authorization`, and `intent` existed, copied verbatim out of
     /// `tests/fixtures/legacy-journal`.
@@ -5111,7 +5448,7 @@ mod tests {
     #[test]
     fn serving_writes_advance_the_shared_walk_without_cloning_all_record_states() {
         let temporary = tempfile::tempdir().unwrap();
-        let database = Database::init(temporary.path().join("serve-walk"))
+        let database = legacy_database(temporary.path().join("serve-walk"))
             .unwrap()
             .with_journal_verification(JournalVerification::Resume)
             .with_server_cache();
@@ -5741,7 +6078,7 @@ mod tests {
         root: &std::path::Path,
         segment_max_events: usize,
     ) -> (Database, Database) {
-        Database::init(root).unwrap();
+        legacy_database(root).unwrap();
         std::fs::write(
             root.join(".cr/config.yaml"),
             format!(
@@ -5813,7 +6150,7 @@ mod tests {
         use crate::FileChange;
 
         let root = tempfile::tempdir().unwrap();
-        Database::init(root.path()).unwrap();
+        legacy_database(root.path()).unwrap();
         std::fs::write(
             root.path().join(".cr/config.yaml"),
             "version: 1\ndata_dir: records\ncollections:\n  items:\n    layout: bundle\naudit:\n  segment_max_events: 2\n",
@@ -6652,7 +6989,7 @@ mod tests {
     #[test]
     fn delegation_and_the_read_it_delegates_share_one_walk() {
         let root = tempfile::tempdir().unwrap();
-        let owner = Database::init(root.path())
+        let owner = legacy_database(root.path())
             .unwrap()
             .with_actor("owner@example.com")
             .unwrap();
@@ -6782,7 +7119,7 @@ mod tests {
         ] {
             let which = format!("{verification:?}");
             let root = tempfile::tempdir().unwrap();
-            let database = Database::init(root.path())
+            let database = legacy_database(root.path())
                 .unwrap()
                 .with_actor("owner@example.com")
                 .unwrap();
@@ -6977,7 +7314,7 @@ mod tests {
     #[test]
     fn bulk_save_preview_and_apply_share_one_verified_replay() {
         let root = tempfile::tempdir().unwrap();
-        let database = Database::init(root.path().join("database"))
+        let database = legacy_database(root.path().join("database"))
             .unwrap()
             .with_actor("tester@example.com")
             .unwrap();

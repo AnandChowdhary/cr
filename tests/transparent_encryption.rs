@@ -89,16 +89,7 @@ fn envelope_lines(raw: &str) -> Vec<&str> {
 }
 
 fn audit_bytes(database: &TestDatabase) -> String {
-    let directory = database.root.join(".cr/audit/segments");
-    let mut paths = fs::read_dir(directory)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths
-        .iter()
-        .map(|path| fs::read_to_string(path).unwrap())
-        .collect()
+    common::chain::journal_text(&database.root)
 }
 
 fn encryption_context(database: &TestDatabase) -> String {
@@ -286,7 +277,7 @@ fn protected_idempotency_keeps_ciphertext_durable_and_replays_logical_plaintext(
 
     fs::write(
         database.root.join(".cr/config.yaml"),
-        "version: 1\ndata_dir: content/data\n",
+        "version: 2\ndata_dir: content/data\n",
     )
     .unwrap();
     fs::create_dir_all(database.root.join("content/data")).unwrap();

@@ -91,7 +91,7 @@ fn signing(database: &TestDatabase, key: &Key) -> Command {
 /// One create and one attributed update, both signed: the seed the
 /// forged-head specification uses.
 fn seeded(name: &str, key: &Key) -> TestDatabase {
-    let database = TestDatabase::new(name);
+    let database = TestDatabase::new_legacy(name);
     run_success(signing(&database, key).args([
         "create",
         "items",
@@ -609,7 +609,7 @@ fn a_signature_copied_from_another_database_is_refused() {
 #[test]
 fn unsigned_databases_are_unchanged() {
     let key = generate_key();
-    let database = TestDatabase::new("unsigned");
+    let database = TestDatabase::new_legacy("unsigned");
     run_success(unkeyed(&database).args(["create", "items", "one", "--set", "stage=screening"]));
     run_success(unkeyed(&database).args(["update", "items", "one", "--set", "stage=hired"]));
     assert!(!database.root.join(SIGNATURE_PATH).exists());
@@ -650,7 +650,7 @@ fn unsigned_databases_are_unchanged() {
     assert_head_signed_by(&database.root, &key);
 
     // A new database has no history to vouch for, so its first event signs.
-    let fresh = TestDatabase::new("signed-from-the-start");
+    let fresh = TestDatabase::new_legacy("signed-from-the-start");
     run_success(signing(&fresh, &key).args(["create", "items", "one"]));
     assert_head_signed_by(&fresh.root, &key);
 }
@@ -773,7 +773,7 @@ fn keys_inside_the_database_are_warned_about() {
 
 #[test]
 fn an_unusable_signing_key_refuses_the_write_before_anything_is_written() {
-    let database = TestDatabase::new("signed-broken-key");
+    let database = TestDatabase::new_legacy("signed-broken-key");
     run_success(unkeyed(&database).args(["create", "items", "one"]));
     let missing = database.root.with_file_name("no-such.key");
     let error = error_envelope(unkeyed(&database).env(SIGNING_KEY_ENV, &missing).args([
@@ -895,7 +895,7 @@ async fn the_rest_routes_verify_signatures_with_inline_keys_only() {
     );
 
     // An unsigned database verifies to exactly the response it always did.
-    let unsigned = TestDatabase::new("unsigned-http");
+    let unsigned = TestDatabase::new_legacy("unsigned-http");
     run_success(unkeyed(&unsigned).args(["create", "items", "one"]));
     let (status, body) = get(&served(&unsigned), "/api/v1/audit/verify").await;
     assert_eq!(status, StatusCode::OK);

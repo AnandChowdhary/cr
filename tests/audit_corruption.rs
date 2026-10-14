@@ -19,7 +19,7 @@ use serde_json::Value;
 
 /// Four events in one segment: three creates and an update.
 fn seeded(name: &str) -> TestDatabase {
-    let database = TestDatabase::new(name);
+    let database = TestDatabase::new_legacy(name);
     for id in ["one", "two", "three"] {
         run_success(
             database
@@ -178,7 +178,7 @@ fn a_re_hashed_forged_event_is_caught_by_the_events_that_follow_it() {
 /// made the false claim, and a later mutation is refused for the same reason.
 #[test]
 fn a_forged_head_result_is_rejected_even_if_rehashed_and_reanchored() {
-    let database = TestDatabase::new("forged-head");
+    let database = TestDatabase::new_legacy("forged-head");
     run_success(
         database
             .command()
@@ -250,7 +250,7 @@ fn a_forged_head_result_is_rejected_even_if_rehashed_and_reanchored() {
 /// forgery.
 #[test]
 fn a_forged_head_actor_still_needs_an_external_checkpoint() {
-    let database = TestDatabase::new("forged-head-actor");
+    let database = TestDatabase::new_legacy("forged-head-actor");
     run_success(
         database
             .command()
@@ -299,7 +299,7 @@ fn a_forged_head_actor_still_needs_an_external_checkpoint() {
 /// detected without relying on an external checkpoint.
 #[test]
 fn a_forged_head_event_should_be_detected_without_an_external_checkpoint() {
-    let database = TestDatabase::new("forged-head-ideal");
+    let database = TestDatabase::new_legacy("forged-head-ideal");
     run_success(
         database
             .command()
@@ -350,7 +350,7 @@ fn a_version_three_baseline_cannot_strip_or_downgrade_its_exact_snapshot() {
             "legacy record witness does not describe the replayed document",
         ),
     ] {
-        let database = TestDatabase::new(&format!("baseline-snapshot-{name}"));
+        let database = TestDatabase::new_legacy(&format!("baseline-snapshot-{name}"));
         fs::create_dir_all(database.root.join("records/legacy")).unwrap();
         fs::write(
             database.root.join("records/legacy/one.md"),
@@ -391,7 +391,7 @@ fn a_version_three_baseline_cannot_strip_or_downgrade_its_exact_snapshot() {
 
 #[test]
 fn every_version_three_present_state_requires_its_exact_snapshot() {
-    let database = TestDatabase::new("update-snapshot-required");
+    let database = TestDatabase::new_legacy("update-snapshot-required");
     run_success(
         database
             .command()
@@ -423,7 +423,7 @@ fn every_version_three_present_state_requires_its_exact_snapshot() {
 
 #[test]
 fn a_legacy_noncanonical_baseline_accepts_a_v3_successor_and_checks_it() {
-    let database = TestDatabase::new("legacy-baseline-successor");
+    let database = TestDatabase::new_legacy("legacy-baseline-successor");
     fs::create_dir_all(database.root.join("records/legacy")).unwrap();
     fs::write(
         database.root.join("records/legacy/one.md"),
@@ -476,7 +476,7 @@ fn a_legacy_noncanonical_baseline_accepts_a_v3_successor_and_checks_it() {
 
 #[test]
 fn a_legacy_noncanonical_filesystem_save_uses_the_current_file_as_its_witness() {
-    let database = TestDatabase::new("legacy-filesystem-save");
+    let database = TestDatabase::new_legacy("legacy-filesystem-save");
     run_success(
         database
             .command()
@@ -521,7 +521,7 @@ fn a_legacy_noncanonical_filesystem_save_uses_the_current_file_as_its_witness() 
 
 #[test]
 fn a_baseline_event_is_valid_only_as_the_first_event_for_a_record() {
-    let database = TestDatabase::new("late-baseline");
+    let database = TestDatabase::new_legacy("late-baseline");
     run_success(
         database
             .command()
@@ -552,7 +552,7 @@ fn a_baseline_event_is_valid_only_as_the_first_event_for_a_record() {
 
 #[test]
 fn an_empty_baseline_cannot_claim_a_present_record_hash() {
-    let database = TestDatabase::new("empty-baseline");
+    let database = TestDatabase::new_legacy("empty-baseline");
     fs::create_dir_all(database.root.join("records/legacy")).unwrap();
     fs::write(
         database.root.join("records/legacy/one.md"),
@@ -601,7 +601,7 @@ fn event_actions_are_bound_to_their_record_presence_transitions() {
             "update action does not match the present-to-absent record transition",
         ),
     ] {
-        let database = TestDatabase::new(name);
+        let database = TestDatabase::new_legacy(name);
         run_success(database.command().args([
             "create",
             "items",
@@ -646,7 +646,7 @@ fn event_actions_are_bound_to_their_record_presence_transitions() {
 
 #[test]
 fn payload_versions_may_increase_but_never_decrease() {
-    let database = TestDatabase::new("payload-version-decrease");
+    let database = TestDatabase::new_legacy("payload-version-decrease");
     run_success(
         database
             .command()
@@ -1082,7 +1082,7 @@ fn a_pending_file_naming_an_unsafe_record_identity_is_refused() {
 /// reported a different record on most runs.
 #[test]
 fn verification_names_the_same_divergent_record_on_every_run() {
-    let database = TestDatabase::new("divergence-order");
+    let database = TestDatabase::new_legacy("divergence-order");
     for id in ["one", "two", "three", "four", "five", "six"] {
         run_success(
             database

@@ -28,7 +28,7 @@ const SAVED_WALK: &str = ".cr/cache/verified-journal.json";
 /// A database whose journal starts a new segment every two events, with
 /// several sealed segments and one still being appended to.
 fn seeded(name: &str) -> TestDatabase {
-    let database = TestDatabase::new(name);
+    let database = TestDatabase::new_legacy(name);
     fs::write(
         database.root.join(".cr/config.yaml"),
         "version: 1\ndata_dir: records\naudit:\n  segment_max_events: 2\n",

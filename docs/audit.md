@@ -4,6 +4,70 @@ Every successful `create`, `update`, `link`, `delete`, direct `save`, and change
 
 ![The global audit log filtered to one CRM deal, with a field-level change expanded](screenshots/audit-log.jpg)
 
+## SQLite audit storage and migration
+
+New databases keep audit history in `.cr/audit.sqlite` (database format 2).
+Records, schemas, bundle assets, views, encryption context, CLI commands, HTTP
+responses, and `serve` keep their existing behavior. SQLite is bundled with the
+binary; there is no database service to install.
+
+For an existing format-1 database, stop all servers, schedulers, and other CR
+writers, take a consistent backup, and run once as its owner:
+
+```sh
+cr --database /path/to/database audit migrate
+cr --database /path/to/database audit verify
+```
+
+Migration validates the legacy chain, imports exact event bytes and hashes,
+builds the operational indexes, independently checks the destination, then
+atomically switches the config to format 2. It preserves unsaved Markdown
+edits, ciphertext, record versions, signed checkpoints, and original retry
+responses. It retains `.cr/audit/segments/` as migration evidence. Repeating the
+command verifies the SQLite projections and reports already migrated.
+Interrupted import rolls back; an import completed before config publication
+can resume after verifying its prefix against the source. An unrelated or
+corrupt destination is refused. Do not change `version` by hand to migrate.
+
+Older binaries refuse format 2. Restart all processes using the updated binary;
+an older process already running before migration cannot honor a fence it does
+not reread. A missing SQLite file is an error, never a fallback to old segments.
+Rollback requires the complete pre-migration backup; switching config back after
+new writes would discard accepted SQLite history.
+
+Normal writes and retries use transactionally maintained per-record and scoped
+retry indexes. A single-record write or recovery reads its affected state and
+the chain head; it does not replay history or serialize every audited record.
+History pages seek through sequence and record/collection/agent/session indexes,
+then apply current visibility before counting the page. Whole-collection and
+working-tree operations still inspect their records.
+
+`audit verify`, `check`, and `--verify-audit` independently replay historical
+bytes and compare the maintained projections. Ordinary operations trust those
+projections; they do not immediately detect every historical rewrite. Retain
+external heads and signed checkpoints. Format 2 does not perform a periodic
+full replay every 64 writes; `audit.full_walk_after_events` applies only to
+legacy storage. Explicit verification and migration still hold writer
+coordination for filesystem consistency and can delay writes; schedule them
+outside latency-sensitive work. Healthy SQLite discovery and ordinary record
+reads do not acquire that writer lock.
+
+SQLite appends events, affected state/activity, retry identities, and the head
+in one transaction. A durable pending row coordinates this with external file
+publication; it remains until anchor/signature publication succeeds. Recovery
+recognizes an already committed event and finishes publication without
+appending it again. Bundles retain the existing staged-files protocol and
+concurrent-read snapshot semantics.
+
+SQLite uses WAL and FULL synchronous writes. Stop all CR processes before
+copying the whole database for a backup. While active, the `audit.sqlite-wal`
+file can contain committed events absent from the main file; copying only
+`audit.sqlite` can lose them. For a live backup, use SQLite's backup API and
+coordinate record-file capture at the same audit head. Use a local filesystem
+with working file locks and shared memory; WAL is not suitable for a database
+file shared across hosts through a network filesystem. See
+[the implementation plan](audit-sqlite-plan.md) for the storage model and checks.
+
 ## View history
 
 Show recent events for the entire database:
@@ -41,9 +105,10 @@ honest without making verification depend on a serializer's current output.
 Old version 1 and 2 events remain readable: when their lost representation
 details matter at a record's current head, the matching materialized record is
 used as the exact witness. Payload versions may increase but never decrease
-within a journal. Every new mutation performs the same replay before it writes,
-so an inconsistent older event refuses the write at the guilty sequence with
-`audit_integrity_failed`.
+within a journal. Legacy mutations verify or resume that historical replay.
+SQLite mutations validate their new transition against the affected committed
+record state; explicit full verification detects inconsistent historical events
+at the guilty sequence with `audit_integrity_failed`.
 
 A [bundle record](working-with-records.md#bundle-records)'s event also lists
 its changed supporting files under `files`, and verification holds them to the
@@ -69,7 +134,7 @@ cr audit verify --expected-head 'sha256:YOUR_SAVED_HASH'
 signs the new head with a key kept outside the database, and a verifier
 holding only the public key checks it.
 
-### Reads, writes, and the saved walk
+### Legacy format 1: reads, writes, and the saved walk
 
 Commands other than `audit verify` and `check` need the journal too: reading
 or listing a collection without encryption checks that no record once owned

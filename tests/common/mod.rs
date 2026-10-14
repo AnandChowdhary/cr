@@ -25,6 +25,18 @@ impl TestDatabase {
         }
     }
 
+    pub fn new_legacy(name: &str) -> Self {
+        let database = Self::new(name);
+        std::fs::remove_file(database.root.join(".cr/audit.sqlite")).unwrap();
+        std::fs::write(
+            database.root.join(".cr/config.yaml"),
+            "version: 1\ndata_dir: records\n",
+        )
+        .unwrap();
+        run_success(database.command().args(["audit", "head"]));
+        database
+    }
+
     pub fn command(&self) -> Command {
         command_for(&self.root)
     }
@@ -90,4 +102,15 @@ pub fn run_failure(command: &mut Command) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stderr).expect("stderr was not UTF-8")
+}
+
+pub fn init_legacy(root: impl AsRef<Path>) -> anyhow::Result<cr::Database> {
+    let root = root.as_ref();
+    cr::Database::init(root)?;
+    std::fs::remove_file(root.join(".cr/audit.sqlite"))?;
+    std::fs::write(
+        root.join(".cr/config.yaml"),
+        "version: 1\ndata_dir: records\n",
+    )?;
+    cr::Database::discover(Some(root))
 }

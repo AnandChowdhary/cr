@@ -52,12 +52,7 @@ fn a_committed_create_replays_its_original_result_without_another_event() {
     assert_eq!(replay.body, first.body);
     assert_eq!(database.audit_head().unwrap().sequence, 1);
 
-    let journal = fs::read_to_string(
-        database
-            .root()
-            .join(".cr/audit/segments/00000000000000000001.jsonl"),
-    )
-    .unwrap();
+    let journal = chain::journal_text(database.root());
     assert!(journal.contains("\"idempotency\""));
     assert!(
         !journal.contains(KEY),
@@ -261,7 +256,7 @@ fn replay_keeps_the_original_path_after_data_directory_changes() {
     let first = run_success(database.command().args(create));
     fs::write(
         database.root.join(".cr/config.yaml"),
-        "version: 1\ndata_dir: content/data\n",
+        "version: 2\ndata_dir: content/data\n",
     )
     .unwrap();
     fs::create_dir_all(database.root.join("content/data")).unwrap();
@@ -465,7 +460,7 @@ fn a_record_written_before_the_event_is_recovered_and_then_replayed() {
 
 #[test]
 fn duplicate_scoped_retry_identity_is_audit_corruption_even_for_another_request() {
-    let database = common::TestDatabase::new("duplicate-idempotency-identity");
+    let database = common::TestDatabase::new_legacy("duplicate-idempotency-identity");
     run_success(
         database
             .command()
@@ -680,12 +675,7 @@ fn sync_never_carries_or_consumes_a_caller_idempotency_key() {
         .unwrap()
         .run_sync("import")
         .unwrap();
-    let journal = fs::read_to_string(
-        database
-            .root()
-            .join(".cr/audit/segments/00000000000000000001.jsonl"),
-    )
-    .unwrap();
+    let journal = chain::journal_text(database.root());
     assert!(journal.contains("\"source\":\"sync\""));
     assert!(!journal.contains("\"idempotency\""));
     assert!(!journal.contains(KEY));
@@ -693,7 +683,7 @@ fn sync_never_carries_or_consumes_a_caller_idempotency_key() {
 
 #[test]
 fn a_rehashed_and_reanchored_forged_result_is_refused_by_verify_and_replay() {
-    let database = common::TestDatabase::new("forged-idempotency-result");
+    let database = common::TestDatabase::new_legacy("forged-idempotency-result");
     run_success(database.command().args([
         "create",
         "items",
@@ -746,7 +736,7 @@ fn a_rehashed_and_reanchored_forged_result_is_refused_by_verify_and_replay() {
 
 #[test]
 fn a_forged_retry_result_path_is_rejected_without_disclosure() {
-    let database = common::TestDatabase::new("forged-idempotency-path");
+    let database = common::TestDatabase::new_legacy("forged-idempotency-path");
     run_success(
         database
             .command()

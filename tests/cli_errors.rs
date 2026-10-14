@@ -48,6 +48,7 @@ fn repeated_init_does_not_modify_an_existing_configless_database() {
     let config = database.root.join(".cr/config.yaml");
     let marker = database.root.join(".cr/keep");
     fs::write(&marker, "unchanged").unwrap();
+    fs::remove_file(&config).unwrap();
     assert!(!config.exists());
 
     let stderr = run_failure(
@@ -135,7 +136,7 @@ fn an_unusable_database_configuration_is_a_validation_failure() {
         ),
         (
             "version: 99\ndata_dir: records\n",
-            "database format version 99 is unsupported (expected 1)",
+            "database format version 99 is unsupported (expected 1 or 2)",
         ),
         (
             "version: 1\ndata_dir: ../outside\n",

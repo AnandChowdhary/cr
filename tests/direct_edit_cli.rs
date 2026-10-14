@@ -238,7 +238,7 @@ fn selective_save_leaves_other_changes_dirty_and_rejects_invalid_selections() {
 
 #[test]
 fn malformed_files_are_visible_but_cannot_be_saved_or_partially_trusted() {
-    let database = TestDatabase::new("direct-malformed");
+    let database = TestDatabase::new_legacy("direct-malformed");
     fs::create_dir_all(database.root.join("records/items")).unwrap();
     fs::write(
         database.root.join("records/items/broken.md"),

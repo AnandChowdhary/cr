@@ -24,7 +24,7 @@ use serde_json::Value;
 /// One create and one attributed update, the same seed the forged-head
 /// specification uses.
 fn seeded(name: &str) -> TestDatabase {
-    let database = TestDatabase::new(name);
+    let database = TestDatabase::new_legacy(name);
     run_success(
         database
             .command()
@@ -346,7 +346,7 @@ fn an_absent_anchor_verifies_with_a_notice_rather_than_failing() {
 /// An empty journal has nothing to anchor and says nothing about it.
 #[test]
 fn an_empty_journal_reports_no_anchor_notice() {
-    let database = TestDatabase::new("anchor-empty");
+    let database = TestDatabase::new_legacy("anchor-empty");
     let verification = run_success(database.command().args(["audit", "verify"]));
     assert!(!verification.contains("notice:"), "{verification}");
     assert_eq!(report_findings_count(&database, "audit_anchor_missing"), 0);
@@ -447,7 +447,7 @@ fn rewriting_the_anchor_is_refused_while_it_disagrees_with_the_journal() {
 /// of them must move the anchor. They share one append, and this pins that.
 #[test]
 fn every_command_that_extends_the_chain_advances_the_anchor() {
-    let database = TestDatabase::new("anchor-every-path");
+    let database = TestDatabase::new_legacy("anchor-every-path");
     let mut expected = 0;
     let mut assert_anchored = |label: &str| {
         expected += 1;
