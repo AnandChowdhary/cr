@@ -1799,6 +1799,14 @@ impl Admission {
             .get(&(collection.to_owned(), id.to_owned()))
             .is_some_and(|state| state.hash.is_none())
     }
+
+    /// Whether this process walked the journal from its first event for this
+    /// admission, and nothing has been appended since, rather than resuming a
+    /// walk that was saved: a walk worth leaving for the next command even
+    /// when the write it admitted appends nothing.
+    pub(crate) fn walked_from_first_event(&self) -> bool {
+        self.journal.walked && self.journal.last_full_walk == self.journal.walk.entries()
+    }
 }
 
 impl<'a> AuditLog<'a> {
@@ -2185,6 +2193,13 @@ impl<'a> AuditLog<'a> {
             None => Err(missing_audit_history(collection, id, "using")),
             Some(_) => Err(stale_audit_state(collection, id)),
         }
+    }
+
+    /// Refuse what [`Self::commit`] refuses for its signing key or signed
+    /// checkpoint, for a write that changes nothing and so commits nothing.
+    pub(crate) fn assert_signable(&self, entry: &PreparedEntry) -> Result<()> {
+        self.append_signer(entry.parsed.sequence.saturating_sub(1))
+            .map(drop)
     }
 
     /// Apply one prepared mutation and append its event, which must still
